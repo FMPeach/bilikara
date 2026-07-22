@@ -11,6 +11,7 @@ import re
 import socket
 import threading
 import time
+import traceback
 import webbrowser
 from http.cookies import SimpleCookie
 from http import HTTPStatus
@@ -74,6 +75,7 @@ from .config import (
     ensure_directories,
 )
 from .diagnostics import DiagnosticArtifact, build_diagnostic_artifact
+from .launcher import append_startup_log
 from .playlist_export import playlist_csv_bytes, playlist_image_export
 from .remote_identity import RemoteIdentityStore
 from .store import PlaylistStore
@@ -1766,6 +1768,16 @@ class BilikaraHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self._write_json({"ok": False, "error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
         except Exception as exc:  # noqa: BLE001
+            request_traceback = traceback.format_exc().rstrip()
+            append_startup_log(
+                f"Unhandled request exception (method=POST, route={route}):\n"
+                f"{request_traceback}"
+            )
+            print(
+                f"[bilikara] unhandled POST exception route={route}:\n"
+                f"{request_traceback}",
+                flush=True,
+            )
             self._write_json(
                 {"ok": False, "error": f"服务器异常: {exc}"},
                 status=HTTPStatus.INTERNAL_SERVER_ERROR,
