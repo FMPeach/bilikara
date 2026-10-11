@@ -1,7 +1,7 @@
 "use strict";
 // Real HTTP -> scheduler -> supervised child -> media -> artifact -> AppState.
 const assert=require("node:assert/strict"),fs=require("node:fs/promises"),path=require("node:path");
-async function runCase({api,okay,capture,browser,evidence,directory,getPage,restart,shutdown}){
+async function runCase({api,okay,capture,browser,evidence,directory,getPage,adoptPage,restart,shutdown}){
   const root=process.env.BILIKARA_BBDOWN_FIXTURE_ROOT;
   let page=getPage();const errors=[],warnings=[];
   function watch(){page.on("pageerror",e=>errors.push(e.message));page.on("console",m=>{
@@ -155,6 +155,8 @@ async function runCase({api,okay,capture,browser,evidence,directory,getPage,rest
   // assertion, just as through the explicit failed-attempt bounds above.
   page=await failureContext.newPage();watch();await page.goto(failureUrl);
   await page.waitForFunction(()=>state.hasValidStateResponse);
+  // A new document mints a new player identity; HTTP checks must follow it.
+  await adoptPage(page);
   await capture("bbdown-failed-desktop.png",page);
   await fetch(process.env.DESKTOP_FIXTURE_CONTROL+"/fixture/bbdown-dash");
   // Retry supersedes an active attempt. Old results cannot become ready.
@@ -162,7 +164,9 @@ async function runCase({api,okay,capture,browser,evidence,directory,getPage,rest
   const retryPids=await running();await mode("success");await retry();await reaped(retryPids);await ready();
   // Cache disablement uses existing player capability settlement, then re-entry.
   await mode("slow");await retry();await until(async()=> (await running()).length>=2);
-  const disabledPids=await running();await caps(false);await reaped(disabledPids);
+  const disabledPids=await running();
+  await page.waitForFunction(()=>state.hostPlaybackSession?.ownershipClaimed);
+  await caps(false);await reaped(disabledPids);
   assert.equal((await okay("/api/state")).cache_policy.enabled,false);
   // Cancellation preserves the last readable publication. Explicitly remove
   // this fixture's one video to exercise fresh admission on capability re-entry.
