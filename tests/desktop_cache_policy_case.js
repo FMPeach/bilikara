@@ -100,7 +100,11 @@ module.exports=async ({api,okay,capture,browser,evidence,getPage,restart,inspect
     });assert.equal(denied,403);
     assert.equal((await okay("/api/state")).cache_policy.media_capabilities.avc_supported,true);
     await remote.locator("#playback-dock").click();
-    await remote.locator("#remote-volume-slider").focus();await remote.locator("#remote-volume-slider").press("End");
+    // Morph/drag content is inert until it settles; focus() does not wait for it.
+    await remote.locator(".playback-sheet-body:not([inert])").waitFor({state:"visible"});
+    await remote.locator("#remote-volume-slider").focus();
+    assert.equal(await remote.locator("#remote-volume-slider").evaluate(node=>node===document.activeElement),true);
+    await remote.locator("#remote-volume-slider").press("End");
     await page.waitForFunction(()=>state.data.player_settings.volume_percent===100);
     await capture("cache-policy-remote-375.png",remote);
     await okay("/api/cache-policy",{reset_offset_on_next:true});
