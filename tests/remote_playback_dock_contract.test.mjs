@@ -460,7 +460,7 @@ assert.ok(contains("setAttribute(\"aria-pressed\", String(!isPaused))", render_s
 async test_transport_grid_keeps_one_row_at_375_and_320_widths() {
 let declaration, phone_rules, progress_rule, range_rule, row_rule, transport_button_rule;
 row_rule = this.styles.match(new RegExp("\\.player-control-row\\s*\\{([^}]*)\\}",""))[1];
-assert.ok(contains("grid-template-columns: 44px 48px 44px minmax(88px, 1fr) 44px", row_rule));
+assert.ok(contains("grid-template-columns: 44px 48px 44px minmax(88px, 1fr) var(--playback-song-actions-width, 44px)", row_rule));
 assert.ok(contains("gap: clamp(4px, 1.2vw, 6px)", row_rule));
 assert.ok(contains("max-width: none", row_rule));
 progress_rule = this.styles.match(new RegExp("\\.player-progress-unit\\s*\\{([^}]*)\\}",""))[1];
@@ -586,7 +586,7 @@ assert.ok(contains("\"progress progress progress progress progress\"", spacious)
 assert.ok(contains("\"back play forward . next\"", spacious));
 assert.ok(contains("grid-template-rows: 48px 48px", spacious));
 sheet_row = this.styles.match(new RegExp("\\.playback-sheet \\.player-control-row\\s*\\{([^}]*)\\}",""))[1];
-assert.ok(contains("grid-template-columns: 44px 48px 44px minmax(88px, 1fr) 44px", sheet_row));
+assert.ok(contains("grid-template-columns: 44px 48px 44px minmax(88px, 1fr) var(--playback-song-actions-width, 44px)", sheet_row));
 sheet_play = this.styles.match(new RegExp("\\.playback-sheet \\.player-control-row \\.player-play-toggle\\s*\\{([^}]*)\\}",""))[1];
 for (const declaration of iterableValues(["width: 48px", "min-width: 48px", "max-width: 48px", "height: 48px", "min-height: 48px"])) {
 assert.ok(contains(declaration, sheet_play));
@@ -596,7 +596,8 @@ assert.ok(contains("row-gap: 8px", spacious));
 adaptive = this.script.slice(sourceIndex(this.script, "function applyPlaybackSheetAdaptiveLayout"), sourceIndex(this.script, "function renderCurrentItem"));
 assert.ok(contains("rangeGain >= 96", adaptive));
 assert.ok(contains("const clearance = 10", adaptive));
-assert.ok(contains("secondaryNaturalHeight <= maximumBodyContentHeight + 0.5", adaptive));
+assert.ok(contains("<= availablePrimaryHeight + 0.5", adaptive));
+assert.ok(!contains("secondaryNaturalHeight <= maximumBodyContentHeight", adaptive));
 assert.ok(contains("panel.dataset.transportLayout", adaptive));
 assert.ok(!contains("cloneNode", adaptive));
 assert.ok(!contains("replaceChildren", adaptive));

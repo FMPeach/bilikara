@@ -418,6 +418,7 @@ html[data-host-layout="portrait"] .developer-mode .request-workspace-head { disp
 /* This footer scrolls with the settings content; it cannot obscure that content. */
 :root .settings-workspace-body .cache-panel-footer { border-top-color: transparent; }
 
+:root .playback-restart-popover::before,
 :root :is(.app-shell[data-narrow-tool-layout="overlay"] .host-workspace-region,
   .session-user-rename-panel, .confirm-popover, .selection-modal-card, .app-shell .song-detail-card,
   .song-detail-card, .rating-card, .volume-adjust-popover, .audio-variant-popover,
@@ -427,7 +428,7 @@ html[data-host-layout="portrait"] .developer-mode .request-workspace-head { disp
   .app-shell[data-stage-controls-layout="popup"] .stage-control-tray) {
   background: var(--modal-card-bg);
   border: var(--modal-card-border);
-  border-radius: 18px;
+  border-radius: var(--floating-panel-radius, 18px);
   box-shadow: var(--rating-card-shadow);
   backdrop-filter: blur(var(--modal-surface-blur));
   -webkit-backdrop-filter: blur(var(--modal-surface-blur));
@@ -436,6 +437,132 @@ html[data-host-layout="portrait"] .developer-mode .request-workspace-head { disp
 :root .source-tools .source-float-surface { border-radius: 999px; }
 :root .source-tools :is(.source-select-mode, .source-remove-selected).source-float-surface { border-radius: 50%; }
 :root .source-tools .source-select-mode[aria-pressed="true"] { border-color: var(--accent); }
+
+/* Only the collapsed popup is a floating capsule. Desktop Host and landscape
+   use ordinary circles in the control row, without an enclosing surface. */
+:root .playback-song-actions {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-self: end;
+  width: 44px;
+  height: 44px;
+}
+:root .playback-song-actions.is-expanded { width: 94px; gap: 6px; }
+:root [data-playback-restart-anchor] { position: relative; z-index: 2; }
+:root .playback-song-actions button {
+  /* Native tap highlights can linger after a captured hold is released.
+     These controls already own pressed and keyboard-focus feedback. */
+  -webkit-tap-highlight-color: transparent;
+}
+:root .playback-restart-popover {
+  --floating-panel-radius: 999px;
+  box-sizing: border-box;
+  width: 100px;
+  height: 52px;
+  padding: 4px;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 4px;
+}
+:root .playback-restart-popover {
+  position: absolute;
+  inset: auto;
+  margin: 0;
+  z-index: 1;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  opacity: 1;
+  transform: none;
+}
+:root .playback-restart-popover::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  box-sizing: border-box;
+  pointer-events: none;
+  clip-path: inset(0 0 0 48px round 26px);
+  transition: clip-path 180ms ease;
+}
+:root .playback-restart-popover[hidden],
+:root .playback-song-actions .playback-restart-action[hidden] { display: none; }
+:root .playback-restart-popover.is-open::before { clip-path: inset(0 round 26px); }
+:root .playback-restart-popover button,
+:root .playback-song-actions .playback-restart-action {
+  box-sizing: border-box;
+  flex: 0 0 44px;
+  width: 44px;
+  min-width: 44px;
+  max-width: 44px;
+  height: 44px;
+  min-height: 44px;
+  max-height: 44px;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  border: 1px solid transparent;
+  border-radius: 50%;
+  background: var(--btn-secondary-bg);
+  color: var(--ink);
+  box-shadow: none;
+  transform: none;
+  transition: background 120ms ease, border-color 120ms ease;
+  touch-action: manipulation;
+}
+:root .playback-song-actions .playback-restart-action { border-color: var(--line); }
+:root .playback-restart-popover > .playback-restart-action {
+  position: relative;
+  opacity: 0;
+  transition: opacity 180ms ease, background 120ms ease, border-color 120ms ease;
+}
+:root .playback-restart-popover.is-open > .playback-restart-action { opacity: 1; }
+:root [data-playback-restart-anchor][aria-haspopup="menu"] { touch-action: none; }
+:root .playback-restart-popover .playback-restart-action:active,
+:root .playback-song-actions.is-expanded .playback-restart-action:active { background: var(--host-control-pressed-bg); border-color: var(--accent); }
+/* Inline Next retains its existing feedback. Remote pointer use must not
+   inherit a keyboard outline from modal focus restoration. */
+:root:not([data-remote-input-modality="pointer"]) .playback-restart-popover button:focus-visible,
+:root:not([data-remote-input-modality="pointer"]) .playback-song-actions.is-expanded .playback-restart-action:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+:root .playback-restart-popover svg,
+:root .playback-song-actions .playback-restart-action svg { width: 24px; height: 24px; }
+/* Playback gestures must not select button labels or SVG text. Keep editable
+   fields outside this rule so numbers and ranges retain their native behavior. */
+:root :is(
+  .playback-sheet,
+  .presentation-host-controls,
+  .stage-control-tray,
+  .stage-extended-controls,
+  .volume-adjust-popover,
+  .playback-restart-popover
+) :is(button, button *),
+:root :is(.playback-dock, .audio-variant-button, .audio-variant-toggle),
+:root :is(.playback-dock, .audio-variant-button, .audio-variant-toggle) * {
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+:root .playback-restart-popover.is-hint {
+  pointer-events: auto;
+}
+:root .playback-restart-popover.is-hint .playback-restart-action:disabled { opacity: 1; cursor: default; }
+:root .playback-sheet-panel.is-spacious-transport .playback-song-actions { grid-area: next; }
+:root :is(.player-control-row, .presentation-host-transport-row):has(.playback-song-actions.is-expanded) {
+  --playback-song-actions-width: 94px;
+}
+@media (hover: hover) and (pointer: fine) {
+  :root:has(.app-shell) .playback-restart-popover .playback-restart-action:hover,
+  :root:has(.app-shell) .playback-song-actions.is-expanded .playback-restart-action:hover { border-color: var(--accent); }
+}
+@media (prefers-reduced-motion: reduce) {
+  :root .playback-restart-popover::before { transition: none; }
+  :root .playback-restart-popover.is-hint { transition: none; }
+  :root .playback-restart-popover > .playback-restart-action,
+  :root .playback-restart-popover button,
+  :root .playback-song-actions.is-expanded .playback-restart-action { transition: none; }
+}
 :root .source-tools .source-remove-selected.drag-over { background: var(--red); color: white; }
 
 /* Passive feedback belongs inside the fullscreen/audience root, never a body portal. */
@@ -658,6 +785,28 @@ html[data-host-layout="portrait"] .developer-mode .request-workspace-head { disp
 
 :root :is(.cache-advanced-tooltip, .remote-tooltip-bubble)[data-i18n],
 :root :is(.cache-advanced-tooltip, .remote-tooltip-bubble) [data-i18n] { white-space: pre-line; }
+
+/* Held playback hints reuse the i bubble, including its tokens and motion.
+   The annotation never takes pointer ownership or opens from hover. */
+:root .playback-control-hint {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+:root .remote-tooltip-bubble.playback-control-hint { white-space: pre-line; }
+:root .playback-control-hint[hidden] { display: none; }
+:root :is(.player-control-row .player-transport-button,
+  .presentation-host-transport-row .presentation-host-seek-button,
+  .presentation-host-transport-row .presentation-host-play,
+  .presentation-host-transport-row .presentation-host-next,
+  .playback-song-actions .playback-restart-action) {
+  /* Keep a held slide between icons under the shared pointer gesture owner. */
+  touch-action: none;
+  -webkit-tap-highlight-color: transparent;
+}
 
 /* Peer cards align their corner axes within each row/column. Keep the
    established outer panel and insets; exact concentric subtraction would

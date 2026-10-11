@@ -267,6 +267,85 @@ Chromium and WebKit, including editable waiting ratings, shared control geometry
 seek gestures and download status across isolated audience storage. Its shell
 relay fixture does not qualify native monitor/fullscreen or device behavior.
 
+`npm run test:playback-restart` separately checks the shared restart affordances
+against an actual isolated native Host, Chromium and short synthetic media.
+Linux needs the cached native alpha build, the pinned Chromium and a test-only
+`ffmpeg` executable; none becomes a product dependency. Set
+`BILIKARA_TEST_NATIVE_ALPHA_BINARY` to reuse the native binary and
+`BILIKARA_RESTART_SCREENSHOTS` to keep screenshots outside the checkout.
+Desktop Host keeps Restart and Next visible in every window shape, including
+the 700px minimum-width portrait console and mixed mouse/touch input. The shared
+component's trusted Host option enables inline actions independently of viewport
+orientation; its grid reserves their actual width. No popup/first-use animation
+is needed there. Remote and Android Host retain the responsive behavior below.
+Portrait holds the existing Next button for half a second to open a capsule
+to its left. Release over Next never skips; a fresh tap chooses restart or Next.
+Alternatively, keep holding and drag into Restart to activate immediately, before
+release. Both paths dismiss the capsule and suppress the hold's compatibility
+click; any fresh tap also dismisses it. The original Next remains painted in
+place throughout capsule entry/exit and the first-use demonstration.
+Landscape exposes two ordinary circular actions directly in the control row,
+without an enclosing capsule. Two-column Remote sheets give progress its own
+row when the left column alone has sufficient viewport height; scrolling in
+the settings column does not block it. Shorter viewports retain compact controls.
+Both use 44px targets and the existing -15s arrow geometry; only the portrait
+popup uses equal capsule insets.
+The circular transport SVG buttons also show their current localized label after
+a half-second hold, using the shared i-bubble tokens and 120ms opacity/3px motion.
+Holding and sliding between circles switches the annotation; release, leaving the
+buttons, cancellation, scrolling or a changed song retires it. Ordinary held
+explanations do not submit playback commands. Next in usable portrait controls
+adds "slide left to restart"; its existing held slide into Restart still executes
+immediately. Landscape Next omits that instruction because Restart is already
+exposed; desktop Host also shows only the ordinary Next label. First-use discovery
+remains the passive capsule animation, while these
+bubbles require an actual hold. The annotation owns no focus or pointer hit area,
+and retains its node/anchor through exit with guarded rapid reopening.
+Restart activates immediately without a confirmation dialog. Orientation is
+measured from the viewport; no URL/storage override or settings switch is used.
+The original Next node, its command guards and all seek controls remain intact.
+Both reuse the generation-bound native seek/play FIFO, preserve the media nodes and never
+retry uncertain mutations. The test covers cancellation, keyboard focus,
+current-song replacement and viewport bounds; it does not qualify physical
+Android, native windowing or public Remote deployment. Ordinary frontend tests
+run only the focused command regressions and do not launch browsers/build Rust.
+
+The restart capsule demonstrates itself once when usable portrait controls first
+become visible. Its extra restart icon is disabled and sends no playback command;
+touching that preview cannot seek through to the covered progress control.
+The existing Next action remains usable during the preview.
+User input interrupts it immediately; landscape does not consume the hint.
+Remote stores a versioned seen flag in site storage; denied storage limits it to
+the current page. Native desktop Host keeps `playback-restart-hint-v1.json`
+beside window preferences, independent of its randomly assigned HTTP port.
+Android uses a fixed private SharedPreferences flag. The two no-argument shell
+commands are limited to the current main Host origin/path; Remote and audience
+windows receive no authority. Missing/failed native preference reads suppress
+the optional hint. These are device-local UI preferences, not Runtime state,
+and carry no song, user, room or credential data.
+
+`npm run test:playback-sheet` is the explicit local rendered gesture gate, with
+the same cached native alpha/Chromium and synthetic-media prerequisites as the
+restart gate. It tests the default dock-to-sheet morph and a trusted local
+comparison build of the bottom-slide variant; there is no product URL/storage
+selector. Both retain click/tap, keyboard, modal focus and document scroll
+ownership. Only the dock and expanded header start vertical touch/pen gestures;
+the body keeps native scrolling and editable controls. Movement is painted once
+per animation frame without continuous measurements or permanent timers.
+The slide variant catches up at twice the initial finger displacement, then
+tracks it; the morph interpolates the existing surfaces and fades their content.
+Clicks use that same measured interpolation, including reversal during a pending
+animation. Only an actual held drag shows the bar, with the content's opacity;
+click animation and release settling retain the normal collapse arrow.
+Release projects position by a bounded recent velocity to decide an endpoint.
+Cancellation, viewport/current-song changes and overlapping modal operations
+discard owned frames/capture and restore the appropriate modal state.
+The browser tests exercise real Chromium touch input, first-use persistence,
+flicks, reversal, cancellation, reduced motion, node identity and 320/360px
+portrait plus landscape geometry. They do not certify physical iOS/Android or
+native window behavior. Ordinary frontend verification runs only small policy
+and preference contracts; it does not start this browser gate.
+
 Playwright is locked to 1.63.0 with its matching browsers. The older 1.55.1
 test client could hang Chromium AudioWorklet loading; upgrading the test client
 does not change the packaged WebView or Signalsmith assets. After a test-client

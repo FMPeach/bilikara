@@ -28,6 +28,8 @@
     "allow-apply-desktop-update",
     "allow-get-host-layout",
     "allow-set-host-layout",
+    "allow-get-playback-restart-hint-seen",
+    "allow-mark-playback-restart-hint-seen",
     "allow-start-desktop-update",
     "allow-cancel-desktop-update",
     "allow-open-external-web-url",

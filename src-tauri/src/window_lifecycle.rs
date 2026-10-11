@@ -1038,6 +1038,20 @@ fn refresh_cached_main_window_geometry(window: &tauri::Window) {
 }
 
 // Device-local presentation only. No AppState/media mutation or arbitrary path.
+pub(crate) fn playback_hint_path(window: &tauri::WebviewWindow) -> Result<PathBuf, String> {
+    let backend = window
+        .try_state::<BackendProcess>()
+        .ok_or("Host unavailable")?;
+    presentation::authorize_window(window, &backend, &["main"])?;
+    crate::playback_hints::authorize_entry_path(window.url().map_err(|e| e.to_string())?.path())?;
+    let state = window
+        .try_state::<MainWindowGeometryState>()
+        .ok_or("window preferences unavailable")?;
+    Ok(state
+        .storage_path()?
+        .with_file_name(crate::playback_hints::FILENAME))
+}
+
 #[tauri::command]
 pub(crate) fn get_host_layout(
     window: tauri::WebviewWindow,

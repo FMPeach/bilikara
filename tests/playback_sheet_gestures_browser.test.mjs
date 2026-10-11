@@ -1,0 +1,262 @@
+// Real Chromium touch input, native Rust Host and synthetic local media.
+import assert from 'node:assert/strict';
+import {cpSync,mkdirSync,mkdtempSync,readFileSync,rmSync,writeFileSync} from 'node:fs';
+import {tmpdir} from 'node:os';
+import path from 'node:path';
+import test from 'node:test';
+import {setTimeout as delay} from 'node:timers/promises';
+import {chromium} from 'playwright';
+import {root,runNative} from './desktop_construction_support.mjs';
+import {buildNativeAlpha} from './native_runtime_artifacts.mjs';
+import {RunningHost,isolatedEnvironment} from './native_host_support.mjs';
+
+for (const variant of ['morph','slide']) test(`real Remote first-use and ${variant} sheet gestures`,{timeout:100000},async()=>{
+  const home=mkdtempSync(path.join(tmpdir(),'bilikara-sheet-'));
+  const evidence=path.join(process.env.BILIKARA_RESTART_SCREENSHOTS || mkdtempSync(path.join(tmpdir(),'bilikara-sheet-evidence-')),variant);
+  mkdirSync(evidence,{recursive:true});
+  let browser,host,passed=false,identityReady=false,phase='setup';
+  const errors=[],external=[],commands=[],httpFailures=[],warnings=[],geometry=[];
+  try {
+    const video=path.join(home,'video.mp4'),audio=path.join(home,'audio.m4a');
+    for (const [file,args] of [[video,['-f','lavfi','-i','color=c=0x224466:s=640x360:r=10:d=120','-c:v','libx264','-preset','ultrafast','-pix_fmt','yuv420p']],
+      [audio,['-f','lavfi','-i','sine=frequency=220:sample_rate=48000:duration=120','-af','volume=0.01','-c:a','aac']]]) {
+      const result=await runNative('ffmpeg',['-hide_banner','-loglevel','error','-y',...args,file],process.env,30000);
+      assert.equal(result.status,0,result.stderr);
+    }
+    const assets=path.join(home,'static');cpSync(path.join(root,'static'),assets,{recursive:true});
+    // An owned, trusted comparison build selects the alternate constructor.
+    // The product defaults to morph; no URL/storage setting or live DOM changes.
+    if (variant==='slide') {
+      const file=path.join(assets,'remote.js'),source=readFileSync(file,'utf8');
+      const anchor='layout: () => applyPlaybackSheetAdaptiveLayout(),';
+      assert.equal(source.split(anchor).length,2);
+      writeFileSync(file,source.replace(anchor,anchor+'\n    variant: "slide",'),'utf8');
+    }
+    host=await RunningHost.start(process.env.BILIKARA_TEST_NATIVE_ALPHA_BINARY || await buildNativeAlpha(),home,
+      [home,assets,video,audio,'3'],isolatedEnvironment(home),true);
+    browser=await chromium.launch({headless:process.env.BILIKARA_RESTART_HEADED!=='1',args:['--autoplay-policy=no-user-gesture-required']});
+    const playerContext=await browser.newContext({viewport:{width:1000,height:800}});
+    await playerContext.addCookies([...host.cookies].map(([name,value])=>({name,value,url:host.base})));
+    const context=await browser.newContext({viewport:{width:375,height:812},hasTouch:true,isMobile:true,
+      recordVideo:{dir:path.join(evidence,'video'),size:{width:375,height:812}}});
+    for (const c of [playerContext,context]) {
+      await c.addInitScript(()=>{localStorage.setItem('bilikara.update.automatic','false');localStorage.setItem('bilikara.ui.language','zh');});
+      await c.route('**/*',route=>{
+        if(new URL(route.request().url()).origin===host.base)return route.continue();
+        external.push(new URL(route.request().url()).origin);return route.abort();
+      });
+    }
+    const player=await playerContext.newPage(),remote=await context.newPage();
+    for(const p of [player,remote]) {
+      p.setDefaultTimeout(12000);
+      p.on('pageerror',error=>errors.push(error.message));
+      p.on('console',message=>{if(['error','warning'].includes(message.type()))warnings.push(message.text());});
+      p.on('response',response=>{if(response.status()>=400)httpFailures.push({path:new URL(response.url()).pathname,status:response.status(),beforeIdentity:!identityReady,phase});});
+      p.on('request',request=>{if(['/api/player/control','/api/player/next'].includes(new URL(request.url()).pathname))commands.push(request.postDataJSON());});
+    }
+    await player.goto(host.base);
+    await player.waitForFunction(()=>state.hostPlaybackSession?.readyCommitted);
+    await remote.goto(host.base+'/remote');
+    await remote.locator('#remote-identity-input').fill('Gesture fixture');
+    await remote.locator('#remote-identity-submit').click();
+    await remote.locator('#remote-identity-modal').waitFor({state:'hidden'});identityReady=true;
+    assert.equal(await remote.title(),'bilikara remote');
+    const sheet=remote.locator('#playback-sheet'),dock=remote.locator('#playback-dock');
+    const menu=remote.locator('.playback-restart-popover'),header=remote.locator('.playback-sheet-status-header');
+    const collapse=remote.locator('#playback-sheet-collapse');
+    const cdp=await context.newCDPSession(remote);
+    const touch=async(type,x=0,y=0)=>cdp.send('Input.dispatchTouchEvent',{type,touchPoints:type==='touchEnd'||type==='touchCancel'?[]:[{x,y}]});
+    const screen=async(name)=>{
+      const metrics=await remote.evaluate(()=>({width:innerWidth,height:innerHeight,overflow:document.documentElement.scrollWidth>innerWidth,selection:String(getSelection()),open:state.playbackSheetOpen,active:!!playbackSheetGesture?.active,
+        panel:(()=>{const r=document.querySelector('#playback-sheet-panel').getBoundingClientRect();return{x:r.x,y:r.y,width:r.width,height:r.height};})()}));
+      assert.equal(metrics.overflow,false);assert.equal(metrics.selection,'');
+      geometry.push({name,...metrics});await remote.screenshot({path:path.join(evidence,name+'.png')});
+    };
+    const idle=()=>remote.waitForFunction(()=>!playbackSheetGesture?.active);
+    const openByClick=async()=>{await dock.tap();await sheet.waitFor({state:'visible'});await delay(300);};
+    const closeByClick=async()=>{await collapse.tap();await sheet.waitFor({state:'hidden'});};
+    const clickMotion=async(expanded)=>{
+      // Read actual rendered frames around the click, without modifying UI.
+      const observed=remote.evaluate(async()=>{
+        const frames=[];let seen=false;
+        for(let i=0;i<100;i++) {
+          await new Promise(resolve=>requestAnimationFrame(resolve));
+          const active=!!playbackSheetGesture?.active;
+          if(active) {
+            seen=true;
+            const panel=document.querySelector('#playback-sheet-panel'),handle=document.querySelector('#playback-sheet-collapse');
+            const rect=panel.getBoundingClientRect();
+            frames.push({width:rect.width,height:rect.height,dragging:document.querySelector('#playback-sheet').classList.contains('is-dragging'),bar:getComputedStyle(handle,'::after').content});
+          } else if(seen) return frames;
+        }
+        return frames;
+      });
+      await (expanded?dock:collapse).tap();
+      const frames=await observed;
+      assert.ok(frames.length>=2,'Click has real intermediate frames');
+      assert.ok(frames.every(frame=>!frame.dragging&&['none','normal'].includes(frame.bar)),'Click animation keeps the arrow, without a drag bar');
+      if(variant==='morph') {
+        assert.ok(Math.max(...frames.map(frame=>frame.width))-Math.min(...frames.map(frame=>frame.width))>4,'Click morphs width, rather than sliding a full-width panel');
+        assert.ok(Math.max(...frames.map(frame=>frame.height))-Math.min(...frames.map(frame=>frame.height))>30,'Click morphs the surface height');
+      }
+      await idle();assert.equal(await remote.evaluate(()=>state.playbackSheetOpen),expanded);
+      geometry.push({name:expanded?'click-open-frames':'click-close-frames',frames});
+    };
+    phase='first-use';
+    await openByClick();
+    await remote.waitForFunction(()=>document.querySelector('.playback-restart-popover').classList.contains('is-hint-open'));
+    await delay(220);
+    assert.equal(await menu.getAttribute('aria-hidden'),'true');
+    assert.equal(await menu.locator('.playback-restart-action').isDisabled(),true);
+    assert.equal(await remote.locator('[data-control-action="next-track"]').evaluate(node=>node.tabIndex),0,'Passive preview keeps the original Next keyboard accessible');
+    assert.equal(await remote.locator('.playback-restart-next').count(),0,'Preview owns no duplicate Next target');
+    assert.equal(await remote.locator('[data-control-action="next-track"]').getAttribute('aria-expanded'),'false');
+    await screen('first-use-expanded');
+    await remote.waitForFunction(()=>localStorage.getItem('bilikara.ui.playback-restart-seen.remote.v1')==='true');
+    await menu.waitFor({state:'hidden'});assert.deepEqual(commands,[]);
+    // A separate owned profile has not seen the hint. A touch on its passive
+    // extra icon must not click the progress control underneath it.
+    const storage=await context.storageState();
+    for(const origin of storage.origins) origin.localStorage=origin.localStorage.filter(entry=>entry.name!=='bilikara.ui.playback-restart-seen.remote.v1');
+    const hintContext=await browser.newContext({viewport:{width:375,height:812},hasTouch:true,isMobile:true,storageState:storage});
+    await hintContext.route('**/*',route=>{
+      if(new URL(route.request().url()).origin===host.base)return route.continue();
+      external.push(new URL(route.request().url()).origin);return route.abort();
+    });
+    const hintPage=await hintContext.newPage();
+    hintPage.on('pageerror',error=>errors.push(error.message));
+    hintPage.on('request',request=>{if(new URL(request.url()).pathname==='/api/player/control')commands.push(request.postDataJSON());});
+    await hintPage.goto(host.base+'/remote');
+    await hintPage.locator('#remote-identity-modal').waitFor({state:'hidden'});
+    await hintPage.locator('#playback-dock').tap();
+    await hintPage.waitForFunction(()=>document.querySelector('.playback-restart-popover').classList.contains('is-hint-open'));
+    const preview=await hintPage.locator('.playback-restart-popover .playback-restart-action').boundingBox();
+    await hintPage.touchscreen.tap(preview.x+preview.width/2,preview.y+preview.height/2);await delay(200);
+    assert.equal(await hintPage.locator('.playback-restart-popover').isVisible(),false);
+    assert.notEqual(await hintPage.evaluate(()=>localStorage.getItem('bilikara.ui.playback-restart-seen.remote.v1')),'true','An interrupted hint was not completed');
+    assert.deepEqual(commands,[],'Passive hint touch cannot seek underneath it');await hintPage.close();
+    await closeByClick();await openByClick();await delay(950);
+    assert.equal(await menu.isVisible(),false,'Completed hint never repeats');await closeByClick();
+    phase='click-morph';
+    await clickMotion(true);await clickMotion(false);
+    // Escape while click-opening reverses from its current position. A fresh
+    // click after settling must own a new animation, not an old callback.
+    await dock.tap();await delay(45);await remote.keyboard.press('Escape');
+    await idle();await sheet.waitFor({state:'hidden'});
+    assert.equal(await remote.locator('.playback-sheet-dock-ghost').count(),0);
+    assert.equal(await remote.evaluate(()=>document.querySelector('.remote-shell').inert),false);
+    await openByClick();await closeByClick();
+    phase='gestures';
+    // Preserve the rendered input node across presentation only.
+    await openByClick();
+    const input=remote.locator('#remote-av-offset-input');
+    const inputHandle=await input.elementHandle();
+    await closeByClick();
+    let box=await dock.boundingBox(),x=box.x+box.width/2,y=box.y+box.height/2;
+    await touch('touchStart',x,y);
+    for(const dy of [12,30,60,100,160,230]) {
+      await touch('touchMove',x,y-dy);await delay(35);
+      if(dy===12&&variant==='morph') {
+        const initial=await remote.evaluate(()=>({body:parseFloat(getComputedStyle(document.querySelector('.playback-sheet-body')).opacity),handle:parseFloat(getComputedStyle(document.querySelector('#playback-sheet-collapse')).opacity)}));
+        assert.equal(initial.body,0);assert.equal(initial.handle,0,'Drag bar stays hidden while dock content is shown');
+      }
+    }
+    assert.equal(await remote.evaluate(()=>playbackSheetGesture.active),true);
+    await screen('opening-half');
+    assert.equal(await remote.evaluate(()=>document.querySelector('#playback-sheet').classList.contains('is-dragging')),true);
+    const handleFade=await remote.evaluate(()=>({body:parseFloat(getComputedStyle(document.querySelector('.playback-sheet-body')).opacity),handle:parseFloat(getComputedStyle(document.querySelector('#playback-sheet-collapse')).opacity)}));
+    assert.ok(Math.abs(handleFade.body-handleFade.handle)<.001,'Drag handle follows the content crossfade');
+    const half=await sheet.evaluate(node=>parseFloat(node.style.getPropertyValue('--playback-sheet-drag-progress')));
+    assert.ok(half>0&&half<1,`Intermediate progress ${half}`);
+    const first=geometry.at(-1);
+    if(variant==='morph') {
+      assert.ok(first.panel.width>box.width,'Surface expands horizontally');
+      assert.ok(first.panel.height>box.height,'Surface expands vertically');
+    }
+    for(const dy of [300,380,450,520]) {await touch('touchMove',x,Math.max(15,y-dy));await delay(30);}
+    await touch('touchEnd');await idle();await delay(50);
+    assert.equal(await remote.evaluate(()=>state.playbackSheetOpen),true);await screen('opened');
+    assert.equal(await inputHandle.evaluate(node=>node===document.querySelector('#remote-av-offset-input')),true);
+    // Long press on the header selects no text; a tap still closes it.
+    box=await header.boundingBox();x=box.x+25;y=box.y+box.height/2;
+    await touch('touchStart',x,y);await delay(750);await touch('touchEnd');
+    assert.equal(await remote.evaluate(()=>String(getSelection())), '');
+    // A short, slow down-drag rebounds. Content cannot start a dismissal.
+    await touch('touchStart',x,y);
+    for(const dy of [12,28,45]) {await touch('touchMove',x,y+dy);await delay(75);}
+    await delay(130);await touch('touchEnd');await idle();
+    assert.equal(await remote.evaluate(()=>state.playbackSheetOpen),true);
+    const content=await remote.locator('.playback-sheet-summary').boundingBox();
+    await touch('touchStart',content.x+30,content.y+30);await touch('touchMove',content.x+30,content.y+110);await touch('touchEnd');
+    assert.equal(await remote.evaluate(()=>playbackSheetGesture.active),false);
+    assert.equal(await remote.evaluate(()=>state.playbackSheetOpen),true);
+    // Downwards motion follows the header until the same midpoint and closes.
+    box=await header.boundingBox();x=box.x+25;y=box.y+box.height/2;
+    await touch('touchStart',x,y);
+    for(const dy of [15,50,100,160,230]) {await touch('touchMove',x,y+dy);await delay(40);}
+    await screen('closing-half');
+    for(const dy of [300,400,510,600]) {await touch('touchMove',x,Math.min(790,y+dy));await delay(30);}
+    await touch('touchEnd');await idle();await sheet.waitFor({state:'hidden'});
+    assert.equal(await remote.evaluate(()=>document.querySelector('.remote-shell').inert),false);
+    // Cancellation rolls back to the original endpoint and leaves no capture/ghost.
+    box=await dock.boundingBox();x=box.x+box.width/2;y=box.y+box.height/2;
+    await touch('touchStart',x,y);await touch('touchMove',x,y-100);await touch('touchCancel');await idle();await sheet.waitFor({state:'hidden'});
+    assert.equal(await remote.locator('.playback-sheet-dock-ghost').count(),0);
+    // Short opening must close; horizontal dragging must retain document gestures.
+    await touch('touchStart',x,y);await touch('touchMove',x,y-25);await delay(150);await touch('touchEnd');await idle();await sheet.waitFor({state:'hidden'});
+    await touch('touchStart',x,y);await touch('touchMove',x+70,y-4);await touch('touchCancel');
+    assert.equal(await remote.evaluate(()=>state.playbackSheetOpen),false);
+    // Real quick flicks decide by recent velocity, before passing halfway.
+    await touch('touchStart',x,y);
+    await touch('touchMove',x,y-12);await delay(20);await touch('touchMove',x,y-130);await touch('touchEnd');
+    await idle();assert.equal(await remote.evaluate(()=>state.playbackSheetOpen),true,'Upward flick expands');
+    box=await header.boundingBox();x=box.x+25;y=box.y+box.height/2;
+    await touch('touchStart',x,y);
+    await touch('touchMove',x,y+12);await delay(20);await touch('touchMove',x,y+140);await touch('touchEnd');
+    await idle();await sheet.waitFor({state:'hidden'});
+    // Reverse direction shortly before release: use recent movement, not the
+    // full gesture average or a previous animation's velocity.
+    box=await dock.boundingBox();x=box.x+box.width/2;y=box.y+box.height/2;
+    await touch('touchStart',x,y);
+    for(const dy of [12,120,300,400]) {await touch('touchMove',x,y-dy);await delay(35);}
+    await delay(140);
+    await touch('touchMove',x,y-380);await delay(20);await touch('touchMove',x,y-260);await touch('touchEnd');
+    await idle();await sheet.waitFor({state:'hidden'});
+    for(const [width,height] of [[320,640],[360,640],[360,1000],[812,375]]) {
+      await remote.setViewportSize({width,height});await openByClick();
+      await remote.waitForFunction(()=>!state.playbackMetadataLayoutFrame);
+      await screen(`opened-${width}x${height}`);await closeByClick();
+    }
+    await remote.setViewportSize({width:375,height:812});await remote.emulateMedia({reducedMotion:'reduce'});
+    await openByClick();box=await header.boundingBox();x=box.x+20;y=box.y+box.height/2;
+    await touch('touchStart',x,y);await touch('touchMove',x,y+60);
+    await remote.setViewportSize({width:360,height:800});await idle();
+    assert.equal(await remote.evaluate(()=>state.playbackSheetOpen),true);await touch('touchCancel');await closeByClick();
+    await cdp.detach();
+    assert.deepEqual(commands,[],'Hints and gestures never invoke playback commands');
+    // Receipt survives a document reload; landscape does not redisplay it.
+    await remote.reload();await dock.waitFor({state:'visible'});
+    await remote.locator('#remote-identity-modal').waitFor({state:'hidden'});
+    await openByClick();await delay(950);assert.equal(await menu.isVisible(),false);await closeByClick();
+    // Existing Next remains deliberate and usable during the passive preview.
+    const nextPage=await hintContext.newPage(),explicitCommands=[];
+    nextPage.on('pageerror',error=>errors.push(error.message));
+    nextPage.on('request',request=>{if(['/api/player/control','/api/player/next'].includes(new URL(request.url()).pathname))explicitCommands.push(new URL(request.url()).pathname);});
+    await nextPage.goto(host.base+'/remote');
+    await nextPage.locator('#remote-identity-modal').waitFor({state:'hidden'});
+    await nextPage.locator('#playback-dock').tap();
+    await nextPage.waitForFunction(()=>document.querySelector('.playback-restart-popover').classList.contains('is-hint-open'));
+    const original=await nextPage.evaluate(()=>state.data.current_item.id);
+    await nextPage.locator('[data-control-action="next-track"]').tap();
+    await nextPage.waitForFunction(id=>state.data.current_item.id!==id,original);
+    assert.deepEqual(explicitCommands,['/api/player/next']);await hintContext.close();
+    assert.deepEqual(errors,[]);assert.deepEqual(external,[]);
+    assert.ok(httpFailures.every(f=>f.path==='/api/remote/connection-diagnostic'&&f.status===403&&f.beforeIdentity),JSON.stringify(httpFailures));
+    assert.ok(warnings.every(w=>w==='Failed to load resource: the server responded with a status of 403 (Forbidden)'),JSON.stringify(warnings));
+    writeFileSync(path.join(evidence,'result.json'),JSON.stringify({passed:true,variant,geometry,commands,explicitCommands,errors,external,warnings,httpFailures},null,2)+'\n','utf8');passed=true;
+  } catch(error) {
+    writeFileSync(path.join(evidence,'failure.json'),JSON.stringify({phase,error:String(error.stack),errors,external,commands,httpFailures,geometry},null,2)+'\n','utf8');
+    for (const [i,page] of (browser?.contexts().flatMap(c=>c.pages())||[]).entries())try{await page.screenshot({path:path.join(evidence,`failure-${i}.png`)});}catch{}
+    throw error;
+  } finally {await browser?.close();await host?.close();if(passed)rmSync(home,{recursive:true,force:true});}
+});

@@ -11490,7 +11490,7 @@ body.is-presentation-control-host .presentation-host-controls {
 
 .presentation-host-transport-row {
   display: grid;
-  grid-template-columns: auto minmax(120px, 1fr) 44px;
+  grid-template-columns: auto minmax(120px, 1fr) var(--playback-song-actions-width, 44px);
   gap: clamp(7px, 1vw, 12px);
   align-items: center;
 }
@@ -11766,7 +11766,7 @@ body.is-presentation-control-host .presentation-host-controls {
 
 @media (max-width: 760px) {
   .presentation-host-transport-row {
-    grid-template-columns: auto minmax(88px, 1fr) 44px;
+    grid-template-columns: auto minmax(88px, 1fr) var(--playback-song-actions-width, 44px);
     gap: 6px;
   }
 }

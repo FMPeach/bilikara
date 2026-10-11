@@ -28,6 +28,8 @@ import './player_fullscreen_frontend_contract.test.mjs';
 import './fullscreen_player_interaction.test.mjs';
 import './player_health_contract.test.mjs';
 import './player_control_consumption.test.mjs';
+import './playback_restart.test.mjs';
+import './playback_sheet_gestures.test.mjs';
 import './presentation_host_frontend_contract.test.mjs';
 import './presentation_feedback.test.mjs';
 import './presentation_renderer_contract.test.mjs';

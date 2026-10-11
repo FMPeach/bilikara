@@ -47,6 +47,7 @@ class HostBridgeRoleTest {
       ActivityScenario.launch<WindowTestActivity>(Intent(context, WindowTestActivity::class.java)).use { scenario ->
         lateinit var view: WebView
         lateinit var controls: HostWindowControls
+        lateinit var presentation: HostPresentation
         scenario.onActivity { activity ->
           view = WebView(activity)
           view.settings.javaScriptEnabled = true
@@ -54,6 +55,8 @@ class HostBridgeRoleTest {
           controls = HostWindowControls(activity)
           assertTrue(controls.install(view, origin))
           assertTrue(HostPlatform(activity).install(view, origin))
+          presentation = HostPresentation(activity)
+          assertTrue(presentation.install(view, origin))
         }
         try {
           for (path in listOf("/", "/remote", "/remote.html", "/controller.html", "/audience", "/index.html")) {
@@ -74,8 +77,13 @@ class HostBridgeRoleTest {
                 window.bridgeReplies = {sent: true};
                 BilikaraHostWindow.onmessage = e => bridgeReplies.window = e.data;
                 BilikaraHostPlatform.onmessage = e => bridgeReplies.platform = JSON.parse(e.data).ok;
+                BilikaraHostPresentation.onmessage = e => {
+                  const reply = JSON.parse(e.data);
+                  bridgeReplies.presentation = reply.ok && typeof reply.data === 'boolean';
+                };
                 BilikaraHostWindow.postMessage('enter');
                 BilikaraHostPlatform.postMessage(JSON.stringify({id:'role-test',action:'environment'}));
+                BilikaraHostPresentation.postMessage(JSON.stringify({id:'hint-role-test',command:'get_playback_restart_hint_seen',args:{}}));
               """.trimIndent(), null)
               view.postDelayed({
                 view.evaluateJavascript("JSON.stringify(bridgeReplies)") { value ->
@@ -90,15 +98,17 @@ class HostBridgeRoleTest {
             if (path in listOf("/", "/index.html")) {
               assertEquals("entered", replies.getString("window"))
               assertTrue(replies.getBoolean("platform"))
+              assertTrue(replies.getBoolean("presentation"))
             } else {
               assertFalse("Window authority on $path", replies.has("window"))
               assertFalse("Platform authority on $path", replies.has("platform"))
+              assertFalse("UI preference authority on $path", replies.has("presentation"))
               scenario.onActivity { assertEquals(orientation, it.requestedOrientation) }
             }
             scenario.onActivity { controls.setFullscreen(false) }
           }
         } finally {
-          scenario.onActivity { controls.setFullscreen(false); view.destroy() }
+          scenario.onActivity { controls.setFullscreen(false); presentation.destroy(); view.destroy() }
         }
       }
     } finally {

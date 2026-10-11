@@ -1,3 +1,4 @@
+let playbackRestartMenu = null;
 // Keep range focus cues for keyboard use without leaving them after touch input.
 document.addEventListener("pointerdown", () => {
   document.documentElement.dataset.hostInputModality = "pointer";
@@ -3168,6 +3169,7 @@ function renderPresentationHostSurface(session = state.hostPlaybackSession) {
       || !playback.canSkip
       || state.presentationHostControlBusy;
   }
+  playbackRestartMenu?.refresh();
 }
 
 function publishPresentationPlaybackState(session = state.hostPlaybackSession) {
@@ -20198,6 +20200,38 @@ elements.presentationHostDisplayList?.addEventListener("click", (event) => {
     return;
   }
   selectPresentationHostDisplay(option.dataset.presentationHostDisplayId || "");
+});
+
+function hostRestartContext(requirePresentation = true) {
+  const item = state.data?.current_item, generation = state.data?.playback_generation;
+  return { key: `${item?.id}:${item?.item_incarnation_id}:${generation}`,
+    itemId: item?.id, generation, title: item?.display_title || item?.title,
+    enabled: Boolean(item && (!requirePresentation || presentationCompositionActive()) && !state.presentationHostControlBusy && state.hostPlaybackSession?.readyCommitted
+      && isCurrentHostPlaybackSession(state.hostPlaybackSession)) };
+}
+function setHostRestartBusy(busy) {
+  state.presentationHostControlBusy = busy;
+  renderPresentationHostSurface();
+}
+async function restartHostPlayback(context) {
+  await globalThis.BilikaraPlaybackRestart.restart({ context,
+    isCurrent: () => hostRestartContext(false).key === context.key,
+    post: async (url, payload) => {
+      const outcome = await apiPostExactStateCommand(url, payload);
+      // Host-originated responses can precede their identical SSE snapshot.
+      // Consume accepted controls now; duplicate snapshots retain the FIFO guard.
+      if (outcome.snapshotAccepted) render();
+      return outcome;
+    } });
+  setFormMessage(t("player.restartSent"));
+}
+playbackRestartMenu = globalThis.BilikaraPlaybackRestart?.create({
+  alwaysInline: !isAndroidNativePlaybackRuntime(),
+  firstUse: globalThis.BilikaraPlaybackRestart.firstUseStore?.("host", tauriInvoke("presentation")) || null,
+  anchor: elements.presentationHostNext, iconSource: elements.presentationHostBack,
+  getContext: hostRestartContext, label: t,
+  onBusy: setHostRestartBusy, onRestart: restartHostPlayback,
+  onError: () => setFormMessage(t("player.restartFailed"), true),
 });
 
 document.querySelectorAll("[data-presentation-host-action]").forEach((button) => {

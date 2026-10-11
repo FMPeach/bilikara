@@ -104,10 +104,26 @@ internal class HostPresentation(private val activity: AppCompatActivity) : Displ
         val common = setOf("get_presentation_session", "deactivate_local_presentation")
         val allowed = if (stage) common + "mark_presentation_controller_ready" else common + setOf(
           "get_presentation_displays", "activate_local_presentation", "mark_presentation_host_ready",
+          "get_playback_restart_hint_seen", "mark_playback_restart_hint_seen",
           "publish_presentation_playback_state", "show_presentation_display_identifiers",
           "dismiss_presentation_display_identifiers", "diagnostics")
         require(command in allowed) { "unsupported_command" }
         val data: Any = when (command) {
+          "get_playback_restart_hint_seen" -> {
+            require(args.length() == 0) { "invalid_hint_request" }
+            activity.getSharedPreferences("host-ui-hints", Context.MODE_PRIVATE)
+              .getBoolean("playback-restart-v1", false)
+          }
+          "mark_playback_restart_hint_seen" -> {
+            require(args.length() == 0) { "invalid_hint_request" }
+            val storage = activity.getSharedPreferences("host-ui-hints", Context.MODE_PRIVATE)
+            if (!storage.getBoolean("playback-restart-v1", false) &&
+              !storage.edit().putBoolean("playback-restart-v1", true).commit()) {
+              storage.edit().putBoolean("playback-restart-v1", false).commit()
+              error("hint_persistence_failed")
+            }
+            true
+          }
           "get_presentation_displays" -> displays()
           "get_presentation_session" -> session()
           "activate_local_presentation" -> activate(args.getString("displayId"))

@@ -20,6 +20,14 @@ async function bridgeTests() {
   window.BilikaraHostPresentation.onmessage({data:JSON.stringify({id:sent[0].id,ok:true,data:{displays:[]}})});
   assert.equal((await pending).displays.length, 0);
   assert.equal(timers.size, 0);
+  for (const [command, value] of [["get_playback_restart_hint_seen", false], ["mark_playback_restart_hint_seen", true]]) {
+    const preference = api.invoke(command);
+    const request = sent.at(-1);
+    assert.deepEqual(request.args, {});
+    window.BilikaraHostPresentation.onmessage({data:JSON.stringify({id:request.id,ok:true,data:value})});
+    assert.equal(await preference, value);
+    assert.equal(timers.size, 0, "UI preference replies retire their owned timeout");
+  }
   await assert.rejects(api.invoke("restart_application"), /unsupported_command/);
   const failed = api.invoke("activate_local_presentation", {displayId:"7"});
   const last = sent.at(-1);

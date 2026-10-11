@@ -15,6 +15,8 @@ mod desktop_storage;
 #[cfg(desktop)]
 mod platform;
 #[cfg(desktop)]
+mod playback_hints;
+#[cfg(desktop)]
 mod presentation;
 #[cfg(desktop)]
 mod presentation_geometry;
