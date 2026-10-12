@@ -1,8 +1,22 @@
 /* Host local-source editor. Remote never mounts this controller. */
 (function (root) {
   "use strict";
-  const icon = path => '<svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' + path + '</svg>';
-  const trash = icon('<path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 10v7M14 10v7"/>');
+  function dropPosition(rows, rowIndex, x, y) {
+    if (!rows[rowIndex]) rowIndex = 0;
+    const row = rows[rowIndex] || rows[0];
+    if (!row) return null;
+    const above = rows[rowIndex - 1], below = rows[rowIndex + 1];
+    // Cross well into the next row, rather than switching at the gap midpoint.
+    if ((above && y <= above.bottom - Math.min(16, (above.bottom-above.top)*.2))
+      || (below && y >= below.top + Math.min(16, (below.bottom-below.top)*.2))) {
+      rowIndex = rows.reduce((best, candidate, index) => Math.abs(y-(candidate.top+candidate.bottom)/2)
+        < Math.abs(y-(rows[best].top+rows[best].bottom)/2) ? index : best, 0);
+    }
+    const cards = rows[rowIndex].cards;
+    const card = cards.reduce((best, candidate) => Math.abs(x-(candidate.left+candidate.right)/2)
+      < Math.abs(x-(best.left+best.right)/2) ? candidate : best);
+    return {rowIndex, card, before:x < (card.left+card.right)/2};
+  }
   class SourceEditor {
     constructor(grid, options) {
       this.grid = grid; this.options = options; this.source = options.source; this.t = options.translate;
@@ -12,26 +26,30 @@
       this.version = ""; this.filter = ""; this.editing = false; this.pending = false; this.active = false;
       this.footer = document.createElement('div'); this.footer.className = 'source-tools';
       this.footer.dataset.source = this.source; this.footer.hidden = true;
+      this.frame = document.createElement('div'); this.frame.className = 'source-frame-footer'; this.frame.hidden = true;
       this.footer.innerHTML = '<button type="button" class="toolbar-button settings-tool-button source-select-page" hidden></button>'
-        + '<button type="button" class="toolbar-button settings-tool-button source-clear-selection" hidden></button>'
         + '<button type="button" class="toolbar-button settings-tool-button source-retry-cleanup" hidden></button>'
         + '<span class="source-selection-count" role="status" aria-live="polite"></span>'
-        + '<button type="button" class="source-select-mode source-float-surface" aria-pressed="false">' + root.BilikaraSessionUserEditor.selectionIcon + '</button>'
-        + '<span class="source-trash-slot"><span class="source-remove-selected source-float-surface" role="img">' + trash + '</span></span>';
-      this.panel.append(this.footer);
-      this.all = this.footer.querySelector('.source-select-page'); this.clear = this.footer.querySelector('.source-clear-selection');
+        + '<button type="button" class="source-select-mode" aria-pressed="false">' + root.BilikaraSessionUserEditor.selectionIcon + '</button>'
+        + '<span class="source-trash-slot"><span class="source-remove-selected" role="img">' + root.BilikaraSessionUserEditor.trashIcon + '</span></span>';
+      this.frame.append(this.footer); this.panel.append(this.frame);
+      this.all = this.footer.querySelector('.source-select-page');
       this.count = this.footer.querySelector('.source-selection-count'); this.toggle = this.footer.querySelector('.source-select-mode');
       this.remove = this.footer.querySelector('.source-remove-selected');
       this.trashSlot = this.remove.parentElement;
-      for (const node of [this.all,this.clear,this.count,this.footer.querySelector('.source-retry-cleanup')]) node.classList.add('source-float-surface');
+      this.footer.setAttribute('role','group');
       this.footer.addEventListener('click', event => {
         if (event.target.closest('.source-select-mode')) {
           if (this.editing ? !this.pending : !this.blocked) this.setEditing(!this.editing);
           return;
         }
         if (this.blocked) return;
-        if (event.target.closest('.source-select-page')) { for (const row of this.pageRecords) if (!row.placeholder) this.selected.add(row.id); this.paint(); }
-        else if (event.target.closest('.source-clear-selection')) { this.selected.clear(); this.paint(); }
+        if (event.target.closest('.source-select-page')) {
+          const members=this.pageRecords.filter(row=>!row.placeholder);
+          if (members.every(row=>this.selected.has(row.id))) this.selected.clear();
+          else for (const row of members) this.selected.add(row.id);
+          this.paint();
+        }
         else if (event.target.closest('.source-retry-cleanup') && this.cleanupIds?.length) void this.commit({action:'cleanup',ids:[...this.cleanupIds]});
       });
       grid.addEventListener('click', event => this.click(event), true);
@@ -72,8 +90,8 @@
       root.addEventListener('resize', () => this.finishDrag());
       root.addEventListener('pagehide', () => this.finishDrag());
       document.addEventListener('visibilitychange', () => { if (document.hidden) this.finishDrag(); });
-      this.pager = root.BilikaraResultPager.create(grid, {
-        footer:this.panel, fit:this.scroll,
+      this.pager = this.mobile ? root.BilikaraResultPager.create(grid, {
+        footer:this.frame, fit:this.scroll,
         ignoreSwipe:".follow-up-button, .source-select-target",
         translate:this.t, reportError:options.reportError,
         renderItems:(rows, message, target = grid) => {
@@ -83,7 +101,7 @@
           this.pageSignature = signature; this.pageRecords = rows;
           options.renderPage(rows, message, grid, this); this.paint();
         },
-      });
+      }) : null;
     }
     get blocked() { return this.pending || this.loading || this.pullBusy || !this.available || !this.active; }
     get mobile() { return document.documentElement.dataset.hostPlatform === 'android'; }
@@ -99,8 +117,8 @@
       this.cancelConfirmation(); this.paint();
     }
     leave() {
-      this.active = false; this.setEditing(false); this.footer.hidden = true;
-      this.pager.hide();
+      this.active = false; this.setEditing(false); this.footer.hidden = true; this.frame.hidden = true;
+      this.pager?.hide();
     }
     cancelConfirmation() {
       if (!this.confirmation) return;
@@ -125,9 +143,11 @@
       const sameIds = records.map(row => row.id).join(',') === this.records.map(row => row.id).join(',');
       const rows = records.map(row => Object.assign(previous.get(row.id) || {}, row));
       if (sameIds) this.records.splice(0,this.records.length,...rows); else this.records = rows;
-      this.pager.update({key:this.source + ':' + filter,items:this.records,total:records.length,pageSize:12,
-        limited:true,hasMore:false,loading:loading || this.pending,language,emptyText});
-      if (!active) this.pager.hide();
+      if (this.pager) {
+        this.pager.update({key:this.source + ':' + filter,items:this.records,total:records.length,pageSize:12,
+          limited:true,hasMore:false,loading:loading || this.pending,language,emptyText});
+        if (!active) this.pager.hide();
+      } else this.pageRecords = this.records;
       // Count/status-only updates retain the page and card nodes during a drag.
       this.options.renderPage(this.pageRecords, emptyText, this.grid, this); this.paint();
     }
@@ -165,39 +185,24 @@
       this.toggle.title = this.toggle.getAttribute('aria-label');
       this.toggle.setAttribute('aria-pressed',String(this.editing));
       this.toggle.disabled = this.editing ? this.pending : this.blocked;
-      this.toggle.hidden = this.mobile && !this.editing;
-      this.all.hidden = this.clear.hidden = !this.editing || this.mobile;
-      this.all.textContent = this.t('sources.selectPage'); this.clear.textContent = this.t('sources.clearSelection');
+      this.all.hidden = !this.editing;
+      const selectable=this.pageRecords.filter(row=>!row.placeholder);
+      const pageSelected=selectable.length > 0 && selectable.every(row=>this.selected.has(row.id));
+      this.all.textContent = this.t(pageSelected ? 'session.clearSelection' : this.mobile ? 'sources.selectPage' : 'session.selectAll');
       this.all.disabled = this.blocked || !this.pageRecords.some(row => !row.placeholder);
-      this.clear.disabled = this.blocked || !this.selected.size;
       const cleanup = this.footer.querySelector('.source-retry-cleanup');
       cleanup.hidden = !this.cleanupIds?.length; cleanup.disabled = this.blocked; cleanup.textContent = this.t('sources.retryCleanup');
       this.remove.setAttribute('aria-label',this.t(this.pending ? 'sources.removing' : 'sources.dragToRemove'));
       if (this.pending) this.remove.setAttribute('aria-busy','true'); else this.remove.removeAttribute('aria-busy');
-      this.trashSlot.hidden = !this.editing;
-      const members = this.records.filter(row => !row.placeholder), index = members.findIndex(row => row.id === this.focusId);
-      this.count.textContent = this.editing ? this.t('sources.selectedTotal',{count:this.selected.size})
-        : !this.mobile && this.focusId ? this.t('sources.orderTarget',{name:members[index]?.title || ''}) : '';
-      if (!this.available && this.active && !this.loading) this.count.textContent = this.t('sources.orderUnavailable');
-      else if (this.pullBusy && this.active) this.count.textContent = this.t('sources.editBusy');
+      this.remove.setAttribute('aria-disabled',String(this.blocked || !this.selected.size || this.selected.size > 128));
+      this.count.textContent = this.editing ? this.t('sources.selectedTotal',{count:this.selected.size}) : '';
+      if (this.editing && !this.available && this.active && !this.loading) this.count.textContent = this.t('sources.orderUnavailable');
+      else if (this.editing && this.pullBusy && this.active) this.count.textContent = this.t('sources.editBusy');
       else if (this.selected.size > 128) this.count.textContent = this.t('sources.batchLimit',{count:this.selected.size});
       this.count.hidden = !this.count.textContent;
-      this.footer.hidden = !this.active || (this.mobile && !this.editing && !this.cleanupIds?.length && !this.count.textContent);
-      const overlay = !this.footer.hidden;
-      // The floating tools never obscure pagination. Add only temporary scroll
-      // reach when they cover a card; neither a tool row nor a smaller viewport.
-      const tools = this.footer.getBoundingClientRect();
-      this.panel.classList.toggle('source-tools-scroll-reach',overlay && this.editing
-        && [...this.grid.children].some(card => {
-          const box = card.getBoundingClientRect();
-          // Assess the unscrolled content so reaching the bottom cannot remove
-          // its own reach and repeatedly clamp/reopen the scrollbar.
-          return box.right > tools.left && box.left < tools.right
-            && box.bottom + this.scroll.scrollTop > tools.top - 8;
-        }));
-      this.panel.classList.toggle('source-page-fits',this.active && Boolean(this.grid.getClientRects().length)
-        && this.grid.getBoundingClientRect().height <= this.scroll.clientHeight + 1);
-      this.panel.classList.toggle('has-source-tools-overlay',overlay);
+      this.footer.setAttribute('aria-label',this.t('sources.selectMode'));
+      this.footer.hidden = !this.active;
+      this.frame.hidden = !this.active;
       for (const card of this.cards.values()) {
         const id = card.dataset.sourceId, button = card.querySelector('.follow-up-button');
         const target = card.querySelector('.source-select-target'), checkbox = target.querySelector('input');
@@ -300,8 +305,17 @@
         },450);
         return;
       }
-      this.focusId = id; this.pointer = {id:event.pointerId,sourceId:id,target,x:event.clientX,y:event.clientY,version:this.version};
-      target.setPointerCapture(event.pointerId); this.paint();
+      const hold = {id:event.pointerId,sourceId:id,x:event.clientX,y:event.clientY,version:this.version,target};
+      this.hold = hold;
+      hold.timer = root.setTimeout(() => {
+        if (this.hold !== hold) return;
+        if (this.blocked || this.editing || hold.version !== this.version || !target.isConnected) { this.cancelHold(); return; }
+        this.hold = null; hold.timer = null;
+        this.focusId = id;
+        this.pointer = {...hold,dragging:true};
+        target.setPointerCapture(event.pointerId);
+        this.cards.get(id)?.classList.add('is-dragging');this.paint();
+      },350);
     }
     pointerMove(event) {
       const hold = this.hold;
@@ -332,15 +346,21 @@
       pointer.valid = event.clientX >= bounds.left && event.clientX <= bounds.right
         && event.clientY >= Math.max(bounds.top,scroll.top) && event.clientY <= Math.min(bounds.bottom,scroll.bottom);
       this.clearIndicators(); if (!pointer.valid) return;
-      let closest = null, distance = Infinity;
-      for (const card of this.grid.querySelectorAll('.source-removal-card')) {
-        if (card.dataset.sourceId === pointer.sourceId) continue;
-        const box = card.getBoundingClientRect(), value = (event.clientX-box.left-box.width/2)**2 + (event.clientY-box.top-box.height/2)**2;
-        if (value < distance) { closest = card; distance = value; }
+      if (!pointer.rows) {
+        pointer.rows = [];
+        for (const card of this.grid.querySelectorAll('.source-removal-card')) {
+          const box = card.getBoundingClientRect(), top = box.top + this.scroll.scrollTop, bottom = box.bottom + this.scroll.scrollTop;
+          let row = pointer.rows.at(-1);
+          if (!row || Math.abs(row.top-top)>4) { row={top,bottom,cards:[]};pointer.rows.push(row); }
+          row.cards.push({node:card,left:box.left,right:box.right});
+          if (card.dataset.sourceId === pointer.sourceId) pointer.rowIndex = pointer.rows.length-1;
+        }
       }
-      if (!closest) { pointer.valid = false; return; }
-      const box = closest.getBoundingClientRect(), before = event.clientX < box.left+box.width/2;
-      const members = this.records.filter(row => !row.placeholder && row.id !== pointer.sourceId);
+      const position = dropPosition(pointer.rows,pointer.rowIndex,event.clientX,event.clientY+this.scroll.scrollTop);
+      if (!position) { pointer.valid = false; return; }
+      pointer.rowIndex = position.rowIndex;
+      const closest = position.card.node, before = position.before;
+      const members = this.records.filter(row => !row.placeholder);
       const index = members.findIndex(row => row.id === closest.dataset.sourceId);
       pointer.before = before ? closest.dataset.sourceId : members[index+1]?.id || null;
       closest.classList.add(before ? 'drop-before' : 'drop-after');
@@ -388,5 +408,5 @@
       this.clearIndicators();
     }
   }
-  root.BilikaraSourceRemoval = Object.freeze({create:(grid,options) => grid ? new SourceEditor(grid,options) : null});
+  root.BilikaraSourceRemoval = Object.freeze({create:(grid,options) => grid ? new SourceEditor(grid,options) : null,dropPosition});
 })(window);

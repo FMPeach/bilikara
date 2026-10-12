@@ -45,7 +45,7 @@
   }
 
   function create({ anchor, iconSource, getContext, label, onRestart, onBusy, onError,
-    firstUse = null, canShowHint = () => true, alwaysInline = false }) {
+    firstUse = null, canShowHint = () => true, alwaysInline = false, hoverHints = false }) {
     if (!anchor || !iconSource) return null;
     const icon = createRestartIcon(iconSource);
     if (!icon) return null;
@@ -86,7 +86,7 @@
     bubble.hidden = true;
     document.body.append(bubble);
 
-    let captured = null, hold = null, hideTimer = null, busy = false, suppressUntil = 0, cancelledPointerId = null;
+    let captured = null, hold = null, hideTimer = null, hoverTimer = null, busy = false, suppressUntil = 0, cancelledPointerId = null;
     let destroyed = false, hintRead = !firstUse, hintSeen = !firstUse, hintDone = false, hintMarked = false;
     let hintTimer = null, hintActive = false, hintKey = null, hintSequence = 0, lastInput = -Infinity;
     let swallowHintClick = false;
@@ -185,7 +185,7 @@
       if (interrupted) hintDone = true;
       hintActive = false;
       hintKey = null;
-      popup.classList.remove("is-open", "is-hint", "is-hint-open");
+      popup.classList.remove("is-open", "is-closing", "is-hint", "is-hint-open");
       popup.removeAttribute("aria-hidden");
       popup.inert = false;
       action.disabled = busy || anchor.disabled || !getContext()?.enabled;
@@ -222,6 +222,7 @@
         hintActive = true;
         hintKey = key;
         popup.classList.add("is-hint");
+        popup.classList.remove("is-closing");
         popup.classList.remove("is-held-open");
         action.disabled = true;
         popup.setAttribute("aria-hidden", "true");
@@ -233,16 +234,18 @@
           hintTimer = window.setTimeout(() => {
             if (sequence !== hintSequence) return;
             popup.classList.remove("is-open", "is-hint-open");
+            popup.classList.add("is-closing");
             hintTimer = window.setTimeout(() => {
               if (sequence !== hintSequence) return;
               markHint();
               cancelHint();
-            }, window.matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : 180);
+            }, window.matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : 240);
           }, 1400);
         });
       }, Math.max(700, 900 - (performance.now() - lastInput)));
     }
     const clearHold = ({ cancel = false } = {}) => {
+      action.classList.remove("is-held-target");
       if (hold) {
         if (cancel) cancelledPointerId = hold.id;
         window.clearTimeout(hold.timer);
@@ -257,18 +260,21 @@
       if (captured) return;
       hideTimer = null;
       popup.hidden = true;
+      popup.classList.remove("is-closing");
     };
     function close({ focus = false, immediate = false } = {}) {
+      window.clearTimeout(hoverTimer);
       cancelHint({ interrupted: true });
       clearHold({ cancel: true });
       if (immediate) hideControlHint(true);
       captured = null;
       popup.classList.remove("is-open");
+      if (!popup.hidden && !immediate) popup.classList.add("is-closing");
       if (expanded()) anchor.removeAttribute("aria-expanded");
       else anchor.setAttribute("aria-expanded", "false");
       if (hideTimer !== null) window.clearTimeout(hideTimer);
       if (immediate) finishClose();
-      else hideTimer = window.setTimeout(finishClose, window.matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : 180);
+      else hideTimer = window.setTimeout(finishClose, window.matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : 240);
       if (focus && anchor.isConnected && !anchor.disabled) anchor.focus({ preventScroll: true });
     }
     function refresh() {
@@ -293,18 +299,19 @@
       }
       if (hold && (hold.key !== getContext()?.key || !hintControlEnabled(hold.button))) clearHold({ cancel: true });
       if (controlHintVisible) showControlHint(hintAnchor);
-      if (captured && (!current() || anchor.disabled || !anchor.getClientRects().length)) close({ immediate: true });
+      if (captured && (!current() || !getContext()?.enabled || anchor.disabled || !anchor.getClientRects().length)) close({ immediate: true });
       scheduleHint();
     }
     function open(keyboard = false, held = false) {
       const context = getContext();
-      if (expanded() || busy || anchor.disabled || !context?.itemId || !anchor.getClientRects().length) return;
+      if (expanded() || busy || anchor.disabled || !context?.enabled || !context?.itemId || !anchor.getClientRects().length) return;
       cancelHint();
       markHint();
       if (hideTimer !== null) window.clearTimeout(hideTimer);
       hideTimer = null;
       captured = context;
       refresh();
+      popup.classList.remove("is-closing");
       popup.classList.toggle("is-held-open", held);
       popup.hidden = false;
       positionPopup();
@@ -339,15 +346,14 @@
       if (!hold || hold.id !== event.pointerId) return;
       if (hold.fired) {
         event.preventDefault();
-        showControlHint(hintControl(document.elementFromPoint(event.clientX, event.clientY)));
+        const over = hintControl(document.elementFromPoint(event.clientX, event.clientY));
+        showControlHint(over);
         const target = hold.target;
-        if (current() && target && event.clientX >= target.left && event.clientX <= target.right
+        const armed = current() && !action.disabled && over === action && target && event.clientX >= target.left && event.clientX <= target.right
           && event.clientY >= target.top && event.clientY <= target.bottom
-          && Math.hypot(event.clientX - hold.x, event.clientY - hold.y) >= 6) {
-          suppressUntil = performance.now() + 1000;
-          swallowHintClick = true;
-          activate(action, captured);
-        }
+          && Math.hypot(event.clientX - hold.x, event.clientY - hold.y) >= 6;
+        hold.armed = Boolean(armed);
+        action.classList.toggle("is-held-target", hold.armed);
         return;
       }
       if (Math.hypot(event.clientX - hold.x, event.clientY - hold.y) > 10) {
@@ -364,8 +370,10 @@
         return;
       }
       if (hold?.id !== event.pointerId) return;
+      const context = hold.armed && current() && hintControl(document.elementFromPoint(event.clientX, event.clientY)) === action ? captured : null;
       if (hold.fired) { suppressUntil = performance.now() + 1000; swallowHintClick = true; event.preventDefault(); }
       clearHold();
+      if (context) activate(action, context);
     }, { capture: true });
     // Native range controls also react to touchstart, independently of the
     // pointer/click sequence (including the capsule's clipped entry frame).
@@ -467,20 +475,30 @@
       busy = true;
       button.disabled = true;
       button.setAttribute("aria-busy", "true");
-      close({ immediate: true });
+      close();
       try { onBusy?.(true); await onRestart(context); }
       catch (error) { onError(error); }
       finally { busy = false; button.removeAttribute("aria-busy"); onBusy?.(false); refresh(); }
     };
     listen(action, "click", () => activate(action, captured));
     listen(inlineAction, "click", () => activate(inlineAction, getContext()));
+    if (hoverHints) for (const button of [action, inlineAction]) {
+      listen(button, "pointerenter", event => {
+        if (event.pointerType !== "mouse" || !matchMedia("(hover: hover) and (pointer: fine)").matches) return;
+        window.clearTimeout(hoverTimer);
+        hoverTimer = window.setTimeout(() => showControlHint(button), 160);
+      });
+      listen(button, "pointerleave", () => { window.clearTimeout(hoverTimer); if (!hold?.fired) hideControlHint(); });
+      listen(button, "focus", () => { if (button.matches(":focus-visible")) showControlHint(button); });
+      listen(button, "blur", () => { if (!hold?.fired) hideControlHint(); });
+    }
     if (firstUse) Promise.resolve().then(() => firstUse.read()).then(seen => {
       hintRead = true;
       hintSeen ||= seen === true;
       refresh();
     }).catch(() => { hintRead = hintSeen = true; });
     refresh();
-    return { refresh, close, destroy() { destroyed = true; close({ immediate: true }); listeners.abort(); popup.remove(); bubble.remove(); group.before(anchor); group.remove(); anchor.removeAttribute("data-playback-restart-anchor"); anchor.removeAttribute("aria-haspopup"); anchor.removeAttribute("aria-controls"); anchor.removeAttribute("aria-expanded"); anchor.removeAttribute("aria-description"); } };
+    return { refresh, close, destroy() { destroyed = true; window.clearTimeout(hoverTimer); close({ immediate: true }); listeners.abort(); popup.remove(); bubble.remove(); group.before(anchor); group.remove(); anchor.removeAttribute("data-playback-restart-anchor"); anchor.removeAttribute("aria-haspopup"); anchor.removeAttribute("aria-controls"); anchor.removeAttribute("aria-expanded"); anchor.removeAttribute("aria-description"); } };
   }
 
   globalThis.BilikaraPlaybackRestart = Object.freeze({ create, restart, firstUseStore });

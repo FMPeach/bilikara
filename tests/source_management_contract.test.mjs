@@ -8,6 +8,21 @@ import {root} from './desktop_construction_support.mjs';
 import {localSignaling} from './local_signaling_fixture.mjs';
 const read = name => readFileSync(path.join(root,name),'utf8');
 
+test('source insertion exposes both outer edges and requires deliberate row crossing',()=>{
+  const context={window:{BilikaraSessionUserEditor:{trashIcon:''}}};
+  vm.runInNewContext(read('static/source-removal.js'),context);
+  const {dropPosition}=context.window.BilikaraSourceRemoval;
+  const cards=[0,1,2].map(index=>({id:index,left:index*110,right:index*110+100}));
+  const rows=[{top:0,bottom:72,cards},{top:80,bottom:152,cards},{top:160,bottom:232,cards}];
+  assert.equal(dropPosition(rows,0,0,36).before,true);
+  assert.equal(dropPosition(rows,0,320,36).before,false);
+  assert.equal(dropPosition(rows,0,50,81).rowIndex,0,'just entering the next row does not jump');
+  assert.equal(dropPosition(rows,0,50,96).rowIndex,1,'deliberately entering the row does switch');
+  assert.equal(dropPosition(rows,1,50,71).rowIndex,1,'boundary jitter stays on the selected row');
+  assert.equal(dropPosition(rows,1,50,56).rowIndex,0,'upward crossing uses the same dead band');
+  assert.equal(dropPosition(rows,0,50,196).rowIndex,2,'a large movement can reach further rows');
+});
+
 test('source completion observes coalesced same-second order changes once and ignores count-only updates',()=>{
   const context={window:{}};vm.runInNewContext(read('static/source-status.js'),context);
   const {takeCompletion}=context.window.BilikaraSourceStatus;

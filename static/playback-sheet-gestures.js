@@ -17,7 +17,17 @@
     const listeners = new AbortController();
     const listen = (target, name, handler, options = {}) => target.addEventListener(name, handler, { ...options, signal: listeners.signal });
     let gesture = null, frame = null, settling = null, ghost = null, suppressUntil = 0, destroyed = false;
-    const properties = ["left", "top", "width", "height", "content-width", "body-height", "radius", "bottom-radius", "translate", "content-opacity", "header-opacity", "ghost-opacity"];
+    let restoredStyles = [];
+    const backdrop = sheet.querySelector(".playback-sheet-backdrop");
+    const headerContent = [...header.querySelectorAll(".playback-sheet-status-label, .playback-sheet-status-actions"), collapse];
+    const properties = ["left", "top", "width", "height", "content-width", "body-height", "header-width", "radius", "bottom-radius", "translate"];
+    function ownStyle(node, names) {
+      if (!node) return;
+      for (const name of names) restoredStyles.push([node, name, node.style.getPropertyValue(name), node.style.getPropertyPriority(name)]);
+    }
+    function writeStyle(node, name, value) {
+      if (node && node.style.getPropertyValue(name) !== value) node.style.setProperty(name, value);
+    }
     const active = () => Boolean(gesture?.started || settling);
     function clearFrame() { if (frame !== null) window.cancelAnimationFrame(frame); frame = null; }
     function releaseCapture(pointerId) {
@@ -29,6 +39,11 @@
       delete sheet.dataset.gestureVariant;
       sheet.style.removeProperty("--playback-sheet-drag-progress");
       for (const property of properties) panel.style.removeProperty(`--sheet-gesture-${property}`);
+      for (const [node, name, value, priority] of restoredStyles) {
+        if (value) node.style.setProperty(name, value, priority);
+        else node.style.removeProperty(name);
+      }
+      restoredStyles = [];
       ghost?.remove(); ghost = null;
     }
     function finish(expanded) {
@@ -54,18 +69,20 @@
     function paint(owner, progress) {
       owner.progress = clamp(progress);
       const p = owner.progress, from = owner.dock, to = owner.panel;
-      const values = variant === "morph" ? {
-        left: mix(from.left, to.left, p), top: mix(from.top, to.top, p),
-        width: mix(from.width, to.width, p), height: mix(from.height, to.height, p),
-        radius: mix(owner.dockRadius, owner.radius, p),
-        "bottom-radius": mix(owner.dockRadius, owner.bottomRadius, p), translate: 0,
-      } : { left: to.left, top: to.top, width: to.width, height: to.height,
-        radius: owner.radius, "bottom-radius": owner.bottomRadius, translate: (1 - p) * owner.travel };
-      for (const [key, value] of Object.entries(values)) panel.style.setProperty(`--sheet-gesture-${key}`, `${value}px`);
-      sheet.style.setProperty("--playback-sheet-drag-progress", p);
-      panel.style.setProperty("--sheet-gesture-content-opacity", variant === "morph" ? smooth((p - 0.12) / 0.58) : 1);
-      panel.style.setProperty("--sheet-gesture-header-opacity", variant === "morph" ? smooth((p - 0.12) / 0.58) : 1);
-      panel.style.setProperty("--sheet-gesture-ghost-opacity", 1 - smooth(p / 0.28));
+      if (variant === "morph") {
+        const left = mix(from.left, to.left, p), top = mix(from.top, to.top, p);
+        const width = mix(from.width, to.width, p), height = mix(from.height, to.height, p);
+        const radius = mix(owner.dockRadius, owner.radius, p), bottom = mix(owner.dockRadius, owner.bottomRadius, p);
+        // Keep the laid-out surface/content fixed. Only its visible rectangle
+        // moves/grows, avoiding layout and inherited-variable cascades per frame.
+        writeStyle(panel, "transform", `translate3d(${left - to.left}px, ${top - to.top}px, 0)`);
+        writeStyle(panel, "clip-path", `inset(0px ${Math.max(0, owner.canvasWidth - width)}px ${Math.max(0, owner.canvasHeight - height)}px 0px round ${radius}px ${radius}px ${bottom}px ${bottom}px)`);
+      } else writeStyle(panel, "transform", `translate3d(0, ${(1 - p) * owner.travel}px, 0)`);
+      writeStyle(backdrop, "opacity", String(p));
+      const opacity = String(variant === "morph" ? smooth((p - 0.12) / 0.58) : 1);
+      writeStyle(body, "opacity", opacity);
+      for (const node of headerContent) writeStyle(node, "opacity", opacity);
+      writeStyle(ghost, "opacity", String(1 - smooth(p / 0.28)));
     }
     function schedulePaint(owner) {
       if (frame !== null) return;
@@ -90,11 +107,17 @@
       owner.radius = parseFloat(style.borderTopLeftRadius) || 18;
       owner.bottomRadius = parseFloat(style.borderBottomLeftRadius) || 0;
       owner.bodyInert = body.inert;
+      owner.canvasWidth = variant === "morph" ? Math.max(owner.dock.width, owner.panel.width) : owner.panel.width;
+      owner.canvasHeight = variant === "morph" ? Math.max(owner.dock.height, owner.panel.height) : owner.panel.height;
       owner.travel = Math.max(80, variant === "morph" ? owner.dock.top - owner.panel.top : innerHeight - owner.panel.top);
       owner.catchUp = Math.max(0, innerHeight - owner.y + Math.min(header.offsetHeight / 2, 28));
       owner.started = true;
       body.inert = true;
       sheet.dataset.gestureVariant = variant;
+      const surface = {left: owner.panel.left, top: owner.panel.top, width: owner.canvasWidth, height: owner.canvasHeight,
+        radius: variant === "morph" ? 0 : owner.radius, "bottom-radius": variant === "morph" ? 0 : owner.bottomRadius, translate: 0};
+      for (const [name, value] of Object.entries(surface)) panel.style.setProperty(`--sheet-gesture-${name}`, `${value}px`);
+      panel.style.setProperty("--sheet-gesture-header-width", `${header.getBoundingClientRect().width}px`);
       panel.style.setProperty("--sheet-gesture-content-width", `${body.getBoundingClientRect().width}px`);
       panel.style.setProperty("--sheet-gesture-body-height", `${body.getBoundingClientRect().height}px`);
       if (variant === "morph") {
@@ -105,12 +128,17 @@
           ghost = content.cloneNode(true);
           for (const node of [ghost, ...ghost.querySelectorAll("*")]) node.removeAttribute("id");
           ghost.classList.add("playback-sheet-dock-ghost");
+          ghost.style.width = `${owner.dock.width}px`;
           ghost.setAttribute("aria-hidden", "true");
           ghost.inert = true;
           panel.append(ghost);
         }
       }
       sheet.classList.add("is-gesturing");
+      ownStyle(panel, ["transform", "clip-path"]);
+      ownStyle(body, ["opacity"]);
+      ownStyle(backdrop, ["opacity"]);
+      for (const node of headerContent) ownStyle(node, ["opacity"]);
       sheet.classList.toggle("is-dragging", owner.pointerDriven);
       sheet.classList.remove("is-gesture-measuring");
       paint(owner, owner.wasOpen ? 1 : 0);

@@ -17,6 +17,7 @@ for (const layout of ['portrait','landscape']) test(`real Remote ${layout} resta
   mkdirSync(evidence,{recursive:true});
   const home=mkdtempSync(path.join(tmpdir(),'bilikara-restart-host-'));
   let browser,host,passed=false,identityReady=false;
+  const mediaGate=Promise.withResolvers();let waitingForMedia=true;
   const errors=[],warnings=[],commands=[],nextCommands=[],hostCommands=[],external=[],httpFailures=[];
   const pendingStatus=new Set();
   let phase='setup';
@@ -39,8 +40,12 @@ for (const layout of ['portrait','landscape']) test(`real Remote ${layout} resta
         localStorage.setItem('bilikara.update.automatic','false');
         localStorage.setItem('bilikara.ui.language','zh');
       });
-      await context.route('**/*',route=>{
-        if(new URL(route.request().url()).origin===host.base) return route.continue();
+      await context.route('**/*',async route=>{
+        const url=new URL(route.request().url());
+        if(url.origin===host.base) {
+          if(context===hostContext&&url.pathname.startsWith('/media/')&&waitingForMedia) await mediaGate.promise;
+          return route.continue();
+        }
         external.push(new URL(route.request().url()).origin); return route.abort();
       });
     }
@@ -51,9 +56,7 @@ for (const layout of ['portrait','landscape']) test(`real Remote ${layout} resta
       page.on('console',message=>{if(message.type()==='warning'||message.type()==='error') warnings.push(message.text());});
       page.on('response',response=>{if(response.status()>=400)httpFailures.push({path:new URL(response.url()).pathname,status:response.status(),beforeIdentity:!identityReady,phase});});
     }
-    await player.goto(host.base);
-    await player.waitForFunction(()=>state.hostPlaybackSession?.readyCommitted);
-    await player.waitForFunction(()=>{const video=document.querySelector('#player-frame video');return video && !video.paused && video.currentTime>0;});
+    await player.goto(host.base,{waitUntil:'domcontentloaded'});
     player.on('request',request=>{if(new URL(request.url()).pathname==='/api/player/control') hostCommands.push(request.postDataJSON());});
     player.on('request',request=>{if(new URL(request.url()).pathname==='/api/player/status') pendingStatus.add(request);});
     player.on('requestfinished',request=>pendingStatus.delete(request));
@@ -71,13 +74,26 @@ for (const layout of ['portrait','landscape']) test(`real Remote ${layout} resta
     const anchor=remote.locator('[data-control-action="next-track"]');
     const menu=remote.locator('.playback-restart-popover');
     const trigger=remote.locator('.playback-song-actions > .playback-restart-action');
-    await anchor.waitFor();
-    await remote.waitForFunction(()=>!document.querySelector('[data-control-action="next-track"]').disabled);
     remote.on('request',request=>{
       const pathname=new URL(request.url()).pathname;
       if(pathname==='/api/player/control') commands.push(request.postDataJSON());
       if(pathname==='/api/player/next') nextCommands.push(request.postDataJSON());
     });
+    assert.equal(await trigger.isDisabled(),true,'Cached URLs before Host media readiness cannot enable Restart');
+    assert.equal(await remote.evaluate(()=>state.data.player_status),null);
+    if(layout==='portrait') {
+      await anchor.click({button:'right'});
+      assert.equal(await menu.isVisible(),false,'An unavailable Restart cannot open a capsule');
+    } else {
+      const before=commands.length;
+      await trigger.tap({force:true});assert.equal(commands.length,before,'Disabled Restart sends no command');
+    }
+    waitingForMedia=false;mediaGate.resolve();
+    await player.waitForFunction(()=>state.hostPlaybackSession?.readyCommitted);
+    await player.waitForFunction(()=>{const video=document.querySelector('#player-frame video');return video && !video.paused && video.currentTime>0;});
+    await remote.waitForFunction(()=>state.data.player_status?.observed_phase==='playing');
+    await anchor.waitFor();
+    await remote.waitForFunction(()=>!document.querySelector('[data-control-action="next-track"]').disabled);
     const progress=remote.locator('#playback-sheet-seek');
     async function seekToMiddle() {
       await remote.waitForFunction(()=>!document.querySelector('#playback-sheet-seek').disabled);
@@ -98,7 +114,7 @@ for (const layout of ['portrait','landscape']) test(`real Remote ${layout} resta
         await session.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});
         await session.detach();
       }
-      await menu.evaluate(node=>Promise.allSettled(node.getAnimations().map(animation=>animation.finished)));
+      await menu.evaluate(node=>Promise.allSettled(node.getAnimations({subtree:true}).map(animation=>animation.finished)));
       return session;
     }
     async function openChoice() {
@@ -285,6 +301,8 @@ for (const layout of ['portrait','landscape']) test(`real Remote ${layout} resta
         assert.ok(progress.y+progress.height<=geometry.y,'Song actions sit below the full-width progress row');
       }
       const ringTarget=capsule.locator('.playback-restart-action:visible [data-restart-ring]');
+      const border=node=>{const s=getComputedStyle(node);return [s.borderTopWidth,s.borderTopStyle,s.borderTopColor];};
+      assert.deepEqual(await ringTarget.locator('..').locator('..').evaluate(border),await iconSource.evaluate(border),'Restart and -15s share the ordinary circle outline');
       const attributes=node=>Object.fromEntries(['d','transform','fill','stroke','stroke-width','stroke-linecap','stroke-linejoin'].map(key=>[key,node.getAttribute(key)]));
       assert.deepEqual(await ringTarget.evaluate(attributes),await iconSource.locator('svg path').evaluate(attributes),'Restart reuses the exact existing -15s arrow geometry');
       const ring=await ringTarget.evaluate(node=>{const b=node.parentElement.getBBox();return {x:b.x+b.width/2,y:b.y+b.height/2};});
@@ -385,21 +403,44 @@ for (const layout of ['portrait','landscape']) test(`real Remote ${layout} resta
     assert.equal(await player.evaluate(()=>restartMediaNodes.every((node,index)=>node===[...document.querySelectorAll('#player-frame video,#player-frame audio')][index])),true);
     await remote.screenshot({path:path.join(evidence,'remote-360-restarted.png')});
     if(layout==='portrait') {
-      // Keep the original touch down: entering Restart activates immediately,
-      // before release; the eventual compatibility click cannot skip or retry.
+      // Moving back out or cancelling after arming must not submit either command.
+      for(const cancelled of [false,true]) {
+        const before=commands.length,beforeNext=nextCommands.length,session=await hold({release:false});
+        const target=await menu.locator('.playback-restart-action').boundingBox();
+        await session.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:target.x+22,y:target.y+22}]});
+        await remote.waitForFunction(()=>document.querySelector('.playback-restart-action.is-held-target'));
+        if(cancelled) await session.send('Input.dispatchTouchEvent',{type:'touchCancel',touchPoints:[]});
+        else {
+          const next=await anchor.boundingBox();
+          await session.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:next.x+22,y:next.y+22}]});
+          assert.equal(await menu.locator('.is-held-target').count(),0);
+          await session.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});
+          await remote.locator('#playback-sheet-title').tap();
+        }
+        await session.detach();await menu.waitFor({state:'hidden'});
+        assert.equal(commands.length,before);assert.equal(nextCommands.length,beforeNext);
+      }
+      // Entering Restart arms pressed feedback; only releasing there submits.
       await seekToMiddle();
       const beforeDrag=commands.length,beforeDragNext=nextCommands.length;
       const session=await hold({release:false});
+      let released=false;
       try {
         const target=await menu.locator('.playback-restart-action').boundingBox();
         await session.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:target.x+22,y:target.y+22}]});
+        await remote.waitForFunction(()=>document.querySelector('.playback-restart-action.is-held-target'));
+        await delay(150);
+        assert.equal(commands.length,beforeDrag,'Moving over Restart sends no mutation');
+        await session.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});
+        released=true;
         await player.waitForFunction(()=>{const v=document.querySelector('#player-frame video');return !v.paused&&v.currentTime<5;});
         await remote.waitForFunction(()=>!state.playerControlPendingAction);
-        assert.deepEqual(commands.slice(beforeDrag).map(command=>command.action),['seek-absolute','play'],'Drag activates without releasing the hold');
+        assert.deepEqual(commands.slice(beforeDrag).map(command=>command.action),['seek-absolute','play'],'Release submits one ordered restart');
         assert.equal(await menu.isVisible(),false);
         await remote.screenshot({path:path.join(evidence,'remote-drag-restarted.png')});
       } finally {
-        await session.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});await session.detach();
+        if(!released) await session.send('Input.dispatchTouchEvent',{type:'touchCancel',touchPoints:[]});
+        await session.detach();
       }
       await delay(200);
       assert.equal(nextCommands.length,beforeDragNext,'Releasing after drag cannot activate Next');
@@ -475,9 +516,10 @@ for (const layout of ['portrait','landscape']) test(`real Remote ${layout} resta
       assert.equal(nextCommands.length,beforeNext+2,'A fresh tap on the original Next with its capsule open submits exactly once');
     }
     assert.deepEqual(external,[]); assert.deepEqual(errors,[]);
-    // Existing LAN diagnostics can arrive before identity registration. Keep that
-    // known authorization refusal visible; never suppress unrelated console errors.
-    assert.ok(httpFailures.every(failure=>failure.path==='/api/remote/connection-diagnostic'&&failure.status===403&&failure.beforeIdentity));
+    // Diagnostics and rating lookup can run during the intentional initial
+    // media hold, before identity/eligible playback. Retain those exact refusals.
+    assert.ok(httpFailures.every(failure=>['/api/remote/connection-diagnostic','/api/rating/log'].includes(failure.path)
+      &&failure.status===403&&failure.beforeIdentity&&failure.phase==='setup'),JSON.stringify(httpFailures));
     assert.equal(warnings.length,httpFailures.length);
     assert.ok(warnings.every(warning=>warning==='Failed to load resource: the server responded with a status of 403 (Forbidden)'));
     writeFileSync(path.join(evidence,'result.json'),JSON.stringify({passed:true,layout,dimensions,commands,nextCommands,hostCommands,errors,warnings,httpFailures,external,flow:'actual native Host + LAN Remote; real decoder and touch/keyboard actions; no Worker'},null,2)+'\n','utf8');
@@ -489,14 +531,79 @@ for (const layout of ['portrait','landscape']) test(`real Remote ${layout} resta
     }
     console.error(`Failure evidence retained: ${evidence}`); throw error;
   } finally {
+    mediaGate.resolve();
     await browser?.close(); await host?.close();
     if(passed) rmSync(home,{recursive:true,force:true});
   }
 });
 
+test('rendered Host restart component keeps disabled hover quiet and shares accessible help', {timeout:30000}, async t=>{
+  // Production markup/styles/component with controlled presentation inputs.
+  // This is UI coverage, separate from real native Runtime/decoder tests above.
+  const html=readFileSync(new URL('../static/index.html',import.meta.url),'utf8');
+  const fragment=html.match(/<section class="presentation-host-controls"[\s\S]*?<\/section>/u)[0].replace(' hidden','');
+  const css=['styles.css','ui-surfaces.css'].map(file=>readFileSync(new URL('../static/'+file,import.meta.url),'utf8')).join('\n');
+  const labels=JSON.parse(readFileSync(new URL('../static/i18n.json',import.meta.url),'utf8')).languages.zh;
+  const browser=await chromium.launch({headless:true});t.after(()=>browser.close());
+  const context=await browser.newContext({viewport:{width:700,height:600}});
+  await context.route('**/*',route=>route.abort());
+  const page=await context.newPage(),errors=[];page.setDefaultTimeout(8000);page.on('pageerror',error=>errors.push(error.message));
+  await page.setContent(`<title>bilikara Host playback component fixture</title><style>${css}</style><body class="is-presentation-control-host"><main class="app-shell">${fragment}</main></body>`);
+  await page.addScriptTag({path:path.join(root,'static/playback-restart.js')});
+  await page.evaluate(labels=>{
+    window.fixtureContext={itemId:'fixture',generation:1,key:'fixture:1',enabled:false};window.fixtureActivations=[];
+    window.fixtureRestart=BilikaraPlaybackRestart.create({anchor:document.querySelector('#presentation-host-next'),iconSource:document.querySelector('#presentation-host-back'),
+      getContext:()=>fixtureContext,label:key=>labels[key],alwaysInline:true,hoverHints:true,onRestart:async context=>fixtureActivations.push(context.key)});
+  },labels);
+  const action=page.locator('.playback-song-actions > .playback-restart-action'),bubble=page.locator('.playback-control-hint');
+  const appearance=node=>{const s=getComputedStyle(node);return {border:s.borderColor,background:s.backgroundColor,color:s.color,opacity:s.opacity};};
+  for(const theme of ['light','dark','blue']) {
+    await page.evaluate(theme=>{document.documentElement.dataset.theme=theme;fixtureContext.enabled=false;fixtureRestart.refresh();},theme);
+    await page.mouse.move(1,1);await delay(200);
+    const quiet=await action.evaluate(appearance);
+    await action.hover();await delay(350);
+    assert.deepEqual(await action.evaluate(appearance),quiet,'Disabled controls retain the same fill/outline on hover');
+    assert.equal(await bubble.isVisible(),false);assert.equal(await action.isDisabled(),true);
+    await action.click({force:true});assert.deepEqual(await page.evaluate(()=>fixtureActivations),[]);
+    await page.mouse.move(1,1);
+    await page.evaluate(()=>{fixtureContext.enabled=true;fixtureRestart.refresh();});
+    await action.hover();await bubble.waitFor({state:'visible'});
+    assert.equal(await bubble.textContent(),labels['player.restart']+'\n'+labels['player.restartDescription']);
+    assert.deepEqual(await bubble.evaluate(node=>{const s=getComputedStyle(node);return [s.fontSize,s.fontWeight,s.borderRadius];}),['13px','400','12px']);
+    await page.mouse.move(1,1);await bubble.waitFor({state:'hidden'});
+  }
+  await page.keyboard.press('Tab');await action.focus();await bubble.waitFor({state:'visible'});
+  await bubble.evaluate(node=>Promise.allSettled(node.getAnimations().map(animation=>animation.finished)));
+  assert.ok((await action.getAttribute('aria-describedby')).includes(await bubble.getAttribute('id')));
+  if(process.env.BILIKARA_RESTART_SCREENSHOTS) {
+    const hint=await bubble.boundingBox(),row=await page.locator('.presentation-host-transport-row').boundingBox();
+    await page.screenshot({path:path.join(process.env.BILIKARA_RESTART_SCREENSHOTS,'host-component-700-tooltip.png'),
+      clip:{x:0,y:0,width:700,height:Math.ceil(Math.max(hint.y+hint.height,row.y+row.height)+12)}});
+  }
+  await page.keyboard.press('Enter');
+  assert.deepEqual(await page.evaluate(()=>fixtureActivations),['fixture:1']);
+  assert.equal(await page.evaluate(()=>String(getSelection())),'');
+  assert.deepEqual(errors,[]);
+});
+
 async function verifyNextRaster(page,context,anchor,evidence,transition) {
   const directory=path.join(evidence,'next-raster');mkdirSync(directory,{recursive:true});
   const bounds=await anchor.boundingBox(),frames=[],session=await context.newCDPSession(page);
+  const motion=page.evaluate(async()=>{
+    const samples=[];
+    for(let i=0;i<200;i++) {
+      await new Promise(resolve=>requestAnimationFrame(resolve));
+      const popup=document.querySelector('.playback-restart-popover');
+      if(popup.hidden) continue;
+      const clip=getComputedStyle(popup,'::before').clipPath;
+      const match=clip.match(/^inset\((.+?)(?: round .+)?\)$/);
+      if(!match) throw Error('Capsule has no actual clipped surface');
+      const values=match[1].split(/\s+/).map(Number.parseFloat);
+      const [top,right=top,bottom=top,left=right]=values;
+      samples.push({closing:popup.classList.contains('is-closing'),width:popup.offsetWidth-left-right,height:popup.offsetHeight-top-bottom});
+    }
+    return samples;
+  });
   session.on('Page.screencastFrame',event=>{
     if(frames.length<128) {
       const name=String(frames.length).padStart(3,'0')+'.png';
@@ -510,6 +617,13 @@ async function verifyNextRaster(page,context,anchor,evidence,transition) {
     await delay(120);
     assert.ok(frames.length,'A real baseline frame is required');
     await transition();
+    const samples=await motion;
+    for(const closing of [false,true]) {
+      assert.ok(samples.some(frame=>frame.closing===closing&&frame.width>44.1&&frame.width<51.9&&Math.abs(frame.width-frame.height)<.1),
+        'Entry/exit includes a real intermediate circle before/after lateral extension');
+    }
+    assert.ok(samples.some(frame=>frame.width>98),'Surface reaches the full capsule');
+    writeFileSync(path.join(directory,'capsule-motion.json'),JSON.stringify(samples,null,2));
   } finally {
     await session.send('Page.stopScreencast');await session.detach();
     writeFileSync(path.join(directory,'frames.json'),JSON.stringify({bounds,frames},null,2)+'\n','utf8');

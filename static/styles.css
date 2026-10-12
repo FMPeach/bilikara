@@ -11991,8 +11991,10 @@ html .volume-adjust-popover::backdrop {
 
 /* The badge owns its size; the name is an accessible action, not a second pill. */
 .session-user-badge .session-user-name {
-  min-height: 0; padding: 0; border: 0; border-radius: 0;
+  min-height: 0; padding: 2px 0; border: 0; border-radius: 0;
   background: transparent; box-shadow: none; color: inherit; font: inherit;
+  /* Keep horizontal ellipsis, with paint room for g/y, accents and emoji. */
+  line-height: 20px;
   transform: none; cursor: inherit;
 }
 
@@ -12045,18 +12047,20 @@ html .volume-adjust-popover::backdrop {
   padding: 4px 8px;
   overflow-y: auto;
 }
-.session-user-tools {
+.session-user-tools, .source-tools {
   display: flex;
   align-items: center;
   justify-content: flex-end;
   gap: 8px;
   min-width: 0;
 }
-.session-user-selection-count { margin-inline-end: auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; color: var(--muted); }
+.session-user-selection-count, .source-selection-count { margin-inline-end: auto; }
+.session-user-selection-count, .source-selection-count { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; color: var(--muted); }
 .session-user-badge { max-width: 100%; box-sizing: border-box; }
 .session-user-tools .session-user-mode-button,
 .source-tools .source-select-mode,
-.session-user-tools .session-user-trash {
+.session-user-tools .session-user-trash,
+.source-tools .source-remove-selected {
   box-sizing: border-box;
   position: static;
   width: 44px; min-width: 44px; max-width: 44px;
@@ -12072,13 +12076,13 @@ html .volume-adjust-popover::backdrop {
   transform: none;
   transition: border-color 120ms, background-color 120ms, transform 120ms;
 }
-.session-user-tools svg, .source-tools .source-select-mode svg { display: block; width: 20px; height: 20px; margin: auto; }
+.session-user-tools svg, .source-tools svg { display: block; width: 20px; height: 20px; margin: auto; }
 .session-user-tools [data-mode][aria-pressed="true"], .source-tools .source-select-mode[aria-pressed="true"] { border-color: var(--accent); color: var(--accent-deep); }
 .session-user-trash-slot { width: 52px; height: 52px; display: grid; place-items: center; flex: 0 0 52px; }
 .session-user-trash-slot:focus-visible { outline: 2px solid var(--focus-border-color); outline-offset: 2px; border-radius: 50%; }
-.session-user-tools .session-user-trash { color: var(--danger-btn-color, var(--red)); background: var(--danger-icon-bg, rgba(177,69,69,.12)); }
+.session-user-tools .session-user-trash, .source-tools .source-remove-selected { color: var(--danger-btn-color, var(--red)); background: var(--danger-icon-bg, rgba(177,69,69,.12)); }
 .session-user-tools .session-user-trash::before { content: none; }
-.session-user-tools .session-user-trash.drag-over { transform: scale(1.15); background: var(--red); color: white; }
+.session-user-tools .session-user-trash.drag-over, .source-tools .source-remove-selected.drag-over { transform: scale(1.15); background: var(--red); color: white; }
 :is(.session-user-stage, .session-user-drag-image)[data-edit-mode="select"] .session-user-order-number { background: transparent; padding: 0; }
 .session-user-order-number { touch-action: none; }
 .session-user-checkbox {

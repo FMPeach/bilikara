@@ -8,6 +8,31 @@ runInNewContext(readFileSync(new URL('../static/playback-restart.js', import.met
 const {restart} = sandbox.BilikaraPlaybackRestart;
 const context = {itemId:'current-song', generation:7, key:'current-song:incarnation:7'};
 
+test('Remote restart requires a playable observation for the current song and generation', () => {
+  const source=readFileSync(new URL('../static/remote.js',import.meta.url),'utf8');
+  const section=(start,end)=>source.slice(source.indexOf(start),source.indexOf(end,source.indexOf(start)));
+  const state={data:{current_item:{id:'current-song',item_incarnation_id:'incarnation'},playback_generation:7,playback_mode:'local'}};
+  const fixture={state,canRemoteControlPlayer:()=>true,frontendPlaybackMode:value=>value};
+  runInNewContext(section('function currentPlayerStatus(', 'function durationSecondsForItem(')
+    +section('function remoteRestartContext()', 'let restartControlSync'),fixture);
+  assert.equal(fixture.remoteRestartContext().enabled,false,'Media URLs alone do not prove Host readiness');
+  for(const phase of ['starting','needs-user-gesture','failed','unknown']) {
+    state.data.player_status={item_id:'current-song',playback_generation:7,observed_phase:phase};
+    assert.equal(fixture.remoteRestartContext().enabled,false,phase);
+  }
+  for(const phase of ['playing','paused','ready-paused','ended']) {
+    state.data.player_status={item_id:'current-song',playback_generation:7,observed_phase:phase};
+    assert.equal(fixture.remoteRestartContext().enabled,true,phase);
+  }
+  for(const status of [{item_id:'old-song',playback_generation:7}, {item_id:'current-song',playback_generation:6}]) {
+    state.data.player_status={...status,observed_phase:'playing'};
+    assert.equal(fixture.remoteRestartContext().enabled,false,'Old observations cannot enable Restart');
+  }
+  fixture.canRemoteControlPlayer=()=>false;
+  state.data.player_status={item_id:'current-song',playback_generation:7,observed_phase:'playing'};
+  assert.equal(fixture.remoteRestartContext().enabled,false,'Existing media/mode gate still applies');
+});
+
 test('restart uses existing ordered seek/play commands bound to the captured song', async () => {
   const requests = [];
   await restart({context, isCurrent:()=>true, post:async (url,body)=>{requests.push([url,JSON.parse(JSON.stringify(body))]); return {commandApplied:true};}});

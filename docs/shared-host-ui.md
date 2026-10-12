@@ -39,7 +39,31 @@ selection and applicable focus/scroll state. They do not reparent the player,
 recreate its media elements or create another Signalsmith graph. The existing
 `android-*` DOM hooks remain stable while the layout implementation is shared.
 
+Playback circles share their ordinary outline; disabled controls have no hover
+feedback or help. Restart becomes available after the current Host playback
+generation is ready. Desktop Host shows it inline and supports mouse-hover or
+keyboard-focus help; Remote keeps held-touch help. A portrait capsule first
+grows around Next, then extends left. Sliding onto Restart arms its pressed
+state; releasing there submits it, while moving away or cancelling does nothing.
+Next keeps its original node and visual layer throughout the animation.
+
+Remote's playback sheet uses the same surface morph for taps and drags. Its
+persistent top handle crossfades with the sheet content and has a wider invisible
+click target; rating and refresh retain priority where targets meet. Animation
+lays out the sheet once and moves/clips its outer surface instead of resizing
+its content every frame. Single-screen fullscreen uses the audience screen's
+shared cache-status presentation, including indeterminate/progress and failure
+states, and hides it again when playback is ready or fullscreen exits.
+
 Desktop workspace and scroll ownership remain explicit:
+
+Sources and Session Users keep the same 8px list-to-tool spacing; desktop also
+shares their platform panel inset. Android Source pagination uses Remote's
+44px track and 4px bottom inset, in one native footer frame below the tools.
+The tools' reserved trash slot and the frame's 4px gap supply 8px between visible
+controls. Session-user name actions retain horizontal ellipsis and a 20px
+line with vertical paint room, so descenders such as `g` fit without increasing
+the badge's height.
 
 | Surface | Placement and scroll owner |
 | --- | --- |

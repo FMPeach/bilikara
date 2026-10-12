@@ -4388,7 +4388,7 @@ body.remote-identity-modal-open {
   z-index: 2;
   display: grid;
   flex: 0 0 auto;
-  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr) 44px minmax(0, 1fr);
   align-items: center;
   min-height: 56px;
   padding: 6px 12px;
@@ -4397,6 +4397,8 @@ body.remote-identity-modal-open {
 }
 
 .playback-sheet-status-label {
+  justify-self: start;
+  max-width: 100%;
   min-width: 0;
   margin: 0;
   overflow: hidden;
@@ -4411,10 +4413,13 @@ body.remote-identity-modal-open {
 }
 
 .playback-sheet-collapse {
+  position: relative;
+  z-index: 0;
+  justify-self: center;
   display: inline-grid;
   place-items: center;
-  width: 44px;
-  min-width: 44px;
+  width: 132px;
+  min-width: 132px;
   height: 44px;
   min-height: 44px;
   padding: 0;
@@ -4426,8 +4431,22 @@ body.remote-identity-modal-open {
 }
 
 .playback-sheet-collapse svg {
+  display: none;
   pointer-events: none;
 }
+
+.playback-sheet-collapse::after {
+  content: "";
+  width: 30px;
+  height: 4px;
+  border-radius: 999px;
+  background: var(--muted);
+  pointer-events: none;
+}
+/* The larger transparent handle shares the old 44px layout slot. Adjacent
+   labels/actions retain their own hit targets above its extra side area. */
+.playback-sheet-status-label,
+.playback-sheet-status-actions { position: relative; z-index: 1; }
 
 :root:not([data-remote-input-modality="pointer"]) .playback-sheet-collapse:focus-visible {
   outline: 2px solid var(--accent);
@@ -5743,43 +5762,31 @@ button:active { transform: none !important; }
     var(--sheet-gesture-bottom-radius) var(--sheet-gesture-bottom-radius);
   transform: translateY(var(--sheet-gesture-translate));
   transition: none;
-  will-change: transform, width, height;
+  will-change: transform, clip-path;
 }
 .playback-sheet.is-gesturing .playback-sheet-backdrop {
-  opacity: var(--playback-sheet-drag-progress, 0);
   transition: none;
 }
 .playback-sheet.is-gesturing .playback-sheet-body {
   flex: 0 0 auto;
   width: var(--sheet-gesture-content-width);
   height: var(--sheet-gesture-body-height);
-  opacity: var(--sheet-gesture-content-opacity);
   pointer-events: none;
 }
 .playback-sheet.is-gesturing .playback-sheet-status-header {
+  width: var(--sheet-gesture-header-width);
+  flex-shrink: 0;
   background: transparent;
 }
 .playback-sheet.is-gesturing :is(.playback-sheet-status-label, .playback-sheet-status-actions) {
-  opacity: var(--sheet-gesture-header-opacity);
   pointer-events: none;
 }
 .playback-sheet.is-gesturing .playback-sheet-collapse {
   position: relative;
-  opacity: var(--sheet-gesture-header-opacity);
-}
-.playback-sheet.is-dragging .playback-sheet-collapse svg { opacity: 0; }
-.playback-sheet.is-dragging .playback-sheet-collapse::after {
-  content: "";
-  position: absolute;
-  width: 30px;
-  height: 4px;
-  border-radius: 999px;
-  background: var(--muted);
 }
 .playback-sheet-dock-ghost {
   position: absolute;
   inset: 0 0 auto;
   height: 68px;
-  opacity: var(--sheet-gesture-ghost-opacity);
   pointer-events: none;
 }

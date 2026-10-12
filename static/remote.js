@@ -10062,9 +10062,11 @@ elements.bindingAudioToggle?.addEventListener("click", () => {
 
 function remoteRestartContext() {
   const item = state.data?.current_item, generation = state.data?.playback_generation;
+  const status = currentPlayerStatus(item);
   return { key: `${item?.id}:${item?.item_incarnation_id}:${generation}`,
     itemId: item?.id, generation, title: item?.display_title || item?.title,
-    enabled: canRemoteControlPlayer(item, frontendPlaybackMode(state.data?.playback_mode)) };
+    enabled: canRemoteControlPlayer(item, frontendPlaybackMode(state.data?.playback_mode))
+      && ["playing", "paused", "ready-paused", "ended"].includes(status?.observed_phase) };
 }
 let restartControlSync = null;
 playbackRestartMenu = globalThis.BilikaraPlaybackRestart?.create({

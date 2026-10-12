@@ -8,6 +8,7 @@
 
   class SessionUserEditor {
     static get selectionIcon() { return checklist; }
+    static get trashIcon() { return trash; }
 
     constructor({ stage, list, t, post, message, bindHelp }) {
       this.stage = stage;

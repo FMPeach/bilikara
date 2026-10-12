@@ -327,7 +327,7 @@ render_end = sourceIndex(this.host_js, "async function localPost", render_start)
 render = this.host_js.slice(render_start, render_end);
 assert.ok(contains("const roomResultAvailable = Boolean(roomActive && state.remoteUrl)", render));
 assert.ok(contains("elements.room.classList.toggle(\"hidden\", !roomResultAvailable)", render));
-assert.ok(contains("elements.stop.classList.toggle(\"hidden\", !roomActive)", render));
+assert.ok(contains("elements.stop.classList.toggle(\"hidden\", !roomActive && state.roomOperation !== \"close\")", render));
 assert.ok(contains("passwordDraftChanged", render));
 assert.ok(contains("lifetimeDraftChanged", render));
 assert.ok(contains("tr(\"internetRemote.rebuildApply\"", render));

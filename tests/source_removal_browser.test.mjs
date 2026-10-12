@@ -109,13 +109,17 @@ async function sources(page, android=false, remote=false) {
 }
 async function settleSourceFit(page,source='uid') {
   await page.waitForFunction(source=>{
-    const editor=sourceRemovalEditors.get(source);if(!editor?.active)return false;
+    const editor=sourceRemovalEditors.get(source);if(!editor?.active||editor.loading||editor.pending)return false;
     const grid=editor.grid,card=grid.firstElementChild,style=getComputedStyle(grid),pager=editor.panel.querySelector('.host-result-pager');
-    if(!card||pager.hidden)return false;
+    if(!editor.records.some(row=>!row.placeholder))return !editor.loading;
+    if(!card)return false;
+    if(!editor.mobile)return !pager&&grid.querySelectorAll('.source-removal-card').length===editor.records.filter(row=>!row.placeholder).length&&!editor.loading;
+    if(!pager||pager.hidden)return false;
     const size=BilikaraResultPager.fittedPageSize({columns:style.gridTemplateColumns.split(' ').length,
       height:editor.scroll.clientHeight,itemHeight:card.getBoundingClientRect().height,gap:parseFloat(style.rowGap)||0,
       padding:(parseFloat(style.paddingTop)||0)+(parseFloat(style.paddingBottom)||0)});
-    return size!==null&&grid.children.length===Math.min(size,editor.records.length-(Number(pager.dataset.page)-1)*size);
+    return size!==null&&grid.children.length===Math.min(size,editor.records.length-(Number(pager.dataset.page)-1)*size)
+      &&editor.scroll.classList.contains('has-scroll-inset')===(editor.scroll.scrollHeight>editor.scroll.clientHeight+1);
   },source);
 }
 async function holdSource(page, card) {
@@ -137,6 +141,9 @@ async function selectPage(grid,footer,android) {
   else await footer.locator('.source-select-page').click();
 }
 async function exitSelection(footer) { await footer.locator('.source-select-mode').click(); }
+async function holdOrder(page) {
+  await page.waitForFunction(()=>[...sourceRemovalEditors.values()].some(editor=>editor.pointer?.dragging&&editor.pointer.kind!=='remove'));
+}
 async function settleSourceCompletion(page,host) {
   // A committed HTTP result can precede its terminal SSE snapshot. Consume
   // that real completion and its queued browse read before starting the next
@@ -172,7 +179,7 @@ async function dragRemoval(page,grid,footer,android=false,{outside=false,cancel=
       await page.waitForFunction(source=>{const node=document.querySelector(`.source-tools[data-source="${source}"] .source-remove-selected`);return node.classList.contains('drag-over')&&getComputedStyle(node).opacity==='1';},await footer.getAttribute('data-source'),{timeout:1500});
       const feedback=await footer.locator('.source-remove-selected').evaluate(node=>{const style=getComputedStyle(node);return {opacity:style.opacity,color:style.color,background:style.backgroundColor,blur:style.backdropFilter};});
       assert.equal(feedback.opacity,'1','drag-over feedback is visibly solid');assert.equal(feedback.color,'rgb(255, 255, 255)');
-      assert.notEqual(feedback.background,'rgba(0, 0, 0, 0)');assert.match(feedback.blur,/blur\(/u);
+      assert.notEqual(feedback.background,'rgba(0, 0, 0, 0)');assert.equal(feedback.blur,'none','trash uses the Session Users control surface');
     }
     if(shot)await screenshot(page,shot);
     if(beforeDrop)await beforeDrop();
@@ -203,40 +210,66 @@ async function footerBounds(page, source='uid') {
     const pager=panel.querySelector('.host-result-pager');
     return {footer:box(footer),scroll:box(scroll),panel:box(panel),pager:pager&&!pager.hidden?box(pager):null,editing:footer.querySelector('.source-select-mode').getAttribute('aria-pressed')==='true',hidden:footer.hidden,mobile:document.documentElement.dataset.hostPlatform==='android',position:style.position,background:style.backgroundColor,shadow:style.boxShadow,paddingBottom:parseFloat(getComputedStyle(panel).paddingBottom),window:innerHeight,dock:document.querySelector('#android-host-nav')?.getBoundingClientRect().top||innerHeight};
   },source);
-  assert.equal(value.position,'absolute','tools never own a layout track on either Host');
+  assert.equal(value.position,'static','resident tools use the Session Users footer layout');
   assert.equal(value.background,'rgba(0, 0, 0, 0)');assert.equal(value.shadow,'none','no full-width toolbar surface');
-  if(value.hidden){assert.equal(value.footer.height,0,'ordinary mobile browsing reserves no toolbar space');return value;}
-  if(value.pager&&!value.editing&&!value.mobile){
-    assert.ok(value.footer.top>=value.pager.top&&value.footer.bottom<=value.pager.bottom+1,'desktop entry occupies the existing page chrome');
-  }else{
-    assert.ok(value.footer.top>=value.scroll.top&&value.footer.top<value.scroll.bottom,'editing tools overlay the existing viewport');
-    if(value.pager)assert.ok(value.footer.bottom<=value.pager.top,'editing tools never cover pagination');
+  if(value.hidden){assert.equal(value.footer.height,0,'hidden list views reserve no toolbar space');return value;}
+  {
+    assert.ok(value.footer.top>=value.scroll.bottom+4,'resident tools stay outside list scrolling');
+    assert.equal(value.footer.height,52,'the shared trash slot owns the stable footer height');
+    if(value.pager)assert.equal(value.pager.top-value.footer.bottom,4,'the compact page track sits 4px below the reserved trash slot');
   }
   assert.ok(value.footer.bottom<=value.window+1,JSON.stringify(value));
   assert.ok(value.footer.bottom<=value.panel.bottom+1,JSON.stringify(value));
   assert.ok(value.footer.bottom<=value.dock+1,JSON.stringify(value));
   return value;
 }
+async function footerSpacing(page, session=false, label='') {
+  const value=await page.evaluate(session=>{
+    const tools=document.querySelector(session?'.session-user-tools':'.source-tools[data-source="uid"]');
+    const owner=tools.closest(session?'.session-users-panel':'.source-mode-panel');
+    const list=owner.querySelector(session?'.session-user-list':'.source-browse-scroll');
+    const pager=owner.querySelector('.host-result-pager'),button=tools.querySelector(session?'[data-mode="select"]':'.source-select-mode');
+    const box=node=>{const b=node.getBoundingClientRect();return {top:b.top,bottom:b.bottom,height:b.height};};
+    const style=node=>{const s=getComputedStyle(node);return {gap:s.rowGap,top:s.paddingTop,bottom:s.paddingBottom,marginTop:s.marginTop,marginBottom:s.marginBottom};};
+    const t=box(tools),l=box(list),o=box(owner),b=box(button),p=pager?box(pager):null;
+    return {owner:style(owner),list:style(list),tools:style(tools),pager:pager?style(pager):null,
+      listToTools:t.top-l.bottom,toolsToPager:p?p.top-t.bottom:null,buttonToPanelBottom:o.bottom-b.bottom,
+      buttonToPagerTargets:p?box(pager.querySelector('.result-pager-controls')).top-b.bottom:null,
+      pagerToPanelBottom:p?o.bottom-p.bottom:null,toolsHeight:t.height,pagerHeight:p?.height??null};
+  },session);
+  sourceLayouts.push({label:`${session?'session':'source'}-footer-spacing-${label}`,...value});
+  return value;
+}
+async function pagerGeometry(pager) {
+  return pager.evaluate(node=>{
+    const input=node.querySelector('[data-page-input]'),button=node.querySelector('[data-page-action]'),s=getComputedStyle(node);
+    const shape=n=>{const b=n.getBoundingClientRect(),style=getComputedStyle(n);return {width:b.width,height:b.height,radius:style.borderRadius,font:style.fontSize};};
+    return {height:node.getBoundingClientRect().height,paddingTop:s.paddingTop,paddingBottom:s.paddingBottom,input:shape(input),button:shape(button)};
+  });
+}
 async function assertNativeSourceFrame(page, {source='uid', fits=true}={}) {
   const value=await page.evaluate(({source,fits})=>{
     const panel=document.querySelector(source==='uid'?'#request-sources-uids':'#request-sources-favorites');
     const scroll=panel.querySelector('.source-browse-scroll'),pager=panel.querySelector('.host-result-pager');
     const form=panel.querySelector('.source-uid-form'),inputs=[...form.children],rect=node=>{const b=node.getBoundingClientRect();return {top:b.top,bottom:b.bottom,left:b.left,right:b.right,width:b.width,height:b.height};};
-    const body=rect(scroll),footer=rect(pager),cardNodes=[...panel.querySelectorAll('.source-removal-card')];
-    return {panel:rect(panel),body,footer,external:pager.parentElement===panel&&!scroll.contains(pager),
-      overflow:document.documentElement.scrollWidth>innerWidth+1,clientHeight:scroll.clientHeight,scrollHeight:scroll.scrollHeight,
+    const body=rect(scroll),footer=pager?rect(pager):null,cardNodes=[...panel.querySelectorAll('.source-removal-card')];
+    return {panel:rect(panel),body,footer,external:!pager||pager.parentElement===panel.querySelector('.source-frame-footer')&&!scroll.contains(pager),
+      overflow:document.documentElement.scrollWidth>innerWidth+1,panelInset:parseFloat(getComputedStyle(panel).paddingBottom),clientHeight:scroll.clientHeight,scrollHeight:scroll.scrollHeight,
       fields:inputs.map(node=>({...rect(node),fontSize:getComputedStyle(node).fontSize,radius:getComputedStyle(node).borderRadius})),refreshType:form.querySelector('.source-refresh-button')?.type,
-      cards:fits?cardNodes.map(rect):[],reachable:[...pager.querySelectorAll('button:not(:disabled),input:not(:disabled)')].filter(node=>node.getClientRects().length&&getComputedStyle(node).pointerEvents!=='none').every(node=>{
+      cards:fits&&pager?cardNodes.map(rect):[],reachable:[...(pager?.querySelectorAll('button:not(:disabled),input:not(:disabled)')||[])].filter(node=>node.getClientRects().length&&getComputedStyle(node).pointerEvents!=='none').every(node=>{
         const b=rect(node);return node.contains(document.elementFromPoint((b.left+b.right)/2,(b.top+b.bottom)/2));
       })};
   },{source,fits});
   assert.equal(value.external,true,'native page navigation lives outside the scroll body');assert.equal(value.overflow,false);
-  assert.ok(value.body.bottom<=value.footer.top-4,'the frame leaves one pagination gap');
-  assert.ok(value.footer.bottom<=value.panel.bottom-12+1,'pagination stays inside the panel border');
-  assert.equal(value.footer.height,52,'44px controls have just 4px above/below');assert.equal(value.reachable,true,'floating tools cannot intercept page controls');
+  if(value.footer){
+    assert.ok(value.body.bottom<=value.footer.top-4,'the frame leaves one pagination gap');
+    assert.ok(Math.abs(value.panel.bottom-value.footer.bottom-value.panelInset)<=1,'pagination uses only its owner inset');
+    assert.equal(value.footer.height,44,'Android Source pagination uses the shared Remote track');
+  }
+  assert.equal(value.reachable,true,'floating tools cannot intercept page controls');
   for(const field of value.fields){assert.equal(field.height,44);assert.equal(field.fontSize,'16px');assert.equal(field.radius,'14px');assert.ok(Math.abs(field.top-value.fields[0].top)<=1,'source actions stay on one row');}
   if(source==='uid')assert.equal(value.refreshType,'button','manual refresh never submits the UID form');
-  if(fits){
+  if(fits&&value.footer){
     assert.ok(value.scrollHeight<=value.clientHeight+1,'ordinary fitted pages do not need scrolling');
     for(const card of value.cards)assert.ok(card.top>=value.body.top-1&&card.bottom<=value.body.bottom+1,'complete card rows fit inside the visible body');
   }
@@ -248,8 +281,8 @@ async function sourceLayout(page, label) {
     const grid=panel.querySelector('.follow-up-grid'),pager=panel.querySelector('.result-pager');
     const box=node=>{const b=node.getBoundingClientRect();return {top:b.top,bottom:b.bottom,width:b.width,height:b.height};};
     return {viewport:innerWidth,columns:getComputedStyle(grid).gridTemplateColumns.split(' ').length,
-      items:grid.querySelectorAll('.source-removal-card').length,page:pager.querySelector('[data-page-input]').value,
-      panel:box(panel),scroll:box(scroll),grid:box(grid),pager:box(pager),
+      items:grid.querySelectorAll('.source-removal-card').length,page:pager?.querySelector('[data-page-input]').value??null,
+      panel:box(panel),scroll:box(scroll),grid:box(grid),pager:pager?box(pager):null,
       clientHeight:scroll.clientHeight,scrollHeight:scroll.scrollHeight,scrollTop:scroll.scrollTop,
       paddingBottom:parseFloat(getComputedStyle(scroll).paddingBottom)};
   });
@@ -290,13 +323,81 @@ async function selectionControls(page, session=false) {
     const checkbox=document.querySelector(session?'.session-user-checkbox': '#follow-up-grid .source-checkbox');
     const trash=document.querySelector(session?'.session-user-trash':'.source-tools[data-source="uid"] .source-remove-selected');
     const slot=trash.parentElement,shape=node=>{const b=node.getBoundingClientRect(),s=getComputedStyle(node);return {width:b.width,height:b.height,radius:s.borderRadius};};
+    const surface=node=>{const s=getComputedStyle(node);return {background:s.backgroundColor,color:s.color,border:s.border,shadow:s.boxShadow,blur:s.backdropFilter};};
+    const all=document.querySelector(session?'.session-user-select-all':'.source-tools[data-source="uid"] .source-select-page');
+    const count=document.querySelector(session?'.session-user-selection-count':'.source-tools[data-source="uid"] .source-selection-count');
     return {toggle:shape(toggle),pressed:toggle.getAttribute('aria-pressed'),border:getComputedStyle(toggle).borderColor,
       color:getComputedStyle(toggle).color,icon:shape(toggle.querySelector('svg')),svg:toggle.querySelector('svg').outerHTML,
       checkbox:{...shape(checkbox),appearance:getComputedStyle(checkbox).appearance,accent:getComputedStyle(checkbox).accentColor},
-      trash:shape(trash),slot:shape(slot)};
+      trash:shape(trash),trashSurface:surface(trash),trashSvg:trash.querySelector('svg').outerHTML,slot:shape(slot),
+      all:{...surface(all),height:all.getBoundingClientRect().height,radius:getComputedStyle(all).borderRadius,font:getComputedStyle(all).fontSize,weight:getComputedStyle(all).fontWeight},
+      count:{color:getComputedStyle(count).color,font:getComputedStyle(count).fontSize,weight:getComputedStyle(count).fontWeight}};
   },session);
 }
 const edit=async(host,source,action)=>host.api('/api/gatcha/sources/edit',{source,expected_version:(await host.api(source==='uid'?'/api/gatcha/browse':'/api/gatcha/favlist/browse')).source_order_version,edit:action});
+
+for(const android of [false,true])test(`${android?'phone':'desktop'} resident Source footer keeps selection and trash centered without covering cards`,{timeout:45000},async t=>{
+  const {host}=await fixture(t,{android,size:60}),{page,requests,errors,consoleLogs}=await browser(t,host,{android});
+  await sources(page,android);
+  const footer=page.locator('.source-tools[data-source="uid"]'),toggle=footer.locator('.source-select-mode'),trash=footer.locator('.source-remove-selected');
+  for(const [width,height] of android?[[360,800],[375,812],[375,667],[320,640]]:[[1000,900],[700,600]]) {
+    await page.setViewportSize({width,height});await settleSourceFit(page);
+    const normal=await sourceLayout(page,`resident-${width}x${height}-normal`),before=await toggle.boundingBox();
+    assert.equal(await footer.isVisible(),true);assert.equal(await trash.isVisible(),true);assert.equal(await trash.getAttribute('aria-disabled'),'true');
+    await footerBounds(page);await assertNativeSourceFrame(page);if(android)await assertFullSourceCapacity(page);
+    const spacing=await footerSpacing(page,false,`${width}x${height}`);
+    assert.equal(spacing.listToTools,8,'Sources share Session Users list-to-footer spacing');
+    if(android){assert.equal(spacing.toolsToPager,4);assert.equal(spacing.buttonToPagerTargets,8,'the trash slot inset and frame gap supply the full control gap');assert.equal(spacing.pagerToPanelBottom,4);}
+    else assert.equal(spacing.buttonToPanelBottom,14,'the narrow desktop shares Session Users block inset');
+    await screenshot(page,`resident-${android?'phone':'desktop'}-${width}x${height}-normal`);
+    await toggle.click();await page.locator('#follow-up-grid .source-checkbox').first().check();
+    await page.locator('#follow-up-grid .follow-up-button').first().evaluate(async node=>{
+      getComputedStyle(node).borderColor;
+      await Promise.all(node.getAnimations().map(animation=>animation.finished));
+    });
+    const border=await page.evaluate(()=>({card:getComputedStyle(document.querySelector('#follow-up-grid .source-removal-card.is-selected > button')).borderColor,toggle:getComputedStyle(document.querySelector('.source-tools[data-source="uid"] .source-select-mode')).borderColor}));
+    assert.equal(border.card,border.toggle,'selected cards retain the visible accent border inside their bounds');
+    const selected=await sourceLayout(page,`resident-${width}x${height}-selected`);
+    for(const key of ['scroll','pager','items','columns','paddingBottom'])assert.deepEqual(selected[key],normal[key],`the resident footer preserves ${key} on selection`);
+    assert.deepEqual(await toggle.boundingBox(),before);assert.equal(await trash.getAttribute('aria-disabled'),'false');
+    const row=await footer.evaluate(node=>{
+      const box=n=>n.getBoundingClientRect(),s=getComputedStyle(node),b=box(node);
+      return {left:b.left,right:b.right,viewport:innerWidth,shadow:s.boxShadow,blur:s.backdropFilter,
+        centers:[...node.children].filter(child=>child.getClientRects().length).map(child=>{const c=box(child);return c.top+c.height/2;})};
+    });
+    assert.ok(Math.max(...row.centers)-Math.min(...row.centers)<1,'all resident tools have the same vertical center');
+    assert.ok(row.left>=12&&row.right<=row.viewport-12);assert.equal(row.shadow,'none');assert.equal(row.blur,'none');
+    await screenshot(page,`resident-${android?'phone':'desktop'}-${width}x${height}-selected`);
+    await toggle.click();await page.mouse.move(1,1);assert.equal(await footer.isVisible(),true);assert.equal(await trash.getAttribute('aria-disabled'),'true');
+    assert.deepEqual(await toggle.boundingBox(),before);await assertMedia(page);
+  }
+  assert.equal(requests.mutations.length,0);assert.equal(requests.blocked,0);assert.deepEqual(errors,[]);assert.deepEqual(consoleLogs,[]);completed.add(t);
+});
+
+test('desktop long-hold ordering renders both column guides and resists row-boundary jitter', {timeout:30000},async t=>{
+  const {host}=await fixture(t,{size:12}),{page,requests,errors}=await browser(t,host);
+  await page.setViewportSize({width:1000,height:900});await sources(page);
+  const grid=page.locator('#follow-up-grid');
+  const boxes=await grid.locator('.source-removal-card').evaluateAll(nodes=>nodes.map(node=>{const b=node.getBoundingClientRect();return {id:node.dataset.sourceId,x:b.x,y:b.y,width:b.width,height:b.height};}));
+  const firstRow=boxes.filter(box=>Math.abs(box.y-boxes[0].y)<4),secondRow=boxes.filter(box=>Math.abs(box.y-(boxes.find(box=>box.y>boxes[0].y+4)?.y))<4);
+  assert.ok(firstRow.length>=2&&secondRow.length>=2);
+  const source=firstRow[1];await page.mouse.move(source.x+22,source.y+22);await page.mouse.down();await holdOrder(page);
+  const first=firstRow[0],last=firstRow.at(-1);
+  await page.mouse.move(first.x+1,first.y+first.height/2);
+  assert.equal(await grid.locator(`[data-source-id="${first.id}"].drop-before`).count(),1);
+  assert.equal(await grid.locator('.drop-before').evaluate(node=>getComputedStyle(node,'::before').left),'0px','the first guide is inside the unclipped card boundary');
+  await screenshot(page,'host-insert-first-column');
+  await page.mouse.move(last.x+last.width-1,last.y+last.height/2);
+  assert.equal(await grid.locator(`[data-source-id="${last.id}"].drop-after`).count(),1);
+  assert.equal(await grid.locator('.drop-after').evaluate(node=>getComputedStyle(node,'::after').right),'0px');
+  await screenshot(page,'host-insert-last-column');
+  await page.mouse.move(last.x+last.width-1,secondRow[0].y+1);
+  assert.equal(await grid.locator(`[data-source-id="${last.id}"].drop-after`).count(),1,'merely entering the next row keeps the previous guide');
+  await page.mouse.move(last.x+last.width-1,secondRow[0].y+20);
+  assert.equal(await grid.locator(`[data-source-id="${secondRow.at(-1).id}"].drop-after`).count(),1,'a deliberate row crossing moves the guide');
+  await page.keyboard.press('Escape');await page.mouse.up();
+  assert.equal(requests.mutations.length,0);assert.deepEqual(errors,[]);await assertMedia(page);completed.add(t);
+});
 
 test('native source editing validates a whole batch, Host capability, narrow version and legacy authorized removal', {timeout:60000},async t=>{
   const {host,data}=await fixture(t,{size:3}),guest=new HttpClient(host.base);await guest.request('/remote');
@@ -373,16 +474,17 @@ test('Host reconciles committed batch cleanup failure and only retries explicit 
   completed.add(t);
 });
 
-test('mobile Host long press opens an overlay without moving cards; scroll, cancel, stale data and leaving retire holds',{timeout:120000},async t=>{
+test('mobile Host long press selects without moving its resident footer; swipe, cancel, stale data and leaving retire holds',{timeout:120000},async t=>{
   const {host}=await fixture(t,{android:true}),{page,context,requests,errors}=await browser(t,host,{android:true});
   await sources(page,true);
   const footer=page.locator('.source-tools[data-source="uid"]'),card=page.locator('#follow-up-grid [data-source-id="42"] .follow-up-button');
-  assert.equal(await footer.isVisible(),false);await footerBounds(page);
+  assert.equal(await footer.isVisible(),true);await footerBounds(page);
   await page.evaluate(()=>{window.sourceCardNodes=[...document.querySelector('#follow-up-grid [data-source-id="42"] .follow-up-button').childNodes];});
   await card.tap();await page.locator('#follow-up-items-view').waitFor({state:'visible'});
   await page.waitForTimeout(500);await page.locator('#follow-browse-back').tap();
   assert.equal(await card.evaluate(button=>button.childNodes.length===sourceCardNodes.length&&[...button.childNodes].every((node,index)=>node===sourceCardNodes[index])),true,'browse loading preserves the original name/count/avatar nodes');
-  assert.equal(await footer.isVisible(),false,'quick tap navigates instead of entering selection');
+  assert.equal(await footer.locator('.source-select-mode').getAttribute('aria-pressed'),'false','quick tap navigates instead of entering selection');
+  await settleSourceFit(page);
   const session=await context.newCDPSession(page);cleanup(t,()=>session.detach());
   const point=async()=>{await card.scrollIntoViewIfNeeded();const box=await card.locator('.request-card-title-line').first().boundingBox();return {x:box.x+Math.min(18,box.width/2),y:box.y+box.height/2};};
   const start=async p=>session.send('Input.dispatchTouchEvent',{type:'touchStart',touchPoints:[p]});
@@ -410,49 +512,49 @@ test('mobile Host long press opens an overlay without moving cards; scroll, canc
   assert.equal(await page.locator('#follow-up-grid').evaluate(grid=>getComputedStyle(grid).gridTemplateColumns.split(' ').length),3,'overlay keeps all three original columns');
   const wideLayoutDuring=await sourceLayout(page,'390-selection');
   for(const key of ['columns','items','page','panel','scroll','grid','pager','clientHeight'])assert.deepEqual(wideLayoutDuring[key],wideLayoutBefore[key],`full pages retain ${key} when tools appear`);
-  assert.equal(wideLayoutDuring.items,18);assert.equal(wideLayoutDuring.page,'1');assert.equal(wideLayoutDuring.paddingBottom,64);
-  assert.ok(wideLayoutDuring.scrollHeight>wideLayoutDuring.clientHeight,'additional complete rows keep temporary reach for covered editing targets');
+  assert.equal(wideLayoutDuring.items,15);assert.equal(wideLayoutDuring.page,'1');assert.equal(wideLayoutDuring.paddingBottom,0,'resident tools need no extra scroll reach');
+  assert.equal(wideLayoutDuring.scrollHeight,wideLayoutDuring.clientHeight,'selection keeps the fitted page free of extra scrolling');
   const checkbox=page.locator('#follow-up-grid [data-source-id="43"] .source-checkbox'),checkboxBox=await checkbox.boundingBox();
   await start({x:checkboxBox.x+checkboxBox.width/2,y:checkboxBox.y+checkboxBox.height/2});
   await page.waitForTimeout(750);await assertNoSourceTextSelection(page);
   await session.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});await assertNoSourceTextSelection(page);
   if(await checkbox.isChecked())await checkbox.tap();
   await screenshot(page,'host-touch-390-overlay');
-  await footer.locator('.source-select-mode').tap();await footer.waitFor({state:'hidden'});await page.waitForTimeout(100);
+  await footer.locator('.source-select-mode').tap();assert.equal(await footer.isVisible(),true);await page.waitForTimeout(100);
   const wideAfter=await snapshot();for(const name of Object.keys(wideBefore))for(const key of Object.keys(wideBefore[name]))assert.ok(Math.abs(wideBefore[name][key]-wideAfter[name][key])<=1,`390px ${name}.${key} stays fixed after Done`);
   await page.setViewportSize({width:320,height:640});
-  await page.waitForFunction(()=>document.querySelectorAll('#follow-up-grid .source-removal-card').length===6);
+  await settleSourceFit(page);
   const narrowLayoutBefore=await sourceLayout(page,'320-normal');await screenshot(page,'host-touch-320-normal');
   assert.equal(narrowLayoutBefore.items,6);assert.equal(narrowLayoutBefore.columns,2);assert.equal(narrowLayoutBefore.page,'1');
   assert.equal(narrowLayoutBefore.paddingBottom,0);assert.equal(narrowLayoutBefore.scrollHeight,narrowLayoutBefore.clientHeight,'a shorter native window chooses fewer complete rows');
   p=await point();await start(p);
   for(let step=1;step<=4;step++){await session.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:p.x,y:p.y-step*20}]});await page.waitForTimeout(20);}
   await session.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});await page.waitForTimeout(500);
-  assert.equal(await footer.isVisible(),false,'scroll gesture cancels the hold');
+  assert.equal(await footer.locator('.source-select-mode').getAttribute('aria-pressed'),'false','swipe gesture cancels the hold');
   p=await point();await start(p);await page.waitForTimeout(90);await cancel();await page.waitForTimeout(500);
-  assert.equal(await footer.isVisible(),false,'pointer cancellation clears the pending timer');
+  assert.equal(await footer.locator('.source-select-mode').getAttribute('aria-pressed'),'false','pointer cancellation clears the pending timer');
   p=await point();const before=await snapshot();await start(p);await footer.waitFor({state:'visible'});
   await page.waitForTimeout(750);await assertNoSourceTextSelection(page);const during=await snapshot();
   for(const name of Object.keys(before))for(const key of Object.keys(before[name]))assert.ok(Math.abs(before[name][key]-during[name][key])<=1,`${name}.${key} stays fixed when the overlay appears`);
   assert.equal(await card.getAttribute('aria-pressed'),'true');
   const narrowLayoutDuring=await sourceLayout(page,'320-selection');assert.equal(narrowLayoutDuring.columns,2);assert.equal(narrowLayoutDuring.items,6);assert.equal(narrowLayoutDuring.page,'1');
-  assert.equal(narrowLayoutDuring.paddingBottom,64);assert.ok(narrowLayoutDuring.scrollHeight>narrowLayoutBefore.scrollHeight,'covered cards gain temporary scroll reach');
-  assert.deepEqual(narrowLayoutDuring.scroll,narrowLayoutBefore.scroll,'scroll reach never shrinks the viewport');
+  assert.equal(narrowLayoutDuring.paddingBottom,0);assert.equal(narrowLayoutDuring.scrollHeight,narrowLayoutBefore.scrollHeight,'selection does not add a scroll track');
+  assert.deepEqual(narrowLayoutDuring.scroll,narrowLayoutBefore.scroll,'the resident footer keeps the viewport fixed');
   await footerBounds(page);await screenshot(page,'host-touch-long-press-overlay');
   await session.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});
   assert.equal(await card.getAttribute('aria-pressed'),'true','releasing a long hold does not unselect its card');
   assert.equal(await page.evaluate(()=>state.followBrowseSelectedUid),'');assert.equal(requests.mutations.length,0);
   assert.match(await footer.locator('.source-selection-count').textContent(),/1/u);
-  assert.equal(await footer.locator('.source-select-page').isVisible(),false);
-  assert.equal(await footer.locator('.source-clear-selection').isVisible(),false);
+  assert.equal(await footer.locator('.source-select-page').isVisible(),true);
+  assert.equal(await footer.locator('.source-clear-selection').count(),0,'the select-all control also clears selection, like Session Users');
   await dragRemoval(page,page.locator('#follow-up-grid'),footer,true);await page.locator('#confirm-cancel').tap();
   assert.equal(requests.mutations.length,0,'canceling deletion leaves the selection intact');
-  await footer.locator('.source-select-mode').tap();await footer.waitFor({state:'hidden'});
+  await footer.locator('.source-select-mode').tap();assert.equal(await footer.isVisible(),true);
   assert.equal(await card.getAttribute('aria-pressed'),null);assert.equal(requests.mutations.length,0,'Done exits without deleting');
   const after=await snapshot();for(const name of Object.keys(before))for(const key of Object.keys(before[name]))assert.ok(Math.abs(before[name][key]-after[name][key])<=1,`${name}.${key} stays fixed after Done`);
   const narrowLayoutAfter=await sourceLayout(page,'320-done');assert.equal(narrowLayoutAfter.paddingBottom,0);assert.equal(narrowLayoutAfter.scrollHeight,narrowLayoutBefore.scrollHeight);
   await screenshot(page,'host-touch-after-done');
-  await holdSource(page,card);const fixedPagerBefore=await page.locator('#request-sources-uids > .result-pager').boundingBox();
+  await holdSource(page,card);const fixedPagerBefore=await page.locator('#request-sources-uids > .source-frame-footer > .result-pager').boundingBox();
   const scrollTitle=await page.locator('#follow-up-grid .request-card-title-line').nth(2).boundingBox();
   const scrollPoint={x:scrollTitle.x+scrollTitle.width/2,y:scrollTitle.y+8};
   assert.equal(await page.evaluate(p=>Boolean(document.elementFromPoint(p.x,p.y)?.closest('.source-select-target,.source-tools')),scrollPoint),false,'scrolling starts on card text, outside the checkbox drag target');
@@ -467,14 +569,15 @@ test('mobile Host long press opens an overlay without moving cards; scroll, canc
     await page.waitForTimeout(16);
   }
   await session.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});
-  await page.waitForFunction(()=>document.querySelector('#request-sources-followed-scroll').scrollTop>0,null,{timeout:1500});
-  assert.deepEqual(await page.locator('#request-sources-uids > .result-pager').boundingBox(),fixedPagerBefore,'the native footer never scrolls with the content');
+  assert.equal(await page.locator('#request-sources-followed-scroll').evaluate(node=>node.scrollTop),0,'a fitted page needs no overlay scroll reach');
+  assert.equal(requests.mutations.length,0,'swiping card text cannot submit an edit');
+  assert.deepEqual(await page.locator('#request-sources-uids > .source-frame-footer > .result-pager').boundingBox(),fixedPagerBefore,'the native footer never scrolls with the content');
   await page.locator('#request-sources-uids [data-page-action="next"]').tap();
-  await page.waitForFunction(()=>document.querySelector('#request-sources-uids > .result-pager').dataset.page==='2');
+  await page.waitForFunction(()=>document.querySelector('#request-sources-uids > .source-frame-footer > .result-pager').dataset.page==='2');
   await assertNativeSourceFrame(page,{fits:false});
   await page.locator('#request-sources-uids [data-page-action="previous"]').tap();
-  await page.waitForFunction(()=>document.querySelector('#request-sources-uids > .result-pager').dataset.page==='1');
-  const bottomLayout=await sourceLayout(page,'320-scrolled-page-footer');assert.equal(bottomLayout.page,'1');assert.equal(bottomLayout.items,6);
+  await page.waitForFunction(()=>document.querySelector('#request-sources-uids > .source-frame-footer > .result-pager').dataset.page==='1');
+  const bottomLayout=await sourceLayout(page,'320-page-footer');assert.equal(bottomLayout.page,'1');assert.equal(bottomLayout.items,6);
   await screenshot(page,'host-touch-320-page-footer');
   await exitSelection(footer);
   p=await point();await start(p);await page.waitForTimeout(90);await edit(host,'uid',{action:'move',id:'44',before_id:'42'});
@@ -482,7 +585,7 @@ test('mobile Host long press opens an overlay without moving cards; scroll, canc
   // ordinary SSE completion reloads may be coalesced beyond that deadline.
   await page.evaluate(()=>loadFollowBrowse({keepQuery:true}));
   await page.waitForFunction(()=>state.followBrowseData.owners[0].uid==='44'&&!state.followBrowseLoading);
-  await page.waitForTimeout(500);await cancel();assert.equal(await footer.isVisible(),false,'stale hold never selects a replacement order');
+  await page.waitForTimeout(500);await cancel();assert.equal(await footer.locator('.source-select-mode').getAttribute('aria-pressed'),'false','stale hold never selects a replacement order');
   p=await point();await start(p);await page.locator('[data-sources-mode="favorites"]').click();await page.waitForTimeout(500);await cancel();
   assert.equal(await page.locator('.source-select-mode[aria-pressed="true"]:visible').count(),0,'leaving the list retires the old hold');
   assert.equal(requests.mutations.length,0);await assertMedia(page);assert.deepEqual(errors,[]);assert.equal(requests.blocked,0);
@@ -497,6 +600,20 @@ for(const android of [false,true])test(`${android?'Android':'desktop'} checkbox 
   const sessionToggle=page.locator('.session-user-mode-button[data-mode="select"]');await sessionToggle.click();
   const sessionCheckbox=page.locator('.session-user-checkbox').first();await sessionCheckbox.check();
   const sessionControls=await selectionControls(page,true);await screenshot(page,android?'host-touch-session-selection':'host-desktop-session-selection');
+  await page.mouse.move(1,1);
+  const sessionSpacing=await footerSpacing(page,true,android?'320x844':'700x650');
+  assert.equal(sessionSpacing.listToTools,8);assert.equal(sessionSpacing.toolsHeight,52);
+  const nameBounds=await page.locator('.session-user-name').first().evaluate(name=>{
+    const s=getComputedStyle(name),canvas=document.createElement('canvas'),context=canvas.getContext('2d');
+    context.font=`${s.fontWeight} ${s.fontSize} ${s.fontFamily}`;
+    const ink=context.measureText(name.textContent);
+    return {visibleHeight:name.clientHeight,scrollHeight:name.scrollHeight,
+      fontHeight:ink.fontBoundingBoxAscent+ink.fontBoundingBoxDescent,
+      paintPadding:parseFloat(s.paddingTop)+parseFloat(s.paddingBottom)};
+  });
+  assert.ok(nameBounds.visibleHeight>=nameBounds.fontHeight+nameBounds.paintPadding,'the actual font, including g descenders, fits inside the clipping box');
+  assert.ok(nameBounds.scrollHeight<=nameBounds.visibleHeight,'username text has no clipped vertical overflow');
+  if(process.env.BILIKARA_TEST_SCREENSHOT_DIR)await page.locator('.session-user-badge').first().screenshot({path:path.join(process.env.BILIKARA_TEST_SCREENSHOT_DIR,android?'phone-username-descenders.png':'desktop-username-descenders.png')});
   await sessionToggle.click();assert.equal(await sessionToggle.getAttribute('aria-pressed'),'false','Session Users uses its pressed toggle for completion');
   await sources(page,android);const grid=page.locator('#follow-up-grid'),footer=page.locator('.source-tools[data-source="uid"]');
   await enterSelection(page,grid,footer,android);
@@ -549,11 +666,50 @@ for(const android of [false,true])test(`${android?'mobile':'desktop'} native Sou
   await sources(page,android);
   const panel=page.locator('#request-sources-uids'),grid=page.locator('#follow-up-grid'),footer=page.locator('.source-tools[data-source="uid"]');
   await page.locator('#modal-follow-uid-input').fill('123456');
-  await page.evaluate(()=>{window.sourceFramePager=document.querySelector('#request-sources-uids > .host-result-pager');});
+  await page.evaluate(()=>{window.sourceFramePager=document.querySelector('#request-sources-uids > .source-frame-footer > .host-result-pager');});
   const baseline=await sourceLayout(page,`${android?'mobile':'desktop'}-frame-baseline`);
   await assertNativeSourceFrame(page);await footerBounds(page);
-  if(android)assert.equal(baseline.items,18);
-  const sizes=android?[[320,844,12],[320,640,6],[390,844,18]]:[[700,600],[1000,900],[700,650]];
+  if(!android) {
+    assert.equal(baseline.items,54);assert.equal(baseline.pager,null,'desktop sources scroll without page chrome');
+    const first=await grid.locator('.follow-up-button').first().boundingBox();
+    await page.mouse.move(first.x+22,first.y+22);await page.mouse.down();
+    await page.mouse.move(first.x+32,first.y+22);await page.mouse.up();
+    await page.locator('#follow-up-items-view').waitFor({state:'visible'});
+    assert.equal(requests.mutations.length,0,'a small movement during a quick click cannot become ordering');
+    await page.locator('#follow-browse-back').click();await settleSourceFit(page);
+    for(const [width,height] of [[700,600],[1000,900],[700,650]]) {
+      await page.setViewportSize({width,height});await settleSourceFit(page);await assertNativeSourceFrame(page);
+      assert.equal(await grid.locator('.source-removal-card').count(),54);
+      assert.equal(await panel.locator('.host-result-pager').count(),0);
+      assert.equal(await panel.locator('.source-browse-scroll').evaluate(node=>node.scrollHeight>node.clientHeight),true);
+      assert.equal(await page.locator('#modal-follow-uid-input').inputValue(),'123456');
+    }
+    const toggle=footer.locator('.source-select-mode'),before=await toggle.boundingBox();
+    await toggle.click();
+    await page.mouse.move(1,1);
+    assert.deepEqual(await toggle.boundingBox(),before,'selection never moves its entry button');
+    assert.equal(await footer.isVisible(),true);
+    const row=await footer.evaluate(node=>{
+      const children=[...node.children].filter(child=>child.getClientRects().length),centers=children.map(child=>{const b=child.getBoundingClientRect();return b.top+b.height/2;});
+      return {centers,shadow:getComputedStyle(node).boxShadow,controls:[...node.querySelectorAll('button, .source-remove-selected')].map(control=>getComputedStyle(control).boxShadow)};
+    });
+    assert.ok(Math.max(...row.centers)-Math.min(...row.centers)<1,'count, select-all and trash share one horizontal center line');
+    assert.equal(row.shadow,'none');assert.ok(row.controls.every(shadow=>shadow==='none'));
+    await screenshot(page,'host-desktop-resident-tools');
+    await grid.locator('.source-checkbox').first().check();
+    const selected=await page.evaluate(()=>[...sourceRemovalEditors.get('uid').selected]);
+    await page.setViewportSize({width:1000,height:900});await settleSourceFit(page);
+    assert.deepEqual(await page.evaluate(()=>[...sourceRemovalEditors.get('uid').selected]),selected);
+    await grid.locator('.source-removal-card').last().scrollIntoViewIfNeeded();
+    assert.equal(await grid.locator('.source-removal-card').last().isVisible(),true);
+    await exitSelection(footer);
+    assert.equal(await footer.isVisible(),true);
+    assert.equal(await footer.locator('.source-selection-count').isVisible(),false);
+    await screenshot(page,'host-desktop-scroll-source-frame');
+    assert.deepEqual(errors,[]);assert.equal(requests.mutations.length,0);await assertMedia(page);completed.add(t);return;
+  }
+  if(android)assert.equal(baseline.items,15);
+  const sizes=android?[[320,844,10],[320,640,6],[390,844,15]]:[[700,600],[1000,900],[700,650]];
   for(const [width,height,count] of sizes){
     await page.setViewportSize({width,height});await settleSourceFit(page);
     const layout=await sourceLayout(page,`${android?'mobile':'desktop'}-frame-${width}x${height}`);
@@ -572,7 +728,7 @@ for(const android of [false,true])test(`${android?'mobile':'desktop'} native Sou
     await page.evaluate(theme=>applyTheme(theme),theme);await assertNativeSourceFrame(page);
   }
   await panel.locator('[data-page-action="next"]').click();
-  await page.waitForFunction(()=>document.querySelector('#request-sources-uids > .host-result-pager').dataset.page==='2');
+  await page.waitForFunction(()=>document.querySelector('#request-sources-uids > .source-frame-footer > .host-result-pager').dataset.page==='2');
   const anchor=await grid.locator('.source-removal-card').first().getAttribute('data-source-id');
   await page.setViewportSize(android?{width:320,height:844}:{width:1000,height:900});await settleSourceFit(page);
   assert.equal(await grid.locator(`[data-source-id="${anchor}"]`).count(),1,'the former first item stays in the new visible page');
@@ -590,6 +746,15 @@ for(const android of [false,true])test(`${android?'mobile':'desktop'} native Sou
   await panel.locator('[data-page-action="next"]').click();await settleSourceFit(page);
   assert.deepEqual(await page.evaluate(()=>[...sourceRemovalEditors.get('uid').selected]),selected,'fixed page navigation remains usable during selection');
   await panel.locator('[data-page-action="previous"]').click();await settleSourceFit(page);
+  // A larger fitted page can put the preserved selection on the first page.
+  // Navigate through real controls before testing the next drag; resizing
+  // preserves the former page anchor, not an arbitrary selected member.
+  if(!await grid.locator('.source-checkbox:checked').count()) {
+    const firstPage=panel.locator('[data-page-action="first"]');
+    if(await firstPage.isEnabled()){await firstPage.click();await settleSourceFit(page);}
+    if(!await grid.locator('.source-checkbox:checked').count()){await panel.locator('[data-page-action="next"]').click();await settleSourceFit(page);}
+    assert.deepEqual(await page.evaluate(()=>[...sourceRemovalEditors.get('uid').selected]),selected);
+  }
   const visibleSelected=await grid.locator('.source-checkbox:checked').count();
   assert.ok(visibleSelected>0,'the resize case leaves an actual selected drag target on this page');
   {
@@ -601,7 +766,7 @@ for(const android of [false,true])test(`${android?'mobile':'desktop'} native Sou
     assert.equal(requests.mutations.length,0,'resize cancels an interrupted drag without opening confirmation or submitting');
   }
   await exitSelection(footer);await settleSourceFit(page);await assertNativeSourceFrame(page);
-  assert.equal(await page.evaluate(()=>document.querySelector('#request-sources-uids > .host-result-pager')===sourceFramePager),true,'resizing keeps the shared pager node');
+  assert.equal(await page.evaluate(()=>document.querySelector('#request-sources-uids > .source-frame-footer > .host-result-pager')===sourceFramePager),true,'resizing keeps the shared pager node');
   await screenshot(page,android?'host-mobile-native-source-frame':'host-desktop-native-source-frame');
   await grid.locator('.follow-up-button').first().click();await page.locator('#follow-up-items-view').waitFor({state:'visible'});
   assert.equal(await panel.locator('.host-result-pager').isVisible(),false,'the source page footer does not leak into a detail view');
@@ -611,10 +776,14 @@ for(const android of [false,true])test(`${android?'mobile':'desktop'} native Sou
   assert.equal(await panel.locator('.host-result-pager').isVisible(),false,'inactive source tabs do not reserve a footer');
   await assertMedia(page);assert.equal(requests.mutations.length,0);assert.equal(requests.blocked,0);assert.deepEqual(errors,[]);assert.deepEqual(consoleLogs,[]);
   if(android){
+    const nativePager=await pagerGeometry(page.locator('#request-sources-favorites .result-pager'));
     const remote=await browser(t,host,{remote:true});await sources(remote.page,false,true);
     assert.equal(await remote.page.locator('#sources-follow-grid .follow-up-button').count(),12,'Remote retains its existing document page capacity');
     assert.equal(await remote.page.locator('.host-result-pager').count(),0,'Remote does not acquire native panel chrome');
     await remote.page.setViewportSize({width:320,height:844});
+    const remotePager=await pagerGeometry(remote.page.locator('#sources-follow-list-view .result-pager'));
+    assert.deepEqual(nativePager,remotePager,'Android Host uses the actual Remote pagination track, fields and arrow targets without extra padding');
+    assert.equal(await remote.page.locator('.request-panel').evaluate(node=>getComputedStyle(node).paddingBottom),'4px');
     for(const language of ['en','ja','zh']){
       await remote.page.evaluate(language=>setLanguage(language),language);
       const fields=await remote.page.locator('#sources-follow-uid-form').evaluate(form=>[...form.children].map(node=>{
@@ -633,7 +802,7 @@ test('mobile Host fits 360px and 320px Source frames through 640–1000px height
   await sources(page,true);
   // Keep threshold checks alongside the minimum supported width and the
   // smaller fallback. Expected counts are independent of the fitting helper.
-  for(const [width,height,count] of [[390,844,18],[320,844,12],[390,835,15],[390,845,18],[390,950,21],[390,1024,24]]){
+  for(const [width,height,count] of [[390,844,15],[320,844,10],[390,870,15],[390,880,18],[390,950,18],[390,1024,21]]){
     await page.setViewportSize({width,height});await settleSourceFit(page);
     const layout=await sourceLayout(page,`capacity-${width}x${height}`);
     assert.equal(layout.items,count,`${width}x${height} displays every available complete row`);
@@ -642,7 +811,7 @@ test('mobile Host fits 360px and 320px Source frames through 640–1000px height
   await page.locator('#modal-follow-uid-input').fill('123456');
   for(const language of ['zh','en','ja']){
     await page.evaluate(language=>setLanguage(language),language);
-    for(const [width,height,count] of [[360,640,6],[360,800,10],[360,1000,14],[320,640,6],[320,800,10],[320,1000,14],[390,844,18],[390,1000,21]]){
+    for(const [width,height,count] of [[360,640,6],[360,800,10],[360,1000,14],[320,640,6],[320,800,10],[320,1000,14],[390,844,15],[390,1000,21]]){
       await page.setViewportSize({width,height});await settleSourceFit(page);
       const normal=await sourceLayout(page,`${language}-capacity-${width}x${height}`);
       assert.equal(normal.items,count);
@@ -663,8 +832,14 @@ test('mobile Host fits 360px and 320px Source frames through 640–1000px height
       });
       assert.ok(frames.every(frame=>frame.count===normal.items&&frame.columns===normal.columns),'selection retains every fitted row across paints');
       const selecting=await sourceLayout(page,`${language}-selection-${width}x${height}`);
-      assert.deepEqual(selecting.scroll,normal.scroll,'floating selection tools preserve the body bounds');
+      assert.deepEqual(selecting.scroll,normal.scroll,'resident selection tools preserve the body bounds');
       assert.deepEqual(selecting.pager,normal.pager,'selection tools preserve the frame footer');
+      const tools=await page.locator('.source-tools[data-source="uid"]').evaluate(node=>{
+        const b=node.getBoundingClientRect();
+        return {left:b.left,right:b.right,viewport:innerWidth,centers:[...node.children].filter(child=>child.getClientRects().length).map(child=>{const c=child.getBoundingClientRect();return c.top+c.height/2;})};
+      });
+      assert.ok(tools.left>=12 && tools.right<=tools.viewport-12,'the translated tool row stays inside the phone viewport');
+      assert.ok(Math.max(...tools.centers)-Math.min(...tools.centers)<1,'phone selection tools remain on one horizontal row');
       const selectedBounds=await first.boundingBox();
       for(const field of ['x','y','width','height'])assert.ok(Math.abs(selectedBounds[field]-cardBounds[field])<=1,`selection retains card ${field} even with a native scrollbar`);
       await assertNoSourceTextSelection(page);await assertNativeSourceFrame(page,{fits:false});await footerBounds(page);
@@ -694,7 +869,7 @@ for(const android of [false,true])test(`${android?'touch portrait shared Android
     return {sourceIcon:source.innerHTML,userIcon:users.innerHTML,source:styles(source),users:styles(users),label:source.getAttribute('aria-label')};
   });
   assert.equal(selectionStyle.sourceIcon,selectionStyle.userIcon,'same selection SVG as session users');
-  assert.deepEqual(selectionStyle.source,selectionStyle.users,'same circular button geometry and glyph color; floating surface intentionally differs');
+  assert.deepEqual(selectionStyle.source,selectionStyle.users,'same circular button geometry and glyph color');
   assert.equal(selectionStyle.source.width,'44px');assert.equal(selectionStyle.source.height,'44px');
   assert.equal(selectionStyle.label,'多选');
   const geometry=await page.evaluate(()=>{
@@ -712,7 +887,7 @@ for(const android of [false,true])test(`${android?'touch portrait shared Android
   await footerBounds(page);await screenshot(page,android?'host-touch-source-list':'host-desktop-source-list');
   await grid.locator('[data-source-id="42"] .follow-up-button').click();
   await page.locator('#follow-up-items-view').waitFor({state:'visible'});assert.equal(await footer.isVisible(),false);
-  await page.locator('#follow-browse-back').click();await footer.waitFor({state:android?'hidden':'visible'});
+  await page.locator('#follow-browse-back').click();await footer.waitFor({state:'visible'});
   const handle=grid.locator('[data-source-id="43"] .follow-up-button'), target=grid.locator('[data-source-id="42"]');
   await handle.scrollIntoViewIfNeeded();
   const from=await handle.boundingBox(),to=await target.boundingBox();
@@ -728,9 +903,13 @@ for(const android of [false,true])test(`${android?'touch portrait shared Android
   }
   // The shared touch layout also supports a mouse; visual touch grips remain
   // a separate placement decision. The real mouse now drags the card itself.
-  await page.mouse.move(from.x+22,from.y+22);await page.mouse.down();await page.mouse.move(to.x+8,to.y+to.height/2,{steps:8});await page.mouse.up();
+  await page.mouse.move(from.x+22,from.y+22);await page.mouse.down();await holdOrder(page);await page.mouse.move(to.x+8,to.y+to.height/2,{steps:8});await page.mouse.up();
   await waitFor(()=>existsSync(path.join(data,'gatcha_source_order.json'))&&read(data,'gatcha_source_order.json').uid[0]==='43','real drag saves full order');
   await waitFor(async()=>!(await handle.isDisabled()),'move guard settled');
+  await page.waitForFunction(()=>{
+    const editor=sourceRemovalEditors.get('uid');
+    return !editor.blocked && editor.records[0]?.id==='43';
+  });
   timings.push({name:android?'portrait-mouse-drag-save':'mouse-drag-save',ms:Math.round(performance.now()-start)});
   assert.deepEqual(read(data,'gatcha_uids.json').uids,ids);
   await handle.focus();await page.keyboard.press('Alt+ArrowDown');
@@ -749,11 +928,11 @@ for(const android of [false,true])test(`${android?'touch portrait shared Android
   await drag.scrollIntoViewIfNeeded();const box=await drag.boundingBox();
   let calls=requests.mutations.length;
   assert.equal(await page.evaluate(({x,y})=>Boolean(document.elementFromPoint(x+22,y+22)?.closest('.follow-up-button')),box),true,'drag starts inside the original card');
-  await page.mouse.move(box.x+22,box.y+22);await page.mouse.down();await page.mouse.move(box.x+5,box.y+5);assert.equal(await grid.locator('.is-dragging').count(),1);await page.keyboard.press('Escape');await page.mouse.up();assert.equal(requests.mutations.length,calls);
+  await page.mouse.move(box.x+22,box.y+22);await page.mouse.down();await holdOrder(page);await page.mouse.move(box.x+5,box.y+5);assert.equal(await grid.locator('.is-dragging').count(),1);await page.keyboard.press('Escape');await page.mouse.up();assert.equal(requests.mutations.length,calls);
   assert.equal(await page.evaluate(()=>state.followBrowseSelectedUid),'','Escape cancels the card drag without opening the source');
-  await page.mouse.move(box.x+22,box.y+22);await page.mouse.down();await page.mouse.move(1,1);await page.mouse.up();assert.equal(requests.mutations.length,calls);
+  await page.mouse.move(box.x+22,box.y+22);await page.mouse.down();await holdOrder(page);await page.mouse.move(1,1);await page.mouse.up();assert.equal(requests.mutations.length,calls);
   assert.equal(await page.evaluate(()=>state.followBrowseSelectedUid),'','invalid drop keeps the source list open');
-  await page.mouse.move(box.x+22,box.y+22);await page.mouse.down();await page.mouse.move(box.x+5,box.y+5);assert.equal(await grid.locator('.is-dragging').count(),1);
+  await page.mouse.move(box.x+22,box.y+22);await page.mouse.down();await holdOrder(page);await page.mouse.move(box.x+5,box.y+5);assert.equal(await grid.locator('.is-dragging').count(),1);
   await edit(host,'uid',{action:'move',id:'44',before_id:'42'});
   await page.waitForFunction(()=>state.followBrowseData.owners[0].uid==='44'&&!state.followBrowseLoading);
   await page.mouse.up();assert.equal(requests.mutations.length,calls,'old captured order cannot overwrite replacement');
@@ -764,10 +943,13 @@ for(const android of [false,true])test(`${android?'touch portrait shared Android
   assert.equal(await grid.locator('.follow-up-button[aria-pressed="true"]').count(),selectedPageSize);
   assert.equal(await grid.locator('.source-order-handle').count(),0);
   assert.equal(await grid.locator('.source-checkbox:checked').count(),selectedPageSize,'native checkbox state follows selection without another column');
+  if(!android)for(const checkbox of await grid.locator('.source-checkbox').all().then(nodes=>nodes.slice(-3)))await checkbox.uncheck();
   const selected=new Set(await grid.locator('.follow-up-button[aria-pressed="true"]').evaluateAll(nodes=>nodes.map(n=>n.closest('.source-removal-card').dataset.sourceId)));
-  await page.locator('#request-sources-uids [data-page-action="next"]').click();
-  await page.waitForFunction(()=>document.querySelector('#request-sources-uids .result-pager').dataset.page==='2');
-  const offPage=grid.locator('.source-removal-card').first();const offId=await offPage.getAttribute('data-source-id');selected.add(offId);await offPage.locator('.follow-up-button').click();
+  if(android) {
+    await page.locator('#request-sources-uids [data-page-action="next"]').click();
+    await page.waitForFunction(()=>document.querySelector('#request-sources-uids .result-pager').dataset.page==='2');
+    const offPage=grid.locator('.source-removal-card').first();const offId=await offPage.getAttribute('data-source-id');selected.add(offId);await offPage.locator('.follow-up-button').click();
+  } else assert.equal(await page.locator('#request-sources-uids .result-pager').count(),0);
   const selectedCount=new RegExp(String(selected.size),'u');
   assert.match(await footer.locator('.source-selection-count').textContent(),selectedCount);
   await screenshot(page,android?'host-touch-selection':'host-desktop-selection');
@@ -808,6 +990,7 @@ for(const android of [false,true])test(`${android?'touch portrait shared Android
   release();await waitFor(()=>read(data,'gatcha_uids.json').uids.length===ids.length-selected.size,'one real batch committed');
   await waitFor(async()=>!(await selectionControl.isDisabled()),'committed batch controls recover');
   await page.unroute('**/api/gatcha/sources/edit');
+  await settleSourceFit(page);
   assert.deepEqual(new Set(read(data,'gatcha_uids.json').uids),new Set(ids.filter(id=>!selected.has(id))));
   assert.match(await footer.locator('.source-selection-count').textContent(),/0/u);
   assert.equal(await grid.getAttribute('inert'),null,'grid releases pending guard');
@@ -829,7 +1012,7 @@ for(const android of [false,true])test(`${android?'touch portrait shared Android
   assert.deepEqual(read(data,'gatcha_favlist.json').folders.map(row=>row.uid+':'+row.id),['43:10']);
   assert.deepEqual(read(data,'gatcha_favlist.json').items.map(row=>row.fav_uid+':'+row.fav_folder_id),['43:10'],'same BV in another owner folder survives');
   await settleSourceCompletion(page,host);
-  await page.locator('[data-sources-mode="uids"]').click();await footer.waitFor({state:android?'hidden':'visible'});
+  await page.locator('[data-sources-mode="uids"]').click();await footer.waitFor({state:'visible'});
   assert.equal(await footer.locator('.source-select-mode').getAttribute('aria-pressed'),'false');
   const settledRequests=requests.mutations.length;
   if(android)await page.setViewportSize({width:320,height:844});
@@ -886,12 +1069,15 @@ test('LAN Remote browses saved order without editor assets or hold/drag/keyboard
 
 // Reuse the relay matrix's narrow signaling contract fixture, with no relay
 // dependency. HTTP is local native routing and local static assets only.
-async function publicService(t,host) {
+async function publicService(t,host,{onClose}={}) {
   const sockets=new Set(),proxies=new Set(),counters={http:0,websocketConnections:0,signals:0,iceConfigs:0};let base;
   const service=http.createServer(async(request,response)=>{
     counters.http++;const pathname=new URL(request.url,'http://localhost').pathname;
     if(pathname==='/v1/rooms'&&request.method==='POST'){for await(const _ of request){}response.setHeader('content-type','application/json');return response.end(JSON.stringify({room_id:'R'.repeat(27),created_at:Date.now(),expires_at:Date.now()+3600000}));}
-    if(pathname.startsWith('/v1/rooms/')&&request.method==='DELETE'){response.writeHead(204);return response.end();}
+    if(pathname.startsWith('/v1/rooms/')&&request.method==='DELETE'){
+      assert.match(request.headers.authorization,/^Bearer [A-Za-z0-9_-]{43}$/u);
+      await onClose?.();response.writeHead(204);return response.end();
+    }
     const name=pathname.startsWith('/static/')?pathname.slice(8):pathname.slice(1);
     if(/^[a-z0-9_.-]+\.(?:js|css|html|json|ico)$/iu.test(name)&&existsSync(path.join(root,'static',name))){
       let bytes=readFileSync(path.join(root,'static',name));
@@ -921,6 +1107,34 @@ async function publicService(t,host) {
   });
   return {base,counters,lanes:signaling.lanes};
 }
+
+test('local room close shows Closing throughout its request and preserves the activated busy guard', {timeout:60000},async t=>{
+  const {host}=await fixture(t,{size:3}),gate=Promise.withResolvers();let closes=0;
+  cleanup(t,()=>gate.resolve());
+  const service=await publicService(t,host,{onClose:async()=>{closes++;await gate.promise;}});
+  const {page,requests,errors}=await browser(t,host,{origin:service.base});
+  await page.locator('#remote-mini-trigger').click();
+  if(await page.locator('#internet-remote-disclosure').getAttribute('aria-expanded')!=='true')await page.locator('#internet-remote-disclosure').click();
+  await page.locator('#internet-remote-password').fill('fixture-only-password');
+  await page.locator('#internet-remote-restart').click();
+  await page.waitForFunction(()=>!document.querySelector('#internet-remote-restart').disabled);
+  const stop=page.locator('#internet-remote-stop');await stop.click();
+  await waitFor(()=>closes===1,'local fixture close request');
+  for(const [language,copy] of [['zh','关闭中…'],['en','Closing…'],['ja','停止中…']]) {
+    await page.evaluate(language=>setLanguage(language),language);
+    assert.equal(await stop.textContent(),copy);
+    assert.equal(await page.locator('#internet-remote-public-meta').textContent(),copy);
+    assert.equal(await stop.getAttribute('aria-busy'),'true');assert.equal(await stop.isDisabled(),true);
+    assert.equal(await page.locator('#internet-remote-restart').getAttribute('aria-busy'),null);
+  }
+  await page.evaluate(()=>setLanguage('zh'));
+  if(process.env.BILIKARA_TEST_SCREENSHOT_DIR)await page.locator('.internet-remote-actions').screenshot({path:path.join(process.env.BILIKARA_TEST_SCREENSHOT_DIR,'local-room-closing.png')});
+  await stop.dispatchEvent('click');assert.equal(closes,1,'a pending close cannot be submitted again');
+  gate.resolve();await page.waitForFunction(()=>!document.querySelector('#internet-remote-restart').disabled);
+  await stop.waitFor({state:'hidden'});
+  assert.equal(await page.locator('#app-toast').textContent(),'公网房间已关闭');
+  assert.equal(requests.blocked,0);assert.deepEqual(errors,[]);await assertMedia(page);completed.add(t);
+});
 
 test('public-mode Remote uses real native WebRTC lanes, saved browse order and legacy removal, with no hidden editor', {timeout:90000},async t=>{
   const {host,data}=await fixture(t,{size:3});await edit(host,'uid',{action:'move',id:'43',before_id:'42'});

@@ -93,6 +93,10 @@
 :root:not([data-host-layout="portrait"]) :is(.request-search-view, .request-discover-view, .request-sources-view) > .request-mode-panel {
   padding: var(--host-peer-panel-padding, 16px);
   padding-top: 18px;
+}
+/* Sources keep their owner's block padding, like Session Users. Other request
+   views retain their existing bottom inset. */
+:root:not([data-host-layout="portrait"]) :is(.request-search-view, .request-discover-view) > .request-mode-panel {
   padding-bottom: var(--host-peer-panel-inline-padding, 16px);
 }
 :root:not([data-host-layout="portrait"]) .request-discover-view .category-browser-home {

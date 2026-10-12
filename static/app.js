@@ -1741,6 +1741,7 @@ function renderCurrentPresentationScene() {
   }
   renderer.renderScene(elements.playerFrame, currentPresentationScene(), {
     compact: !isPlayerPanelFullscreen(),
+    showDownloadProgress: isPlayerPanelFullscreen(),
     manageVisibility: false,
     now: Date.now(),
   });
@@ -15537,11 +15538,13 @@ function beginHostPlaybackSessionOwnershipClaim(session) {
 
 function replaceHostPlayerView(...nodes) {
   const overlay = playerDelayOverlay();
+  const download = elements.playerFrame.querySelector(".presentation-download-status");
   const announcement = elements.presentationHostAnnouncement;
   elements.playerFrame.replaceChildren(...nodes);
   if (overlay) {
     elements.playerFrame.appendChild(overlay);
   }
+  if (download) elements.playerFrame.appendChild(download);
   if (announcement) {
     elements.playerFrame.appendChild(announcement);
   }
@@ -20283,6 +20286,7 @@ async function restartHostPlayback(context) {
   setFormMessage(t("player.restartSent"));
 }
 playbackRestartMenu = globalThis.BilikaraPlaybackRestart?.create({
+  hoverHints: true,
   alwaysInline: !isAndroidNativePlaybackRuntime(),
   firstUse: globalThis.BilikaraPlaybackRestart.firstUseStore?.("host", tauriInvoke("presentation")) || null,
   anchor: elements.presentationHostNext, iconSource: elements.presentationHostBack,
@@ -21550,6 +21554,7 @@ function handleFullscreenChange() {
     }
   }
   renderPlayerFullscreenButton();
+  renderCurrentPresentationScene();
 }
 
 document.addEventListener("fullscreenchange", handleFullscreenChange);

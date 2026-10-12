@@ -247,8 +247,7 @@ html[data-host-layout="portrait"] .developer-mode .request-workspace-head { disp
 }
 :root :is(.session-user-rename-head .banner-close, .selection-modal-head .banner-close, .binding-sheet-close,
   #confirm-close,
-  .rating-close, .song-detail-close, .stage-control-tray-head .banner-close,
-  .playback-sheet-collapse),
+  .rating-close, .song-detail-close, .stage-control-tray-head .banner-close),
 :root[data-host-layout="portrait"] #binding-modal .selection-modal-head .banner-close {
   width: var(--panel-header-control-size);
   min-width: var(--panel-header-control-size);
@@ -380,14 +379,20 @@ html[data-host-layout="portrait"] .developer-mode .request-workspace-head { disp
   /* Controls have a -4px optical offset: both outer insets are 16px. */
   padding: 20px 16px 4px 20px;
   align-items: start;
-  grid-template-columns: minmax(0, 1fr) auto minmax(min-content, 1fr);
+  grid-template-columns: minmax(0, 1fr) 44px minmax(min-content, 1fr);
 }
 :root .playback-sheet-status-label { grid-column: 1; grid-row: 1; }
 :root[data-ui-client="remote"] #playback-sheet-collapse { grid-column: 2; grid-row: 1; background: transparent; }
+/* Keep the handle on the header's first-line center while its invisible
+   44px target extends around the former 32px icon slot. */
+:root .playback-sheet-collapse {
+  margin-top: calc(var(--panel-header-control-offset) - 6px);
+  margin-bottom: calc(-1 * var(--panel-header-control-offset) - 6px);
+}
 /* Equal outer tracks center collapse; the actions' minimum width shifts it
    left only when the right-hand buttons need more room. */
 :root .playback-sheet-status-actions { grid-column: 3; grid-row: 1; flex-wrap: nowrap; }
-:root .playback-sheet-status-header.is-stacked-actions { grid-template-columns: minmax(0, 1fr) auto; }
+:root .playback-sheet-status-header.is-stacked-actions { grid-template-columns: minmax(0, 1fr) 44px; }
 :root .playback-sheet-status-header.is-stacked-actions .playback-sheet-collapse { grid-column: 2; }
 :root .playback-sheet-status-header.is-stacked-actions .playback-sheet-status-actions { grid-column: 1 / -1; grid-row: 2; }
 
@@ -424,7 +429,7 @@ html[data-host-layout="portrait"] .developer-mode .request-workspace-head { disp
   .song-detail-card, .rating-card, .volume-adjust-popover, .audio-variant-popover,
   .remote-access-card, .remote-identity-card, .binding-sheet-panel, .history-export-dialog,
   .playback-sheet-panel, .remote-menu-panel, .menu-content, .topbar .cache-panel,
-  .presentation-feedback-card, .source-tools .source-float-surface,
+  .presentation-feedback-card,
   .app-shell[data-stage-controls-layout="popup"] .stage-control-tray) {
   background: var(--modal-card-bg);
   border: var(--modal-card-border);
@@ -433,10 +438,6 @@ html[data-host-layout="portrait"] .developer-mode .request-workspace-head { disp
   backdrop-filter: blur(var(--modal-surface-blur));
   -webkit-backdrop-filter: blur(var(--modal-surface-blur));
 }
-
-:root .source-tools .source-float-surface { border-radius: 999px; }
-:root .source-tools :is(.source-select-mode, .source-remove-selected).source-float-surface { border-radius: 50%; }
-:root .source-tools .source-select-mode[aria-pressed="true"] { border-color: var(--accent); }
 
 /* Only the collapsed popup is a floating capsule. Desktop Host and landscape
    use ordinary circles in the control row, without an enclosing surface. */
@@ -483,12 +484,22 @@ html[data-host-layout="portrait"] .developer-mode .request-workspace-head { disp
   inset: 0;
   box-sizing: border-box;
   pointer-events: none;
-  clip-path: inset(0 0 0 48px round 26px);
-  transition: clip-path 180ms ease;
+  clip-path: inset(4px 4px 4px 52px round 22px);
 }
 :root .playback-restart-popover[hidden],
 :root .playback-song-actions .playback-restart-action[hidden] { display: none; }
-:root .playback-restart-popover.is-open::before { clip-path: inset(0 round 26px); }
+:root .playback-restart-popover.is-open::before { animation: playback-capsule-open 240ms ease both; }
+:root .playback-restart-popover.is-closing::before { animation: playback-capsule-close 240ms ease both; }
+@keyframes playback-capsule-open {
+  0% { clip-path: inset(4px 4px 4px 52px round 22px); }
+  35% { clip-path: inset(0 0 0 48px round 26px); }
+  100% { clip-path: inset(0 round 26px); }
+}
+@keyframes playback-capsule-close {
+  0% { clip-path: inset(0 round 26px); }
+  65% { clip-path: inset(0 0 0 48px round 26px); }
+  100% { clip-path: inset(4px 4px 4px 52px round 22px); }
+}
 :root .playback-restart-popover button,
 :root .playback-song-actions .playback-restart-action {
   box-sizing: border-box;
@@ -503,7 +514,7 @@ html[data-host-layout="portrait"] .developer-mode .request-workspace-head { disp
   padding: 0;
   display: grid;
   place-items: center;
-  border: 1px solid transparent;
+  border: var(--player-btn-border, 1px solid var(--line));
   border-radius: 50%;
   background: var(--btn-secondary-bg);
   color: var(--ink);
@@ -512,22 +523,36 @@ html[data-host-layout="portrait"] .developer-mode .request-workspace-head { disp
   transition: background 120ms ease, border-color 120ms ease;
   touch-action: manipulation;
 }
-:root .playback-song-actions .playback-restart-action { border-color: var(--line); }
+:root .playback-song-actions .playback-restart-action:disabled {
+  background: var(--remote-secondary-button-disabled-bg, var(--btn-secondary-bg));
+  color: var(--remote-secondary-button-disabled-color, var(--muted));
+  cursor: default;
+}
 :root .playback-restart-popover > .playback-restart-action {
   position: relative;
   opacity: 0;
+  clip-path: inset(0 0 0 44px);
   transition: opacity 180ms ease, background 120ms ease, border-color 120ms ease;
 }
-:root .playback-restart-popover.is-open > .playback-restart-action { opacity: 1; }
+:root .playback-restart-popover.is-open > .playback-restart-action { opacity: 1; animation: playback-capsule-action-open 240ms ease both; }
+:root .playback-restart-popover.is-closing > .playback-restart-action { animation: playback-capsule-action-close 240ms ease both; }
+@keyframes playback-capsule-action-open {
+  0%, 35% { clip-path: inset(0 0 0 44px); }
+  100% { clip-path: inset(0); }
+}
+@keyframes playback-capsule-action-close {
+  0% { clip-path: inset(0); }
+  65%, 100% { clip-path: inset(0 0 0 44px); }
+}
 :root [data-playback-restart-anchor][aria-haspopup="menu"] { touch-action: none; }
-:root .playback-restart-popover .playback-restart-action:active,
-:root .playback-song-actions.is-expanded .playback-restart-action:active { background: var(--host-control-pressed-bg); border-color: var(--accent); }
+:root .playback-restart-popover .playback-restart-action:not(:disabled):is(:active, .is-held-target),
+:root .playback-song-actions.is-expanded .playback-restart-action:not(:disabled):active { background: var(--host-control-pressed-bg); border-color: var(--accent); }
 /* Inline Next retains its existing feedback. Remote pointer use must not
    inherit a keyboard outline from modal focus restoration. */
 :root:not([data-remote-input-modality="pointer"]) .playback-restart-popover button:focus-visible,
 :root:not([data-remote-input-modality="pointer"]) .playback-song-actions.is-expanded .playback-restart-action:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 :root .playback-restart-popover svg,
-:root .playback-song-actions .playback-restart-action svg { width: 24px; height: 24px; }
+:root .playback-song-actions .playback-restart-action svg { width: 26px; height: 26px; }
 /* Playback gestures must not select button labels or SVG text. Keep editable
    fields outside this rule so numbers and ranges retain their native behavior. */
 :root :is(
@@ -553,15 +578,15 @@ html[data-host-layout="portrait"] .developer-mode .request-workspace-head { disp
   --playback-song-actions-width: 94px;
 }
 @media (hover: hover) and (pointer: fine) {
-  :root:has(.app-shell) .playback-restart-popover .playback-restart-action:hover,
-  :root:has(.app-shell) .playback-song-actions.is-expanded .playback-restart-action:hover { border-color: var(--accent); }
+  :root:has(.app-shell) .playback-restart-popover .playback-restart-action:not(:disabled):hover,
+  :root:has(.app-shell) .playback-song-actions.is-expanded .playback-restart-action:not(:disabled):hover { border-color: var(--accent); }
 }
 @media (prefers-reduced-motion: reduce) {
-  :root .playback-restart-popover::before { transition: none; }
+  :root .playback-restart-popover::before { animation-duration: 1ms !important; }
   :root .playback-restart-popover.is-hint { transition: none; }
   :root .playback-restart-popover > .playback-restart-action,
   :root .playback-restart-popover button,
-  :root .playback-song-actions.is-expanded .playback-restart-action { transition: none; }
+  :root .playback-song-actions.is-expanded .playback-restart-action { transition: none; animation-duration: 1ms !important; }
 }
 :root .source-tools .source-remove-selected.drag-over { background: var(--red); color: white; }
 
@@ -786,8 +811,8 @@ html[data-host-layout="portrait"] .developer-mode .request-workspace-head { disp
 :root :is(.cache-advanced-tooltip, .remote-tooltip-bubble)[data-i18n],
 :root :is(.cache-advanced-tooltip, .remote-tooltip-bubble) [data-i18n] { white-space: pre-line; }
 
-/* Held playback hints reuse the i bubble, including its tokens and motion.
-   The annotation never takes pointer ownership or opens from hover. */
+/* Playback hints reuse the i bubble, including its tokens and motion.
+   Remote uses holds; Host also supports hover and keyboard focus. */
 :root .playback-control-hint {
   opacity: 0;
   visibility: hidden;
@@ -812,6 +837,31 @@ html[data-host-layout="portrait"] .developer-mode .request-workspace-head { disp
    established outer panel and insets; exact concentric subtraction would
    flatten small cards into nearly square corners. */
 :root { --request-inner-card-radius: 16px; }
+
+/* One cache status surface for the audience screen and single-screen fullscreen. */
+.presentation-download-status {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  padding: 28px;
+  background: radial-gradient(circle at center, #25201d, #050505 72%);
+  color: rgba(255, 255, 255, 0.86);
+  text-align: center;
+  pointer-events: none;
+}
+.presentation-download-status[hidden] { display: none; }
+.presentation-download-title { max-width: 900px; font-size: clamp(18px, 2.4vw, 30px); font-weight: 650; }
+.presentation-download-detail { font-size: clamp(14px, 1.6vw, 20px); line-height: 1.5; white-space: pre-line; }
+.presentation-download-status progress { width: min(360px, 100%); height: 8px; border: 0; border-radius: 999px; accent-color: var(--accent); }
+.presentation-download-status progress[hidden] { display: none; }
+.presentation-download-status progress::-webkit-progress-bar { background: rgba(255, 255, 255, 0.18); border-radius: 999px; }
+.presentation-download-status progress::-webkit-progress-value { background: var(--accent); border-radius: 999px; }
+.presentation-download-status progress::-moz-progress-bar { background: var(--accent); border-radius: 999px; }
 :root :is(#host-workspace-request, .request-workspace, .search-card-surface, .request-panel,
   .gatcha-panel, .selection-modal, .binding-sheet)
   :is(.follow-up-button, .tag-browser-tag, .category-browser-card, .search-result-item) {

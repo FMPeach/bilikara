@@ -6,6 +6,7 @@ import path from 'node:path';
 import test from 'node:test';
 import {setTimeout as delay} from 'node:timers/promises';
 import {chromium} from 'playwright';
+import visibleBounds from './browser/playback_visible_bounds.cjs';
 import {root,runNative} from './desktop_construction_support.mjs';
 import {buildNativeAlpha} from './native_runtime_artifacts.mjs';
 import {RunningHost,isolatedEnvironment} from './native_host_support.mjs';
@@ -65,10 +66,11 @@ for (const variant of ['morph','slide']) test(`real Remote first-use and ${varia
     const menu=remote.locator('.playback-restart-popover'),header=remote.locator('.playback-sheet-status-header');
     const collapse=remote.locator('#playback-sheet-collapse');
     const cdp=await context.newCDPSession(remote);
+    await remote.evaluate(fn=>{window.playbackVisibleBounds=(0,eval)('('+fn+')');},visibleBounds.toString());
     const touch=async(type,x=0,y=0)=>cdp.send('Input.dispatchTouchEvent',{type,touchPoints:type==='touchEnd'||type==='touchCancel'?[]:[{x,y}]});
     const screen=async(name)=>{
       const metrics=await remote.evaluate(()=>({width:innerWidth,height:innerHeight,overflow:document.documentElement.scrollWidth>innerWidth,selection:String(getSelection()),open:state.playbackSheetOpen,active:!!playbackSheetGesture?.active,
-        panel:(()=>{const r=document.querySelector('#playback-sheet-panel').getBoundingClientRect();return{x:r.x,y:r.y,width:r.width,height:r.height};})()}));
+        panel:playbackVisibleBounds(document.querySelector('#playback-sheet-panel'))}));
       assert.equal(metrics.overflow,false);assert.equal(metrics.selection,'');
       geometry.push({name,...metrics});await remote.screenshot({path:path.join(evidence,name+'.png')});
     };
@@ -85,7 +87,7 @@ for (const variant of ['morph','slide']) test(`real Remote first-use and ${varia
           if(active) {
             seen=true;
             const panel=document.querySelector('#playback-sheet-panel'),handle=document.querySelector('#playback-sheet-collapse');
-            const rect=panel.getBoundingClientRect();
+            const rect=playbackVisibleBounds(panel);
             frames.push({width:rect.width,height:rect.height,dragging:document.querySelector('#playback-sheet').classList.contains('is-dragging'),bar:getComputedStyle(handle,'::after').content});
           } else if(seen) return frames;
         }
@@ -94,7 +96,7 @@ for (const variant of ['morph','slide']) test(`real Remote first-use and ${varia
       await (expanded?dock:collapse).tap();
       const frames=await observed;
       assert.ok(frames.length>=2,'Click has real intermediate frames');
-      assert.ok(frames.every(frame=>!frame.dragging&&['none','normal'].includes(frame.bar)),'Click animation keeps the arrow, without a drag bar');
+      assert.ok(frames.every(frame=>!frame.dragging&&frame.bar==='""'),'Click and drag use the same visible handle');
       if(variant==='morph') {
         assert.ok(Math.max(...frames.map(frame=>frame.width))-Math.min(...frames.map(frame=>frame.width))>4,'Click morphs width, rather than sliding a full-width panel');
         assert.ok(Math.max(...frames.map(frame=>frame.height))-Math.min(...frames.map(frame=>frame.height))>30,'Click morphs the surface height');
@@ -166,7 +168,7 @@ for (const variant of ['morph','slide']) test(`real Remote first-use and ${varia
     assert.equal(await remote.evaluate(()=>document.querySelector('#playback-sheet').classList.contains('is-dragging')),true);
     const handleFade=await remote.evaluate(()=>({body:parseFloat(getComputedStyle(document.querySelector('.playback-sheet-body')).opacity),handle:parseFloat(getComputedStyle(document.querySelector('#playback-sheet-collapse')).opacity)}));
     assert.ok(Math.abs(handleFade.body-handleFade.handle)<.001,'Drag handle follows the content crossfade');
-    const half=await sheet.evaluate(node=>parseFloat(node.style.getPropertyValue('--playback-sheet-drag-progress')));
+    const half=await sheet.locator('.playback-sheet-backdrop').evaluate(node=>parseFloat(getComputedStyle(node).opacity));
     assert.ok(half>0&&half<1,`Intermediate progress ${half}`);
     const first=geometry.at(-1);
     if(variant==='morph') {
@@ -225,6 +227,16 @@ for (const variant of ['morph','slide']) test(`real Remote first-use and ${varia
     for(const [width,height] of [[320,640],[360,640],[360,1000],[812,375]]) {
       await remote.setViewportSize({width,height});await openByClick();
       await remote.waitForFunction(()=>!state.playbackMetadataLayoutFrame);
+      const hit=await collapse.evaluate(node=>{
+        const rect=node.getBoundingClientRect(),points=[rect.left+22,rect.right-22];
+        return {width:rect.width,blankTargets:points.map(x=>node.contains(document.elementFromPoint(x,rect.top+22))),
+          actions:[...document.querySelectorAll('.playback-sheet-status-actions button')].map(button=>{
+            const b=button.getBoundingClientRect();return button.contains(document.elementFromPoint(b.left+b.width/2,b.top+b.height/2));
+          })};
+      });
+      assert.equal(hit.width,132,'Transparent handle target expands equally on both sides');
+      assert.ok(hit.actions.every(Boolean),'Rating and refresh retain their own targets');
+      assert.ok(hit.blankTargets.some(Boolean),'At least one extended blank area is usable');
       await screen(`opened-${width}x${height}`);await closeByClick();
     }
     await remote.setViewportSize({width:375,height:812});await remote.emulateMedia({reducedMotion:'reduce'});

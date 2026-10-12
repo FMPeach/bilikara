@@ -397,7 +397,7 @@ assert.ok(sourceIndex(escape_owner, "else if (state.audioVariantBarExpanded)") <
 async test_sheet_css_uses_measured_two_column_threshold_and_one_scroller() {
 let body_rule, column, header_rule, portrait_rule, rule, sheet_rule;
 header_rule = this.styles.match(new RegExp("\\.playback-sheet-status-header\\s*\\{([^}]*)\\}",""))[1];
-assert.ok(contains("grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr)", header_rule));
+assert.ok(contains("grid-template-columns: minmax(0, 1fr) 44px minmax(0, 1fr)", header_rule));
 body_rule = this.styles.match(new RegExp("\\.playback-sheet-body\\s*\\{([^}]*)\\}",""))[1];
 assert.ok(contains("overflow-y: auto", body_rule));
 assert.ok(contains("overflow-x: hidden", body_rule));

@@ -1,92 +1,38 @@
-/* Only the tools float; the list never reserves a management row or surface. */
-.source-mode-panel { position: relative; display: flex; flex-direction: column; }
+/* The resident tools share Session User geometry, outside list scrolling. */
+.source-mode-panel { position: relative; display: flex; flex-direction: column; row-gap: 8px; }
 /* Android keeps the frame's controls 8px apart. The grid needs 2px of paint room
    at each edge; old browse padding must not cost a complete extra row. */
-:root[data-host-platform="android"] .source-mode-panel:has(> .host-result-pager:not([hidden])) { row-gap: 8px; }
-:root[data-host-platform="android"] .source-mode-panel:has(> .host-result-pager:not([hidden])) .follow-up-grid.has-result-pages { padding-block: 2px; }
-/* Keep floating targets close to, and entirely above, the page frame. */
-.source-mode-panel:has(> .host-result-pager:not([hidden])) .source-tools { bottom: 68px; }
-/* The desktop entry shares the pagination chrome. Editing tools float above
-   it; neither state adds a management row or blocks a page control. */
-.source-mode-panel:has(> .host-result-pager:not([hidden])) .source-tools:has(> .source-select-mode[aria-pressed="false"]:not([hidden])) {
-  inset-inline-end: 16px;
-  bottom: 20px;
-}
-.source-tools:has(> .source-select-mode[aria-pressed="false"]:not([hidden])) .source-selection-count {
-  position: absolute;
-  inset-inline-end: 0;
-  bottom: 52px;
-  width: max-content;
-  max-width: min(320px, calc(100vw - 48px));
-}
-.source-mode-panel:has(.source-select-mode[aria-pressed="false"]:not([hidden])) > .host-result-pager .result-pager-items-total { margin-inline-end: 52px; }
+:root[data-host-platform="android"] .source-mode-panel:has(> .source-frame-footer > .host-result-pager:not([hidden])) .follow-up-grid.has-result-pages { padding-block: 2px; }
+/* The phone page footer uses Remote's 4px outer inset. Other views retain
+   the platform panel padding, including the Session User tool row. */
+:root[data-host-platform="android"] .source-mode-panel:has(> .source-frame-footer > .host-result-pager:not([hidden])) { padding-bottom: 4px; }
+.source-frame-footer { display: flex; flex-direction: column; flex: 0 0 auto; min-width: 0; gap: 0; }
+:root[data-host-platform="android"] .source-frame-footer:has(> .host-result-pager:not([hidden])) { gap: 4px; }
+.source-frame-footer[hidden] { display: none; }
 .source-tools {
-  position: absolute;
-  inset-inline-end: 12px;
-  bottom: 12px;
-  z-index: 2;
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
+  flex: 0 0 52px;
+  height: 52px;
+  min-height: 52px;
   flex-wrap: nowrap;
-  gap: 8px;
-  min-width: 0;
-  max-width: calc(100% - 24px);
-  pointer-events: none;
 }
 .source-tools [hidden], .source-tools[hidden], .source-removal-card [hidden] { display: none !important; }
 .source-selection-count {
   min-width: 0;
-  height: 30px;
-  line-height: 30px;
-  padding-inline: 10px;
+  padding: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--muted);
   font-size: 12px;
 }
-.source-tools .source-select-page, .source-tools .source-clear-selection { flex: 0 0 auto; }
+.source-tools :is(.source-select-page, .source-retry-cleanup) { flex: 0 0 auto; }
 .source-tools button { pointer-events: auto; }
-.source-tools .source-remove-selected {
-  box-sizing: border-box;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 44px;
-  min-width: 44px;
-  max-width: 44px;
-  height: 44px;
-  min-height: 44px;
-  padding: 0;
-  flex: 0 0 44px;
-  border: 1px solid var(--line);
-  border-radius: 50%;
-  background: var(--btn-secondary-bg);
-  color: var(--ink);
-  font: inherit;
-  font-size: 14px;
-  box-shadow: none;
-  opacity: .5;
-  pointer-events: none;
-  transform: none;
-  transition: opacity 120ms, transform 120ms, background-color 120ms;
-}
+.source-tools .source-remove-selected { display: inline-grid; place-items: center; pointer-events: none; }
 .source-tools svg { display: block; width: 20px; height: 20px; }
 .source-trash-slot { width: 52px; height: 52px; display: grid; place-items: center; flex: 0 0 52px; pointer-events: auto; }
-.source-tools .source-remove-selected { color: var(--danger-btn-color, var(--red)); background: var(--danger-icon-bg, rgba(177,69,69,.12)); }
-.source-tools .source-remove-selected.drag-over { opacity: 1; transform: scale(1.15); background: var(--red); color: white; }
+.source-tools .source-remove-selected.drag-over { transform: scale(1.15); }
+.source-tools .source-remove-selected[aria-disabled="true"] { opacity: .5; }
 .source-tools button:disabled { opacity: .5; cursor: default; }
-/* Only covered cards gain temporary reach. When the page itself fits, that
-   extra reach must not add the ordinary scrollbar gap and move its cards. */
-.source-tools-scroll-reach .source-browse-scroll { padding-bottom: 64px; scroll-padding-bottom: 64px; }
-:root .source-page-fits .source-browse-scroll.has-scroll-inset { padding-right: 0; }
-/* WebView's styled scrollbar consumes width. Temporary overlay reach must
-   not turn a fitted three-column page into two columns and refit every frame.
-   Touch scrolling still reaches covered cards; ordinary overflow keeps its
-   usual scrollbar. Desktop retains its existing scrollbar treatment. */
-:root[data-host-platform="android"] .source-tools-scroll-reach.source-page-fits .source-browse-scroll { scrollbar-width: none; }
-:root[data-host-platform="android"] .source-tools-scroll-reach.source-page-fits .source-browse-scroll::-webkit-scrollbar { display: none; }
 /* Long presses and drags belong to the card, including title fragments,
    avatars and the sibling checkbox target. Keep body scrolling native. */
 .source-removal-card, .source-removal-card * {
@@ -118,14 +64,15 @@
 .source-removal-card.drop-before::before, .source-removal-card.drop-after::after {
   content: "";
   position: absolute;
-  inset-block: 0;
+  inset-block: 6px;
+  z-index: 1;
   width: 3px;
   border-radius: 2px;
   background: var(--accent);
   pointer-events: none;
 }
-.source-removal-card.drop-before::before { inset-inline-start: -4px; }
-.source-removal-card.drop-after::after { inset-inline-end: -4px; }
+.source-removal-card.drop-before::before { inset-inline-start: 0; }
+.source-removal-card.drop-after::after { inset-inline-end: 0; }
 .source-tools button:focus-visible {
   outline: 2px solid var(--focus-border-color, var(--accent));
   outline-offset: 2px;

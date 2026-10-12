@@ -387,6 +387,7 @@
       "internetRemote.create": "创建房间",
       "internetRemote.stop": "关闭房间",
       "internetRemote.creating": "创建中…",
+      "internetRemote.closing": "关闭中…",
       "internetRemote.rebuild": "重建房间",
       "internetRemote.rebuildApply": "重建并应用",
       "internetRemote.notCreated": "未创建",
@@ -1020,7 +1021,7 @@
       "sources.removedCleanupPending": "来源已移除，部分本地元数据清理未完成。请重试清理，不要重复提交原批次。",
       "sources.retryCleanup": "重试清理",
       "sources.cleanupDone": "本地元数据清理完成。",
-      "sources.orderCard": "可用 Alt＋上下方向键调整此来源的展示顺序；桌面也可用鼠标拖动卡片。",
+      "sources.orderCard": "单击进入来源；长按后拖动排序，或使用 Alt＋上下方向键。",
       "sources.longPressToSelect": "长按进入多选；轻点查看来源。",
       "sources.dragToRemove": "从复选框拖入这里，确认移除所选来源。"
     },
@@ -1410,6 +1411,7 @@
       "internetRemote.create": "Create room",
       "internetRemote.stop": "Close room",
       "internetRemote.creating": "Creating…",
+      "internetRemote.closing": "Closing…",
       "internetRemote.rebuild": "Rebuild",
       "internetRemote.rebuildApply": "Rebuild & apply",
       "internetRemote.notCreated": "Not created",
@@ -2043,7 +2045,7 @@
       "sources.removedCleanupPending": "Sources removed; some local metadata cleanup remains. Retry cleanup rather than resubmitting this batch.",
       "sources.retryCleanup": "Retry cleanup",
       "sources.cleanupDone": "Local metadata cleanup complete.",
-      "sources.orderCard": "Use Alt + up/down arrow keys to reorder this source; desktop mouse dragging also works on the card.",
+      "sources.orderCard": "Click to browse; hold then drag to reorder, or use Alt + up/down arrow keys.",
       "sources.longPressToSelect": "Touch and hold to select sources; tap to browse.",
       "sources.dragToRemove": "Drag from a checkbox here to confirm removal of the selected sources."
     },
@@ -2433,6 +2435,7 @@
       "internetRemote.create": "ルームを作成",
       "internetRemote.stop": "ルームを停止",
       "internetRemote.creating": "作成中…",
+      "internetRemote.closing": "停止中…",
       "internetRemote.rebuild": "再作成",
       "internetRemote.rebuildApply": "再作成して反映",
       "internetRemote.notCreated": "未作成",
@@ -3066,7 +3069,7 @@
       "sources.removedCleanupPending": "取得元は削除済みですが、一部のローカルメタデータの整理が未完了です。同じ一括削除ではなく整理を再試行してください。",
       "sources.retryCleanup": "整理を再試行",
       "sources.cleanupDone": "ローカルメタデータの整理が完了しました。",
-      "sources.orderCard": "Alt＋上下矢印キーで表示順を変更できます。デスクトップではカードをマウスでドラッグできます。",
+      "sources.orderCard": "クリックで開き、長押ししてからドラッグで並べ替えます。Alt＋上下矢印キーも使えます。",
       "sources.longPressToSelect": "長押しで複数選択、タップで取得元を表示します。",
       "sources.dragToRemove": "チェックボックスからここへドラッグして、選択した取得元の削除を確認します。"
     }

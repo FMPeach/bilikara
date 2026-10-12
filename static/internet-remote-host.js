@@ -20,6 +20,7 @@
     internetExpanded: false,
     available: typeof RTCPeerConnection !== "undefined",
     busy: false,
+    roomOperation: "",
     roomId: "",
     hostToken: "",
     joinToken: "",
@@ -123,6 +124,12 @@
     }));
   }
 
+  function roomBusyLabel() {
+    return state.roomOperation === "close"
+      ? tr("internetRemote.closing", "关闭中…")
+      : tr("internetRemote.creating", "创建中…");
+  }
+
   function roomCreationProblem() {
     if (window.isSecureContext === false || !window.crypto?.subtle) {
       return tr("internetRemote.insecureContext", "当前页面不能使用建房所需的加密功能。请在这台电脑上通过 127.0.0.1 或 localhost 打开 Host 后重试。");
@@ -139,11 +146,9 @@
       && !state.expired,
     );
     const connectedCount = [...peers.values()].filter((peer) => peer.authorized).length;
-    const hint = !online
+    const hint = state.busy ? roomBusyLabel() : !online
       ? tr("internetRemote.localHint", "同一局域网内直接扫码")
-      : state.busy
-        ? tr("internetRemote.creating", "创建中…")
-        : state.expired
+      : state.expired
           ? tr("internetRemote.expired", "公网房间已过期，请重建房间")
           : active
             ? tr("internetRemote.createdStatus", "已创建 · 连接 {count}", { count: connectedCount })
@@ -193,7 +198,7 @@
       : !state.available
       ? tr("internetRemote.unavailableShort", "WebRTC 不可用")
       : state.busy
-      ? tr("internetRemote.creating", "创建中…")
+      ? roomBusyLabel()
       : state.expired
         ? tr("internetRemote.expiredShort", "已过期")
         : roomActive
@@ -212,18 +217,19 @@
     elements.password.disabled = state.busy;
     elements.duration.disabled = state.busy;
     elements.regenerate.disabled = state.busy;
-    if (state.busy) elements.restart.setAttribute("aria-busy", "true");
+    if (state.busy && state.roomOperation !== "close") elements.restart.setAttribute("aria-busy", "true");
     else elements.restart.removeAttribute("aria-busy");
-    if (state.busy && state.roomId) elements.stop.setAttribute("aria-busy", "true");
+    if (state.busy && state.roomOperation === "close") elements.stop.setAttribute("aria-busy", "true");
     else elements.stop.removeAttribute("aria-busy");
-    elements.restart.textContent = state.busy
+    elements.restart.textContent = state.busy && state.roomOperation !== "close"
       ? tr("internetRemote.creating", "创建中…")
       : roomActive && draftChanged
         ? tr("internetRemote.rebuildApply", "重建并应用")
         : state.roomId
           ? tr("internetRemote.rebuild", "重建房间")
         : tr("internetRemote.create", "创建房间");
-    elements.stop.classList.toggle("hidden", !roomActive);
+    elements.stop.textContent = state.roomOperation === "close" ? roomBusyLabel() : tr("internetRemote.stop", "关闭房间");
+    elements.stop.classList.toggle("hidden", !roomActive && state.roomOperation !== "close");
     elements.room.classList.toggle("hidden", !roomResultAvailable);
     elements.copy.disabled = !roomResultAvailable;
     if (roomResultAvailable) elements.url.href = state.remoteUrl;
@@ -947,6 +953,7 @@
       return;
     }
     state.busy = true;
+    state.roomOperation = "create";
     state.roomFailure = false;
     setStatus("");
     render();
@@ -1048,6 +1055,7 @@
       notifyAction(message, true);
     } finally {
       state.busy = false;
+      state.roomOperation = "";
       render();
     }
   }
@@ -1100,12 +1108,14 @@
   async function stopInternetRoom() {
     if (state.busy || !state.roomId) return;
     state.busy = true;
+    state.roomOperation = "close";
     render();
     try {
       await stopRoom(true);
       notifyAction(tr("internetRemote.closed", "公网房间已关闭"));
     } finally {
       state.busy = false;
+      state.roomOperation = "";
       render();
     }
   }
