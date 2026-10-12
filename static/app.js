@@ -401,6 +401,8 @@ const state = {
   updateAutomaticEnabled: true,
   updateAutomaticAttemptedChannels: new Set(),
   startupUpdateCheckScheduled: false,
+  updatePreferenceSaveInFlight: false,
+  updatePreferencesHydration: null,
   updateCheckRequestInFlight: false,
   manualUpdateCheck: null,
   reportedLastInstall: "",
@@ -3809,6 +3811,53 @@ function hydrateLocalPreferences() {
   applyTheme(state.theme);
 }
 
+async function hydrateNativeUpdatePreferences() {
+  const store = globalThis.BilikaraHostUpdates?.preferences;
+  if (!store) return;
+  const saved = await store.load();
+  if (saved === null) {
+    // Migrate choices from this origin once, before the first automatic check.
+    await store.save({automatic: state.updateAutomaticEnabled, preview: state.updatePreviewEnabled});
+  } else {
+    if (!saved || Object.keys(saved).length !== 2 || typeof saved.automatic !== "boolean" || typeof saved.preview !== "boolean") {
+      throw new Error(t("service.updatePreferencesFailed"));
+    }
+    state.updateAutomaticEnabled = saved.automatic;
+    state.updatePreviewEnabled = saved.preview;
+    writeLocalPreference(storageKeys.updateAutomatic, saved.automatic);
+    writeLocalPreference(storageKeys.updatePreview, saved.preview);
+  }
+}
+
+async function saveUpdatePreference(control, key) {
+  if (state.updatePreferenceSaveInFlight) return false;
+  const checked = Boolean(control.checked);
+  state.updatePreferenceSaveInFlight = true;
+  control.setAttribute("aria-busy", "true");
+  renderUpdatePreviewControl();
+  try {
+    await state.updatePreferencesHydration;
+    const preferences = {
+      automatic: key === "automatic" ? checked : state.updateAutomaticEnabled,
+      preview: key === "preview" ? checked : state.updatePreviewEnabled,
+    };
+    await globalThis.BilikaraHostUpdates?.preferences?.save(preferences);
+    state.updateAutomaticEnabled = preferences.automatic;
+    state.updatePreviewEnabled = preferences.preview;
+    writeLocalPreference(storageKeys.updateAutomatic, preferences.automatic);
+    writeLocalPreference(storageKeys.updatePreview, preferences.preview);
+    return true;
+  } catch {
+    state.updateAutomaticEnabled = false;
+    setAppMessage(t("service.updatePreferencesFailed"), true);
+    return false;
+  } finally {
+    state.updatePreferenceSaveInFlight = false;
+    control.removeAttribute("aria-busy");
+    renderUpdatePreviewControl();
+  }
+}
+
 function normalizeRequestSubview(value, fallback = "quick") {
   const candidate = String(value || "").trim().toLowerCase();
   return ["quick", "search", "discover", "sources"].includes(candidate)
@@ -6426,6 +6475,7 @@ async function fetchState() {
   }
   updateRemoteAccessFailure(null, sequence);
   if (!acceptHostStateSnapshot(payload.data)) {
+    if (state.hasValidStateResponse) scheduleStartupAppUpdateCheck();
     return false;
   }
   state.hasValidStateResponse = true;
@@ -10928,11 +10978,11 @@ function renderUpdatePreviewControl() {
   const accessibleText = eligible ? updateIndicatorAccessibleText(update) : "";
   if (elements.updateAutomaticCheckbox) {
     elements.updateAutomaticCheckbox.checked = state.updateAutomaticEnabled;
-    elements.updateAutomaticCheckbox.disabled = false;
+    elements.updateAutomaticCheckbox.disabled = state.updatePreferenceSaveInFlight;
   }
   if (elements.updatePreviewCheckbox) {
     elements.updatePreviewCheckbox.checked = state.updatePreviewEnabled;
-    elements.updatePreviewCheckbox.disabled = busy;
+    elements.updatePreviewCheckbox.disabled = busy || state.updatePreferenceSaveInFlight;
   }
   if (elements.updateCheckButton) {
     elements.updateCheckButton.disabled = busy;
@@ -18787,16 +18837,18 @@ async function requestAppUpdateCheck({ automatic = false, force = false } = {}) 
     ) {
       return false;
     }
-    state.updateAutomaticAttemptedChannels.add(channel);
   }
   if (state.updateCheckRequestInFlight) {
+    if (automatic) state.startupUpdateCheckScheduled = false;
     return false;
   }
   const currentUpdate = appUpdateStatus();
   if (isAppUpdateBusy(currentUpdate)) {
+    if (automatic) state.startupUpdateCheckScheduled = false;
     return false;
   }
 
+  if (automatic) state.updateAutomaticAttemptedChannels.add(channel);
   state.updateCheckRequestInFlight = true;
   if (!automatic) {
     state.updateManualVisibleChannel = "";
@@ -18813,6 +18865,10 @@ async function requestAppUpdateCheck({ automatic = false, force = false } = {}) 
     }, { timeoutMs: appUpdateCheckTimeoutMs });
     return true;
   } catch (error) {
+    if (automatic && error?.code === "update_busy") {
+      state.updateAutomaticAttemptedChannels.delete(channel);
+      state.startupUpdateCheckScheduled = false;
+    }
     if (!automatic) {
       state.manualUpdateCheck = null;
       setAppMessage(error?.message || t("service.updateFailed"), true);
@@ -18829,6 +18885,7 @@ function scheduleStartupAppUpdateCheck() {
   if (state.startupUpdateCheckScheduled || !state.hasValidStateResponse) {
     return false;
   }
+  if (state.updateCheckRequestInFlight || isAppUpdateBusy()) return false;
   state.startupUpdateCheckScheduled = true;
   if (!state.updateAutomaticEnabled) {
     return false;
@@ -20354,8 +20411,7 @@ elements.resetOffsetCheckbox?.addEventListener("change", async (event) => {
 
 elements.updatePreviewCheckbox?.addEventListener("change", async (event) => {
   const hadVisibleUpdate = shouldPresentCurrentChannelUpdate();
-  state.updatePreviewEnabled = Boolean(event.target.checked);
-  writeLocalPreference(storageKeys.updatePreview, state.updatePreviewEnabled);
+  if (!await saveUpdatePreference(event.target, "preview")) return;
   state.manualUpdateCheck = null;
   state.updateManualVisibleChannel = "";
   renderUpdatePreviewControl();
@@ -20368,8 +20424,7 @@ elements.updatePreviewCheckbox?.addEventListener("change", async (event) => {
 });
 
 elements.updateAutomaticCheckbox?.addEventListener("change", async (event) => {
-  state.updateAutomaticEnabled = Boolean(event.target.checked);
-  writeLocalPreference(storageKeys.updateAutomatic, state.updateAutomaticEnabled);
+  if (!await saveUpdatePreference(event.target, "automatic")) return;
   state.manualUpdateCheck = null;
   state.updateManualVisibleChannel = "";
   renderUpdatePreviewControl();
@@ -22361,7 +22416,15 @@ elements.modalFavlistPullForm?.addEventListener("submit", async (event) => {
 
 async function startPolling() {
   hydrateLocalPreferences();
+  let preferencesFailed = false;
+  state.updatePreferencesHydration = hydrateNativeUpdatePreferences().catch(() => {
+    // An unreadable native choice must not turn a previously disabled check on.
+    state.updateAutomaticEnabled = false;
+    preferencesFailed = true;
+  });
   await loadTranslations();
+  await state.updatePreferencesHydration;
+  if (preferencesFailed) setAppMessage(t("service.updatePreferencesFailed"), true);
   initializeHostShell();
   syncApplicationRestartAvailability();
   initSearchDetailController();

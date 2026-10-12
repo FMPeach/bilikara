@@ -17,6 +17,10 @@
   };
   window.BilikaraDesktopPlatform = Object.freeze({
     windowPreferences,
+    updatePreferences: window.__TAURI__?.core?.invoke ? {
+      load: () => invoke("get_host_update_preferences"),
+      save: preferences => invoke("set_host_update_preferences", {preferences}),
+    } : undefined,
     startUpdate(includePreview) { return invoke("start_desktop_update", { includePreview }); },
     cancelUpdate() { return invoke("cancel_desktop_update"); },
     openExternal(url) { return invoke("open_external_web_url", { url }); },

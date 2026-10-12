@@ -4,6 +4,7 @@ import './android_alpha_bootstrap_contract.test.mjs';
 import './frontend_command_contract.test.mjs';
 import './frontend_support.test.mjs';
 import './app_update_frontend_contract.test.mjs';
+import './app_update_startup.test.mjs';
 import './application_restart_source_contract.test.mjs';
 import './async_action_guards_contract.test.mjs';
 import './audio_pitch_lifecycle_contract.test.mjs';

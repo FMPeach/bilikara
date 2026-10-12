@@ -29,6 +29,10 @@
     });
   }
   root.BilikaraAndroidPlatform = {
+    updatePreferences: {
+      load: () => call("get-update-preferences"),
+      save: preferences => call("save-update-preferences", {preferences}),
+    },
     environment: () => call("environment"),
     installUpdate: candidate => call("install-update", {package:candidate}, 540000),
   };

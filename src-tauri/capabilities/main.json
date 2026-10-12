@@ -30,6 +30,8 @@
     "allow-set-host-layout",
     "allow-get-playback-restart-hint-seen",
     "allow-mark-playback-restart-hint-seen",
+    "allow-get-host-update-preferences",
+    "allow-set-host-update-preferences",
     "allow-start-desktop-update",
     "allow-cancel-desktop-update",
     "allow-open-external-web-url",

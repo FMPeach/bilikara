@@ -28,6 +28,8 @@ fn main() {
         "set_host_layout",
         "get_playback_restart_hint_seen",
         "mark_playback_restart_hint_seen",
+        "get_host_update_preferences",
+        "set_host_update_preferences",
         "start_desktop_update",
         "cancel_desktop_update",
         "open_external_web_url",
