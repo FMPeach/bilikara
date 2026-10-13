@@ -978,6 +978,9 @@ for (const [name, engine] of [['Chromium', chromium], ['WebKit', webkit]]) {
       await route.fulfill({ json: { ok: true, data: {} } });
     });
     const range = page.locator('#playback-sheet-seek');
+    // The morph keeps content inert while its translated surface is moving.
+    // Measure and interact only after its owner restores the settled layout.
+    await page.locator('.playback-sheet-body:not([inert])').waitFor({ state: 'visible' });
     await range.waitFor({ state: 'visible' });
     await range.evaluate(node => node.blur());
     assert.equal(await range.evaluate(node => node.matches(':focus')), false);
