@@ -84,6 +84,9 @@ guides within the scroll boundary. Existing card/media nodes remain stable.
 Bounded local source edits use the repository commit lock without replacing a
 network refresh's status lease. Refresh publication retains the latest source
 membership, including during schema rebuilds, so deleted sources stay deleted.
+Deletion also prunes active queue placeholders and failure retry entries while
+retaining the in-flight worker's lease until it retires; late completion uses
+only the remaining source selection.
 The favorite chooser presents its folder count beside the section heading using
 the shared small count style. Its single body/footer gap equals the outer inset.
 
