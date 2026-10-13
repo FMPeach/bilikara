@@ -5,7 +5,7 @@ use crate::app_state::{
 use crate::bilibili_service::{BilibiliDashRequest, BilibiliStream, fetch_dash_playurl};
 use crate::http_downloader::{
     DownloadCandidate, DownloadError, DownloadErrorKind, DownloadRequest, HttpHeader,
-    download_to_path,
+    download_to_path, download_to_path_cancellable,
 };
 use crate::media_backend::{
     ExpectedMediaKind, MediaNormalizeRequest, MediaProbe, cached_audio_requires_refresh,
@@ -1646,7 +1646,7 @@ fn run_track(
                     return Err(error);
                 }
             };
-            download_to_path(&request, |progress| {
+            download_to_path_cancellable(&request, cancel, |progress| {
                 emit_track_progress(
                     shared,
                     job,
