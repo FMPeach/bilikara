@@ -112,9 +112,16 @@ async function runCase({api,okay,capture,browser,evidence,directory,getPage,adop
   assert.ok(success.audio_variants.every(v=>v.audio_url.startsWith("/media/")));
   const response=await page.request.get(new URL(success.video_media_url,page.url()).href);assert.equal(response.status(),200);assert.ok((await response.body()).length>0);
   await capture("bbdown-ready-desktop.png",page);
-  // Hi-Res uses actual FLAC-in-MP4 input and shared normalization to .flac.
+  // Preference changes preserve the captured attempt and readable media.
+  const hiresBefore=await current(),hiresStarts=(await starts()).length;
   await okay("/api/cache-policy",{audio_hires:true});
-  await until(async()=>{const item=await current();return item.cache_status==="ready" && item.audio_variants.some(v=>v.audio_url.endsWith(".flac"));});
+  await sleep(1500);
+  assert.equal((await starts()).length,hiresStarts,"HiRes preference must not start another executor attempt");
+  assert.equal((await current()).artifact_set_id,hiresBefore.artifact_set_id);
+  // Explicit recache uses actual FLAC-in-MP4 and shared normalization to .flac.
+  await retry();const hiresReady=await ready();
+  assert.notEqual(hiresReady.artifact_set_id,hiresBefore.artifact_set_id);
+  assert.ok(hiresReady.audio_variants.some(v=>v.audio_url.endsWith(".flac")));
   // Isolate the executor's explicit retry bound from the real player's own
   // missing-media recovery. Its current video is deliberately removed below;
   // keep UI/recovery coverage above and test worker admissions through HTTP.
@@ -234,7 +241,7 @@ async function runCase({api,okay,capture,browser,evidence,directory,getPage,adop
   const log=(await Promise.all((await fs.readdir(path.join(directory,"logs/bbdown"))).map(name=>fs.readFile(path.join(directory,"logs/bbdown",name),"utf8")))).join("\n");assert.ok(!/synthetic-secret-output|synthetic-import|synthetic-csrf/.test(log));
   assert.ok(!/synthetic-secret-output|synthetic-import|synthetic-csrf/.test(initialLog));
   assert.deepEqual(errors,[]);
-  await fs.writeFile(path.join(evidence,"bbdown-summary.json"),JSON.stringify({passed:true,fixtureChild:true,providerDownloadTested:false,pythonBackend:false,applicationPathEmpty:true,choices,success:true,hiresFlac:true,multiPageAudio:true,sourceReplacement:true,lateOldStagingResult:true,nonDashRejectedBeforeChild:true,userRetry:true,disablement:true,windowShrink:true,removal:true,shutdown:true,unavailable:true,outcomes,consoleErrors:errors,browserWarnings:warnings},null,2));
+  await fs.writeFile(path.join(evidence,"bbdown-summary.json"),JSON.stringify({passed:true,fixtureChild:true,providerDownloadTested:false,pythonBackend:false,applicationPathEmpty:true,choices,success:true,hiresFlac:true,deferredHires:true,multiPageAudio:true,sourceReplacement:true,lateOldStagingResult:true,nonDashRejectedBeforeChild:true,userRetry:true,disablement:true,windowShrink:true,removal:true,shutdown:true,unavailable:true,outcomes,consoleErrors:errors,browserWarnings:warnings},null,2));
 }
 
 module.exports=async options=>{
