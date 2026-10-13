@@ -9098,7 +9098,7 @@ function updateHostSourceEditor(source, entries, data, {loading, detail, filter,
       : String(entry.title || (entry.placeholder ? t("favlist.folder") + " " + entry.folder_id : entry.id || t("favlist.folder"))),
   }));
   editor?.update({records, version:data?.source_order_version, editable:data?.source_order_editable,
-    count:data?.source_order_count, loading, pullBusy:Boolean(state.data?.gatcha?.busy || state.data?.gatcha?.background_busy),
+    count:data?.source_order_count, loading,
     active:!detail && state.requestSubview === "sources"
       && state.sourcesMode === (source === "uid" ? "uids" : "favorites")
       && state.activeHostWorkspace === "request", filter, language:state.language, emptyText});
@@ -9878,6 +9878,9 @@ function renderGatchaUidFace() {
     return;
   }
   state.gatchaUidFaceRenderSignature = signature;
+  if (state.gatchaFavlistIntent) {
+    setTextContent(document.getElementById("gatcha-favlist-count"), t("favlist.folderCount", {count:state.gatchaFavlistIntent.folders.length}));
+  }
 
   setTextContent(elements.gatchaTag, t("gatcha.tag"));
   setTextContent(elements.gatchaTitle, t("gatcha.title"));
@@ -17640,10 +17643,9 @@ function openGatchaFavlistModal(uid, payload, { messageTarget = "gatcha" } = {})
     messageTarget,
     focusElement: document.activeElement,
   };
-  elements.gatchaFavlistModalText.textContent = t("favlist.chooseForUid", {
-    uid: payload?.uid || uid,
-    count: payload?.public_folder_count || folders.length,
-  });
+  elements.gatchaFavlistModalText.textContent = "";
+  elements.gatchaFavlistModalText.classList.add("hidden");
+  document.getElementById("gatcha-favlist-count").textContent = t("favlist.folderCount", {count:folders.length});
   elements.gatchaFavlistOptions.innerHTML = "";
   folders.forEach((folder) => {
     elements.gatchaFavlistOptions.appendChild(renderGatchaFavlistOption(folder));

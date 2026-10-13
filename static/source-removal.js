@@ -23,25 +23,30 @@
       this.panel = grid.closest('.source-mode-panel');
       this.scroll = grid.closest('.source-browse-scroll');
       this.selected = new Set(); this.cards = new Map(); this.records = []; this.pageRecords = [];
-      this.version = ""; this.filter = ""; this.editing = false; this.pending = false; this.active = false;
+      this.version = ""; this.filter = ""; this.editing = false; this.ordering = false; this.pending = false; this.active = false;
       this.footer = document.createElement('div'); this.footer.className = 'source-tools';
       this.footer.dataset.source = this.source; this.footer.hidden = true;
       this.frame = document.createElement('div'); this.frame.className = 'source-frame-footer'; this.frame.hidden = true;
       this.footer.innerHTML = '<button type="button" class="toolbar-button settings-tool-button source-select-page" hidden></button>'
         + '<button type="button" class="toolbar-button settings-tool-button source-retry-cleanup" hidden></button>'
         + '<span class="source-selection-count" role="status" aria-live="polite"></span>'
+        + '<button type="button" class="source-order-mode" aria-pressed="false"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 3v18m-4-4 4 4 4-4M17 21V3m-4 4 4-4 4 4"/></svg></button>'
         + '<button type="button" class="source-select-mode" aria-pressed="false">' + root.BilikaraSessionUserEditor.selectionIcon + '</button>'
         + '<span class="source-trash-slot"><span class="source-remove-selected" role="img">' + root.BilikaraSessionUserEditor.trashIcon + '</span></span>';
       this.frame.append(this.footer); this.panel.append(this.frame);
       this.all = this.footer.querySelector('.source-select-page');
       this.count = this.footer.querySelector('.source-selection-count'); this.toggle = this.footer.querySelector('.source-select-mode');
       this.remove = this.footer.querySelector('.source-remove-selected');
+      this.orderToggle = this.footer.querySelector('.source-order-mode');
       this.trashSlot = this.remove.parentElement;
       this.footer.setAttribute('role','group');
       this.footer.addEventListener('click', event => {
-        if (event.target.closest('.source-select-mode')) {
-          if (this.editing ? !this.pending : !this.blocked) this.setEditing(!this.editing);
-          return;
+        const mode = event.target.closest('.source-select-mode, .source-order-mode');
+        if (mode) {
+          if (event.detail !== 0 && this.toolRelease?.target === mode && event.timeStamp-this.toolRelease.time < 500) {
+            event.preventDefault(); event.stopImmediatePropagation(); this.toolRelease = null; return;
+          }
+          this.activateMode(mode); return;
         }
         if (this.blocked) return;
         if (event.target.closest('.source-select-page')) {
@@ -51,6 +56,32 @@
           this.paint();
         }
         else if (event.target.closest('.source-retry-cleanup') && this.cleanupIds?.length) void this.commit({action:'cleanup',ids:[...this.cleanupIds]});
+      });
+      // Some touch browsers omit the compatibility click after a captured
+      // card drag. Activate these immediate mode actions on a stationary
+      // release, and reject any subsequent compatibility click of that press.
+      this.footer.addEventListener('pointerdown', event => {
+        this.toolRelease = null; this.toolPointer = null;
+        const target = event.target.closest('.source-select-mode, .source-order-mode');
+        if (event.pointerType === 'touch' && event.isPrimary !== false && event.button === 0 && target && !target.disabled) {
+          this.toolPointer = {id:event.pointerId,target,x:event.clientX,y:event.clientY,version:this.version,filter:this.filter};
+        }
+      });
+      this.footer.addEventListener('pointermove', event => {
+        const press = this.toolPointer;
+        if (press?.id === event.pointerId && Math.hypot(event.clientX-press.x,event.clientY-press.y)>8) press.cancelled = true;
+      });
+      this.footer.addEventListener('pointercancel', () => { this.toolPointer = null; });
+      this.footer.addEventListener('pointerup', event => {
+        const press = this.toolPointer; this.toolPointer = null;
+        if (press?.id === event.pointerId && press.cancelled) {
+          this.toolRelease = {target:press.target,time:event.timeStamp}; event.preventDefault(); return;
+        }
+        if (press?.id !== event.pointerId || !this.active || press.version !== this.version || press.filter !== this.filter
+          || event.target.closest('button') !== press.target || Math.hypot(event.clientX-press.x,event.clientY-press.y)>8) return;
+        if (this.activateMode(press.target)) {
+          this.toolRelease = {target:press.target,time:event.timeStamp}; event.preventDefault();
+        }
       });
       grid.addEventListener('click', event => this.click(event), true);
       grid.addEventListener('change', event => {
@@ -77,6 +108,7 @@
       });
       this.scroll.addEventListener('scroll', () => { if (!this.hold?.triggered) this.cancelHold(); });
       root.addEventListener('pointerdown', event => {
+        if (this.toolPointer && event.pointerId !== this.toolPointer.id) this.toolPointer = null;
         if (this.hold && event.pointerId !== this.hold.id) this.cancelHold();
         if (this.pointer && event.pointerId !== this.pointer.id) this.finishDrag();
       }, true);
@@ -103,17 +135,25 @@
         },
       }) : null;
     }
-    get blocked() { return this.pending || this.loading || this.pullBusy || !this.available || !this.active; }
+    get blocked() { return this.pending || this.loading || !this.available || !this.active; }
     get mobile() { return document.documentElement.dataset.hostPlatform === 'android'; }
+    activateMode(button) {
+      if (button === this.toggle) {
+        if (this.editing ? this.pending : this.blocked) return false;
+        this.setEditing(!this.editing); return true;
+      }
+      if (this.ordering ? this.pending : this.blocked) return false;
+      const next = !this.ordering; this.setEditing(false); this.ordering = next; this.paint(); return true;
+    }
     handleEscape() {
       if (!this.active || this.confirmation) return false;
       if (this.pointer || (this.hold && !this.hold.triggered)) this.finishDrag();
-      else if (this.editing && !this.pending) { this.setEditing(false); this.toggle.focus({preventScroll:true}); }
+      else if ((this.editing || this.ordering) && !this.pending) { this.setEditing(false); this.toggle.focus({preventScroll:true}); }
       else return false;
       return true;
     }
     setEditing(value) {
-      this.finishDrag(); this.editing = value; this.selected.clear(); this.focusId = "";
+      this.finishDrag(); this.editing = value; this.ordering = false; this.selected.clear(); this.focusId = "";
       this.cancelConfirmation(); this.paint();
     }
     leave() {
@@ -124,9 +164,9 @@
       if (!this.confirmation) return;
       this.confirmation = null; this.options.closeConfirmation?.(this);
     }
-    update({records, version, editable, count, loading, pullBusy, active, filter = "", language, emptyText}) {
+    update({records, version, editable, count, loading, active, filter = "", language, emptyText}) {
       if (filter !== this.filter || !active) this.setEditing(false);
-      this.filter = filter; this.active = active; this.loading = loading; this.pullBusy = pullBusy;
+      this.filter = filter; this.active = active; this.loading = loading;
       const nextVersion = String(version || '');
       if (nextVersion !== this.version) {
         const interrupted = Boolean(this.pointer || this.hold || this.confirmation);
@@ -185,6 +225,10 @@
       this.toggle.title = this.toggle.getAttribute('aria-label');
       this.toggle.setAttribute('aria-pressed',String(this.editing));
       this.toggle.disabled = this.editing ? this.pending : this.blocked;
+      this.orderToggle.setAttribute('aria-label',this.t(this.ordering ? 'sources.doneOrdering' : 'sources.orderMode'));
+      this.orderToggle.title = this.orderToggle.getAttribute('aria-label');
+      this.orderToggle.setAttribute('aria-pressed',String(this.ordering));
+      this.orderToggle.disabled = this.ordering ? this.pending : this.blocked;
       this.all.hidden = !this.editing;
       const selectable=this.pageRecords.filter(row=>!row.placeholder);
       const pageSelected=selectable.length > 0 && selectable.every(row=>this.selected.has(row.id));
@@ -197,7 +241,6 @@
       this.remove.setAttribute('aria-disabled',String(this.blocked || !this.selected.size || this.selected.size > 128));
       this.count.textContent = this.editing ? this.t('sources.selectedTotal',{count:this.selected.size}) : '';
       if (this.editing && !this.available && this.active && !this.loading) this.count.textContent = this.t('sources.orderUnavailable');
-      else if (this.editing && this.pullBusy && this.active) this.count.textContent = this.t('sources.editBusy');
       else if (this.selected.size > 128) this.count.textContent = this.t('sources.batchLimit',{count:this.selected.size});
       this.count.hidden = !this.count.textContent;
       this.footer.setAttribute('aria-label',this.t('sources.selectMode'));
@@ -213,8 +256,8 @@
         if (this.editing) button.setAttribute('aria-pressed',String(this.selected.has(id)));
         else button.removeAttribute('aria-pressed');
         button.setAttribute('aria-keyshortcuts','Alt+ArrowUp Alt+ArrowDown');
-        button.setAttribute('aria-description',this.t(this.mobile ? 'sources.longPressToSelect' : 'sources.orderCard'));
-        card.classList.toggle('is-draggable',!this.blocked && !this.editing);
+        button.setAttribute('aria-description',this.t(this.ordering ? 'sources.orderCard' : this.mobile ? 'sources.longPressToSelect' : 'sources.browseCard'));
+        card.classList.toggle('is-draggable',!this.blocked && this.ordering);
         card.classList.toggle('is-selecting',this.editing);
         card.classList.toggle('is-selected',this.selected.has(id)); card.classList.toggle('is-order-target',this.focusId === id);
       }
@@ -226,6 +269,7 @@
         event.preventDefault(); event.stopImmediatePropagation(); this.suppressClick = null; return;
       }
       if (this.pending || (this.editing && this.blocked)) { event.preventDefault(); event.stopImmediatePropagation(); return; }
+      if (this.ordering) { event.preventDefault(); event.stopImmediatePropagation(); return; }
       if (this.editing) {
         // Native label activation/change owns checkbox clicks and Space.
         if (event.target.closest('.source-select-target')) return;
@@ -292,6 +336,12 @@
       if (event.pointerType !== 'mouse' && !(event.pointerType === 'touch' && this.mobile)) return;
       this.finishDrag(); this.suppressClick = null;
       const id = target.closest('.source-removal-card').dataset.sourceId;
+      if (this.ordering) {
+        this.focusId = id;
+        this.pointer = {id:event.pointerId,sourceId:id,x:event.clientX,y:event.clientY,version:this.version,target};
+        target.setPointerCapture(event.pointerId); this.paint();
+        return;
+      }
       if (event.pointerType === 'touch') {
         const hold = {id:event.pointerId,sourceId:id,x:event.clientX,y:event.clientY,version:this.version,target};
         this.hold = hold;
@@ -305,17 +355,7 @@
         },450);
         return;
       }
-      const hold = {id:event.pointerId,sourceId:id,x:event.clientX,y:event.clientY,version:this.version,target};
-      this.hold = hold;
-      hold.timer = root.setTimeout(() => {
-        if (this.hold !== hold) return;
-        if (this.blocked || this.editing || hold.version !== this.version || !target.isConnected) { this.cancelHold(); return; }
-        this.hold = null; hold.timer = null;
-        this.focusId = id;
-        this.pointer = {...hold,dragging:true};
-        target.setPointerCapture(event.pointerId);
-        this.cards.get(id)?.classList.add('is-dragging');this.paint();
-      },350);
+
     }
     pointerMove(event) {
       const hold = this.hold;
@@ -360,6 +400,12 @@
       if (!position) { pointer.valid = false; return; }
       pointer.rowIndex = position.rowIndex;
       const closest = position.card.node, before = position.before;
+      const row = pointer.rows[position.rowIndex].cards, slot = row.indexOf(position.card);
+      const neighbor = row[slot + (before ? -1 : 1)];
+      // Interior guides bisect the actual gap. Outer guides remain inside the
+      // card so the scroll viewport cannot clip the first/last insertion.
+      const offset = neighbor ? -(before ? position.card.left-neighbor.right : neighbor.left-position.card.right)/2 - 1.5 : 0;
+      closest.style.setProperty('--source-drop-offset',offset+'px');
       const members = this.records.filter(row => !row.placeholder);
       const index = members.findIndex(row => row.id === closest.dataset.sourceId);
       pointer.before = before ? closest.dataset.sourceId : members[index+1]?.id || null;
@@ -390,7 +436,7 @@
       this.suppressClick = {id:pointer.sourceId,time:event.timeStamp}; event.preventDefault();
       if (pointer.valid && pointer.version === this.version && !unchanged) void this.commit({action:'move',id:pointer.sourceId,before_id:pointer.before},pointer.version);
     }
-    clearIndicators() { for (const card of this.cards.values()) card.classList.remove('drop-before','drop-after'); }
+    clearIndicators() { for (const card of this.cards.values()) { card.classList.remove('drop-before','drop-after'); card.style.removeProperty('--source-drop-offset'); } }
     cancelHold() {
       const hold = this.hold; this.hold = null;
       if (!hold) return;
@@ -398,6 +444,7 @@
       if (hold.triggered) this.suppressClick = {id:hold.sourceId,time:performance.now()};
     }
     finishDrag() {
+      this.toolPointer = null;
       this.cancelHold();
       const pointer = this.pointer; this.pointer = null;
       // Canceling capture can still produce a card click on mouse release.

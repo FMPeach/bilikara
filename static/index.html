@@ -1764,10 +1764,10 @@
         <button type="button" id="gatcha-favlist-modal-close" class="banner-close" aria-label="关闭"
           data-i18n-aria-label="common.close"><svg class="close-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m6 6 12 12M18 6 6 18" /></svg></button>
       </div>
-      <p class="selection-modal-text" id="gatcha-favlist-modal-text" data-i18n="favlist.text">请选择要拉取的公开收藏夹。</p>
+      <p class="selection-modal-text hidden" id="gatcha-favlist-modal-text"></p>
       <div class="selection-modal-grid selection-modal-grid-single">
         <section class="selection-modal-column">
-          <h3 data-i18n="favlist.folder">收藏夹</h3>
+          <h3><span data-i18n="favlist.folder">收藏夹</span> <span class="queue-count" id="gatcha-favlist-count"></span></h3>
           <div id="gatcha-favlist-options" class="selection-option-list"></div>
         </section>
       </div>

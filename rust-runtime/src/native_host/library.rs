@@ -874,6 +874,49 @@ pub(super) fn start_coordinator(context: Arc<HostContext>) -> Result<(), ApiErro
         .map_err(|_| ApiError::new(503, "library_task", "无法启动曲库调度"))
 }
 
+fn apply_source_edit(
+    app: &mut crate::app_state::AppState,
+    directory: &Path,
+    identity: &Identity,
+    source: String,
+    expected_version: String,
+    edit: crate::gatcha_repository::SourceEdit,
+) -> Result<Value, ApiError> {
+    app.native_requester(identity, "")?;
+    let session = app.native();
+    if session.library_source_exclusive
+        || (session.login.gacha_snapshot().busy
+            && !session.library_refresh_active
+            && !session.library_source_active)
+    {
+        return Err(ApiError::new(
+            409,
+            "library_busy",
+            "本地曲库维护中，请稍后重试",
+        ));
+    }
+    let source_index = usize::from(source == "favlist");
+    let value = execute(
+        directory,
+        GatchaOperation::EditSources {
+            source,
+            expected_version,
+            edit,
+        },
+    )?;
+    if value["operation"] == "remove_sources" {
+        for removal in value["removals"].as_array().into_iter().flatten() {
+            session.library_queue.remove_source(removal);
+        }
+    }
+    if value["changed"] != false {
+        session.source_edit_revisions[source_index] =
+            session.source_edit_revisions[source_index].saturating_add(1);
+        session.revision += 1;
+    }
+    Ok(value)
+}
+
 pub(super) fn write(
     context: &Arc<HostContext>,
     identity: &Identity,
@@ -897,56 +940,15 @@ pub(super) fn write(
             &edit.edit,
         )
         .map_err(repository_error)?;
-        if let crate::gatcha_repository::SourceEdit::Move { id, before_id } = &edit.edit {
-            // A read-only no-op needs no task status or state broadcast. An
-            // actual write revalidates the captured version under the lease.
-            with_app(|app| {
-                let session = app.native();
-                if session.library_refresh_active
-                    || session.library_source_active
-                    || session.login.gacha_snapshot().busy
-                {
-                    return Err(ApiError::new(
-                        409,
-                        "library_busy",
-                        "拉取任务执行中，请等待任务结束",
-                    ));
-                }
-                Ok(())
-            })?;
-            let preview = crate::gatcha_repository::preview_source_move(
-                &paths(&context.directory),
-                &edit.source,
-                &edit.expected_version,
-                id,
-                before_id.as_deref(),
-            )
-            .map_err(repository_error)?;
-            if preview["changed"] == false {
-                return Ok(preview);
-            }
-        }
-        let (lease, _) = TaskLease::acquire(Some(identity), "remove_source", false, true)?;
-        let result = execute(
-            &context.directory,
-            GatchaOperation::EditSources {
-                source: edit.source,
-                expected_version: edit.expected_version,
-                edit: edit.edit,
-            },
-        );
-        if let Ok(value) = &result
-            && value["operation"] == "remove_sources"
-        {
-            with_app(|app| {
-                for removal in value["removals"].as_array().into_iter().flatten() {
-                    app.native().library_queue.remove_source(removal);
-                }
-                Ok(())
-            })?;
+        // A bounded local edit does not acquire/replace the network task's
+        // status lease. Serialize its admission with other Host actions and
+        // its repository commit with per-source publications. No HTTP here.
+        let result = with_app(|app| {
+            apply_source_edit(app, &context.directory, identity, edit.source, edit.expected_version, edit.edit)
+        });
+        if result.as_ref().is_ok_and(|value| value["operation"] == "remove_sources") {
             publish_favorites_timestamp(&context.directory);
         }
-        lease.finish(&result)?;
         return result;
     }
     if path == "/api/gatcha/pool-config" {
@@ -1086,6 +1088,111 @@ pub(super) fn write(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn source_edits_during_pull_preserve_network_task_ownership_and_stale_version_guard() {
+        let _owned = crate::app_state::native_session::GLOBAL_APP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let directory = std::env::temp_dir().join(format!("bilikara-pull-edit-{}", token().unwrap()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let files = paths(&directory);
+        std::fs::write(
+            &files.uid_file,
+            json!({"schema_version":2,"uids":["42","43","44"],"profiles":{}}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            &files.cache_file,
+            json!({"schema_version":3,"uids":{},"profiles":{}}).to_string(),
+        )
+        .unwrap();
+        with_app(|app| {
+            *app.native() = crate::app_state::native_session::NativeSession::default();
+            app.native().cookie = "local-fixture".into();
+            app.native().host_token = "local-host".into();
+            Ok(())
+        })
+        .unwrap();
+        let (refresh, _) = TaskLease::acquire(None, "credential_restore", true, false).unwrap();
+        let (pull, _) = TaskLease::acquire(None, "pull_uid", false, true).unwrap();
+        let identity = Identity {
+            token: "local-host".into(),
+            loopback: true,
+            client: "local".into(),
+        };
+        let before = with_app(|app| Ok(json!(app.native().login.gacha_snapshot()))).unwrap();
+        let version = execute(
+            &directory,
+            GatchaOperation::BrowseUid {
+                uid: String::new(),
+                query: String::new(),
+                offset: 0,
+                limit: 100,
+            },
+        )
+        .unwrap()["source_order_version"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let order = with_app(|app| {
+            apply_source_edit(
+                app,
+                &directory,
+                &identity,
+                "uid".into(),
+                version.clone(),
+                crate::gatcha_repository::SourceEdit::Move {
+                    id: "44".into(),
+                    before_id: Some("42".into()),
+                },
+            )
+        })
+        .unwrap();
+        let next = order["source_order_version"].as_str().unwrap().to_owned();
+        assert!(
+            with_app(|app| apply_source_edit(
+                app,
+                &directory,
+                &identity,
+                "uid".into(),
+                version,
+                crate::gatcha_repository::SourceEdit::Remove {
+                    ids: vec!["42".into()]
+                }
+            ))
+            .is_err()
+        );
+        with_app(|app| {
+            apply_source_edit(
+                app,
+                &directory,
+                &identity,
+                "uid".into(),
+                next,
+                crate::gatcha_repository::SourceEdit::Remove {
+                    ids: vec!["42".into()],
+                },
+            )
+        })
+        .unwrap();
+        with_app(|app| {
+            let session = app.native();
+            assert_eq!(json!(session.login.gacha_snapshot()), before);
+            assert!(refresh.owns(session, refresh.ticket.as_ref().unwrap()));
+            assert!(pull.owns(session, pull.ticket.as_ref().unwrap()));
+            Ok(())
+        })
+        .unwrap();
+        pull.finish(&Ok(json!({}))).unwrap();
+        refresh.finish(&Ok(json!({}))).unwrap();
+        with_app(|app| {
+            *app.native() = crate::app_state::native_session::NativeSession::default();
+            Ok(())
+        })
+        .unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn removal_lease_blocks_refresh_without_login_or_cooldown_cost() {
         let _owned = crate::app_state::native_session::GLOBAL_APP_TEST_LOCK

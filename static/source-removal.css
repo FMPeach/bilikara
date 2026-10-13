@@ -71,8 +71,8 @@
   background: var(--accent);
   pointer-events: none;
 }
-.source-removal-card.drop-before::before { inset-inline-start: 0; }
-.source-removal-card.drop-after::after { inset-inline-end: 0; }
+.source-removal-card.drop-before::before { inset-inline-start: var(--source-drop-offset, 0px); }
+.source-removal-card.drop-after::after { inset-inline-end: var(--source-drop-offset, 0px); }
 .source-tools button:focus-visible {
   outline: 2px solid var(--focus-border-color, var(--accent));
   outline-offset: 2px;
@@ -88,3 +88,5 @@
 @media (prefers-reduced-motion: reduce) {
   .source-tools button, .source-tools .source-remove-selected { transition: none; }
 }
+
+.source-removal-card.is-draggable > .follow-up-button { touch-action: none; }

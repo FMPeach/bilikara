@@ -5,11 +5,18 @@
   let observedTask;
   let observedSources;
   let observedQueue;
+  let observedEdits;
   function takeSourceChanges(task = {}) {
     const completed = task.source_queue?.completed;
     const queuedChanges = ["uids", "favorites"].filter(key => Number(completed?.[key]) > 0
       && completed[key] !== observedQueue?.[key]);
     observedQueue = completed && {...completed};
+    const edits = task.source_edit_revisions;
+    for (const key of ["uids", "favorites"]) {
+      if (observedEdits && Number.isSafeInteger(edits?.[key]) && edits[key] !== observedEdits[key]
+        && !queuedChanges.includes(key)) queuedChanges.push(key);
+    }
+    observedEdits = edits && {...edits};
     const sources = task.last_result?.rebuild?.sources;
     if (!sources) { observedSources = undefined; return queuedChanges; }
     const previous = observedSources;

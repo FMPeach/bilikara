@@ -61,10 +61,10 @@ async function screenshot(page, name) {
   const file=path.join(output,name+'.png'); await page.screenshot({path:file});
   snapshots.push(file);
 }
-async function browser(t, host, {android=false, remote=false, origin=host.base, hasTouch=android||remote} = {}) {
+async function browser(t, host, {android=false, remote=false, origin=host.base, hasTouch=android||remote, mobileBrowser=false} = {}) {
   const instance=await chromium.launch({headless:process.env.BILIKARA_SOURCE_TEST_HEADED!=='1',args:['--disable-background-networking','--disable-features=WebRtcHideLocalIpsWithMdns'],...(process.platform==='win32'?{channel:'msedge'}:{})});
   cleanup(t,async()=>{if(!completed.has(t)&&process.env.BILIKARA_TEST_SCREENSHOT_DIR){for(const [i,p] of instance.contexts().flatMap(c=>c.pages()).entries())if(!p.isClosed())await screenshot(p,`failure-${t.name.includes('touch')?'touch':t.name.includes('public')?'public':'desktop'}-${i}`).catch(()=>{});}await instance.close();});
-  const context=await instance.newContext({viewport:android||remote?{width:390,height:844}:{width:700,height:650},hasTouch,reducedMotion:'reduce',locale:'zh-CN'});
+  const context=await instance.newContext({viewport:android||remote?{width:390,height:844}:{width:700,height:650},hasTouch,isMobile:mobileBrowser,reducedMotion:'reduce',locale:'zh-CN'});
   if(!remote)await context.addCookies([...host.cookies].map(([name,value])=>({name,value,url:origin})));
   await context.addInitScript(()=>localStorage.setItem('bilikara.update.automatic','false'));
   if(android)await context.addInitScript(()=>{
@@ -100,9 +100,14 @@ async function browser(t, host, {android=false, remote=false, origin=host.base, 
 async function sources(page, android=false, remote=false) {
   if(remote)await page.locator('[data-remote-request-view="sources"]').click();
   else {
-    if(android)await page.locator('[data-android-page="request"]').click();
-    else await page.locator('[data-host-workspace="request"]').click();
-    await page.locator('[data-request-view="sources"]').click();
+    if(!await page.locator('#request-sources-panel').isVisible()) {
+      if(!await page.locator('[data-request-view="sources"]').isVisible()) {
+        if(android&&await page.locator('[data-android-page="request"]').isVisible())await page.locator('[data-android-page="request"]').click();
+        else await page.locator('[data-host-workspace="request"]').click();
+      }
+      await page.locator('[data-request-view="sources"]').click();
+    }
+    await page.locator('[data-sources-mode="uids"]').click();
   }
   await page.locator(remote?'#sources-follow-grid .follow-up-button':'#follow-up-grid .source-removal-card').first().waitFor({state:'visible'});
   if(!remote)await settleSourceFit(page);
@@ -133,6 +138,7 @@ async function holdSource(page, card) {
   } finally { await session.detach(); }
 }
 async function enterSelection(page,grid,footer,android) {
+  if(await footer.locator('.source-order-mode').getAttribute('aria-pressed')==='true')await footer.locator('.source-order-mode').click();
   if(android)await holdSource(page,grid.locator('.source-removal-card .follow-up-button').first());
   else await footer.locator('.source-select-mode').click();
 }
@@ -141,15 +147,22 @@ async function selectPage(grid,footer,android) {
   else await footer.locator('.source-select-page').click();
 }
 async function exitSelection(footer) { await footer.locator('.source-select-mode').click(); }
+async function enableOrdering(page) {
+  const toggle=page.locator('.source-tools:not([hidden]) .source-order-mode');
+  if(await toggle.getAttribute('aria-pressed')!=='true')await toggle.click();
+}
 async function holdOrder(page) {
-  await page.waitForFunction(()=>[...sourceRemovalEditors.values()].some(editor=>editor.pointer?.dragging&&editor.pointer.kind!=='remove'));
+  await page.waitForFunction(()=>[...sourceRemovalEditors.values()].some(editor=>editor.ordering&&editor.pointer&&editor.pointer.kind!=='remove'));
 }
 async function settleSourceCompletion(page,host) {
   // A committed HTTP result can precede its terminal SSE snapshot. Consume
   // that real completion and its queued browse read before starting the next
   // independent gesture; loading must still cancel an interrupted drag.
-  const task=JSON.stringify((await host.api('/api/state')).gatcha?.last_result);
+  const current=(await host.api('/api/state')).gatcha;
+  const task=JSON.stringify(current?.last_result);
   await page.waitForFunction(task=>JSON.stringify(state.data?.gatcha?.last_result)===task,task);
+  const edits=JSON.stringify(current?.source_edit_revisions);
+  await page.waitForFunction(edits=>JSON.stringify(state.data?.gatcha?.source_edit_revisions)===edits,edits);
   await page.waitForFunction(()=>!state.followBrowseLoading&&!state.favlistBrowseLoading
     &&!state.followBrowseReloadTimer&&!state.favlistBrowseReloadTimer);
 }
@@ -374,14 +387,22 @@ for(const android of [false,true])test(`${android?'phone':'desktop'} resident So
   assert.equal(requests.mutations.length,0);assert.equal(requests.blocked,0);assert.deepEqual(errors,[]);assert.deepEqual(consoleLogs,[]);completed.add(t);
 });
 
-test('desktop long-hold ordering renders both column guides and resists row-boundary jitter', {timeout:30000},async t=>{
+test('explicit ordering renders centered interior and visible edge guides and resists row-boundary jitter', {timeout:30000},async t=>{
   const {host}=await fixture(t,{size:12}),{page,requests,errors}=await browser(t,host);
   await page.setViewportSize({width:1000,height:900});await sources(page);
   const grid=page.locator('#follow-up-grid');
+  assert.equal(await grid.locator('.is-draggable').count(),0,'ordinary cards do not capture reorder gestures');
+  const ordinary=await grid.locator('.follow-up-button').first().boundingBox();
+  await page.mouse.move(ordinary.x+22,ordinary.y+22);await page.mouse.down();
+  await page.waitForTimeout(500);await page.mouse.move(ordinary.x+30,ordinary.y+30);await page.mouse.up();
+  assert.equal(requests.mutations.length,0,'a hold in browsing mode cannot reorder');
+  // Release may browse normally; return through the ordinary back action.
+  if(await page.evaluate(()=>Boolean(state.followBrowseSelectedUid)))await page.locator('#follow-browse-back').click();
+  await settleSourceFit(page);
   const boxes=await grid.locator('.source-removal-card').evaluateAll(nodes=>nodes.map(node=>{const b=node.getBoundingClientRect();return {id:node.dataset.sourceId,x:b.x,y:b.y,width:b.width,height:b.height};}));
   const firstRow=boxes.filter(box=>Math.abs(box.y-boxes[0].y)<4),secondRow=boxes.filter(box=>Math.abs(box.y-(boxes.find(box=>box.y>boxes[0].y+4)?.y))<4);
   assert.ok(firstRow.length>=2&&secondRow.length>=2);
-  const source=firstRow[1];await page.mouse.move(source.x+22,source.y+22);await page.mouse.down();await holdOrder(page);
+  const source=firstRow[1];await enableOrdering(page);await page.mouse.move(source.x+22,source.y+22);await page.mouse.down();await holdOrder(page);
   const first=firstRow[0],last=firstRow.at(-1);
   await page.mouse.move(first.x+1,first.y+first.height/2);
   assert.equal(await grid.locator(`[data-source-id="${first.id}"].drop-before`).count(),1);
@@ -391,12 +412,89 @@ test('desktop long-hold ordering renders both column guides and resists row-boun
   assert.equal(await grid.locator(`[data-source-id="${last.id}"].drop-after`).count(),1);
   assert.equal(await grid.locator('.drop-after').evaluate(node=>getComputedStyle(node,'::after').right),'0px');
   await screenshot(page,'host-insert-last-column');
+  await page.mouse.move(first.x+first.width-1,first.y+first.height/2);
+  const marker=await grid.locator('.drop-after').evaluate(node=>{
+    const box=node.getBoundingClientRect(),guide=getComputedStyle(node,'::after');
+    return box.right-parseFloat(guide.right)-parseFloat(guide.width)/2;
+  });
+  assert.ok(Math.abs(marker-(first.x+first.width+firstRow[1].x)/2)<1,'the interior guide bisects the actual card gap');
+  await screenshot(page,'host-insert-between-cards');
+  await page.mouse.move(last.x+last.width-1,last.y+last.height/2);
+
   await page.mouse.move(last.x+last.width-1,secondRow[0].y+1);
   assert.equal(await grid.locator(`[data-source-id="${last.id}"].drop-after`).count(),1,'merely entering the next row keeps the previous guide');
   await page.mouse.move(last.x+last.width-1,secondRow[0].y+20);
   assert.equal(await grid.locator(`[data-source-id="${secondRow.at(-1).id}"].drop-after`).count(),1,'a deliberate row crossing moves the guide');
   await page.keyboard.press('Escape');await page.mouse.up();
   assert.equal(requests.mutations.length,0);assert.deepEqual(errors,[]);await assertMedia(page);completed.add(t);
+});
+
+test('favorite chooser puts the count beside its heading and keeps equal footer insets', {timeout:60000},async t=>{
+  for(const android of [false,true]) {
+  const {host}=await fixture(t,{android}),{page,errors}=await browser(t,host,{android});
+  await page.route('**/api/gatcha/favlist/preview',route=>route.fulfill({contentType:'application/json',body:JSON.stringify({ok:true,data:{uid:'42',public_folder_count:1,folders:[{id:'10',title:'本地测试收藏夹',media_count:791,selected:true}]}})}));
+  for(const size of android?[{width:375,height:667},{width:360,height:800},{width:320,height:640}]:[{width:700,height:650},{width:1000,height:800}]) {
+    await page.setViewportSize(size);await sources(page,android);
+    await page.locator('[data-sources-mode="favorites"]').click();
+    await page.locator('#modal-favlist-uid-input').fill('42');
+    await page.locator('#modal-pull-favlist-button').click();
+    const modal=page.locator('#gatcha-favlist-modal');await modal.waitFor({state:'visible'});
+    assert.equal(await modal.locator('#gatcha-favlist-modal-text').isVisible(),false);
+    assert.equal(await modal.locator('#gatcha-favlist-count').textContent(),'(1个)');
+    const geometry=await modal.evaluate(node=>{
+      const card=node.querySelector('.selection-modal-card'),actions=node.querySelector('.selection-modal-actions'),body=node.querySelector('.selection-modal-grid'),count=node.querySelector('.queue-count');
+      const b=card.getBoundingClientRect(),a=actions.getBoundingClientRect(),c=body.getBoundingClientRect();
+      return {gap:a.top-c.bottom,bottom:b.bottom-a.bottom-parseFloat(getComputedStyle(card).borderBottomWidth),countFont:getComputedStyle(count).fontSize,width:document.documentElement.scrollWidth,viewport:innerWidth,left:b.left,right:innerWidth-b.right};
+    });
+    assert.ok(Math.abs(geometry.gap-geometry.bottom)<1,'body/actions gap equals the bottom content inset');
+    assert.equal(geometry.countFont,'13px');assert.ok(geometry.width<=geometry.viewport);
+    assert.ok(geometry.left>=12&&geometry.right>=12&&Math.abs(geometry.left-geometry.right)<1,`modal stays centered inside both viewport insets: ${JSON.stringify({size,geometry})}`);
+    await screenshot(page,`favorite-chooser-${size.width}x${size.height}`);
+    await page.locator('#gatcha-favlist-modal-cancel').click();
+  }
+  assert.deepEqual(errors,[]);
+  }
+  completed.add(t);
+});
+
+test('phone reorder toggle owns real touch dragging and leaves long press for selection', {timeout:30000},async t=>{
+  const {host,data}=await fixture(t,{android:true,size:12}),{page,requests,errors}=await browser(t,host,{android:true,mobileBrowser:true});
+  await page.setViewportSize({width:375,height:667});await sources(page,true);
+  const grid=page.locator('#follow-up-grid'),footer=page.locator('.source-tools[data-source="uid"]');
+  const session=await page.context().newCDPSession(page);
+  const press=async (x,y)=>session.send('Input.dispatchTouchEvent',{type:'touchStart',touchPoints:[{x,y,force:1}]});
+  const release=async()=>session.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});
+  const tap=async locator=>{const b=await locator.boundingBox();await press(b.x+b.width/2,b.y+b.height/2);await page.waitForTimeout(40);await release();};
+  try {
+    await tap(footer.locator('.source-order-mode'));
+    await page.waitForFunction(()=>sourceRemovalEditors.get('uid').ordering);
+    const from=await grid.locator('[data-source-id="43"]').boundingBox(),to=await grid.locator('[data-source-id="42"]').boundingBox();
+    await press(from.x+22,from.y+22);
+    await session.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:to.x+1,y:to.y+to.height/2,force:1}]});
+    assert.equal(await grid.locator('.is-dragging').count(),1);assert.equal(await grid.locator('.drop-before').count(),1);
+    await release();
+    await waitFor(()=>existsSync(path.join(data,'gatcha_source_order.json'))&&read(data,'gatcha_source_order.json').uid[0]==='43','actual native Host commits the touch move');
+    await settleSourceCompletion(page,host);
+    assert.equal(requests.mutations.length,1);assert.equal(requests.mutations[0].edit.action,'move');
+    await tap(footer.locator('.source-order-mode'));
+    await page.waitForFunction(()=>!sourceRemovalEditors.get('uid').ordering,null,{timeout:3000});
+    const b=await grid.locator('.follow-up-button').first().boundingBox();
+    await press(b.x+b.width/2,b.y+b.height/2);
+    await page.waitForFunction(()=>sourceRemovalEditors.get('uid').editing,null,{timeout:3000});
+    await release();
+    assert.equal(await page.evaluate(()=>String(window.getSelection())), '');
+    await tap(footer.locator('.source-select-mode'));
+    await page.waitForFunction(()=>!sourceRemovalEditors.get('uid').editing);
+    const cancel=await footer.locator('.source-order-mode').boundingBox();
+    await press(cancel.x+22,cancel.y+22);
+    await session.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:cancel.x+40,y:cancel.y+22,force:1}]});
+    await session.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:cancel.x+22,y:cancel.y+22,force:1}]});
+    await release();
+    assert.equal(await footer.locator('.source-order-mode').getAttribute('aria-pressed'),'false','moving out and back cancels a tool press');
+    assert.equal(requests.mutations.length,1);assert.deepEqual(errors,[]);await assertMedia(page);
+    await screenshot(page,'phone-touch-reordered-375x667');
+    completed.add(t);
+  } finally {await session.detach();}
 });
 
 test('native source editing validates a whole batch, Host capability, narrow version and legacy authorized removal', {timeout:60000},async t=>{
@@ -883,7 +981,7 @@ for(const android of [false,true])test(`${android?'touch portrait shared Android
   assert.equal(geometry.cardWidth,geometry.buttonWidth,'no extra management column reduces the card');
   assert.equal(geometry.cardHeight,geometry.buttonHeight);
   assert.equal(geometry.children,1,'ordinary card remains the only visible content');
-  if(!android)assert.equal(geometry.cursor,'grab');
+  if(!android)assert.equal(geometry.cursor,'pointer','ordinary browse cards do not claim a reorder gesture');
   await footerBounds(page);await screenshot(page,android?'host-touch-source-list':'host-desktop-source-list');
   await grid.locator('[data-source-id="42"] .follow-up-button').click();
   await page.locator('#follow-up-items-view').waitFor({state:'visible'});assert.equal(await footer.isVisible(),false);
@@ -903,7 +1001,7 @@ for(const android of [false,true])test(`${android?'touch portrait shared Android
   }
   // The shared touch layout also supports a mouse; visual touch grips remain
   // a separate placement decision. The real mouse now drags the card itself.
-  await page.mouse.move(from.x+22,from.y+22);await page.mouse.down();await holdOrder(page);await page.mouse.move(to.x+8,to.y+to.height/2,{steps:8});await page.mouse.up();
+  await enableOrdering(page);await page.mouse.move(from.x+22,from.y+22);await page.mouse.down();await holdOrder(page);await page.mouse.move(to.x+8,to.y+to.height/2,{steps:8});await page.mouse.up();
   await waitFor(()=>existsSync(path.join(data,'gatcha_source_order.json'))&&read(data,'gatcha_source_order.json').uid[0]==='43','real drag saves full order');
   await waitFor(async()=>!(await handle.isDisabled()),'move guard settled');
   await page.waitForFunction(()=>{
@@ -928,11 +1026,11 @@ for(const android of [false,true])test(`${android?'touch portrait shared Android
   await drag.scrollIntoViewIfNeeded();const box=await drag.boundingBox();
   let calls=requests.mutations.length;
   assert.equal(await page.evaluate(({x,y})=>Boolean(document.elementFromPoint(x+22,y+22)?.closest('.follow-up-button')),box),true,'drag starts inside the original card');
-  await page.mouse.move(box.x+22,box.y+22);await page.mouse.down();await holdOrder(page);await page.mouse.move(box.x+5,box.y+5);assert.equal(await grid.locator('.is-dragging').count(),1);await page.keyboard.press('Escape');await page.mouse.up();assert.equal(requests.mutations.length,calls);
+  await enableOrdering(page);await page.mouse.move(box.x+22,box.y+22);await page.mouse.down();await holdOrder(page);await page.mouse.move(box.x+5,box.y+5);assert.equal(await grid.locator('.is-dragging').count(),1);await page.keyboard.press('Escape');await page.mouse.up();assert.equal(requests.mutations.length,calls);
   assert.equal(await page.evaluate(()=>state.followBrowseSelectedUid),'','Escape cancels the card drag without opening the source');
-  await page.mouse.move(box.x+22,box.y+22);await page.mouse.down();await holdOrder(page);await page.mouse.move(1,1);await page.mouse.up();assert.equal(requests.mutations.length,calls);
+  await enableOrdering(page);await page.mouse.move(box.x+22,box.y+22);await page.mouse.down();await holdOrder(page);await page.mouse.move(1,1);await page.mouse.up();assert.equal(requests.mutations.length,calls);
   assert.equal(await page.evaluate(()=>state.followBrowseSelectedUid),'','invalid drop keeps the source list open');
-  await page.mouse.move(box.x+22,box.y+22);await page.mouse.down();await holdOrder(page);await page.mouse.move(box.x+5,box.y+5);assert.equal(await grid.locator('.is-dragging').count(),1);
+  await enableOrdering(page);await page.mouse.move(box.x+22,box.y+22);await page.mouse.down();await holdOrder(page);await page.mouse.move(box.x+5,box.y+5);assert.equal(await grid.locator('.is-dragging').count(),1);
   await edit(host,'uid',{action:'move',id:'44',before_id:'42'});
   await page.waitForFunction(()=>state.followBrowseData.owners[0].uid==='44'&&!state.followBrowseLoading);
   await page.mouse.up();assert.equal(requests.mutations.length,calls,'old captured order cannot overwrite replacement');

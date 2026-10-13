@@ -646,6 +646,12 @@ fn project_public_data(value: &Value, depth: u8) -> Value {
             result[key] = json!(asset_url(value));
         }
     }
+    if let Some(edits) = object.get("source_edit_revisions").and_then(Value::as_object) {
+        result["source_edit_revisions"] = json!({
+            "uids":edits.get("uids").and_then(Value::as_u64).unwrap_or(0),
+            "favorites":edits.get("favorites").and_then(Value::as_u64).unwrap_or(0),
+        });
+    }
     for key in [
         "items",
         "owners",
@@ -736,12 +742,14 @@ mod tests {
     fn public_source_refresh_keeps_progress_and_commit_counters_only() {
         let projected = public_source_status(&json!({
             "busy": true, "background_busy": true, "last_status": "running",
+            "source_edit_revisions": {"uids":3,"favorites":2,"cookie":"secret"},
             "last_result": {"path": "private", "rebuild": {
                 "phase": "uid", "current_uid": "42", "cookie": "secret",
                 "sources": {"generation": 9, "uids": 2, "favorites": 1, "path": "private"}
             }}
         }));
         assert_eq!(projected["background_busy"], true);
+        assert_eq!(projected["source_edit_revisions"],json!({"uids":3,"favorites":2}));
         assert_eq!(
             projected["last_result"]["rebuild"],
             json!({

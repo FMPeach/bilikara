@@ -76,6 +76,17 @@ the badge's height.
 Common components have one maintained structure, action definition and base
 style, rather than a shared initial render followed by a separate phone render:
 
+Source management uses a separate circular reorder toggle beside the selection
+toggle. Reorder mode owns card dragging on both pointer types; ordinary mouse
+holds do not begin a drag, and phone holds retain their selection meaning.
+Interior insertion guides bisect the measured card gap; row edges keep their
+guides within the scroll boundary. Existing card/media nodes remain stable.
+Bounded local source edits use the repository commit lock without replacing a
+network refresh's status lease. Refresh publication retains the latest source
+membership, including during schema rebuilds, so deleted sources stay deleted.
+The favorite chooser presents its folder count beside the section heading using
+the shared small count style. Its single body/footer gap equals the outer inset.
+
 - `session-user-editor.js` owns shared stable-ID roster editing, selection, rename,
   ordered batch dragging and deletion. `app.js` connects it to authoritative
   snapshots and HTTP actions,

@@ -223,3 +223,19 @@ test("SourceStatusFrontendTest.test_each_committed_source_refreshes_while_batch_
 test("SourceStatusFrontendTest.test_queued_completion_is_not_lost_when_next_job_already_started", async () => { const instance = Object.create(SourceStatusFrontendTest); await instance.test_queued_completion_is_not_lost_when_next_job_already_started(); });
 test("SourceStatusFrontendTest.test_folder_titles_are_sent_only_to_capable_hosts", async () => { const instance = Object.create(SourceStatusFrontendTest); await instance.test_folder_titles_are_sent_only_to_capable_hosts(); });
 test("SourceStatusFrontendTest.test_queued_sources_are_placeholders_until_the_library_lists_them", async () => { const instance = Object.create(SourceStatusFrontendTest); await instance.test_queued_sources_are_placeholders_until_the_library_lists_them(); });
+
+test("source edits refresh Host and Remote without replacing an active pull's status", async () => {
+  const instance=Object.create(SourceStatusFrontendTest);
+  for(const client of ["app","remote"]) await instance.run_client(client, `
+    const base={busy:true,background_busy:true,last_status:'running',last_result:{rebuild:{sources:{generation:1,uids:0,favorites:0}}}};
+    const publish=(uids,favorites)=>{ state.data.gatcha={...base,source_edit_revisions:{uids,favorites}};syncGatchaTaskTerminalMessage(); };
+    publish(0,0); assert.equal(reads.length,0);
+    publish(1,0); assert.deepEqual(reads.map(r=>r[0]),['uids']);
+    publish(1,0); assert.equal(reads.length,1);
+    state.favlistBrowseLoading=true; publish(1,1); publish(1,2);
+    assert.equal(reads.length,1);
+    state.favlistBrowseLoading=false; BilikaraSourceStatus.flush('favorites');
+    assert.deepEqual(reads.map(r=>r[0]),['uids','favorites']);
+    assert.equal(state.data.gatcha.last_status,'running');
+  `);
+});
