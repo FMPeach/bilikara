@@ -646,7 +646,10 @@ fn project_public_data(value: &Value, depth: u8) -> Value {
             result[key] = json!(asset_url(value));
         }
     }
-    if let Some(edits) = object.get("source_edit_revisions").and_then(Value::as_object) {
+    if let Some(edits) = object
+        .get("source_edit_revisions")
+        .and_then(Value::as_object)
+    {
         result["source_edit_revisions"] = json!({
             "uids":edits.get("uids").and_then(Value::as_u64).unwrap_or(0),
             "favorites":edits.get("favorites").and_then(Value::as_u64).unwrap_or(0),
@@ -749,7 +752,10 @@ mod tests {
             }}
         }));
         assert_eq!(projected["background_busy"], true);
-        assert_eq!(projected["source_edit_revisions"],json!({"uids":3,"favorites":2}));
+        assert_eq!(
+            projected["source_edit_revisions"],
+            json!({"uids":3,"favorites":2})
+        );
         assert_eq!(
             projected["last_result"]["rebuild"],
             json!({

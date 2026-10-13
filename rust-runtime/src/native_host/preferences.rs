@@ -667,7 +667,9 @@ mod tests {
             assert!(!next.requires_replacement(&captured));
         }
         let changed_source = MediaSelection::new(
-            &policy.updated(&json!({"download_source":"bbdown"})).unwrap(),
+            &policy
+                .updated(&json!({"download_source":"bbdown"}))
+                .unwrap(),
             &player,
             true,
         );

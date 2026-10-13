@@ -944,9 +944,19 @@ pub(super) fn write(
         // status lease. Serialize its admission with other Host actions and
         // its repository commit with per-source publications. No HTTP here.
         let result = with_app(|app| {
-            apply_source_edit(app, &context.directory, identity, edit.source, edit.expected_version, edit.edit)
+            apply_source_edit(
+                app,
+                &context.directory,
+                identity,
+                edit.source,
+                edit.expected_version,
+                edit.edit,
+            )
         });
-        if result.as_ref().is_ok_and(|value| value["operation"] == "remove_sources") {
+        if result
+            .as_ref()
+            .is_ok_and(|value| value["operation"] == "remove_sources")
+        {
             publish_favorites_timestamp(&context.directory);
         }
         return result;
@@ -1093,7 +1103,8 @@ mod tests {
         let _owned = crate::app_state::native_session::GLOBAL_APP_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let directory = std::env::temp_dir().join(format!("bilikara-pull-edit-{}", token().unwrap()));
+        let directory =
+            std::env::temp_dir().join(format!("bilikara-pull-edit-{}", token().unwrap()));
         std::fs::create_dir_all(&directory).unwrap();
         let files = paths(&directory);
         std::fs::write(

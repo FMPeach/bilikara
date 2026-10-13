@@ -735,7 +735,8 @@ fn add_uid_source(
     client: &BilibiliHttpClient,
     control: &RefreshControl,
 ) -> Result<Value, GatchaRepositoryError> {
-    let was_member = normalized_strings(uid_snapshot(&paths.uid_file, &[])?.get("uids")).contains(&uid.to_owned());
+    let was_member = normalized_strings(uid_snapshot(&paths.uid_file, &[])?.get("uids"))
+        .contains(&uid.to_owned());
     let profile = fetch_profile(client, uid)?;
     let uid = text_value(&profile, "uid");
     let (added, uids, cache) = control.commit(|| {
@@ -743,7 +744,9 @@ fn add_uid_source(
         let mut uid_payload = uid_snapshot(paths.uid_file.as_path(), &[])?;
         let mut uids = normalized_strings(uid_payload.get("uids"));
         let added = !uids.contains(&uid);
-        if added && was_member { return Err(error("cancelled", "来源已删除，已丢弃过期拉取结果")); }
+        if added && was_member {
+            return Err(error("cancelled", "来源已删除，已丢弃过期拉取结果"));
+        }
         if added {
             uids.push(uid.clone());
         }
@@ -915,7 +918,9 @@ fn refresh_all(
                 }
                 results.push(summary);
             }
-            Err(failure) if failure.kind == "cancelled" => { control.check()?; }
+            Err(failure) if failure.kind == "cancelled" => {
+                control.check()?;
+            }
             Err(failure) => errors.push(json!({"uid": uid, "error": failure.message})),
         }
         control.commit(|| {
@@ -1140,9 +1145,12 @@ fn refresh_favlist(
     if selected.as_ref().is_some_and(HashSet::is_empty) {
         return Err(error("invalid_request", "请选择至少一个收藏夹"));
     }
-    let existing_folders: HashSet<_> = array(&load_favlist(&paths.favlist_file), "folders").iter()
-        .filter_map(Value::as_object).filter(|folder| text_map(folder, "uid") == uid)
-        .map(folder_id).collect();
+    let existing_folders: HashSet<_> = array(&load_favlist(&paths.favlist_file), "folders")
+        .iter()
+        .filter_map(Value::as_object)
+        .filter(|folder| text_map(folder, "uid") == uid)
+        .map(folder_id)
+        .collect();
     let folders = fetch_favlist_folders(client, &uid)?;
     let mut matched = 0;
     let mut item_count = 0;
@@ -1174,7 +1182,14 @@ fn refresh_favlist(
         let result = control.source(format!("favlist:{uid}:{folder_id}"), || {
             let fresh = fetch_favlist_entries_controlled(client, &uid, folder, None, control)?;
             let (entries, item_count) = control.commit(|| {
-                persist_favlist_source_expected(paths, &uid, &folder_id, &fresh, Some(&summary), existing_folders.contains(&folder_id))
+                persist_favlist_source_expected(
+                    paths,
+                    &uid,
+                    &folder_id,
+                    &fresh,
+                    Some(&summary),
+                    existing_folders.contains(&folder_id),
+                )
             })?;
             Ok(json!({"uid":uid,"folder_id":folder_id,"item_count":item_count,"entries":entries}))
         });
@@ -1186,7 +1201,10 @@ fn refresh_favlist(
                     additions.extend(array(&value, "entries").iter().cloned());
                 }
             }
-            Err(failure) if failure.kind == "cancelled" => { control.check()?; continue; },
+            Err(failure) if failure.kind == "cancelled" => {
+                control.check()?;
+                continue;
+            }
             Err(failure) => {
                 errors.push(json!({"uid":uid,"folder_id":folder_id,"error":failure.message}))
             }
@@ -1226,7 +1244,12 @@ fn persist_favlist_source(
 }
 
 fn persist_favlist_source_expected(
-    paths: &GatchaPaths, uid: &str, id: &str, incoming: &[Value], replacement: Option<&Value>, require_existing: bool,
+    paths: &GatchaPaths,
+    uid: &str,
+    id: &str,
+    incoming: &[Value],
+    replacement: Option<&Value>,
+    require_existing: bool,
 ) -> Result<(Vec<Value>, usize), GatchaRepositoryError> {
     let _guard = repository_guard()?;
     let mut current = load_favlist(&paths.favlist_file);
@@ -3493,8 +3516,19 @@ mod tests {
                 .kind,
             "cancelled"
         );
-        assert_eq!(persist_favlist_source_expected(&paths,"1","10",&[json!({"bvid":"BVSTALE"})],
-            Some(&json!({"uid":"1","id":"10"})),true).unwrap_err().kind,"cancelled");
+        assert_eq!(
+            persist_favlist_source_expected(
+                &paths,
+                "1",
+                "10",
+                &[json!({"bvid":"BVSTALE"})],
+                Some(&json!({"uid":"1","id":"10"})),
+                true
+            )
+            .unwrap_err()
+            .kind,
+            "cancelled"
+        );
         let stopped = RefreshControl::default();
         stopped.stop();
         assert_eq!(

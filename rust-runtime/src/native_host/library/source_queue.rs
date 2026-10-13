@@ -392,15 +392,17 @@ mod tests {
     }
     #[test]
     fn deleting_a_pulling_source_removes_its_active_placeholder() {
-        let mut q = SourceQueue::default();
-        q.active = Some(SourceJob {
-            uid: "42".into(),
-            folder_ids: Some(vec!["10".into(), "11".into()]),
-            folder_titles: BTreeMap::from([
-                ("10".into(), "Ten".into()),
-                ("11".into(), "Eleven".into()),
-            ]),
-        });
+        let mut q = SourceQueue {
+            active: Some(SourceJob {
+                uid: "42".into(),
+                folder_ids: Some(vec!["10".into(), "11".into()]),
+                folder_titles: BTreeMap::from([
+                    ("10".into(), "Ten".into()),
+                    ("11".into(), "Eleven".into()),
+                ]),
+            }),
+            ..Default::default()
+        };
         q.remove_source(&json!({"source":"favlist","uid":"43","folder_id":"10"}));
         assert_eq!(q.snapshot()["active"]["folder_ids"], json!(["10", "11"]));
         q.remove_source(&json!({"source":"favlist","uid":"42","folder_id":"10"}));
