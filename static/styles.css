@@ -10203,7 +10203,6 @@ body.is-presentation-stage-only .left-column {
 
 .critical-banner-region .backup-actions .banner-action,
 .critical-banner-region .backup-actions .next-button,
-.critical-banner-region .backup-actions .banner-close,
 .selection-modal-actions .toolbar-button,
 .selection-modal-actions .next-button,
 .confirm-actions .toolbar-button,
@@ -10219,9 +10218,16 @@ body.is-presentation-stage-only .left-column {
 }
 
 .critical-banner-region .backup-actions .banner-close {
-  width: var(--host-peer-action-height);
-  min-width: var(--host-peer-action-height);
+  width: var(--panel-header-control-size);
+  min-width: var(--panel-header-control-size);
+  max-width: var(--panel-header-control-size);
+  height: var(--panel-header-control-size);
+  min-height: var(--panel-header-control-size);
+  max-height: var(--panel-header-control-size);
+  flex: 0 0 var(--panel-header-control-size);
   padding: 0;
+  font-size: 14px;
+  line-height: 1;
 }
 
 .critical-banner-region .backup-actions .banner-close.is-close-glyph {

@@ -9943,11 +9943,17 @@ function disconnectClient() {
 function render() {
   if (state.desktopClosing) return;
   window.BilikaraAnnouncements?.sync();
-  if (window.BilikaraNativeSession?.syncSessionChoice()) return;
+  const sessionChoicePending = window.BilikaraNativeSession?.syncSessionChoice();
   const data = state.data;
   if (!data) {
     return;
   }
+  // Runtime preferences and LAN invitations do not depend on the restored
+  // session. Keep them visible while Rust waits for the Host's choice, without
+  // mounting its player or rendering the unresolved queue/roster.
+  renderCacheSettings(data.bbdown, data.ffmpeg, data.cache_policy);
+  renderRemoteAccess(data.remote_access);
+  if (sessionChoicePending) return;
   if (window.BilikaraPresentationFeedback) renderPresentationFeedback();
 
   const currentItem = data.current_item;
@@ -9961,9 +9967,7 @@ function render() {
   renderRequesterSelect(data.session_users || []);
   renderCurrentRatingButton(currentItem);
   renderSessionUsers(data.session_users || []);
-  renderCacheSettings(data.bbdown, data.ffmpeg, data.cache_policy);
   renderPlaybackRepairControls(currentItem);
-  renderRemoteAccess(data.remote_access);
   renderHostWorkspaceSelection();
   renderGatchaWorkspace();
 
@@ -10787,6 +10791,7 @@ function renderCacheSettings(bbdown, ffmpeg, cachePolicy) {
     downloadState,
     bbdownTitle,
     login: bbdown?.login || { logged_in: Boolean(bbdown?.logged_in) },
+    sessionChoicePending: Boolean(state.data?.session_flags?.startup_choice_pending),
     language: state.language,
   });
 
@@ -11092,6 +11097,10 @@ function renderBBDownLogin(login) {
 }
 
 function maybeStartBBDownLogin(login, options = {}) {
+  // The settings view can render before the restored session is resolved.
+  // Defer login side effects until Rust admits them; ordinary LAN QR rendering
+  // uses the existing snapshot and needs no provider request.
+  if (state.data?.session_flags?.startup_choice_pending) return;
   const loginState = String(login?.state || "idle");
   if (loginState !== "failed") state.bbdownExpiredRetryHandled = false;
   if (!state.cacheSettingsOpen || state.bbdownLoginRequesting || login?.logged_in) {

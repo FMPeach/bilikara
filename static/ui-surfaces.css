@@ -1097,13 +1097,15 @@ html[data-host-layout="portrait"] .developer-mode .request-workspace-head { disp
 }
 :root:not([data-ui-client="remote"]) :is(.tag-letter-button, .tag-browser-back,
   #follow-browse-back, #favlist-browse-back, #catalog-advanced-back,
-  .av-sync-step-button, .av-sync-reset-button, [data-volume-step], [data-volume-reset]) {
+  .av-sync-step-button, .av-sync-reset-button, [data-volume-step], [data-volume-reset],
+  .critical-banner-region .banner-action) {
   transition: transform 120ms ease, background 120ms ease, border-color 120ms ease;
 }
 @media (hover: hover) and (pointer: fine) {
   :root:not([data-ui-client="remote"]) :is(.tag-letter-button, .tag-browser-back,
     #follow-browse-back, #favlist-browse-back, #catalog-advanced-back,
-    .av-sync-step-button, .av-sync-reset-button, [data-volume-step], [data-volume-reset]):hover:not(:disabled) {
+    .av-sync-step-button, .av-sync-reset-button, [data-volume-step], [data-volume-reset],
+    .critical-banner-region .banner-action):hover:not(:disabled) {
     transform: translateY(-1px);
     background: var(--host-control-hover-bg);
     border-color: var(--sync-button-hover-border);
@@ -1114,7 +1116,8 @@ html[data-host-layout="portrait"] .developer-mode .request-workspace-head { disp
 }
 :root:not([data-ui-client="remote"]) :is(.tag-letter-button, .tag-browser-back,
   #follow-browse-back, #favlist-browse-back, #catalog-advanced-back,
-  .av-sync-step-button, .av-sync-reset-button, [data-volume-step], [data-volume-reset]):active:not(:disabled) {
+  .av-sync-step-button, .av-sync-reset-button, [data-volume-step], [data-volume-reset],
+  .critical-banner-region .banner-action):active:not(:disabled) {
   transform: none;
   background: var(--host-control-pressed-bg);
   border-color: var(--sync-focus-border);
@@ -1122,13 +1125,15 @@ html[data-host-layout="portrait"] .developer-mode .request-workspace-head { disp
 @media (prefers-reduced-motion: reduce) {
   :root:not([data-ui-client="remote"]) :is(.tag-letter-button, .tag-browser-back,
     #follow-browse-back, #favlist-browse-back, #catalog-advanced-back,
-    .av-sync-step-button, .av-sync-reset-button, [data-volume-step], [data-volume-reset]) {
+    .av-sync-step-button, .av-sync-reset-button, [data-volume-step], [data-volume-reset],
+    .critical-banner-region .banner-action) {
     transition: none;
   }
 }
 :root :is(.tag-letter-button, .tag-browser-back, #follow-browse-back,
   #favlist-browse-back, #sources-follow-back, #catalog-advanced-back):focus-visible,
-:root:not([data-ui-client="remote"]) :is(.av-sync-step-button, .av-sync-reset-button):focus-visible {
+:root:not([data-ui-client="remote"]) :is(.av-sync-step-button, .av-sync-reset-button,
+  .critical-banner-region .banner-action):focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
