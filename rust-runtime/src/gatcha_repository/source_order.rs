@@ -18,6 +18,10 @@ pub enum SourceEdit {
         id: String,
         before_id: Option<String>,
     },
+    MoveMany {
+        ids: Vec<String>,
+        before_id: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -73,6 +77,15 @@ pub(crate) fn validate_edit(
         }
         SourceEdit::Move { id, before_id } => {
             validate_ids(source, std::slice::from_ref(id), 1)?;
+            if let Some(before) = before_id {
+                validate_ids(source, std::slice::from_ref(before), 1)?;
+            }
+        }
+        SourceEdit::MoveMany { ids, before_id } => {
+            validate_ids(source, ids, MAX_BATCH)?;
+            if ids.is_empty() {
+                return Err(error("invalid_request", "Select at least one source"));
+            }
             if let Some(before) = before_id {
                 validate_ids(source, std::slice::from_ref(before), 1)?;
             }
@@ -239,6 +252,24 @@ pub(super) fn move_source_controlled(
     before: Option<&str>,
     publish: bool,
 ) -> Result<Value, GatchaRepositoryError> {
+    move_sources_controlled(
+        paths,
+        source,
+        expected_version,
+        &[id.to_owned()],
+        before,
+        publish,
+    )
+}
+
+pub(super) fn move_sources_controlled(
+    paths: &GatchaPaths,
+    source: &str,
+    expected_version: &str,
+    ids: &[String],
+    before: Option<&str>,
+    publish: bool,
+) -> Result<Value, GatchaRepositoryError> {
     let members = members(paths, source)?;
     let mut order = read(paths)?;
     let old_version = version(source, &members, &order);
@@ -248,7 +279,8 @@ pub(super) fn move_source_controlled(
             "Sources changed; reload before editing",
         ));
     }
-    if !members.iter().any(|v| v == id) || before.is_some_and(|v| !members.iter().any(|id| id == v))
+    if ids.iter().any(|id| !members.contains(id))
+        || before.is_some_and(|v| !members.iter().any(|id| id == v))
     {
         return Err(error(
             "unknown_source",
@@ -257,12 +289,18 @@ pub(super) fn move_source_controlled(
     }
     let previous = order.effective(source, &members);
     let mut displayed = previous.clone();
-    if before != Some(id) {
-        displayed.retain(|v| v != id);
+    if !before.is_some_and(|anchor| ids.iter().any(|id| id == anchor)) {
+        // The saved display order owns relative order, not the request's ID order.
+        let moved: Vec<_> = displayed
+            .iter()
+            .filter(|id| ids.contains(id))
+            .cloned()
+            .collect();
+        displayed.retain(|v| !ids.contains(v));
         let index = before
             .and_then(|anchor| displayed.iter().position(|v| v == anchor))
             .unwrap_or(displayed.len());
-        displayed.insert(index, id.to_owned());
+        displayed.splice(index..index, moved);
     }
     let changed = displayed != previous;
     if changed {

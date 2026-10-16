@@ -6299,6 +6299,7 @@ function applyPlaybackSheetAdaptiveLayout({ preserveTransportMode = false } = {}
   }
 
   panel.dataset.transportLayout = spacious ? "spacious" : "compact";
+  panel.classList.toggle("has-scrollable-body", body.scrollHeight > body.clientHeight + 1);
   panel.dataset.metadataTruncated = truncatedFields.join(",");
   state.playbackMetadataLayoutRunCount += 1;
   const primaryRect = primary.getBoundingClientRect();
@@ -10193,25 +10194,48 @@ elements.playerControlPanel.addEventListener("click", async (event) => {
   await sendPlayerControl(action, deltaSeconds);
 });
 
+let playbackSeekRevealOnly = false;
 elements.playerControlPanel.addEventListener("input", (event) => {
   const seek = event.target.closest('input[data-control-action="seek-absolute"]');
   if (!seek || seek.disabled) {
+    return;
+  }
+  if (playbackSeekRevealOnly) {
+    state.playbackSheetSeekScrubbing = false;
+    paintPlaybackClockSurfaces();
     return;
   }
   state.playbackSheetSeekScrubbing = true;
   paintPlaybackSheetSeekPreview(Number(seek.value || 0));
 });
 
-elements.playbackSheetSeek?.addEventListener("pointerdown", () => {
-  elements.playbackSheetSeek.classList.add("is-engaged");
+elements.playbackSheetSeek?.addEventListener("pointerdown", event => {
+  if (elements.playbackSheetSeek.disabled || !event.isPrimary || event.button !== 0) return;
+  playbackSeekRevealOnly = !elements.playbackSheetSeek.classList.contains("is-engaged");
+  if (playbackSeekRevealOnly) {
+    // Reveal only. Prevent the range's native track-jump and retain the real
+    // current value; a subsequent pointer gesture or keyboard action can seek.
+    event.preventDefault();
+    elements.playbackSheetSeek.classList.add("is-engaged");
+    elements.playbackSheetSeek.focus({ preventScroll: true });
+  }
 });
+// Chromium's touch range default can run even when pointerdown was canceled.
+// Keep the entire first gesture reveal-only, including delayed input/change.
+elements.playbackSheetSeek?.addEventListener("touchstart", event => {
+  if (playbackSeekRevealOnly) event.preventDefault();
+}, { passive: false });
 elements.playbackSheetSeek?.addEventListener("keydown", event => {
   if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown"].includes(event.key)) {
+    playbackSeekRevealOnly = false;
     elements.playbackSheetSeek.classList.add("is-engaged");
   }
 });
 elements.playbackSheet?.addEventListener("pointerdown", event => {
-  if (event.target !== elements.playbackSheetSeek) elements.playbackSheetSeek?.classList.remove("is-engaged");
+  if (event.target !== elements.playbackSheetSeek) {
+    playbackSeekRevealOnly = false;
+    elements.playbackSheetSeek?.classList.remove("is-engaged");
+  }
 });
 for (const name of ["pointercancel", "blur"]) {
   elements.playbackSheetSeek?.addEventListener(name, () => {
@@ -10228,6 +10252,11 @@ for (const name of ["pointercancel", "blur"]) {
 elements.playerControlPanel.addEventListener("change", async (event) => {
   const seek = event.target.closest('input[data-control-action="seek-absolute"]');
   if (!seek || seek.disabled || state.playerControlPendingAction) {
+    return;
+  }
+  if (playbackSeekRevealOnly) {
+    state.playbackSheetSeekScrubbing = false;
+    paintPlaybackClockSurfaces();
     return;
   }
   const targetSeconds = Number(seek.value || 0);

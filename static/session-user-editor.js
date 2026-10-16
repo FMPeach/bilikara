@@ -78,8 +78,8 @@
         const drag = this.drag; this.finishDrag();
         void this.commit({ action: "remove", user_ids: drag.ids }, drag.version);
       });
-      // The numbered target owns touch dragging; swiping a tag's name or the
-      // surrounding list still scrolls vertically, without changing tag sizes.
+      // Normal mode keeps the numbered touch handle. Selection mode reserves
+      // its checkbox for clicks and lets the remaining tag drag the group.
       list.addEventListener("pointerdown", event => this.pointerDown(event));
       list.addEventListener("pointermove", event => this.pointerMove(event));
       list.addEventListener("pointerup", event => this.pointerUp(event));
@@ -336,7 +336,7 @@
 
     dragStart(event) {
       const badge = event.target.closest(".session-user-badge");
-      if (!badge || this.busy || this.mode === "rename") { event.preventDefault(); return; }
+      if (!badge || this.busy || this.mode === "rename" || this.checkboxPress) { event.preventDefault(); return; }
       this.beginDrag(badge);
       event.dataTransfer.effectAllowed = "move";
       event.dataTransfer.setData("text/plain", this.drag.ids.join(","));
@@ -401,8 +401,10 @@
     }
 
     pointerDown(event) {
-      if (event.pointerType === "mouse" || this.busy || this.mode === "rename" || !event.target.closest(".session-user-order-number")) return;
+      this.checkboxPress = this.mode === "select" && Boolean(event.target.closest(".session-user-order-number"));
+      if (event.pointerType === "mouse" || this.busy || this.mode === "rename") return;
       const badge = event.target.closest(".session-user-badge");
+      if (!badge || (this.mode === "select" ? this.checkboxPress : !event.target.closest(".session-user-order-number"))) return;
       this.pointer = { id: event.pointerId, x: event.clientX, y: event.clientY, badge };
       badge.setPointerCapture(event.pointerId);
     }

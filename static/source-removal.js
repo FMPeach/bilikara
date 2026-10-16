@@ -23,25 +23,23 @@
       this.panel = grid.closest('.source-mode-panel');
       this.scroll = grid.closest('.source-browse-scroll');
       this.selected = new Set(); this.cards = new Map(); this.records = []; this.pageRecords = [];
-      this.version = ""; this.filter = ""; this.editing = false; this.ordering = false; this.pending = false; this.active = false;
+      this.version = ""; this.filter = ""; this.editing = false; this.pending = false; this.active = false;
       this.footer = document.createElement('div'); this.footer.className = 'source-tools';
       this.footer.dataset.source = this.source; this.footer.hidden = true;
       this.frame = document.createElement('div'); this.frame.className = 'source-frame-footer'; this.frame.hidden = true;
       this.footer.innerHTML = '<button type="button" class="toolbar-button settings-tool-button source-select-page" hidden></button>'
         + '<button type="button" class="toolbar-button settings-tool-button source-retry-cleanup" hidden></button>'
         + '<span class="source-selection-count" role="status" aria-live="polite"></span>'
-        + '<button type="button" class="source-order-mode" aria-pressed="false"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 3v18m-4-4 4 4 4-4M17 21V3m-4 4 4-4 4 4"/></svg></button>'
         + '<button type="button" class="source-select-mode" aria-pressed="false">' + root.BilikaraSessionUserEditor.selectionIcon + '</button>'
         + '<span class="source-trash-slot"><span class="source-remove-selected" role="img">' + root.BilikaraSessionUserEditor.trashIcon + '</span></span>';
       this.frame.append(this.footer); this.panel.append(this.frame);
       this.all = this.footer.querySelector('.source-select-page');
       this.count = this.footer.querySelector('.source-selection-count'); this.toggle = this.footer.querySelector('.source-select-mode');
       this.remove = this.footer.querySelector('.source-remove-selected');
-      this.orderToggle = this.footer.querySelector('.source-order-mode');
       this.trashSlot = this.remove.parentElement;
       this.footer.setAttribute('role','group');
       this.footer.addEventListener('click', event => {
-        const mode = event.target.closest('.source-select-mode, .source-order-mode');
+        const mode = event.target.closest('.source-select-mode');
         if (mode) {
           if (event.detail !== 0 && this.toolRelease?.target === mode && event.timeStamp-this.toolRelease.time < 500) {
             event.preventDefault(); event.stopImmediatePropagation(); this.toolRelease = null; return;
@@ -62,7 +60,7 @@
       // release, and reject any subsequent compatibility click of that press.
       this.footer.addEventListener('pointerdown', event => {
         this.toolRelease = null; this.toolPointer = null;
-        const target = event.target.closest('.source-select-mode, .source-order-mode');
+        const target = event.target.closest('.source-select-mode');
         if (event.pointerType === 'touch' && event.isPrimary !== false && event.button === 0 && target && !target.disabled) {
           this.toolPointer = {id:event.pointerId,target,x:event.clientX,y:event.clientY,version:this.version,filter:this.filter};
         }
@@ -138,22 +136,18 @@
     get blocked() { return this.pending || this.loading || !this.available || !this.active; }
     get mobile() { return document.documentElement.dataset.hostPlatform === 'android'; }
     activateMode(button) {
-      if (button === this.toggle) {
-        if (this.editing ? this.pending : this.blocked) return false;
-        this.setEditing(!this.editing); return true;
-      }
-      if (this.ordering ? this.pending : this.blocked) return false;
-      const next = !this.ordering; this.setEditing(false); this.ordering = next; this.paint(); return true;
+      if (button !== this.toggle || (this.editing ? this.pending : this.blocked)) return false;
+      this.setEditing(!this.editing); return true;
     }
     handleEscape() {
       if (!this.active || this.confirmation) return false;
       if (this.pointer || (this.hold && !this.hold.triggered)) this.finishDrag();
-      else if ((this.editing || this.ordering) && !this.pending) { this.setEditing(false); this.toggle.focus({preventScroll:true}); }
+      else if (this.editing && !this.pending) { this.setEditing(false); this.toggle.focus({preventScroll:true}); }
       else return false;
       return true;
     }
     setEditing(value) {
-      this.finishDrag(); this.editing = value; this.ordering = false; this.selected.clear(); this.focusId = "";
+      this.finishDrag(); this.editing = value; this.selected.clear(); this.focusId = "";
       this.cancelConfirmation(); this.paint();
     }
     leave() {
@@ -225,10 +219,6 @@
       this.toggle.title = this.toggle.getAttribute('aria-label');
       this.toggle.setAttribute('aria-pressed',String(this.editing));
       this.toggle.disabled = this.editing ? this.pending : this.blocked;
-      this.orderToggle.setAttribute('aria-label',this.t(this.ordering ? 'sources.doneOrdering' : 'sources.orderMode'));
-      this.orderToggle.title = this.orderToggle.getAttribute('aria-label');
-      this.orderToggle.setAttribute('aria-pressed',String(this.ordering));
-      this.orderToggle.disabled = this.ordering ? this.pending : this.blocked;
       this.all.hidden = !this.editing;
       const selectable=this.pageRecords.filter(row=>!row.placeholder);
       const pageSelected=selectable.length > 0 && selectable.every(row=>this.selected.has(row.id));
@@ -252,14 +242,14 @@
         button.disabled = this.pending;
         target.hidden = !this.editing; checkbox.checked = this.selected.has(id); checkbox.disabled = this.blocked;
         checkbox.setAttribute('aria-label',this.t('sources.selectSource',{name:card.dataset.sourceTitle}));
-        checkbox.setAttribute('aria-description',this.t('sources.dragToRemove'));
+        checkbox.setAttribute('aria-description',this.t('sources.selectMode'));
         if (this.editing) button.setAttribute('aria-pressed',String(this.selected.has(id)));
         else button.removeAttribute('aria-pressed');
         button.setAttribute('aria-keyshortcuts','Alt+ArrowUp Alt+ArrowDown');
-        button.setAttribute('aria-description',this.t(this.ordering ? 'sources.orderCard' : this.mobile ? 'sources.longPressToSelect' : 'sources.browseCard'));
-        card.classList.toggle('is-draggable',!this.blocked && this.ordering);
+        button.setAttribute('aria-description',this.t(this.editing ? 'sources.orderCard' : this.mobile ? 'sources.longPressToSelect' : 'sources.browseCard'));
+        card.classList.toggle('is-draggable',!this.blocked && this.editing);
         card.classList.toggle('is-selecting',this.editing);
-        card.classList.toggle('is-selected',this.selected.has(id)); card.classList.toggle('is-order-target',this.focusId === id);
+        card.classList.toggle('is-selected',this.selected.has(id));
       }
     }
     click(event) {
@@ -269,7 +259,6 @@
         event.preventDefault(); event.stopImmediatePropagation(); this.suppressClick = null; return;
       }
       if (this.pending || (this.editing && this.blocked)) { event.preventDefault(); event.stopImmediatePropagation(); return; }
-      if (this.ordering) { event.preventDefault(); event.stopImmediatePropagation(); return; }
       if (this.editing) {
         // Native label activation/change owns checkbox clicks and Space.
         if (event.target.closest('.source-select-target')) return;
@@ -283,9 +272,9 @@
       if (records.length !== ids.length) return;
       const captured = {ids:records.map(row => row.id),version:this.version,filter:this.filter};
       this.confirmation = captured;
-      this.options.confirm(this,captured,this.t('sources.removeBatchConfirm',{count:captured.ids.length,
-        type:this.t(this.source === 'uid' ? 'sources.ownerList' : 'sources.favorites')}),
-        records.slice(0,3).map(row => row.title.slice(0,80)).join('、'));
+      const names = records.slice(0,3).map(row => row.title.slice(0,80)).join('、') + (records.length > 3 ? '…' : '');
+      this.options.confirm(this,captured,this.t(this.source === 'uid' ? 'sources.removeOwnersConfirm' : 'sources.removeFavoritesConfirm',
+        {count:captured.ids.length,names}) + '\n' + this.t('sources.removeScope'));
     }
     async confirmRemoval(captured) {
       if (this.confirmation !== captured || this.blocked) return;
@@ -312,33 +301,33 @@
       }
     }
     moveBy(direction) {
-      if (this.blocked || this.editing) return;
-      const members = this.records.filter(row => !row.placeholder), index = members.findIndex(row => row.id === this.focusId);
-      if (index < 0 || index + direction < 0 || index + direction >= members.length) return;
-      const anchor = direction < 0 ? members[index-1] : members[index+2];
-      return this.commit({action:'move',id:this.focusId,before_id:anchor?.id || null});
+      if (this.blocked) return;
+      const members = this.records.filter(row => !row.placeholder);
+      const ids = this.editing && this.selected.size ? members.filter(row => this.selected.has(row.id)).map(row => row.id) : [this.focusId];
+      const indexes = members.flatMap((row,i) => ids.includes(row.id) ? [i] : []);
+      if (!indexes.length) return;
+      const edge = direction < 0 ? indexes[0] : indexes.at(-1);
+      if (edge + direction < 0 || edge + direction >= members.length) return;
+      const anchor = direction < 0 ? members[edge-1] : members[edge+2];
+      return this.commit(ids.length === 1 ? {action:'move',id:ids[0],before_id:anchor?.id || null}
+        : {action:'move_many',ids,before_id:anchor?.id || null});
     }
     pointerDown(event) {
       // Suppress only the release click of a retired drag, never a deliberate
       // new press on that card after canceling its confirmation.
       if (event.target.closest('.source-removal-card') && event.isPrimary !== false && event.button === 0) this.suppressClick = null;
       const selectionTarget = event.target.closest('.source-select-target');
-      if (this.editing && selectionTarget && !this.blocked && event.isPrimary !== false && event.button === 0) {
-        this.finishDrag(); this.suppressClick = null;
-        this.pointer = {kind:'remove',id:event.pointerId,sourceId:selectionTarget.closest('.source-removal-card').dataset.sourceId,
-          target:selectionTarget,x:event.clientX,y:event.clientY,version:this.version,filter:this.filter};
-        selectionTarget.setPointerCapture(event.pointerId);
-        return;
-      }
+      // Checkbox/label presses only select. The remaining card owns dragging.
+      if (selectionTarget) return;
       const target = event.target.closest('.follow-up-button');
       if (!target || !target.closest('.source-removal-card')
-        || this.blocked || this.editing || event.isPrimary === false || event.button !== 0) return;
-      if (event.pointerType !== 'mouse' && !(event.pointerType === 'touch' && this.mobile)) return;
+        || this.blocked || event.isPrimary === false || event.button !== 0) return;
+      if (event.pointerType !== 'mouse' && !this.editing && !(event.pointerType === 'touch' && this.mobile)) return;
       this.finishDrag(); this.suppressClick = null;
       const id = target.closest('.source-removal-card').dataset.sourceId;
-      if (this.ordering) {
+      if (this.editing) {
         this.focusId = id;
-        this.pointer = {id:event.pointerId,sourceId:id,x:event.clientX,y:event.clientY,version:this.version,target};
+        this.pointer = {kind:'move',id:event.pointerId,sourceId:id,x:event.clientX,y:event.clientY,version:this.version,filter:this.filter,target};
         target.setPointerCapture(event.pointerId); this.paint();
         return;
       }
@@ -365,23 +354,27 @@
       }
       const pointer = this.pointer; if (!pointer || pointer.id !== event.pointerId) return;
       if (!pointer.dragging && Math.hypot(event.clientX-pointer.x,event.clientY-pointer.y) < 6) return;
-      if (pointer.kind === 'remove') {
-        if (this.blocked || pointer.version !== this.version || pointer.filter !== this.filter) { this.finishDrag(); return; }
-        if (!pointer.dragging) {
-          this.selected.add(pointer.sourceId);
-          pointer.ids = this.records.filter(row => !row.placeholder && this.selected.has(row.id)).map(row => row.id);
-          pointer.dragging = true; this.paint();
-          for (const id of pointer.ids) this.cards.get(id)?.classList.add('is-dragging');
-        }
-        event.preventDefault();
-        const box = this.trashSlot.getBoundingClientRect();
-        pointer.overTrash = !this.trashSlot.hidden && pointer.ids.length <= 128
-          && event.clientX >= box.left && event.clientX <= box.right && event.clientY >= box.top && event.clientY <= box.bottom;
-        this.remove.classList.toggle('drag-over',pointer.overTrash);
-        return;
+      if (this.blocked || pointer.version !== this.version || pointer.filter !== this.filter) { this.finishDrag(); return; }
+      if (!pointer.dragging) {
+        this.selected.add(pointer.sourceId);
+        pointer.ids = this.records.filter(row => !row.placeholder && this.selected.has(row.id)).map(row => row.id);
+        pointer.dragging = true;
+        if (pointer.ids.length > 128) { this.finishDrag(); this.options.reportError(this.t('sources.batchLimit',{count:pointer.ids.length})); return; }
+        this.paint();
+        for (const id of pointer.ids) this.cards.get(id)?.classList.add('is-dragging');
+        const preview = this.cards.get(pointer.sourceId).cloneNode(true);
+        for (const node of [preview,...preview.querySelectorAll('*')]) node.removeAttribute('id');
+        preview.classList.remove('is-dragging'); preview.classList.add('source-drag-preview');
+        preview.setAttribute('aria-hidden','true'); preview.inert = true;
+        const bounds = pointer.target.getBoundingClientRect();
+        preview.style.width = bounds.width+'px'; preview.style.height = bounds.height+'px';
+        document.body.append(preview); pointer.preview = preview;
       }
-      pointer.dragging = true; event.preventDefault();
-      this.cards.get(pointer.sourceId)?.classList.add('is-dragging');
+      event.preventDefault();
+      pointer.preview.style.left = (event.clientX-24)+'px'; pointer.preview.style.top = (event.clientY-24)+'px';
+      const box = this.trashSlot.getBoundingClientRect();
+      pointer.overTrash = event.clientX >= box.left && event.clientX <= box.right && event.clientY >= box.top && event.clientY <= box.bottom;
+      this.remove.classList.toggle('drag-over',pointer.overTrash);
       const bounds = this.grid.getBoundingClientRect(), scroll = this.scroll.getBoundingClientRect();
       pointer.valid = event.clientX >= bounds.left && event.clientX <= bounds.right
         && event.clientY >= Math.max(bounds.top,scroll.top) && event.clientY <= Math.min(bounds.bottom,scroll.bottom);
@@ -420,21 +413,14 @@
         return;
       }
       const pointer = this.pointer; if (!pointer || pointer.id !== event.pointerId) return;
-      if (pointer.kind === 'remove') {
-        const valid = pointer.dragging && pointer.overTrash && pointer.version === this.version && pointer.filter === this.filter && !this.blocked;
-        this.finishDrag();
-        if (pointer.dragging) {
-          this.suppressClick = {id:pointer.sourceId,time:event.timeStamp}; event.preventDefault();
-          if (valid) this.askRemoval(pointer.ids);
-        }
-        return;
-      }
-      const members = this.records.filter(row => !row.placeholder), index = members.findIndex(row => row.id === pointer.sourceId);
-      const unchanged = pointer.before === (members[index+1]?.id || null) || pointer.before === pointer.sourceId;
       this.finishDrag();
       if (!pointer.dragging) return;
       this.suppressClick = {id:pointer.sourceId,time:event.timeStamp}; event.preventDefault();
-      if (pointer.valid && pointer.version === this.version && !unchanged) void this.commit({action:'move',id:pointer.sourceId,before_id:pointer.before},pointer.version);
+      if (pointer.version !== this.version || pointer.filter !== this.filter || this.blocked) return;
+      if (pointer.overTrash) { this.askRemoval(pointer.ids); return; }
+      if (pointer.valid) void this.commit(pointer.ids.length === 1
+        ? {action:'move',id:pointer.sourceId,before_id:pointer.before}
+        : {action:'move_many',ids:pointer.ids,before_id:pointer.before},pointer.version);
     }
     clearIndicators() { for (const card of this.cards.values()) { card.classList.remove('drop-before','drop-after'); card.style.removeProperty('--source-drop-offset'); } }
     cancelHold() {
@@ -447,6 +433,7 @@
       this.toolPointer = null;
       this.cancelHold();
       const pointer = this.pointer; this.pointer = null;
+      pointer?.preview?.remove();
       // Canceling capture can still produce a card click on mouse release.
       if (pointer?.dragging) this.suppressClick = {id:pointer.sourceId,time:performance.now()};
       if (pointer?.target.hasPointerCapture(pointer.id)) pointer.target.releasePointerCapture(pointer.id);

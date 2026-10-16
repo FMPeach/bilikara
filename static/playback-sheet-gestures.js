@@ -185,7 +185,13 @@
       if (!event.isPrimary || event.button !== 0 || !["touch", "pen"].includes(event.pointerType) || !canUse() || settling || gesture) return;
       const wasOpen = isOpen();
       if (wasOpen) {
-        if (!header.contains(event.target) || (event.target.closest("button, input, a, select, textarea") && !collapse.contains(event.target))) return;
+        if (!panel.contains(event.target) || (event.target.closest("button, input, a, select, textarea, label, [role='button'], [contenteditable='true']") && !collapse.contains(event.target))) return;
+        if (!header.contains(event.target) && body.scrollHeight > body.clientHeight + 1) return;
+        // Any scrollable content ancestor owns its whole gesture, including
+        // at the top edge. Never change an in-flight scroll into a sheet drag.
+        for (let node = event.target; node && node !== panel; node = node.parentElement) {
+          if (node.scrollHeight > node.clientHeight + 1 && /auto|scroll/.test(getComputedStyle(node).overflowY)) return;
+        }
       } else if (!dock.contains(event.target)) return;
       gesture = { id: event.pointerId, pointerDriven: true, wasOpen, x: event.clientX, y: event.clientY,
         key: getKey(), started: false, progress: wasOpen ? 1 : 0, samples: [], lastAt: performance.now() };
@@ -225,7 +231,7 @@
       settle(owner, shouldExpand(owner.progress, velocity, owner.travel));
     }
     listen(dock, "pointerdown", pointerDown);
-    listen(header, "pointerdown", pointerDown);
+    listen(panel, "pointerdown", pointerDown);
     listen(document, "pointerdown", event => {
       suppressUntil = 0;
       if (!event.isPrimary && gesture) cancel();

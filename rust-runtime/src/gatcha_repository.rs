@@ -291,6 +291,14 @@ fn execute_gatcha_operation(
                 id,
                 before_id.as_deref(),
             ),
+            SourceEdit::MoveMany { ids, before_id } => source_order::move_sources_controlled(
+                &request.paths,
+                source,
+                expected_version,
+                ids,
+                before_id.as_deref(),
+                true,
+            ),
         },
         GatchaOperation::PreviewSourceEdit {
             source,
@@ -303,6 +311,15 @@ fn execute_gatcha_operation(
                     source,
                     expected_version,
                     id,
+                    before_id.as_deref(),
+                    false,
+                )
+            } else if let SourceEdit::MoveMany { ids, before_id } = edit {
+                source_order::move_sources_controlled(
+                    &request.paths,
+                    source,
+                    expected_version,
+                    ids,
                     before_id.as_deref(),
                     false,
                 )

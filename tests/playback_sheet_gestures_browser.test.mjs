@@ -19,7 +19,10 @@ for (const variant of ['morph','slide']) test(`real Remote first-use and ${varia
   const errors=[],external=[],commands=[],httpFailures=[],warnings=[],geometry=[];
   try {
     const video=path.join(home,'video.mp4'),audio=path.join(home,'audio.m4a');
-    for (const [file,args] of [[video,['-f','lavfi','-i','color=c=0x224466:s=640x360:r=10:d=120','-c:v','libx264','-preset','ultrafast','-pix_fmt','yuv420p']],
+    if (process.env.BILIKARA_TEST_MEDIA_VIDEO || process.env.BILIKARA_TEST_MEDIA_AUDIO) {
+      assert.ok(process.env.BILIKARA_TEST_MEDIA_VIDEO && process.env.BILIKARA_TEST_MEDIA_AUDIO, 'Both cached synthetic fixtures are required');
+      cpSync(process.env.BILIKARA_TEST_MEDIA_VIDEO,video); cpSync(process.env.BILIKARA_TEST_MEDIA_AUDIO,audio);
+    } else for (const [file,args] of [[video,['-f','lavfi','-i','color=c=0x224466:s=640x360:r=10:d=120','-c:v','libx264','-preset','ultrafast','-pix_fmt','yuv420p']],
       [audio,['-f','lavfi','-i','sine=frequency=220:sample_rate=48000:duration=120','-af','volume=0.01','-c:a','aac']]]) {
       const result=await runNative('ffmpeg',['-hide_banner','-loglevel','error','-y',...args,file],process.env,30000);
       assert.equal(result.status,0,result.stderr);
@@ -149,6 +152,47 @@ for (const variant of ['morph','slide']) test(`real Remote first-use and ${varia
     assert.equal(await remote.evaluate(()=>document.querySelector('.remote-shell').inert),false);
     await openByClick();await closeByClick();
     phase='gestures';
+    // The hidden seek thumb is a reveal-only first gesture, including its
+    // native range default. Only a second real tap submits a seek command.
+    await openByClick();
+    const seek=remote.locator('#playback-sheet-seek');
+    const seekBox=await seek.boundingBox(),seekBefore=commands.length,previousPosition=Number(await seek.inputValue());
+    await remote.touchscreen.tap(seekBox.x+seekBox.width*.6,seekBox.y+seekBox.height/2);
+    assert.equal(await seek.evaluate(node=>node.classList.contains('is-engaged')),true);
+    assert.equal(commands.length,seekBefore,'First tap reveals without a native track jump');
+    assert.ok(Math.abs(Number(await seek.inputValue())-previousPosition)<=2,'Reveal keeps the real playback position');
+    const seekRequest=remote.waitForRequest(request=>new URL(request.url()).pathname==='/api/player/control');
+    await remote.touchscreen.tap(seekBox.x+seekBox.width*.25,seekBox.y+seekBox.height/2);await seekRequest;
+    await remote.waitForFunction(()=>!state.playerControlPendingAction);
+    assert.equal(commands.length,seekBefore+1); assert.equal(commands.at(-1).action,'seek-absolute');
+    commands.splice(seekBefore);
+    await closeByClick();
+    // Spacious content: the non-control body surface can collapse the sheet.
+    await remote.setViewportSize({width:1000,height:700});await openByClick();await idle();
+    const body=remote.locator('.playback-sheet-body');
+    assert.equal(await body.evaluate(node=>node.scrollHeight>node.clientHeight+1),false);
+    let base=await body.boundingBox(),baseX=base.x+3,baseY=base.y+20;
+    await touch('touchStart',baseX,baseY);
+    for(const dy of [20,80,180,300]){await touch('touchMove',baseX,baseY+dy);await delay(30);}
+    assert.equal(await remote.evaluate(()=>playbackSheetGesture.active),true);
+    await screen('body-swipe-closing');await touch('touchEnd');await idle();await sheet.waitFor({state:'hidden'});
+    await openByClick();
+    const field=await remote.locator('#remote-av-offset-input').boundingBox();
+    await touch('touchStart',field.x+field.width/2,field.y+field.height/2);
+    await touch('touchMove',field.x+field.width/2,field.y+field.height/2+120);await touch('touchEnd');
+    assert.equal(await remote.evaluate(()=>playbackSheetGesture.active),false,'Inputs retain their own gestures');
+    assert.equal(await remote.evaluate(()=>state.playbackSheetOpen),true);await closeByClick();
+    // Short content viewport: the entire overflowing body retains native scroll.
+    await remote.setViewportSize({width:640,height:320});await openByClick();await idle();
+    assert.equal(await body.evaluate(node=>node.scrollHeight>node.clientHeight+1),true);
+    base=await body.boundingBox();baseX=base.x+3;baseY=base.y+Math.min(200,base.height-20);
+    await touch('touchStart',baseX,baseY);
+    for(const dy of [20,60,100,150]){await touch('touchMove',baseX,baseY-dy);await delay(30);}
+    await touch('touchEnd');await delay(150);
+    assert.ok(await body.evaluate(node=>node.scrollTop)>0,'Actual browser scroll wins over closing');
+    assert.equal(await remote.evaluate(()=>state.playbackSheetOpen&&!playbackSheetGesture.active),true);
+    await screen('short-body-scroll-priority');await closeByClick();
+    await remote.setViewportSize({width:375,height:812});
     // Preserve the rendered input node across presentation only.
     await openByClick();
     const input=remote.locator('#remote-av-offset-input');
@@ -183,14 +227,10 @@ for (const variant of ['morph','slide']) test(`real Remote first-use and ${varia
     box=await header.boundingBox();x=box.x+25;y=box.y+box.height/2;
     await touch('touchStart',x,y);await delay(750);await touch('touchEnd');
     assert.equal(await remote.evaluate(()=>String(getSelection())), '');
-    // A short, slow down-drag rebounds. Content cannot start a dismissal.
+    // A short, slow down-drag rebounds. Scrollable content keeps its gesture.
     await touch('touchStart',x,y);
     for(const dy of [12,28,45]) {await touch('touchMove',x,y+dy);await delay(75);}
     await delay(130);await touch('touchEnd');await idle();
-    assert.equal(await remote.evaluate(()=>state.playbackSheetOpen),true);
-    const content=await remote.locator('.playback-sheet-summary').boundingBox();
-    await touch('touchStart',content.x+30,content.y+30);await touch('touchMove',content.x+30,content.y+110);await touch('touchEnd');
-    assert.equal(await remote.evaluate(()=>playbackSheetGesture.active),false);
     assert.equal(await remote.evaluate(()=>state.playbackSheetOpen),true);
     // Downwards motion follows the header until the same midpoint and closes.
     box=await header.boundingBox();x=box.x+25;y=box.y+box.height/2;
@@ -250,6 +290,20 @@ for (const variant of ['morph','slide']) test(`real Remote first-use and ${varia
     await remote.reload();await dock.waitFor({state:'visible'});
     await remote.locator('#remote-identity-modal').waitFor({state:'hidden'});
     await openByClick();await delay(950);assert.equal(await menu.isVisible(),false);await closeByClick();
+    // A real Restart traverses the existing native FIFO and decoder, then
+    // renders one dedicated playback notice on the actual fullscreen surface.
+    phase='confirmed-restart';
+    await player.locator('#player-fullscreen-button').click();
+    await player.waitForFunction(()=>document.fullscreenElement===elements.playerPanel);
+    await remote.setViewportSize({width:812,height:375});await openByClick();
+    await remote.locator('.playback-song-actions > .playback-restart-action').tap();
+    await player.waitForFunction(()=>document.querySelector('#presentation-feedback [data-feedback-category="playback"].is-visible .presentation-feedback-label')?.textContent==='重唱');
+    assert.equal(await player.locator('#presentation-feedback [data-feedback-category="playback"]').count(),1);
+    assert.deepEqual(commands.slice(-2).map(command=>command.action),['seek-absolute','play']);
+    assert.equal(commands.at(-2).target_seconds,0);
+    assert.ok(await player.locator('#player-frame video').evaluate(video=>video.currentTime<3&&!video.paused));
+    await player.screenshot({path:path.join(evidence,'fullscreen-restart-feedback.png')});
+    await remote.screenshot({path:path.join(evidence,'remote-restart-completed.png')});await closeByClick();
     // Existing Next remains deliberate and usable during the passive preview.
     const nextPage=await hintContext.newPage(),explicitCommands=[];
     nextPage.on('pageerror',error=>errors.push(error.message));

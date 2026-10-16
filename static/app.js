@@ -1033,7 +1033,8 @@ function confirmPresentationPlaybackFeedback(session) {
     && isCurrentHostPlaybackSession(session, session.video, session.audio)
     && hostPlaybackSessionObservedPlaying(session, session.video, session.audio)) {
     session.presentationFeedbackPlayPending = false;
-    showPresentationOperationFeedback({ kind: "play", value: "" });
+    showPresentationOperationFeedback({ kind: session.presentationFeedbackPlayKind || "play", value: "" });
+    session.presentationFeedbackPlayKind = null;
   }
 }
 
@@ -9034,9 +9035,10 @@ function sourceRemovalEditor(source) {
           }
         },
         refresh: () => source === "uid" ? renderFollowBrowse() : renderFavlistBrowse(),
-        confirm: (editor, captured, message, preview) => {
+        confirm: (editor, captured, message) => {
           openConfirm({type: "remove-sources", sourceEditor: editor, captured,
-            message: message + (preview ? "\n" + preview : ""), primaryLabel: t("sources.removeSelected")});
+            message, anchorElement: editor.trashSlot, anchorSide: "above",
+            primaryLabel: t("sources.removeSelected")});
           elements.confirmCancel.focus({preventScroll:true});
         },
         closeConfirmation: editor => {
@@ -16294,6 +16296,16 @@ function applyRemotePlayerControl(command, currentItem, playbackMode) {
             }
           }
         }
+        // The existing ordered seek-to-zero + play pair is the shared Restart
+        // affordance. Classify only confirmed adjacent commands on this same
+        // playback owner; ordinary seeks and delayed/unrelated plays stay distinct.
+        if (globalThis.BilikaraPresentationFeedback?.isRestartPair?.(playbackSession.presentationFeedbackPreviousControl, command)) {
+          playbackSession.presentationFeedbackPlayKind = "restart";
+          playbackSession.presentationFeedbackPlayPending = true;
+          confirmPresentationPlaybackFeedback(playbackSession);
+        }
+        playbackSession.presentationFeedbackPreviousControl = { action, seq, item_id: commandItemId,
+          playback_generation: expectedPlaybackGeneration, target_seconds: command.target_seconds, at: Date.now() };
       }
     }
   }
@@ -17208,6 +17220,7 @@ function closeConfirm({ restoreFocus = true } = {}) {
 }
 
 function confirmPopoverAnchorElement(intent) {
+  if (intent?.anchorElement?.isConnected) return intent.anchorElement;
   const anchorElementId = String(intent?.anchorElementId || "").trim();
   return anchorElementId ? document.getElementById(anchorElementId) : null;
 }
@@ -17237,6 +17250,7 @@ function confirmPopoverRenderSignature(intent) {
     y: Math.round(Number(intent.y || 0)),
     anchorElementId: String(intent.anchorElementId || ""),
     anchorAlign: String(intent.anchorAlign || ""),
+    anchorSide: String(intent.anchorSide || ""),
     anchorGap: Math.round(Number(intent.anchorGap || 0)),
     anchorLeft: anchorRect ? Math.round(anchorRect.left) : 0,
     anchorTop: anchorRect ? Math.round(anchorRect.top) : 0,
@@ -17268,7 +17282,7 @@ function confirmPopoverPlacement(intent, width, popoverHeight) {
     }
 
     const aboveTop = anchorRect.top - popoverHeight - anchorGap;
-    if (rawTop + popoverHeight > window.innerHeight - margin && aboveTop >= margin) {
+    if ((intent.anchorSide === "above" || rawTop + popoverHeight > window.innerHeight - margin) && aboveTop >= margin) {
       rawTop = aboveTop;
     }
   }

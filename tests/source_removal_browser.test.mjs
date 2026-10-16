@@ -138,7 +138,7 @@ async function holdSource(page, card) {
   } finally { await session.detach(); }
 }
 async function enterSelection(page,grid,footer,android) {
-  if(await footer.locator('.source-order-mode').getAttribute('aria-pressed')==='true')await footer.locator('.source-order-mode').click();
+  if(await footer.locator('.source-select-mode').getAttribute('aria-pressed')==='true')return;
   if(android)await holdSource(page,grid.locator('.source-removal-card .follow-up-button').first());
   else await footer.locator('.source-select-mode').click();
 }
@@ -148,11 +148,11 @@ async function selectPage(grid,footer,android) {
 }
 async function exitSelection(footer) { await footer.locator('.source-select-mode').click(); }
 async function enableOrdering(page) {
-  const toggle=page.locator('.source-tools:not([hidden]) .source-order-mode');
+  const toggle=page.locator('.source-tools:not([hidden]) .source-select-mode');
   if(await toggle.getAttribute('aria-pressed')!=='true')await toggle.click();
 }
 async function holdOrder(page) {
-  await page.waitForFunction(()=>[...sourceRemovalEditors.values()].some(editor=>editor.ordering&&editor.pointer&&editor.pointer.kind!=='remove'));
+  await page.waitForFunction(()=>[...sourceRemovalEditors.values()].some(editor=>editor.editing&&editor.pointer&&editor.pointer.kind!=='remove'));
 }
 async function settleSourceCompletion(page,host) {
   // A committed HTTP result can precede its terminal SSE snapshot. Consume
@@ -174,9 +174,9 @@ async function dragRemoval(page,grid,footer,android=false,{outside=false,cancel=
       if(sourceDragTrace.length<30)sourceDragTrace.push({type,id:event.pointerId,target:event.target?.className||'',time:Math.round(event.timeStamp)});
     },true);
   });
-  const checkbox=grid.locator('.source-checkbox:checked').first();await checkbox.scrollIntoViewIfNeeded();
-  const box=await checkbox.boundingBox(),start={x:box.x+box.width/2,y:box.y+box.height/2};
-  assert.equal(await page.evaluate(p=>document.elementFromPoint(p.x,p.y)?.matches('.source-checkbox'),start),true,'drag begins at the actual checkbox');
+  const checkbox=grid.locator('.source-checkbox:checked').first().locator('..').locator('..').locator('.follow-up-button');await checkbox.scrollIntoViewIfNeeded();
+  const box=await checkbox.boundingBox(),start={x:box.x+box.width*.65,y:box.y+box.height/2};
+  assert.equal(await page.evaluate(p=>Boolean(document.elementFromPoint(p.x,p.y)?.closest('.follow-up-button')),start),true,'drag begins on the card outside the checkbox');
   const session=android?await page.context().newCDPSession(page):null;
   const touch=(type,p)=>session.send('Input.dispatchTouchEvent',{type,touchPoints:p?[p]:[]});
   try {
@@ -457,7 +457,7 @@ test('favorite chooser puts the count beside its heading and keeps equal footer 
   completed.add(t);
 });
 
-test('phone reorder toggle owns real touch dragging and leaves long press for selection', {timeout:30000},async t=>{
+test('phone selection mode owns touch ordering and keeps long press for entry', {timeout:30000},async t=>{
   const {host,data}=await fixture(t,{android:true,size:12}),{page,requests,errors}=await browser(t,host,{android:true,mobileBrowser:true});
   await page.setViewportSize({width:375,height:667});await sources(page,true);
   const grid=page.locator('#follow-up-grid'),footer=page.locator('.source-tools[data-source="uid"]');
@@ -466,8 +466,8 @@ test('phone reorder toggle owns real touch dragging and leaves long press for se
   const release=async()=>session.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});
   const tap=async locator=>{const b=await locator.boundingBox();await press(b.x+b.width/2,b.y+b.height/2);await page.waitForTimeout(40);await release();};
   try {
-    await tap(footer.locator('.source-order-mode'));
-    await page.waitForFunction(()=>sourceRemovalEditors.get('uid').ordering);
+    await tap(footer.locator('.source-select-mode'));
+    await page.waitForFunction(()=>sourceRemovalEditors.get('uid').editing);
     const from=await grid.locator('[data-source-id="43"]').boundingBox(),to=await grid.locator('[data-source-id="42"]').boundingBox();
     await press(from.x+22,from.y+22);
     await session.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:to.x+1,y:to.y+to.height/2,force:1}]});
@@ -476,8 +476,8 @@ test('phone reorder toggle owns real touch dragging and leaves long press for se
     await waitFor(()=>existsSync(path.join(data,'gatcha_source_order.json'))&&read(data,'gatcha_source_order.json').uid[0]==='43','actual native Host commits the touch move');
     await settleSourceCompletion(page,host);
     assert.equal(requests.mutations.length,1);assert.equal(requests.mutations[0].edit.action,'move');
-    await tap(footer.locator('.source-order-mode'));
-    await page.waitForFunction(()=>!sourceRemovalEditors.get('uid').ordering,null,{timeout:3000});
+    await tap(footer.locator('.source-select-mode'));
+    await page.waitForFunction(()=>!sourceRemovalEditors.get('uid').editing,null,{timeout:3000});
     const b=await grid.locator('.follow-up-button').first().boundingBox();
     await press(b.x+b.width/2,b.y+b.height/2);
     await page.waitForFunction(()=>sourceRemovalEditors.get('uid').editing,null,{timeout:3000});
@@ -485,12 +485,12 @@ test('phone reorder toggle owns real touch dragging and leaves long press for se
     assert.equal(await page.evaluate(()=>String(window.getSelection())), '');
     await tap(footer.locator('.source-select-mode'));
     await page.waitForFunction(()=>!sourceRemovalEditors.get('uid').editing);
-    const cancel=await footer.locator('.source-order-mode').boundingBox();
+    const cancel=await footer.locator('.source-select-mode').boundingBox();
     await press(cancel.x+22,cancel.y+22);
     await session.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:cancel.x+40,y:cancel.y+22,force:1}]});
     await session.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:cancel.x+22,y:cancel.y+22,force:1}]});
     await release();
-    assert.equal(await footer.locator('.source-order-mode').getAttribute('aria-pressed'),'false','moving out and back cancels a tool press');
+    assert.equal(await footer.locator('.source-select-mode').getAttribute('aria-pressed'),'false','moving out and back cancels a tool press');
     assert.equal(requests.mutations.length,1);assert.deepEqual(errors,[]);await assertMedia(page);
     await screenshot(page,'phone-touch-reordered-375x667');
     completed.add(t);
@@ -655,7 +655,7 @@ test('mobile Host long press selects without moving its resident footer; swipe, 
   await holdSource(page,card);const fixedPagerBefore=await page.locator('#request-sources-uids > .source-frame-footer > .result-pager').boundingBox();
   const scrollTitle=await page.locator('#follow-up-grid .request-card-title-line').nth(2).boundingBox();
   const scrollPoint={x:scrollTitle.x+scrollTitle.width/2,y:scrollTitle.y+8};
-  assert.equal(await page.evaluate(p=>Boolean(document.elementFromPoint(p.x,p.y)?.closest('.source-select-target,.source-tools')),scrollPoint),false,'scrolling starts on card text, outside the checkbox drag target');
+  assert.equal(await page.evaluate(p=>Boolean(document.elementFromPoint(p.x,p.y)?.closest('.source-select-target,.source-tools')),scrollPoint),false,'card dragging starts outside the checkbox and tools');
   await start(scrollPoint);
   if(process.env.BILIKARA_SOURCE_TEST_DEBUG)console.log('Native scroll gesture',await page.evaluate(p=>{
     const editor=sourceRemovalEditors.get('uid'),scroll=editor.scroll,nodes=[];let node=document.elementFromPoint(p.x,p.y);
@@ -666,9 +666,10 @@ test('mobile Host long press selects without moving its resident footer; swipe, 
     await session.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:scrollPoint.x,y:scrollPoint.y-step*15}]});
     await page.waitForTimeout(16);
   }
-  await session.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});
+  assert.equal(await page.locator('.source-drag-preview').count(),1,'selected-mode card text starts a drag');
+  await session.send('Input.dispatchTouchEvent',{type:'touchCancel',touchPoints:[]});
   assert.equal(await page.locator('#request-sources-followed-scroll').evaluate(node=>node.scrollTop),0,'a fitted page needs no overlay scroll reach');
-  assert.equal(requests.mutations.length,0,'swiping card text cannot submit an edit');
+  assert.equal(requests.mutations.length,0,'canceling the card drag cannot submit an edit');
   assert.deepEqual(await page.locator('#request-sources-uids > .source-frame-footer > .result-pager').boundingBox(),fixedPagerBefore,'the native footer never scrolls with the content');
   await page.locator('#request-sources-uids [data-page-action="next"]').tap();
   await page.waitForFunction(()=>document.querySelector('#request-sources-uids > .source-frame-footer > .result-pager').dataset.page==='2');
@@ -1289,4 +1290,56 @@ test.after(()=>{
     writeFileSync(path.join(process.env.BILIKARA_TEST_SCREENSHOT_DIR,'timing-screenshots.json'),JSON.stringify({timings,screenshots:snapshots},null,2));
     writeFileSync(path.join(process.env.BILIKARA_TEST_SCREENSHOT_DIR,'source-ui-geometry.json'),JSON.stringify(sourceLayouts,null,2));
   }
+});
+
+test('selection cards share pointer roles, group ordering, drag previews and an anchored removal confirmation', {timeout:60000},async t=>{
+  const {host,data}=await fixture(t,{size:6}),{page,requests,errors}=await browser(t,host);
+  await sources(page);
+  const grid=page.locator('#follow-up-grid'),footer=page.locator('.source-tools[data-source="uid"]');
+  await footer.locator('.source-select-mode').click();
+  assert.equal(await footer.locator('.source-order-mode').count(),0);
+  for(const id of ['43','44'])await grid.locator(`[data-source-id="${id}"] .follow-up-button`).click();
+  const checkbox=grid.locator('[data-source-id="43"] .source-checkbox');
+  assert.equal(await checkbox.evaluate(node=>getComputedStyle(node).cursor),'pointer');
+  const card=grid.locator('[data-source-id="43"] .follow-up-button');
+  assert.equal(await card.evaluate(node=>getComputedStyle(node).cursor),'grab');
+  // A checkbox gesture can never start a drag or delete anything.
+  const c=await checkbox.boundingBox(),trash=await footer.locator('.source-trash-slot').boundingBox();
+  await page.mouse.move(c.x+8,c.y+8);await page.mouse.down();await page.mouse.move(trash.x+26,trash.y+26,{steps:8});
+  assert.equal(await page.locator('.source-drag-preview').count(),0);await page.mouse.up();
+  assert.equal(requests.mutations.length,0);
+  // Dragging the card moves both selected members in one versioned request.
+  const from=await card.boundingBox(),to=await grid.locator('[data-source-id="42"]').boundingBox();
+  await page.mouse.move(from.x+from.width*.65,from.y+from.height/2);await page.mouse.down();
+  await page.mouse.move(to.x+2,to.y+to.height/2,{steps:6});
+  assert.equal(await grid.locator('.is-dragging').count(),2);
+  assert.equal(await page.locator('.source-drag-preview').evaluate(node=>getComputedStyle(node).opacity),'0.65');
+  await screenshot(page,'source-selected-group-drag');
+  await page.mouse.up();
+  await waitFor(()=>existsSync(path.join(data,'gatcha_source_order.json'))&&read(data,'gatcha_source_order.json').uid.slice(0,3).join(',')==='43,44,42','one atomic ordered group');
+  await settleSourceCompletion(page,host);
+  assert.equal(requests.mutations.length,1);assert.equal(requests.mutations[0].edit.action,'move_many');
+  await checkbox.uncheck();
+  assert.equal(await grid.locator('.is-order-target').count(),0,'deselecting a dragged card leaves no old ordering outline');
+  await checkbox.check();
+  await dragRemoval(page,grid,footer);
+  const dialog=page.locator('#confirm-popover');await dialog.waitFor({state:'visible'});
+  await dialog.evaluate(node=>Promise.allSettled(node.getAnimations().map(animation=>animation.finished)));
+  const bounds=await dialog.boundingBox(),anchor=await footer.locator('.source-trash-slot').boundingBox();
+  assert.ok(bounds.y+bounds.height<=anchor.y-8,'confirmation opens above the actual trash anchor');
+  assert.ok(Math.abs(bounds.x+bounds.width-anchor.x-anchor.width)<2,JSON.stringify({bounds,anchor}));
+  assert.ok(bounds.width<=440&&bounds.x>=12);
+  const text=await page.locator('#confirm-text').textContent();
+  assert.match(text,/从 UP 主列表中移除这 2 个 UP 主（.*）？\n仅影响/u);
+  assert.equal(await page.locator('#confirm-text').evaluate(node=>getComputedStyle(node).whiteSpace),'pre-line');
+  await screenshot(page,'source-removal-confirmation-anchored');
+  await page.locator('#confirm-cancel').click();assert.equal(requests.mutations.length,1);
+  await page.locator('[data-host-workspace="users"]').click();
+  await page.locator('.session-user-tools [data-mode="select"]').click();
+  const badge=page.locator('#session-user-list .session-user-badge').first();
+  await badge.locator('.session-user-name').click();
+  const style=await badge.evaluate(node=>{const s=getComputedStyle(node);return {outline:s.outlineStyle,border:s.borderTopWidth,cursor:getComputedStyle(node.querySelector('.session-user-name')).cursor,checkbox:getComputedStyle(node.querySelector('.session-user-checkbox')).cursor};});
+  assert.deepEqual(style,{outline:'none',border:'1px',cursor:'grab',checkbox:'pointer'});
+  await screenshot(page,'session-selection-border');
+  assert.deepEqual(errors,[]);await assertMedia(page);completed.add(t);
 });

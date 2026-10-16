@@ -12,30 +12,31 @@ const [exe, directory, executablePath] = process.argv.slice(2);
 (async () => {
   await fs.mkdir(directory, {recursive:true});
   const server = spawn(exe, [path.join(directory,"data"), path.resolve("static")], {stdio:["pipe","pipe","pipe"]});
-  let diagnostics="";server.stderr.on("data", data => { diagnostics += data; });
+  let browser, diagnostics="";server.stderr.on("data", data => { diagnostics += data; });
   const lines=createInterface({input:server.stdout});
-  const bootstrap=JSON.parse((await Promise.race([
-    once(lines,"line"),
-    once(server,"exit").then(()=>{throw new Error(`Host exited during startup: ${diagnostics.slice(-1500)}`);}),
-    new Promise((_,reject)=>{const timer=setTimeout(()=>reject(new Error("Host startup timed out")),20000);timer.unref();}),
-  ]))[0]).bootstrap_url;
-  const browser=await chromium.launch({headless:true,...(executablePath ? {executablePath} : {})});
-  const errors=[];
-  const hostContext=await browser.newContext({viewport:{width:1280,height:800}});
-  const remoteContexts=[];
-  const host=await hostContext.newPage();
-  host.on("pageerror", error => errors.push(error.message));
-  const checks=[];
-  async function remote() {
-    const context=await browser.newContext({viewport:{width:390,height:844},hasTouch:true,isMobile:true});
-    remoteContexts.push(context);
-    const page=await context.newPage();page.on("pageerror",error=>errors.push(error.message));
-    await page.goto(new URL("/remote",bootstrap).href);
-    await page.waitForFunction(()=>state.data?.session_user_entries?.length);
-    await page.evaluate(async()=>applyRemoteIdentity(await apiPost("/api/remote-identity/register",{name:"Alice",claim:true})));
-    return page;
-  }
   try {
+    const bootstrap=JSON.parse((await Promise.race([
+      once(lines,"line"),
+      once(server,"exit").then(()=>{throw new Error(`Host exited during startup: ${diagnostics.slice(-1500)}`);}),
+      new Promise((_,reject)=>{const timer=setTimeout(()=>reject(new Error("Host startup timed out")),20000);timer.unref();}),
+    ]))[0]).bootstrap_url;
+    browser=await chromium.launch({headless:true,...(executablePath ? {executablePath} : {}),
+      ...(process.env.BILIKARA_TEST_BROWSER_LIBRARY_PATH ? {env:{...process.env,LD_LIBRARY_PATH:process.env.BILIKARA_TEST_BROWSER_LIBRARY_PATH}} : {})});
+    const errors=[];
+    const hostContext=await browser.newContext({viewport:{width:1280,height:800}});
+    const remoteContexts=[];
+    const host=await hostContext.newPage();
+    host.on("pageerror", error => errors.push(error.message));
+    const checks=[];
+    async function remote() {
+      const context=await browser.newContext({viewport:{width:390,height:844},hasTouch:true,isMobile:true});
+      remoteContexts.push(context);
+      const page=await context.newPage();page.on("pageerror",error=>errors.push(error.message));
+      await page.goto(new URL("/remote",bootstrap).href);
+      await page.waitForFunction(()=>state.data?.session_user_entries?.length);
+      await page.evaluate(async()=>applyRemoteIdentity(await apiPost("/api/remote-identity/register",{name:"Alice",claim:true})));
+      return page;
+    }
     await host.goto(bootstrap);
     await host.waitForFunction(()=>state.data?.session_user_edit_version===1);
     assert.match(await host.title(),/bilikara/i);
@@ -189,7 +190,7 @@ const [exe, directory, executablePath] = process.argv.slice(2);
     await touch.locator('#session-user-list .session-user-checkbox').nth(1).tap();
     assert.equal(await touch.locator('#session-user-list .session-user-checkbox:checked').count(),2);
     const touchIds=await touch.evaluate(()=>state.data.session_user_entries.map(user=>user.id));
-    const start=await touch.locator('#session-user-list .session-user-order-number').nth(0).boundingBox();
+    const start=await touch.locator('#session-user-list .session-user-name').nth(0).boundingBox();
     const target=await touch.locator('#session-user-list .session-user-badge').nth(8).boundingBox();
     const cdp=await touchContext.newCDPSession(touch);
     const point=(box)=>({x:box.x+8,y:box.y+box.height/2});
@@ -202,7 +203,7 @@ const [exe, directory, executablePath] = process.argv.slice(2);
     const reordered=await touch.evaluate(()=>state.data.session_user_entries.map(user=>user.id));
     assert.equal(reordered.indexOf(touchIds[1]),reordered.indexOf(touchIds[0])+1);
     assert.equal(await touch.locator('#session-user-list .session-user-checkbox:checked').count(),2);
-    const cancelStart=await touch.locator('#session-user-list .session-user-order-number').nth(0).boundingBox();
+    const cancelStart=await touch.locator('#session-user-list .session-user-name').nth(0).boundingBox();
     await cdp.send('Input.dispatchTouchEvent',{type:'touchStart',touchPoints:[point(cancelStart)]});
     await cdp.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:cancelStart.x+8,y:cancelStart.y+cancelStart.height/2+8}]});
     await touch.waitForFunction(()=>!!state.sessionUserEditor.drag);
@@ -214,7 +215,7 @@ const [exe, directory, executablePath] = process.argv.slice(2);
     assert.deepEqual(errors,[]);
     console.log(JSON.stringify({passed:checks,screenshots:["users-select.png","users-rename.png"]}));
   } finally {
-    await browser.close();server.stdin.end("stop\n");lines.close();
+    await browser?.close();server.stdin.end("stop\n");lines.close();
     if(server.exitCode===null)await once(server,"exit");
     assert.equal(server.exitCode,0,diagnostics.slice(-1500));
   }

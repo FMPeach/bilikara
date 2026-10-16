@@ -704,6 +704,74 @@ mod tests {
     }
 
     #[test]
+    fn group_display_moves_are_atomic_bounded_and_preserve_saved_relative_order() {
+        let f = Fixture::new();
+        let initial = f.browse("favlist");
+        let version = initial["source_order_version"].as_str().unwrap();
+        let input = fs::read(&f.paths.favlist_file).unwrap();
+        f.edit(
+            "favlist",
+            version,
+            SourceEdit::MoveMany {
+                ids: vec!["43:10".into(), "42:10".into()],
+                before_id: Some("42:11".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            source_order::read(&f.paths).unwrap().favlist,
+            ["42:10", "43:10", "42:11"]
+        );
+        assert_eq!(fs::read(&f.paths.favlist_file).unwrap(), input);
+        let saved = fs::read(source_order::path(&f.paths)).unwrap();
+        assert!(
+            f.edit(
+                "favlist",
+                version,
+                SourceEdit::MoveMany {
+                    ids: vec!["42:10".into()],
+                    before_id: None,
+                }
+            )
+            .is_err(),
+            "stale groups cannot overwrite a newer order"
+        );
+        let current = f.browse("favlist");
+        let version = current["source_order_version"].as_str().unwrap();
+        for ids in [
+            vec![],
+            vec!["42:10".into(), "99:10".into()],
+            vec!["42:10".into(); 129],
+        ] {
+            assert!(
+                f.edit(
+                    "favlist",
+                    version,
+                    SourceEdit::MoveMany {
+                        ids,
+                        before_id: None
+                    }
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(fs::read(source_order::path(&f.paths)).unwrap(), saved);
+        assert_eq!(
+            f.edit(
+                "favlist",
+                version,
+                SourceEdit::MoveMany {
+                    ids: vec!["42:10".into(), "43:10".into()],
+                    before_id: Some("43:10".into()),
+                }
+            )
+            .unwrap()["changed"],
+            false,
+            "dropping inside the selected group is a no-op"
+        );
+    }
+
+    #[test]
     fn display_order_persists_independently_and_noop_does_not_write_or_seed() {
         let f = Fixture::new();
         let files = [

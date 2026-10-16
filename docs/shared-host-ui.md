@@ -51,9 +51,18 @@ Remote's playback sheet uses the same surface morph for taps and drags. Its
 persistent top handle crossfades with the sheet content and has a wider invisible
 click target; rating and refresh retain priority where targets meet. Animation
 lays out the sheet once and moves/clips its outer surface instead of resizing
-its content every frame. Single-screen fullscreen uses the audience screen's
+its content every frame. Non-control sheet surfaces may start a vertical drag;
+buttons and inputs retain their actions. An overflowing content body owns its
+whole scroll gesture, including at the top edge; the header remains available
+to dismiss. A first pointer gesture on the hidden seek thumb only reveals it;
+subsequent gestures seek, while keyboard navigation remains immediate.
+Single-screen fullscreen uses the audience screen's
 shared cache-status presentation, including indeterminate/progress and failure
 states, and hides it again when playback is ready or fullscreen exits.
+Fullscreen and the audience output both show incoming-request notices,
+including the first accepted song while idle. Restart is recognized from the
+existing adjacent, current-generation seek-to-zero and play commands after
+playback is observed; it shares a feedback slot with seek and play/pause.
 
 Desktop workspace and scroll ownership remain explicit:
 
@@ -76,9 +85,12 @@ the badge's height.
 Common components have one maintained structure, action definition and base
 style, rather than a shared initial render followed by a separate phone render:
 
-Source management uses a separate circular reorder toggle beside the selection
-toggle. Reorder mode owns card dragging on both pointer types; ordinary mouse
-holds do not begin a drag, and phone holds retain their selection meaning.
+Source management combines ordering with selection on both pointer types.
+Checkbox regions select without starting a drag; the rest of each selected-mode
+card uses the grab cursor and moves the selected group, with a translucent
+preview. Clicking anywhere still selects. Ordinary mouse clicks browse, and
+phone holds enter selection. Both source and session-user selections use an
+inset border without changing their outer dimensions.
 Interior insertion guides bisect the measured card gap; row edges keep their
 guides within the scroll boundary. Existing card/media nodes remain stable.
 Bounded local source edits use the repository commit lock without replacing a

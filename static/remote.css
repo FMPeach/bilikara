@@ -4516,6 +4516,7 @@ body.remote-identity-modal-open {
   scrollbar-gutter: auto;
   -webkit-overflow-scrolling: touch;
 }
+.playback-sheet-panel:not(.has-scrollable-body) { touch-action: pan-x; }
 
 .playback-sheet-primary,
 .playback-sheet-secondary {
