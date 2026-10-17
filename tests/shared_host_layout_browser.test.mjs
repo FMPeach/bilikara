@@ -10,7 +10,7 @@ import { RunningHost, isolatedEnvironment } from './native_host_support.mjs';
 
 let alpha;
 before(async () => {
-  if (process.platform === 'linux') alpha = await buildNativeAlpha();
+  if (process.platform === 'linux') alpha = process.env.BILIKARA_TEST_NATIVE_ALPHA_BINARY || await buildNativeAlpha();
 }, { timeout: 300000 });
 
 test('actual shared Android layout releases desktop popup coordinates and keeps settings reachable', {

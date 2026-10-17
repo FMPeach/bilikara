@@ -58,6 +58,11 @@
           event.preventDefault(); this.moveSelection(event.key === "ArrowUp" ? -1 : 1);
         }
       });
+      // WebKit can begin native HTML dragging without a pointerdown. Record
+      // the same checkbox exclusion from its mouse press before dragstart.
+      list.addEventListener("mousedown", event => {
+        this.checkboxPress = this.mode === "select" && Boolean(event.target.closest(".session-user-order-number"));
+      }, { capture: true });
       list.addEventListener("dragstart", event => this.dragStart(event));
       list.addEventListener("dragover", event => this.dragOver(event));
       list.addEventListener("drop", event => this.drop(event));

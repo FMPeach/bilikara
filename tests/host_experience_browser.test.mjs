@@ -13,8 +13,8 @@ const ratingDialog = require('./browser/remote_rating_dialog.cjs');
 let alpha, desktop;
 before(async () => {
   if (process.platform !== 'linux') return;
-  alpha = await buildNativeAlpha();
-  desktop = await buildNativeHost();
+  alpha = process.env.BILIKARA_TEST_NATIVE_ALPHA_BINARY || await buildNativeAlpha();
+  desktop = process.env.BILIKARA_TEST_NATIVE_HOST_BINARY || await buildNativeHost();
 }, { timeout: 300000 });
 
 async function open(t, engine, role = 'host', input = {}, desktopEntry = false) {
@@ -576,7 +576,20 @@ for (const [name, engine] of [['Chromium', chromium], ['WebKit', webkit]]) {
         };
         document.addEventListener('dragover', observeFirstMarker);
       });
-      await source.dragTo(first, { sourcePosition: { x: 5, y: 18 }, targetPosition: { x: 2, y: 18 } });
+      if (mode === 'select') {
+        // A checkbox gesture only selects; it must never reorder the roster.
+        const before = await page.evaluate(() => state.sessionUserEditor.entries.map(user => user.id));
+        const checkbox = await source.locator('.session-user-checkbox').boundingBox(), target = await first.boundingBox();
+        await page.mouse.move(checkbox.x + checkbox.width / 2, checkbox.y + checkbox.height / 2);
+        await page.mouse.down(); await page.mouse.move(target.x + 2, target.y + 18, { steps: 5 }); await page.mouse.up();
+        assert.deepEqual(await page.evaluate(() => state.sessionUserEditor.entries.map(user => user.id)), before);
+        const native = (await host.api('/api/state')).session_user_entries.map(user => user.id);
+        assert.deepEqual(native, before);
+        assert.equal(await page.locator('.session-user-drag-image').count(), 0);
+      }
+      // Selection reserves the numbered/checkbox region for clicks. Start the
+      // actual HTML drag on the name, retaining the first-edge marker check.
+      await source.locator('.session-user-name').dragTo(first, { targetPosition: { x: 2, y: 18 } });
       assert.equal(await page.evaluate(() => firstMarkerPainted), true, `${mode || 'normal'} first marker is actually painted during HTML dragging`);
       await page.waitForFunction(id => state.sessionUserEditor.entries[0].id === id && !state.sessionUserEditor.busy, sourceId);
       assert.equal((await host.api('/api/state')).session_user_entries[0].id, sourceId, 'Actual HTML drop reaches the native atomic reorder');
@@ -986,6 +999,11 @@ for (const [name, engine] of [['Chromium', chromium], ['WebKit', webkit]]) {
     assert.equal(await range.evaluate(node => node.matches(':focus')), false);
     const rect = await range.boundingBox();
     assert.equal(rect.height, 44);
+    const initialPosition = Number(await range.inputValue());
+    await range.click({ position: { x: rect.width / 2, y: rect.height / 2 } });
+    assert.equal(await range.evaluate(node => node.classList.contains('is-engaged')), true);
+    assert.equal(Number(await range.inputValue()), initialPosition, 'First click only reveals the thumb');
+    assert.equal(requests.length, 0, 'Revealing the thumb cannot send a seek');
     let response = page.waitForResponse(value => value.url().endsWith('/api/player/control'));
     await range.click({ position: { x: rect.width / 2, y: rect.height / 2 } });
     await response;

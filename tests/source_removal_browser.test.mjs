@@ -750,6 +750,9 @@ for(const android of [false,true])test(`${android?'Android':'desktop'} checkbox 
     await page.waitForFunction(()=>state.followBrowseData.owners[0].uid==='44'&&!state.followBrowseLoading);
   }});
   assert.equal(await page.locator('#confirm-popover').isVisible(),false,'stale pointer cannot confirm a replacement revision');
+  // The explicit browse reply may precede the native edit's SSE revision.
+  // Finish that revision/reload before the next independent valid gesture.
+  await settleSourceCompletion(page,host);
   await dragRemoval(page,grid,footer,android);
   await page.locator('#confirm-popover').waitFor({state:'visible'});assert.match(await page.locator('#confirm-text').textContent(),/2/u);
   assert.equal(requests.mutations.length,0,'valid drop only opens confirmation');await page.locator('#confirm-cancel').click();
