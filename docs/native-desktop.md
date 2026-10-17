@@ -280,8 +280,8 @@ orientation; its grid reserves their actual width. No popup/first-use animation
 is needed there. Remote and Android Host retain the responsive behavior below.
 Portrait holds the existing Next button for half a second to open a capsule
 to its left. Release over Next never skips; a fresh tap chooses restart or Next.
-Alternatively, keep holding and drag into Restart to activate immediately, before
-release. Both paths dismiss the capsule and suppress the hold's compatibility
+Alternatively, keep holding and drag into Restart to arm it, then release there
+to activate; moving away or cancelling does nothing. Both paths dismiss the capsule and suppress the hold's compatibility
 click; any fresh tap also dismisses it. The original Next remains painted in
 place throughout capsule entry/exit and the first-use demonstration.
 Landscape exposes two ordinary circular actions directly in the control row,
@@ -289,19 +289,21 @@ without an enclosing capsule. Two-column Remote sheets give progress its own
 row when the left column alone has sufficient viewport height; scrolling in
 the settings column does not block it. Shorter viewports retain compact controls.
 Both use 44px targets and the existing -15s arrow geometry; only the portrait
-popup uses equal capsule insets.
+popup uses equal capsule insets. Opening the capsule does not require media
+readiness: Restart can remain disabled while Next reveals the menu. Ordinary
+state refreshes retain it; only a ready, current action can arm or submit.
 The circular transport SVG buttons also show their current localized label after
 a half-second hold, using the shared i-bubble tokens and 120ms opacity/3px motion.
 Holding and sliding between circles switches the annotation; release, leaving the
 buttons, cancellation, scrolling or a changed song retires it. Ordinary held
 explanations do not submit playback commands. Next in usable portrait controls
-adds "slide left to restart"; its existing held slide into Restart still executes
-immediately. Landscape Next omits that instruction because Restart is already
+adds "slide left to restart"; sliding into Restart arms it until release.
+Landscape Next omits that instruction because Restart is already
 exposed; desktop Host also shows only the ordinary Next label. First-use discovery
 remains the passive capsule animation, while these
 bubbles require an actual hold. The annotation owns no focus or pointer hit area,
 and retains its node/anchor through exit with guarded rapid reopening.
-Restart activates immediately without a confirmation dialog. Orientation is
+Restart activates without a confirmation dialog. Orientation is
 measured from the viewport; no URL/storage override or settings switch is used.
 The original Next node, its command guards and all seek controls remain intact.
 Both reuse the generation-bound native seek/play FIFO, preserve the media nodes and never
@@ -329,14 +331,17 @@ the same cached native alpha/Chromium and synthetic-media prerequisites as the
 restart gate. It tests the default dock-to-sheet morph and a trusted local
 comparison build of the bottom-slide variant; there is no product URL/storage
 selector. Both retain click/tap, keyboard, modal focus and document scroll
-ownership. Only the dock and expanded header start vertical touch/pen gestures;
-the body keeps native scrolling and editable controls. Movement is painted once
+ownership. The dock, expanded header, surface and ordinary buttons can start
+vertical touch/pen gestures. Buttons yield only after 12px of predominantly
+vertical intent, preserving taps and suppressing a claimed gesture's click.
+Text, range and select inputs retain their gestures; overflowing content owns
+its whole scroll gesture, including at the top edge. Movement is painted once
 per animation frame without continuous measurements or permanent timers.
 The slide variant catches up at twice the initial finger displacement, then
 tracks it; the morph interpolates the existing surfaces and fades their content.
 Clicks use that same measured interpolation, including reversal during a pending
-animation. Only an actual held drag shows the bar, with the content's opacity;
-click animation and release settling retain the normal collapse arrow.
+animation. The persistent top handle crossfades with the content for both
+clicks and drags; its expanded hit area yields to rating and refresh controls.
 Release projects position by a bounded recent velocity to decide an endpoint.
 Cancellation, viewport/current-song changes and overlapping modal operations
 discard owned frames/capture and restore the appropriate modal state.

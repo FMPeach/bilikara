@@ -20,6 +20,8 @@
 
 在 `announcements/index.json` 编辑真实公告，格式参考 `announcements/example.json`。**示例不是实际服务异常，不要直接发布示例文件。** 历史发布清单保留既有 ID；过期限时通知由客户端隐藏。新版本草稿放在发布文档中，确认发布前不写入线上 index。
 
+稳定版 v0.8.0 的[发布说明草稿](releases/v0.8.0.md)与[中英日公告草稿](releases/v0.8.0-announcement.md)单独保存；尚未加入公告清单或上传。发布时再核对实际可下载资产，填写真实发布时间，并按下述流程校验与发布。
+
 字段为 `schema_version: 1`、`announcements` 数组、不可复用的 `id`、`kind`、`published_at`、`platforms`、`title`、`body_markdown`。后两项为 zh/en/ja 字典，至少一种语言。优先当前语言，缺失时按 en → zh → ja 回退。
 
 - release 必须有 `version`，不带起止时间。
