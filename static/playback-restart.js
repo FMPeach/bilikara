@@ -299,12 +299,13 @@
       }
       if (hold && (hold.key !== getContext()?.key || !hintControlEnabled(hold.button))) clearHold({ cancel: true });
       if (controlHintVisible) showControlHint(hintAnchor);
-      if (captured && (!current() || !getContext()?.enabled || anchor.disabled || !anchor.getClientRects().length)) close({ immediate: true });
+      if (captured && (!current() || anchor.disabled || !anchor.getClientRects().length)) close({ immediate: true });
       scheduleHint();
     }
     function open(keyboard = false, held = false) {
       const context = getContext();
-      if (expanded() || busy || anchor.disabled || !context?.enabled || !context?.itemId || !anchor.getClientRects().length) return;
+      // Opening is presentation only; readiness continues to guard the action.
+      if (expanded() || busy || anchor.disabled || !context?.itemId || !anchor.getClientRects().length) return;
       cancelHint();
       markHint();
       if (hideTimer !== null) window.clearTimeout(hideTimer);
@@ -318,7 +319,7 @@
       void getComputedStyle(popup, "::before").clipPath;
       popup.classList.add("is-open");
       anchor.setAttribute("aria-expanded", "true");
-      if (keyboard) action.focus({ preventScroll: true });
+      if (keyboard) (action.disabled ? anchor : action).focus({ preventScroll: true });
     }
     listen(controls, "pointerdown", event => {
       if (!event.isPrimary || event.button !== 0) return;

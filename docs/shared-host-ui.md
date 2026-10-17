@@ -45,6 +45,9 @@ generation is ready. Desktop Host shows it inline and supports mouse-hover or
 keyboard-focus help; Remote keeps held-touch help. A portrait capsule first
 grows around Next, then extends left. Sliding onto Restart arms its pressed
 state; releasing there submits it, while moving away or cancelling does nothing.
+Opening the capsule is independent of media readiness: a visible, enabled Next
+can reveal it while Restart stays disabled, including across state refreshes.
+Only an enabled Restart may arm or submit a playback command.
 Next keeps its original node and visual layer throughout the animation.
 
 Remote's playback sheet uses the same surface morph for taps and drags. Its

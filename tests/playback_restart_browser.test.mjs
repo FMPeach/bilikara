@@ -62,6 +62,7 @@ for (const layout of ['portrait','landscape']) test(`real Remote ${layout} resta
     player.on('requestfinished',request=>pendingStatus.delete(request));
     player.on('requestfailed',request=>pendingStatus.delete(request));
     await remote.goto(host.base+'/remote');
+    await remote.waitForFunction(()=>state.data?.session_user_entries?.length>0);
     await remote.locator('#remote-identity-input').fill('Restart fixture');
     await remote.locator('#remote-identity-submit').click();
     await remote.locator('#remote-identity-modal').waitFor({state:'hidden'});
@@ -83,7 +84,25 @@ for (const layout of ['portrait','landscape']) test(`real Remote ${layout} resta
     assert.equal(await remote.evaluate(()=>state.data.player_status),null);
     if(layout==='portrait') {
       await anchor.click({button:'right'});
-      assert.equal(await menu.isVisible(),false,'An unavailable Restart cannot open a capsule');
+      await menu.waitFor({state:'visible'});
+      assert.equal(await menu.locator('button').isDisabled(),true,'Opening the capsule does not enable an unavailable Restart');
+      await remote.keyboard.press('Escape');
+      await menu.waitFor({state:'hidden'});
+      const before=commands.length,beforeNext=nextCommands.length;
+      const held=await hold({release:false});
+      assert.equal(await menu.locator('button').isDisabled(),true,'A real held touch can reveal a disabled Restart');
+      await host.api('/api/session-users/add',{name:'Pending playback'});
+      await remote.waitForFunction(()=>state.data.session_users.includes('Pending playback'));
+      assert.equal(await menu.isVisible(),true,'An actual SSE refresh retains the open capsule while media is unavailable');
+      const target=await menu.locator('button').boundingBox();
+      await held.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:target.x+target.width/2,y:target.y+target.height/2}]});
+      assert.equal(await menu.locator('button').evaluate(node=>node.classList.contains('is-held-target')),false,'A disabled Restart cannot be armed');
+      await held.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});await held.detach();
+      assert.equal(commands.length,before,'Releasing over a disabled Restart submits no command');
+      assert.equal(nextCommands.length,beforeNext,'Holding Next does not accidentally skip');
+      await remote.screenshot({path:path.join(evidence,'remote-unavailable-restart-capsule.png')});
+      await remote.keyboard.press('Escape');
+      await menu.waitFor({state:'hidden'});
     } else {
       const before=commands.length;
       await trigger.tap({force:true});assert.equal(commands.length,before,'Disabled Restart sends no command');
@@ -98,6 +117,11 @@ for (const layout of ['portrait','landscape']) test(`real Remote ${layout} resta
     async function seekToMiddle() {
       await remote.waitForFunction(()=>!document.querySelector('#playback-sheet-seek').disabled);
       const box=await progress.boundingBox();
+      if(!await progress.evaluate(node=>node.classList.contains('is-engaged'))) {
+        const before=commands.length;
+        await progress.click({position:{x:box.width*.1,y:box.height/2}});
+        assert.equal(commands.length,before,'The first gesture only reveals the seek thumb');
+      }
       await remote.mouse.move(box.x+box.width*.1,box.y+box.height/2);
       await remote.mouse.down();
       await remote.mouse.move(box.x+box.width*.45,box.y+box.height/2,{steps:3});
