@@ -37,6 +37,10 @@
       this.count = this.footer.querySelector('.source-selection-count'); this.toggle = this.footer.querySelector('.source-select-mode');
       this.remove = this.footer.querySelector('.source-remove-selected');
       this.trashSlot = this.remove.parentElement;
+      this.trashSlot.tabIndex = 0;
+      this.help = new Map([...this.footer.querySelectorAll('button'), this.remove].map((button, index) => [button,
+        root.BilikaraSessionUserEditor.toolHelp(button, `source-${this.source}-tool-help-${index}`,
+          options.bindHelp, button === this.remove ? this.trashSlot : null)]));
       this.footer.setAttribute('role','group');
       this.footer.addEventListener('click', event => {
         const mode = event.target.closest('.source-select-mode');
@@ -134,6 +138,7 @@
       }) : null;
     }
     get blocked() { return this.pending || this.loading || !this.available || !this.active; }
+    get interacting() { return Boolean(this.pointer || this.hold); }
     get mobile() { return document.documentElement.dataset.hostPlatform === 'android'; }
     activateMode(button) {
       if (button !== this.toggle || (this.editing ? this.pending : this.blocked)) return false;
@@ -158,16 +163,20 @@
       if (!this.confirmation) return;
       this.confirmation = null; this.options.closeConfirmation?.(this);
     }
-    update({records, version, editable, count, loading, active, filter = "", language, emptyText}) {
+    update({records, version, editable, editRevision, count, loading, active, filter = "", language, emptyText}) {
       if (filter !== this.filter || !active) this.setEditing(false);
       this.filter = filter; this.active = active; this.loading = loading;
       const nextVersion = String(version || '');
-      if (nextVersion !== this.version) {
+      // Background pull completions may wait for release, but an authoritative
+      // edit revision must retire a captured gesture before its list reload.
+      const edited = Number.isSafeInteger(editRevision) && this.editRevision !== undefined && editRevision !== this.editRevision;
+      if (nextVersion !== this.version || edited) {
         const interrupted = Boolean(this.pointer || this.hold || this.confirmation);
         this.finishDrag(); this.cancelConfirmation();
         if (interrupted) this.options.reportError(this.t('sources.changed'));
       }
       this.version = nextVersion;
+      if (Number.isSafeInteger(editRevision)) this.editRevision = editRevision;
       const ids = new Set(records.filter(row => !row.placeholder).map(row => row.id));
       this.available = editable === true && count === ids.size && /^[a-f0-9]{64}$/u.test(this.version);
       for (const id of this.selected) if (!ids.has(id)) this.selected.delete(id);
@@ -236,6 +245,9 @@
       this.footer.setAttribute('aria-label',this.t('sources.selectMode'));
       this.footer.hidden = !this.active;
       this.frame.hidden = !this.active;
+      for (const [button, syncHelp] of this.help) syncHelp(button === this.toggle && !this.editing
+        ? `${this.t('sources.selectMode')} · ${this.t('sources.orderCard')}`
+        : button.getAttribute('aria-label') || button.textContent);
       for (const card of this.cards.values()) {
         const id = card.dataset.sourceId, button = card.querySelector('.follow-up-button');
         const target = card.querySelector('.source-select-target'), checkbox = target.querySelector('input');
@@ -296,7 +308,7 @@
       } catch (error) { this.options.reportError(error.message || this.t('sources.changed')); }
       finally {
         await this.options.reload().catch(error => this.options.reportError(error.message));
-        this.pending = false; this.options.refresh?.(); this.paint();
+        this.pending = false; this.options.refresh?.(); this.paint(); this.options.onIdle?.();
         if (focusId && this.active) this.cards.get(focusId)?.querySelector('.follow-up-button')?.focus({preventScroll:true});
       }
     }
@@ -426,6 +438,7 @@
     cancelHold() {
       const hold = this.hold; this.hold = null;
       if (!hold) return;
+      Promise.resolve().then(() => this.options.onIdle?.());
       root.clearTimeout(hold.timer);
       if (hold.triggered) this.suppressClick = {id:hold.sourceId,time:performance.now()};
     }
@@ -433,6 +446,7 @@
       this.toolPointer = null;
       this.cancelHold();
       const pointer = this.pointer; this.pointer = null;
+      if (pointer) Promise.resolve().then(() => this.options.onIdle?.());
       pointer?.preview?.remove();
       // Canceling capture can still produce a card click on mouse release.
       if (pointer?.dragging) this.suppressClick = {id:pointer.sourceId,time:performance.now()};

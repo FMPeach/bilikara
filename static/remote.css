@@ -5742,7 +5742,9 @@ button:active { transform: none !important; }
 .playback-dock,
 .playback-sheet-status-header { touch-action: pan-x; }
 .playback-sheet-status-header,
-.playback-sheet-status-header * {
+.playback-sheet-status-header *,
+.playback-dock-meta,
+.playback-sheet-summary-copy :is(#current-meta, #current-requester, #current-cache-state) {
   -webkit-user-select: none;
   user-select: none;
   -webkit-touch-callout: none;

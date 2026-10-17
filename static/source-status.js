@@ -108,6 +108,16 @@
     const status = sourceState(task, source);
     return status ? translate(status === "queued" ? "gatcha.sourceWaiting" : `gatcha.source${status[0].toUpperCase()}${status.slice(1)}`) : fallback;
   }
+  function selectedFolderId(task, selected, requested) {
+    // A queued folder is not in the saved library yet. Its trusted queue entry
+    // still owns a browsable empty detail while the repository returns "".
+    const status = sourceState(task, {folderId: requested});
+    return String(selected || ((status === "running" || status === "queued") ? requested : "") || "");
+  }
+  function selectedFolder(task, folders, selected) {
+    return [...(folders || []), ...queuedSources(task, "favorites", (folders || []).map(folder => folder.id))]
+      .find(folder => String(folder.id) === selected) || null;
+  }
   function syncCard(card, task = {}, translate) {
     const status = sourceState(task, card.dataset);
     const active = status === "running";
@@ -141,5 +151,5 @@
     }
   }
   root.BilikaraSourceStatus = {sync, syncCard, sourceState, emptyText, setBusy, queueReload, flush, takeCompletion, takeSourceChanges,
-    queuedSources, rememberSource};
+    queuedSources, rememberSource, selectedFolderId, selectedFolder};
 })(window);

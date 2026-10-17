@@ -51,8 +51,11 @@ Remote's playback sheet uses the same surface morph for taps and drags. Its
 persistent top handle crossfades with the sheet content and has a wider invisible
 click target; rating and refresh retain priority where targets meet. Animation
 lays out the sheet once and moves/clips its outer surface instead of resizing
-its content every frame. Non-control sheet surfaces may start a vertical drag;
-buttons and inputs retain their actions. An overflowing content body owns its
+its content every frame. Sheet surfaces and ordinary buttons may start a
+vertical drag. A button retains its normal press/tap feedback until at least
+12px of predominantly vertical movement claims the gesture; that release
+cannot activate the button. Text, range and select inputs retain their own
+gestures. An overflowing content body owns its
 whole scroll gesture, including at the top edge; the header remains available
 to dismiss. A first pointer gesture on the hidden seek thumb only reveals it;
 subsequent gestures seek, while keyboard navigation remains immediate.
@@ -91,6 +94,12 @@ card uses the grab cursor and moves the selected group, with a translucent
 preview. Clicking anywhere still selects. Ordinary mouse clicks browse, and
 phone holds enter selection. Both source and session-user selections use an
 inset border without changing their outer dimensions.
+Footer actions use the shared localized help bubble, including the inert
+source trash target. Switching workspaces or UP/favorites tabs exits selection;
+pagination retains it. Automatic source-completion reloads coalesce while a
+card is held or dragged, then resume after release/cancellation. Actual source
+version conflicts still reject edits. Both detail views keep their header and
+search controls fixed with hover paint room; only the result list scrolls.
 Interior insertion guides bisect the measured card gap; row edges keep their
 guides within the scroll boundary. Existing card/media nodes remain stable.
 Bounded local source edits use the repository commit lock without replacing a

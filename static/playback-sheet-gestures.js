@@ -184,8 +184,13 @@
     function pointerDown(event) {
       if (!event.isPrimary || event.button !== 0 || !["touch", "pen"].includes(event.pointerType) || !canUse() || settling || gesture) return;
       const wasOpen = isOpen();
+      let fromControl = false;
       if (wasOpen) {
-        if (!panel.contains(event.target) || (event.target.closest("button, input, a, select, textarea, label, [role='button'], [contenteditable='true']") && !collapse.contains(event.target))) return;
+        if (!panel.contains(event.target)) return;
+        // Native text/range/select editing keeps its gesture. Ordinary buttons
+        // remain clickable until a deliberate vertical drag claims the press.
+        if (event.target.closest("input, a, select, textarea, label, [role='slider'], [role='spinbutton'], [contenteditable]:not([contenteditable='false'])")) return;
+        fromControl = Boolean(event.target.closest("button, [role='button']") && !collapse.contains(event.target));
         if (!header.contains(event.target) && body.scrollHeight > body.clientHeight + 1) return;
         // Any scrollable content ancestor owns its whole gesture, including
         // at the top edge. Never change an in-flight scroll into a sheet drag.
@@ -194,7 +199,7 @@
         }
       } else if (!dock.contains(event.target)) return;
       gesture = { id: event.pointerId, pointerDriven: true, wasOpen, x: event.clientX, y: event.clientY,
-        key: getKey(), started: false, progress: wasOpen ? 1 : 0, samples: [], lastAt: performance.now() };
+        key: getKey(), fromControl, started: false, progress: wasOpen ? 1 : 0, samples: [], lastAt: performance.now() };
     }
     function pointerMove(event) {
       const owner = gesture;
@@ -202,8 +207,8 @@
       if (!event.isPrimary || owner.key !== getKey() || !canUse()) { cancel(); return; }
       const dx = event.clientX - owner.x, dy = event.clientY - owner.y;
       if (!owner.started) {
-        if (Math.hypot(dx, dy) < 8) return;
-        if (Math.abs(dx) > Math.abs(dy) || (!owner.wasOpen && dy >= 0) || (owner.wasOpen && dy <= 0)) { cancel({ restore: false }); return; }
+        if (Math.hypot(dx, dy) < (owner.fromControl ? 12 : 8)) return;
+        if (Math.abs(dx) * (owner.fromControl ? 1.25 : 1) > Math.abs(dy) || (!owner.wasOpen && dy >= 0) || (owner.wasOpen && dy <= 0)) { cancel({ restore: false }); return; }
         if (!begin(owner)) return;
       }
       event.preventDefault();

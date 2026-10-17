@@ -9,8 +9,12 @@ import { contains, sourceIndex, iterableValues, concatenate } from './frontend_c
 async function checked(program, args, cwd) { const result = await runNative(program, args, process.env, 120000, cwd); assert.equal(result.status, 0, result.stdout + result.stderr); return result; }
 const SourceStatusFrontendTest = {
 async run_client(client, script) {
-let handler, result, shared, source, start, sync;
+let handler, result, shared, source, start, sync, readiness = "";
 source = readFileSync(path.join(path.join(ROOT, "static"), (String(client) + ".js")), "utf8");
+if (client === "app") {
+  start = sourceIndex(source, "function sourceBrowseReady(source) {");
+  readiness = source.slice(start, sourceIndex(source, "\n}", start) + 2);
+}
 shared = readFileSync(path.join(path.join(ROOT, "static"), "source-status.js"), "utf8");
 start = sourceIndex(source, "function syncGatchaTaskTerminalMessage() {");
 sync = source.slice(start, concatenate(sourceIndex(source, `
@@ -31,6 +35,7 @@ const state = { data: {gatcha:{last_status:'idle'}},
 let click, pulls=0, reads=[];
 const elements = {refreshGatchaCacheButton:{addEventListener:(_event, fn)=>click=fn}};
 const t=key=>key;
+const sourceRemovalEditors=new Map();
 function localizedGatchaTaskMessage(message) {return message;}
 function setGatchaUidMessage() {}
 function setGatchaUidInlineMessage() {}
@@ -44,6 +49,7 @@ function renderSourceManagementControls() {syncGatchaTaskTerminalMessage();}
 let refreshImpl;
 async function refreshGatchaCache() {pulls++;return refreshImpl();}
 async function fetchState() { /* same authoritative completion already delivered */ }
+` + String(readiness) + `
 ` + String(sync) + `
 ` + String(handler) + `
 (async()=>{
@@ -237,5 +243,19 @@ test("source edits refresh Host and Remote without replacing an active pull's st
     state.favlistBrowseLoading=false; BilikaraSourceStatus.flush('favorites');
     assert.deepEqual(reads.map(r=>r[0]),['uids','favorites']);
     assert.equal(state.data.gatcha.last_status,'running');
+  `);
+});
+
+test('Host pull completion coalesces while a source gesture owns capture',async()=>{
+  const instance=Object.create(SourceStatusFrontendTest);
+  await instance.run_client('app', `
+    const editor={interacting:true,pending:false};sourceRemovalEditors.set('uid',editor);
+    for(const uids of [1,2,3]){
+      state.data.gatcha={busy:true,source_queue:{completed:{uids}}};syncGatchaTaskTerminalMessage();
+    }
+    assert.equal(reads.length,0);
+    editor.interacting=false;BilikaraSourceStatus.flush('uids');
+    assert.deepEqual(reads.map(r=>r[0]),['uids']);
+    syncGatchaTaskTerminalMessage();assert.equal(reads.length,1);
   `);
 });

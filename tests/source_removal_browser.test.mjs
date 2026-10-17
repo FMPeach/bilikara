@@ -11,6 +11,7 @@ import {root} from './desktop_construction_support.mjs';
 import {buildNativeHost, buildNativeAlpha} from './native_runtime_artifacts.mjs';
 import {RunningHost, HttpClient, isolatedEnvironment, waitFor} from './native_host_support.mjs';
 import {localSignaling} from './local_signaling_fixture.mjs';
+import {videoFixture} from './video_service_fixture.mjs';
 
 let executable, androidHost;
 before(async () => {
@@ -35,7 +36,7 @@ const bvid = 'BV1z84y1p7oS';
 const snapshots = [], timings = [], sourceLayouts = [], completed = new WeakSet();
 function save(data, file, value) {writeFileSync(path.join(data,file),JSON.stringify(value));}
 function read(data, file) {return JSON.parse(readFileSync(path.join(data,file),'utf8'));}
-async function fixture(t, {android=false, size=18} = {}) {
+async function fixture(t, {android=false, size=18, environment={}, prepare} = {}) {
   const home = mkdtempSync(path.join(tmpdir(),'bilikara-source-editor-')), data=path.join(home,'data'); mkdirSync(data);
   writeFileSync(path.join(data,'.bilikara-desktop-rust-preview'),'desktop-rust-preview-v1\n');
   const ids=sourceIds.slice(0,size);
@@ -43,15 +44,16 @@ async function fixture(t, {android=false, size=18} = {}) {
   save(data,'gatcha_uids.json',{schema_version:2,uids:ids,profiles:Object.fromEntries(ids.map((id,i)=>[id,{name:`本地 UP ${i+1}`,avatar_url:'/fixture-avatar.png'}]))});
   save(data,'gatcha_cache.json',{schema_version:3,uids:Object.fromEntries(ids.map(id=>[id,[{bvid,title:`Shared song ${id}`}]]))});
   save(data,'gatcha_favlist.json',{schema_version:2,uids:['42'],folders:[{uid:'42',id:'10',title:'我的本地收藏',media_count:1},{uid:'42',id:'11',title:'独立收藏夹',media_count:1},{uid:'43',id:'10',title:'同编号其他 UP',media_count:1}],items:[{bvid,fav_uid:'42',fav_folder_id:'10'},{bvid,fav_uid:'42',fav_folder_id:'11'},{bvid,fav_uid:'43',fav_folder_id:'10'}]});
+  await prepare?.(data);
   let host;
   cleanup(t,async () => {try {if(host)await host.close();} finally {if(completed.has(t))rmSync(home,{recursive:true,force:true});else console.error('Source failure fixture retained:',home);}});
   const start=performance.now();
-  host=await RunningHost.start(android?androidHost:executable,home,android?[data,path.join(root,'static')]:['--headless','--port','0','--data-dir',data,'--static-dir',path.join(root,'static')],isolatedEnvironment(home),android);
+  host=await RunningHost.start(android?androidHost:executable,home,android?[data,path.join(root,'static')]:['--headless','--port','0','--data-dir',data,'--static-dir',path.join(root,'static')],{...isolatedEnvironment(home),...environment},android);
   timings.push({name:android?'android-fixture-start':'desktop-fixture-start',ms:Math.round(performance.now()-start)});
   await host.api('/api/session-users/add',{name:'Fixture singer'});
   return {host,data,ids,async restart() {
     await host.close();
-    host=await RunningHost.start(android?androidHost:executable,home,android?[data,path.join(root,'static')]:['--headless','--port','0','--data-dir',data,'--static-dir',path.join(root,'static')],isolatedEnvironment(home),android);
+    host=await RunningHost.start(android?androidHost:executable,home,android?[data,path.join(root,'static')]:['--headless','--port','0','--data-dir',data,'--static-dir',path.join(root,'static')],{...isolatedEnvironment(home),...environment},android);
     return host;
   }};
 }
@@ -1345,4 +1347,113 @@ test('selection cards share pointer roles, group ordering, drag previews and an 
   assert.deepEqual(style,{outline:'none',border:'1px',cursor:'grab',checkbox:'pointer'});
   await screenshot(page,'session-selection-border');
   assert.deepEqual(errors,[]);await assertMedia(page);completed.add(t);
+});
+
+async function controlledSources(t) {
+  let release;const gate=new Promise(resolve=>{release=resolve;});
+  const provider=await videoFixture(async target=>{
+    const u=new URL(target,'https://api.bilibili.com'),uid=u.searchParams.get('mid')||'42';
+    if(u.pathname.endsWith('/nav'))return {code:0,data:{isLogin:true,wbi_img:{img_url:`https://i0.hdslb.com/${'a'.repeat(32)}.png`,sub_url:`https://i0.hdslb.com/${'b'.repeat(32)}.png`}}};
+    if(u.pathname.endsWith('/acc/info'))return {code:0,data:{mid:Number(uid),name:`本地 UP ${Number(uid)-41}`,face:''}};
+    if(u.pathname.endsWith('/arc/search')){await gate;return {code:0,data:{list:{vlist:[{bvid,title:'Refreshed song',length:'1:30',author:'本地 UP 1'}]}}};}
+    if(u.pathname.endsWith('/list-all'))return {code:0,data:{list:[{id:10,title:'我的本地收藏',attr:0,media_count:1},{id:11,title:'独立收藏夹',attr:0,media_count:1},{id:12,title:'正在拉取的收藏夹',attr:0,media_count:1},{id:13,title:'等待拉取的收藏夹',attr:0,media_count:1}]}};
+    if(u.pathname.endsWith('/resource/list')){await gate;return {code:0,data:{medias:[{bvid,title:'Refreshed favorite',duration:90,upper:{mid:42,name:'本地 UP 1'}}],has_more:false}};}
+    return {code:0,data:{}};
+  });cleanup(t,()=>provider.close());return {provider,release};
+}
+
+test('queued favorite folders remain browsable on Host and Remote during actual native pulls',{timeout:45000},async t=>{
+  const {provider,release}=await controlledSources(t),{host}=await fixture(t,{size:3,environment:{...provider.environment,BILIKARA_CF_API_URL:provider.base},prepare:data=>writeFileSync(path.join(data,'BBDown.data'),'SESSDATA=fixture; bili_jct=fixture')});cleanup(t,release);
+  await host.api('/api/gatcha/favlist',{uid:'42',folder_ids:['12'],folder_titles:{12:'正在拉取的收藏夹'},queue:true});
+  await waitFor(async()=>(await host.api('/api/state')).gatcha.source_queue.active?.folder_ids?.includes('12'),'active local favorite pull');
+  await host.api('/api/gatcha/favlist',{uid:'42',folder_ids:['13'],folder_titles:{13:'等待拉取的收藏夹'},queue:true});
+  for(const remote of [false,true]){
+    const {page,errors}=await browser(t,host,{remote});await sources(page,false,remote);
+    await page.locator(remote?'[data-remote-sources-mode="favorites"]':'[data-sources-mode="favorites"]').click();
+    for(const id of ['12','13']){
+      const reply=page.waitForResponse(r=>new URL(r.url()).pathname==='/api/gatcha/favlist/browse');
+      await page.locator(`#favlist-grid button[data-folder-id="42:${id}"]`).click();await reply;
+      await page.waitForFunction(()=>!state.favlistBrowseLoading);
+      assert.equal(await page.evaluate(()=>state.favlistBrowseSelectedFolderId),`42:${id}`,'native empty saved selection must not bounce a queued folder back');
+      assert.match(await page.locator('#favlist-song-results').innerText(),id==='12'?/拉取/u:/等待拉取/u);
+      assert.match(await page.locator('#favlist-browse-title').innerText(),/收藏夹/u);
+      await screenshot(page,`${remote?'remote':'host'}-favorite-${id}`);await page.locator('#favlist-browse-back').click();
+    }assert.deepEqual(errors,[]);
+  }release();completed.add(t);
+});
+
+for(const source of ['uid','favlist'])test(`${source} completion waits for a real selected-card drag before reloading`,{timeout:45000},async t=>{
+  const {provider,release}=await controlledSources(t),{host}=await fixture(t,{size:3,environment:{...provider.environment,BILIKARA_CF_API_URL:provider.base},prepare:data=>writeFileSync(path.join(data,'BBDown.data'),'SESSDATA=fixture; bili_jct=fixture')});cleanup(t,release);
+  const {page,requests,errors}=await browser(t,host);await sources(page);
+  if(source==='favlist')await page.locator('[data-sources-mode="favorites"]').click();
+  await page.waitForFunction(s=>sourceRemovalEditors.get(s)?.active&&!sourceRemovalEditors.get(s).blocked,source);
+  await host.api(source==='uid'?'/api/gatcha/uids/add':'/api/gatcha/favlist',source==='uid'?{uid:'42',queue:true}:{uid:'42',folder_ids:['10'],folder_titles:{10:'我的本地收藏'},queue:true});
+  await waitFor(async()=>Boolean((await host.api('/api/state')).gatcha.source_queue.active),'local source pull started');
+  const grid=page.locator(source==='uid'?'#follow-up-grid':'#favlist-grid'),footer=page.locator(`.source-tools[data-source="${source}"]`);
+  await footer.locator('.source-select-mode').click();await grid.locator('.source-checkbox').nth(1).check();
+  const button=grid.locator('.source-removal-card .follow-up-button').nth(1),from=await button.boundingBox(),to=await grid.locator('.source-removal-card').first().boundingBox();
+  let reads=0,releaseRead;const gate=new Promise(resolve=>{releaseRead=resolve;});cleanup(t,releaseRead);
+  await page.route(`**${source==='uid'?'/api/gatcha/browse':'/api/gatcha/favlist/browse'}*`,async route=>{reads++;await gate;await route.continue();});
+  await page.mouse.move(from.x+from.width*.65,from.y+from.height/2);await page.mouse.down();await page.mouse.move(to.x+2,to.y+to.height/2,{steps:6});
+  const captured=await button.elementHandle();assert.equal(await page.locator('.source-drag-preview').count(),1);release();
+  await page.waitForFunction(s=>Number(state.data?.gatcha?.source_queue?.completed?.[s==='uid'?'uids':'favorites'])>0,source);
+  assert.equal(reads,0,'completion cannot disable or replace a captured card');
+  assert.equal(await page.evaluate(s=>Boolean(sourceRemovalEditors.get(s).pointer?.dragging),source),true);
+  assert.equal(await captured.evaluate(node=>node.isConnected),true);await screenshot(page,`${source}-drag-survives-completion`);
+  releaseRead();await page.mouse.up();await waitFor(()=>requests.mutations.length===1,'one release submits once');
+  await page.waitForFunction(s=>!sourceRemovalEditors.get(s).pending&&!sourceRemovalEditors.get(s).loading,source);
+  await waitFor(async()=>{const task=(await host.api('/api/state')).gatcha;return !task.background_busy&&!task.source_queue.active&&!task.source_queue.pending.length;},'both actual source workers finish before comparing their terminal snapshot');
+  await settleSourceCompletion(page,host);
+  assert.ok(reads>0,'deferred refresh resumes');assert.equal(requests.mutations[0].edit.action,'move');assert.deepEqual(errors,[]);completed.add(t);
+});
+
+test('editing tooltips share geometry and switching workspaces or source tabs exits selection',{timeout:45000},async t=>{
+  const {host}=await fixture(t,{size:3}),{page,errors}=await browser(t,host);await sources(page);
+  for(const source of ['uid','favlist']){
+    await page.locator(`[data-sources-mode="${source==='uid'?'uids':'favorites'}"]`).click();
+    const footer=page.locator(`.source-tools[data-source="${source}"]`);await footer.locator('.source-select-mode').click();
+    await page.locator(source==='uid'?'#follow-up-grid .source-checkbox':'#favlist-grid .source-checkbox').first().check();
+    for(const selector of ['.source-select-mode','.source-select-page','.source-remove-selected']){
+      const control=footer.locator(selector),id=await control.getAttribute('aria-describedby');assert.ok(id);
+      await control.locator('..').hover();await page.waitForFunction(id=>document.getElementById(id).matches(':popover-open'),id);
+      const tip=page.locator(`#${id}`);await tip.waitFor({state:'visible'});await tip.evaluate(n=>Promise.allSettled(n.getAnimations().map(a=>a.finished)));
+      assert.ok((await tip.innerText()).length>0,id);assert.equal(await tip.evaluate(n=>getComputedStyle(n).fontSize),'13px');
+      await page.mouse.move(1,1);
+    }
+    await page.locator('[data-host-workspace="users"]').click();await page.locator('[data-host-workspace="request"]').click();
+    assert.equal(await footer.locator('.source-select-mode').getAttribute('aria-pressed'),'false');
+    assert.equal(await page.evaluate(s=>sourceRemovalEditors.get(s).selected.size,source),0);
+    await footer.locator('.source-select-mode').click();await page.locator(`[data-sources-mode="${source==='uid'?'favorites':'uids'}"]`).click();
+    assert.equal(await page.evaluate(s=>sourceRemovalEditors.get(s).editing,source),false);
+  }
+  await page.locator('[data-host-workspace="users"]').click();await page.locator('.session-user-tools [data-mode="select"]').click();await page.locator('.session-user-checkbox').first().check();
+  for(const b of await page.locator('.session-user-tools button:visible').all())assert.ok(await b.getAttribute('aria-describedby'));
+  await page.locator('[data-host-workspace="request"]').click();await page.locator('[data-host-workspace="users"]').click();
+  assert.equal(await page.locator('.session-user-tools [data-mode="select"]').getAttribute('aria-pressed'),'false');assert.equal(await page.evaluate(()=>state.sessionUserEditor.selected.size),0);
+  assert.deepEqual(errors,[]);completed.add(t);
+});
+
+for(const [android,width] of [[false,700],[true,360],[true,320]])test(`${android?'Android':'desktop'} ${width}px UP and favorites detail hover and scroll remain below their fixed header`,{timeout:45000},async t=>{
+  const songs=Array.from({length:40},(_,i)=>({bvid:`BV1z84y1p7A${'123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'[i]}`,title:`本地歌曲 ${i+1}`}));
+  const {host}=await fixture(t,{android,size:3,prepare:data=>{
+    const cache=read(data,'gatcha_cache.json');cache.uids['42']=songs;save(data,'gatcha_cache.json',cache);
+    const f=read(data,'gatcha_favlist.json');f.folders.find(folder=>folder.uid==='42'&&folder.id==='10').media_count=songs.length;
+    f.items=songs.map(s=>({...s,fav_uid:'42',fav_folder_id:'10'}));save(data,'gatcha_favlist.json',f);
+  }}),{page,errors}=await browser(t,host,{android});
+  if(android)await page.setViewportSize({width,height:640});await sources(page,android);
+  for(const favorite of [false,true]){
+    if(favorite)await page.locator('[data-sources-mode="favorites"]').click();
+    await page.locator(favorite?'#favlist-grid button[data-folder-id="42:10"]':'#follow-up-grid button[data-uid="42"]').click();
+    const outer=page.locator(favorite?'#request-sources-favorites-scroll':'#request-sources-followed-scroll'),results=page.locator(favorite?'#favlist-song-results':'#follow-song-results'),back=page.locator(favorite?'#favlist-browse-back':'#follow-browse-back');
+    await results.locator('.search-result-item').first().waitFor({state:'visible'});
+    for(const control of [back,page.locator(favorite?'#favlist-items-view .browse-search-cancel':'#follow-up-items-view .browse-search-cancel')]){
+      await control.hover();await control.evaluate(n=>Promise.allSettled(n.getAnimations().map(a=>a.finished)));
+      const b=await control.boundingBox(),p=await outer.boundingBox();assert.ok(b.y>=p.y,JSON.stringify({b,p}));
+      assert.equal(await control.evaluate(n=>{const b=n.getBoundingClientRect();return n.contains(document.elementFromPoint(b.x+b.width/2,b.y+1));}),true);
+    }
+    await page.mouse.move(1,1);const header=await back.boundingBox();await results.hover();await page.mouse.wheel(0,600);
+    await page.waitForFunction(id=>document.getElementById(id).scrollTop>0,favorite?'favlist-song-results':'follow-song-results');
+    assert.equal(await outer.evaluate(n=>n.scrollTop),0);assert.deepEqual(await back.boundingBox(),header);
+    await screenshot(page,`${android?'android':'desktop'}-${width}-${favorite?'favorite':'up'}-detail-scroll`);await back.click();
+  }assert.deepEqual(errors,[]);completed.add(t);
 });

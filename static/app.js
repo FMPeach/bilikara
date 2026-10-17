@@ -3918,7 +3918,7 @@ function activeRequestScrollOwner() {
   if (subview === "sources") {
     const mode = normalizeSourcesMode(state.sourcesMode);
     if (mode === "favorites") {
-      return elements.sourcesFavoritesScroll;
+      return state.favlistBrowseSelectedFolderId ? elements.favlistSongResults : elements.sourcesFavoritesScroll;
     }
     return state.followBrowseSelectedUid
       ? elements.followSongResults
@@ -4833,7 +4833,10 @@ function activateHostWorkspace(workspace, { inputOrigin = "pointer" } = {}) {
     rememberRequestScrollPosition();
   }
   const changed = state.activeHostWorkspace !== nextWorkspace;
-  if (changed) leaveSourceEditors();
+  if (changed) {
+    leaveSourceEditors();
+    state.sessionUserEditor?.setMode("");
+  }
   const interactiveActivation = inputOrigin === "pointer" || inputOrigin === "keyboard";
   if (changed && interactiveActivation) {
     beginHostWorkspaceTransition(state.activeHostWorkspace, nextWorkspace);
@@ -9013,6 +9016,11 @@ function followOwnerDisplayName(owner) {
 }
 
 const sourceRemovalEditors = new Map();
+function sourceBrowseReady(source) {
+  const editor = sourceRemovalEditors.get(source);
+  return !(source === "uid" ? state.followBrowseLoading : state.favlistBrowseLoading)
+    && !editor?.interacting && !editor?.pending;
+}
 function leaveSourceEditors() {
   for (const editor of sourceRemovalEditors.values()) editor?.leave();
 }
@@ -9022,6 +9030,8 @@ function sourceRemovalEditor(source) {
       source === "uid" ? elements.followUpGrid : elements.favlistGrid, {
         source, translate: t, reportError: message => setAppMessage(message, true),
         message: setAppMessage,
+        bindHelp: info => bindHostContextualInfo(info, { actionHelp: false }),
+        onIdle: () => window.BilikaraSourceStatus?.flush(source === "uid" ? "uids" : "favorites"),
         post: body => apiPost("/api/gatcha/sources/edit", body),
         reload: async () => {
           state.gatchaCandidate = null;
@@ -9100,6 +9110,7 @@ function updateHostSourceEditor(source, entries, data, {loading, detail, filter,
       : String(entry.title || (entry.placeholder ? t("favlist.folder") + " " + entry.folder_id : entry.id || t("favlist.folder"))),
   }));
   editor?.update({records, version:data?.source_order_version, editable:data?.source_order_editable,
+    editRevision:state.data?.gatcha?.source_edit_revisions?.[source === "uid" ? "uids" : "favorites"],
     count:data?.source_order_count, loading,
     active:!detail && state.requestSubview === "sources"
       && state.sourcesMode === (source === "uid" ? "uids" : "favorites")
@@ -9218,7 +9229,7 @@ async function refreshFollowBrowseAfterGatchaUidAdd(uid = "") {
 
 function selectedFavlistFolder() {
   const folders = Array.isArray(state.favlistBrowseData?.folders) ? state.favlistBrowseData.folders : [];
-  return folders.find((folder) => String(folder.id || "") === state.favlistBrowseSelectedFolderId) || null;
+  return window.BilikaraSourceStatus.selectedFolder(state.data?.gatcha, folders, state.favlistBrowseSelectedFolderId);
 }
 
 function renderFavlistBrowse() {
@@ -9227,6 +9238,7 @@ function renderFavlistBrowse() {
   }
   const folders = Array.isArray(state.favlistBrowseData?.folders) ? state.favlistBrowseData.folders : [];
   const items = Array.isArray(state.favlistBrowseData?.items) ? state.favlistBrowseData.items : [];
+  elements.sourcesFavoritesScroll?.classList.toggle("is-detail-view", Boolean(state.favlistBrowseSelectedFolderId));
   const placeholders = window.BilikaraSourceStatus?.queuedSources?.(state.data?.gatcha, "favorites",
     folders.map((folder) => folder?.folder_id || folder?.id)) || [];
   const signature = JSON.stringify({
@@ -9308,9 +9320,8 @@ async function loadFavlistBrowse({
       return;
     }
     state.favlistBrowseData = nextData;
-    state.favlistBrowseSelectedFolderId = String(
-      nextData.selected_folder_id ?? state.favlistBrowseSelectedFolderId ?? "",
-    );
+    state.favlistBrowseSelectedFolderId = window.BilikaraSourceStatus.selectedFolderId(
+      state.data?.gatcha, nextData.selected_folder_id, state.favlistBrowseSelectedFolderId);
     if (!keepQuery && elements.favlistSearchQuery) {
       elements.favlistSearchQuery.value = String(nextData.query || "");
     }
@@ -9346,19 +9357,10 @@ async function refreshFavlistBrowseAfterPull() {
 function scheduleFavlistBrowseReloadFromState(previousSnapshot, nextSnapshot) {
   const previousUpdatedAt = Number(previousSnapshot?.gatcha_favlist_updated_at || 0);
   const nextUpdatedAt = Number(nextSnapshot?.gatcha_favlist_updated_at || 0);
-  if (!state.favlistBrowseData || state.favlistBrowseLoading || !nextUpdatedAt || nextUpdatedAt <= previousUpdatedAt) {
+  if (!state.favlistBrowseData || !nextUpdatedAt || nextUpdatedAt <= previousUpdatedAt) {
     return;
   }
-  if (state.favlistBrowseReloadTimer) {
-    window.clearTimeout(state.favlistBrowseReloadTimer);
-  }
-  state.favlistBrowseReloadTimer = window.setTimeout(() => {
-    state.favlistBrowseReloadTimer = null;
-    if (!state.favlistBrowseData || state.favlistBrowseLoading) {
-      return;
-    }
-    refreshFavlistBrowseAfterPull();
-  }, 0);
+  window.BilikaraSourceStatus?.queueReload("favorites", () => sourceBrowseReady("favlist"), refreshFavlistBrowseAfterPull);
 }
 
 async function previewGatchaUidAddFromInput(input, {
@@ -9841,7 +9843,7 @@ function syncGatchaTaskTerminalMessage() {
     setGatchaUidMessage(detail, status !== "success");
   }
   // Each committed source becomes visible while the rest of the batch runs.
-  if ((completed || changedSources.includes("uids")) && (state.followBrowseData || state.followBrowseLoading)) window.BilikaraSourceStatus?.queueReload("uids", () => !state.followBrowseLoading, () => {
+  if ((completed || changedSources.includes("uids")) && (state.followBrowseData || state.followBrowseLoading)) window.BilikaraSourceStatus?.queueReload("uids", () => sourceBrowseReady("uid"), () => {
     state.followBrowseRenderSignature = "";
     void loadFollowBrowse({
       uid: state.followBrowseSelectedUid,
@@ -9849,7 +9851,7 @@ function syncGatchaTaskTerminalMessage() {
       keepQuery: true,
     });
   });
-  if ((completed || changedSources.includes("favorites")) && (state.favlistBrowseData || state.favlistBrowseLoading)) window.BilikaraSourceStatus?.queueReload("favorites", () => !state.favlistBrowseLoading, () => {
+  if ((completed || changedSources.includes("favorites")) && (state.favlistBrowseData || state.favlistBrowseLoading)) window.BilikaraSourceStatus?.queueReload("favorites", () => sourceBrowseReady("favlist"), () => {
     state.favlistBrowseRenderSignature = "";
     void loadFavlistBrowse({
       folderId: state.favlistBrowseSelectedFolderId,
@@ -22236,13 +22238,13 @@ elements.favlistGrid?.addEventListener("click", async (event) => {
     t("favlist.loadingItems"),
     () => loadFavlistBrowse({ folderId, query: "" }),
   );
-  if (elements.sourcesFavoritesScroll) {
-    elements.sourcesFavoritesScroll.scrollTop = state.sourceItemScrollPositions.favorites;
+  if (elements.favlistSongResults) {
+    elements.favlistSongResults.scrollTop = state.sourceItemScrollPositions.favorites;
   }
 });
 
 elements.favlistBrowseBack?.addEventListener("click", () => {
-  state.sourceItemScrollPositions.favorites = Number(elements.sourcesFavoritesScroll?.scrollTop || 0);
+  state.sourceItemScrollPositions.favorites = Number(elements.favlistSongResults?.scrollTop || 0);
   state.favlistBrowseSelectedFolderId = "";
   if (elements.favlistSearchQuery) {
     elements.favlistSearchQuery.value = "";
@@ -22313,9 +22315,14 @@ elements.followSongResults?.addEventListener("scroll", () => {
 });
 
 elements.sourcesFavoritesScroll?.addEventListener("scroll", () => {
-  const bucket = state.favlistBrowseSelectedFolderId ? state.sourceItemScrollPositions : state.sourceParentScrollPositions;
-  bucket.favorites = Number(elements.sourcesFavoritesScroll.scrollTop || 0);
-  state.requestScrollPositions.sources.favorites = bucket.favorites;
+  if (state.favlistBrowseSelectedFolderId) return;
+  state.sourceParentScrollPositions.favorites = Number(elements.sourcesFavoritesScroll.scrollTop || 0);
+  state.requestScrollPositions.sources.favorites = state.sourceParentScrollPositions.favorites;
+});
+elements.favlistSongResults?.addEventListener("scroll", () => {
+  if (!state.favlistBrowseSelectedFolderId) return;
+  state.sourceItemScrollPositions.favorites = Number(elements.favlistSongResults.scrollTop || 0);
+  state.requestScrollPositions.sources.favorites = state.sourceItemScrollPositions.favorites;
 });
 
 elements.gatchaStage?.addEventListener("scroll", () => {

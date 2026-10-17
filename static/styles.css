@@ -9800,15 +9800,6 @@ body[data-tauri-platform="linux"] .app-shell {
   max-height: none;
 }
 
-/* Favorites use the outer source viewport. The old ID-specific search rule
-   made this full-content-height grid an overscroll-containment trap: it could
-   not scroll itself and swallowed wheel/touch input meant for its parent. */
-#host-workspace-request #favlist-song-results {
-  height: auto;
-  overflow: visible;
-  overscroll-behavior: auto;
-}
-
 @media (max-width: 1230px) {
   .topbar {
     padding-left: 13px;
@@ -10463,25 +10454,27 @@ body.is-presentation-stage-only .left-column {
 
 /* In an UP detail, only the card list scrolls; its title and query controls
    remain fixed and the outer Sources scrollbar is suppressed. */
-#request-sources-followed-scroll.is-detail-view {
+.request-sources-view .source-browse-scroll.is-detail-view {
   overflow-y: hidden;
   padding-right: 0;
   scrollbar-gutter: auto;
 }
 
-#request-sources-followed-scroll.is-detail-view .follow-browser {
+.request-sources-view .source-browse-scroll.is-detail-view > :is(.follow-browser, .favlist-browser) {
   height: 100%;
   grid-template-rows: minmax(0, 1fr) auto;
   overflow: hidden;
 }
 
-#request-sources-followed-scroll.is-detail-view .follow-up-items-view {
+.request-sources-view .source-browse-scroll.is-detail-view .follow-up-items-view {
   height: 100%;
+  padding-top: 2px;
+  box-sizing: border-box;
   grid-template-rows: auto minmax(0, 1fr);
   overflow: hidden;
 }
 
-#request-sources-followed-scroll.is-detail-view #follow-song-results {
+.request-sources-view .source-browse-scroll.is-detail-view :is(#follow-song-results, #favlist-song-results) {
   height: 100%;
   min-height: 0;
   overflow-y: auto;
@@ -12025,7 +12018,7 @@ html .volume-adjust-popover::backdrop {
 .internet-remote-disclosure-chevron { flex: 0 0 18px; }
 
 /* Result viewports use the same bottom/side inset; an empty status adds no row. */
-#request-sources-followed-scroll.is-detail-view .follow-browser { grid-template-rows: minmax(0, 1fr); }
+.request-sources-view .source-browse-scroll.is-detail-view > :is(.follow-browser, .favlist-browser) { grid-template-rows: minmax(0, 1fr); }
 .cache-update-actions { gap: 8px; }
 
 .confirm-manual-update { margin: 12px 0 0; font-size: 13px; line-height: 1.45; color: var(--muted); }
@@ -12062,6 +12055,8 @@ html .volume-adjust-popover::backdrop {
   gap: 8px;
   min-width: 0;
 }
+.editing-tool-help { flex: 0 0 auto; }
+.editing-tool-help[hidden] { display: none !important; }
 .session-user-selection-count, .source-selection-count { margin-inline-end: auto; }
 .session-user-selection-count, .source-selection-count { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; color: var(--muted); }
 .session-user-badge { max-width: 100%; box-sizing: border-box; }

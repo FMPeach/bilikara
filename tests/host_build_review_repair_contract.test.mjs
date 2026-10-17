@@ -443,7 +443,8 @@ let owner;
 owner = this.script.slice(sourceIndex(this.script, "function activeRequestScrollOwner"), sourceIndex(this.script, "function normalizedD1BrowseLevel"));
 assert.ok(contains("state.followBrowseSelectedUid", owner));
 assert.ok(contains("elements.followSongResults", owner));
-assert.ok(contains("#request-sources-followed-scroll.is-detail-view #follow-song-results", this.styles));
+assert.ok(contains("state.favlistBrowseSelectedFolderId ? elements.favlistSongResults : elements.sourcesFavoritesScroll", owner));
+assert.ok(contains(".source-browse-scroll.is-detail-view :is(#follow-song-results, #favlist-song-results)", this.styles));
 assert.ok(contains("overflow-y: hidden", this.styles));
 assert.ok(contains("overflow-y: auto", this.styles));
 },

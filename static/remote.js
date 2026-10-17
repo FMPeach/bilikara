@@ -4948,7 +4948,7 @@ function paginatedBrowseStatus(items, { loading, loadingText, emptyText = "" }) 
 
 function selectedFavlistFolder() {
   const folders = Array.isArray(state.favlistBrowseData?.folders) ? state.favlistBrowseData.folders : [];
-  return folders.find((folder) => String(folder.id || "") === state.favlistBrowseSelectedFolderId) || null;
+  return window.BilikaraSourceStatus.selectedFolder(state.data?.gatcha, folders, state.favlistBrowseSelectedFolderId);
 }
 
 function renderFavlistBrowse() {
@@ -5080,9 +5080,8 @@ async function loadFavlistBrowse({
       ...nextData,
       items: mergeBrowseItems(previousItems, nextData.items),
     };
-    state.favlistBrowseSelectedFolderId = String(
-      nextData.selected_folder_id ?? state.favlistBrowseSelectedFolderId ?? "",
-    );
+    state.favlistBrowseSelectedFolderId = window.BilikaraSourceStatus.selectedFolderId(
+      state.data?.gatcha, nextData.selected_folder_id, state.favlistBrowseSelectedFolderId);
     if (!keepQuery && elements.favlistSearchQuery) {
       elements.favlistSearchQuery.value = String(nextData.query || "");
     }

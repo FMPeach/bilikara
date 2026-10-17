@@ -35,6 +35,21 @@ test('source completion observes coalesced same-second order changes once and ig
   assert.equal(takeCompletion({...updated,last_result:{operation:'remove_sources',source_order_version:'c'.repeat(64)}}),true);
 });
 
+test('only trusted pending folders retain an empty saved-library selection, with their shared title',()=>{
+  const context={window:{}};vm.runInNewContext(read('static/source-status.js'),context);
+  const {selectedFolderId,selectedFolder}=context.window.BilikaraSourceStatus;
+  const task={source_queue:{active:{uid:'42',folder_ids:['12'],folder_titles:{12:'Fixture favorites'}},pending:[{uid:'43',folder_ids:['13']}]}};
+  assert.equal(selectedFolderId(task,'','42:12'),'42:12');
+  assert.equal(selectedFolderId(task,'','43:13'),'43:13');
+  assert.equal(selectedFolderId(task,'','43:12'),'');
+  assert.equal(selectedFolderId(task,'','99:99'),'');
+  assert.equal(selectedFolderId({},'','42:12'),'');
+  assert.equal(selectedFolderId({},'42:10','42:12'),'42:10');
+  assert.equal(selectedFolder(task,[],'42:12').title,'Fixture favorites');
+  assert.equal(selectedFolder(task,[{id:'42:12',title:'Saved title'}],'42:12').title,'Saved title');
+  assert.equal(selectedFolder(task,[],'43:12'),null);
+});
+
 test('Remote never loads or mounts the editor; legacy removal transport and shared pagination stay owned',()=>{
   const remote=read('static/remote.js'),html=read('static/remote.html'),sync=read('scripts/sync_internet_remote_assets.ps1');
   for(const source of [remote,html,sync])assert.doesNotMatch(source,/BilikaraSourceRemoval|source-removal\.(?:js|css)|sourceRemovalEditor/u);

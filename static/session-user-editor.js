@@ -9,6 +9,21 @@
   class SessionUserEditor {
     static get selectionIcon() { return checklist; }
     static get trashIcon() { return trash; }
+    static toolHelp(button, id, bindHelp, slot) {
+      const region = slot || document.createElement("span");
+      if (!slot) { button.before(region); region.append(button); }
+      region.classList.add("editing-tool-help", "cache-advanced-info");
+      const tooltip = region.querySelector(".cache-advanced-tooltip") || document.createElement("span");
+      tooltip.className = "cache-advanced-tooltip"; tooltip.id = id; tooltip.setAttribute("role", "tooltip");
+      if (!tooltip.parentElement) region.append(tooltip);
+      button.setAttribute("data-contextual-info-anchor", ""); button.setAttribute("aria-describedby", id);
+      if (slot) region.setAttribute("aria-describedby", id);
+      bindHelp?.(region);
+      return label => {
+        tooltip.textContent = label; button.removeAttribute("title");
+        if (!slot) region.hidden = button.hidden;
+      };
+    }
 
     constructor({ stage, list, t, post, message, bindHelp }) {
       this.stage = stage;
@@ -35,9 +50,11 @@
       stage.append(this.footer);
       this.trash = this.footer.querySelector(".session-user-trash");
       this.trashSlot = this.trash.parentElement;
-      bindHelp?.(this.trashSlot);
       this.all = this.footer.querySelector(".session-user-select-all");
       this.count = this.footer.querySelector(".session-user-selection-count");
+      this.help = new Map([...this.footer.querySelectorAll("button")].map((button, index) => [button,
+        SessionUserEditor.toolHelp(button, button === this.trash ? "session-user-trash-help" : `session-user-tool-help-${index}`,
+          bindHelp, button === this.trash ? this.trashSlot : null)]));
       this.footer.addEventListener("click", event => {
         if (this.busy) return;
         const mode = event.target.closest("[data-mode]");
@@ -184,6 +201,9 @@
       this.trash.disabled = this.busy || (!this.drag && (this.mode !== "select" || !this.selected.size));
       this.trash.setAttribute("aria-label", this.t("session.deleteSelected"));
       this.trashSlot.querySelector('.cache-advanced-tooltip').textContent = this.t("session.dragToDelete");
+      for (const [button, syncHelp] of this.help) syncHelp(button === this.trash ? this.t("session.dragToDelete")
+        : button.getAttribute("aria-pressed") === "true" && button.dataset.mode ? this.t("sources.doneSelecting")
+        : button.getAttribute("aria-label") || button.textContent);
       if (this.busy) this.footer.setAttribute("aria-busy", "true"); else this.footer.removeAttribute("aria-busy");
       if (this.editor) {
         this.editor.node.setAttribute("aria-label", this.t("remoteIdentity.renameTitle"));

@@ -177,6 +177,43 @@ for (const variant of ['morph','slide']) test(`real Remote first-use and ${varia
     assert.equal(await remote.evaluate(()=>playbackSheetGesture.active),true);
     await screen('body-swipe-closing');await touch('touchEnd');await idle();await sheet.waitFor({state:'hidden'});
     await openByClick();
+    // An ordinary control keeps its tap/jitter behavior. A deliberate vertical
+    // drag from that same real target closes without dispatching its action.
+    const play=remote.locator('[data-control-action="toggle-play"]'),controlBox=await play.boundingBox();
+    const beforeTap=commands.length;
+    for(let i=0;i<2;i++){
+      const reply=remote.waitForResponse(r=>new URL(r.url()).pathname==='/api/player/control');
+      await touch('touchStart',controlBox.x+controlBox.width/2,controlBox.y+controlBox.height/2);
+      await touch('touchMove',controlBox.x+controlBox.width/2+2,controlBox.y+controlBox.height/2+3);
+      await touch('touchEnd');await reply;await remote.waitForFunction(()=>!state.playerControlPendingAction);
+      assert.equal(commands.length,beforeTap+i+1,'small pointer jitter retains a single ordinary activation');
+      assert.equal(await remote.evaluate(()=>state.playbackSheetOpen&&!playbackSheetGesture.active),true);
+    }
+    commands.splice(beforeTap);
+    const beforeDrag=commands.length;
+    await touch('touchStart',controlBox.x+controlBox.width/2,controlBox.y+controlBox.height/2);
+    for(const dy of [16,60,130,220]){await touch('touchMove',controlBox.x+controlBox.width/2,controlBox.y+controlBox.height/2+dy);await delay(25);}
+    assert.equal(await remote.evaluate(()=>playbackSheetGesture.active),true,'vertical intent can start on an ordinary button');
+    await screen('button-drag-active');await touch('touchEnd');await idle();
+    assert.equal(commands.length,beforeDrag,'releasing a claimed button gesture must not play/pause');
+    // This short movement straddles slide's halfway point; its velocity may
+    // settle either way. A top-row button permits a position-based close that
+    // is independent of dispatch speed on a loaded browser runner.
+    if(await remote.evaluate(()=>state.playbackSheetOpen))await closeByClick();
+    await openByClick();
+    const ratingBox=await remote.locator('#open-rating-button').boundingBox();assert.ok(ratingBox);
+    const distance=await remote.evaluate(()=>.65*(innerHeight-document.querySelector('#playback-sheet-panel').getBoundingClientRect().top));
+    const ratingX=ratingBox.x+ratingBox.width/2,ratingY=ratingBox.y+ratingBox.height/2;
+    assert.ok(ratingY+distance<700,'the deliberate close stays within the touch viewport');
+    await touch('touchStart',ratingX,ratingY);
+    for(const fraction of [.1,.3,.6,1]){await touch('touchMove',ratingX,ratingY+distance*fraction);await delay(25);}
+    await screen('button-swipe-closing');await touch('touchEnd');await idle();await sheet.waitFor({state:'hidden'});
+    assert.equal(await remote.locator('.rating-modal').count(),0,'the claimed release cannot open a rating dialog');
+    await openByClick();
+    for(const id of ['current-requester','current-meta','current-cache-state'])assert.equal(await remote.locator(`#${id}`).evaluate(n=>getComputedStyle(n).userSelect),'none');
+    const prose=await remote.locator('#current-requester').boundingBox();
+    await touch('touchStart',prose.x+prose.width/2,prose.y+prose.height/2);await delay(550);await touch('touchEnd');
+    assert.equal(await remote.evaluate(()=>String(getSelection())),'','holding playback metadata cannot select text');
     const field=await remote.locator('#remote-av-offset-input').boundingBox();
     await touch('touchStart',field.x+field.width/2,field.y+field.height/2);
     await touch('touchMove',field.x+field.width/2,field.y+field.height/2+120);await touch('touchEnd');
