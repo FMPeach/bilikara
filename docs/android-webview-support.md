@@ -60,6 +60,19 @@ or accept a website-supplied package/URL. Store support varies by vendor; a
 component with no listing may need the manufacturer's system update. Reopen
 bilikara after updating, without clearing its data.
 
+A store accepting the link does **not** prove that the package is listed or an
+update exists. Availability depends on the actual provider and device/region
+ROM, not just the MIUI, ColorOS or OriginOS name. If the vendor supplies neither
+an independent component update nor a suitable system update, this action
+cannot resolve compatibility. Installing a newer browser or an arbitrary
+WebView APK does not establish that the Host's provider changed: production
+devices enforce configured provider/package/signature restrictions. See
+[Chromium's provider requirements](https://chromium.googlesource.com/chromium/src/+/main/android_webview/docs/webview-providers.md)
+and [vendor update distribution](https://chromium.googlesource.com/chromium/src/+/main/android_webview/docs/aosp-system-integration.md).
+An emulator's successful provider update does not qualify that update path on
+a retail device. Supporting an engine that cannot be updated requires software
+compatibility work; diagnostics and update links alone do not provide it.
+
 Android documents the [active-provider lookup and update lifecycle](https://developer.android.com/reference/androidx/webkit/WebViewCompat#getCurrentWebViewPackage(android.content.Context))
 and the [component settings action](https://developer.android.com/reference/android/provider/Settings#ACTION_APPLICATION_DETAILS_SETTINGS).
 The full Host action uses the existing main-frame, exact local-origin bridge;

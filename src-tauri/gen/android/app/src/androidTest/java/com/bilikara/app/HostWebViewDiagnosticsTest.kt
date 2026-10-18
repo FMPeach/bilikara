@@ -10,6 +10,7 @@ import androidx.test.espresso.Espresso.onView
 import androidx.test.espresso.action.ViewActions.click
 import androidx.test.espresso.assertion.ViewAssertions.matches
 import androidx.test.espresso.matcher.ViewMatchers.isDisplayed
+import androidx.test.espresso.matcher.ViewMatchers.withId
 import androidx.test.espresso.matcher.ViewMatchers.withText
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -25,6 +26,18 @@ import java.util.concurrent.atomic.AtomicReference
 
 @RunWith(AndroidJUnit4::class)
 class HostWebViewDiagnosticsTest {
+  @Test fun adviceDoesNotAskPassedOrIncompleteChecksToUpdate() {
+    val passed = HostWebViewDiagnostics.statusMessage(113, true, 0)
+    assertTrue(passed.contains("可以关闭此窗口继续使用"))
+    assertFalse(passed.contains("请更新"))
+    assertTrue(HostWebViewDiagnostics.statusMessage(101, true, 4).contains("请更新"))
+    assertTrue(HostWebViewDiagnostics.statusMessage(113, false, 0).contains("请更新"))
+    val incomplete = HostWebViewDiagnostics.statusMessage(113, true, null)
+    assertTrue(incomplete.contains("未能完成"))
+    assertFalse(incomplete.contains("请更新"))
+    assertTrue(HostWebViewDiagnostics.statusMessage(null, true, 0).contains("未能确认"))
+  }
+
   // Use the standard Espresso device setup (system animations off).
   @Test fun updateActionTargetsActualProviderWithoutContactingAnyStore() {
     val instrumentation = InstrumentationRegistry.getInstrumentation()
@@ -50,6 +63,14 @@ class HostWebViewDiagnosticsTest {
         assertTrue("Native diagnostic report settled", reportReady.await(5, TimeUnit.SECONDS))
         instrumentation.waitForIdleSync()
         onView(withText("WebView 自诊断")).check(matches(isDisplayed()))
+        if (provider.versionName!!.substringBefore('.').toInt() >= HostWebViewDiagnostics.UI_CHROMIUM_BASELINE) {
+          onView(withId(android.R.id.message)).check { view, error ->
+            if (error != null) throw error
+            val message = (view as android.widget.TextView).text.toString()
+            assertTrue("Supported engine must not look blocked", message.contains("可以关闭此窗口继续使用"))
+            assertFalse("No unconditional update advice after passing", message.contains("请更新"))
+          }
+        }
         onView(withText("检查更新")).perform(click())
         assertEquals(Intent.ACTION_VIEW, captured.get()?.action)
         assertEquals(provider.packageName, captured.get()?.data?.getQueryParameter("id"))

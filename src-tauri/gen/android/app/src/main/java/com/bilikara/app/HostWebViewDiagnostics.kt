@@ -53,6 +53,14 @@ internal class HostWebViewDiagnostics(private val activity: AppCompatActivity) {
 
     internal fun componentIntent(providerPackage: String) = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
       Uri.fromParts("package", providerPackage, null))
+
+    internal fun statusMessage(major: Int?, bridge: Boolean, missing: Int?): String = when {
+      major == null -> "未能确认当前 WebView 版本，请复制诊断信息排查；这不代表检测通过。"
+      major < UI_CHROMIUM_BASELINE || !bridge || (missing != null && missing > 0) ->
+        "当前 WebView 未满足已检查的界面能力要求。请更新当前实际使用的组件，再重新打开 bilikara。无需清除应用数据。"
+      missing == null -> "未能完成网页能力检测，请复制诊断信息排查；这不代表检测通过。"
+      else -> "当前 WebView 已通过基础能力检查。可以关闭此窗口继续使用；若仍有故障，请复制诊断信息协助排查。"
+    }
   }
 
   private var dialog: AlertDialog? = null
@@ -71,14 +79,14 @@ internal class HostWebViewDiagnostics(private val activity: AppCompatActivity) {
     if (dialog?.isShowing == true || activity.isFinishing || activity.isDestroyed) return
     val provider = WebViewCompat.getCurrentWebViewPackage(activity)
     val bridge = WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)
-    val summary = "完整界面需要 Chromium $UI_CHROMIUM_BASELINE 及以上能力，并支持原生消息桥。" +
-      "请更新当前实际使用的组件，再重新打开 bilikara。无需清除应用数据。"
+    val major = provider?.versionName?.substringBefore('.')?.toIntOrNull()
     val base = "Android ${Build.VERSION.RELEASE} / API ${Build.VERSION.SDK_INT}\n" +
       "WebView: ${provider?.packageName ?: "未识别"}\n版本: ${provider?.versionName ?: "未知"}\n" +
+      "界面能力基线: Chromium $UI_CHROMIUM_BASELINE\n" +
       "原生消息桥: ${if (bridge) "支持" else "不支持"}"
     report = "$base\n网页能力: 检测中"
     val current = AlertDialog.Builder(activity).setTitle("WebView 自诊断")
-      .setMessage("$summary\n\n$report")
+      .setMessage("正在检测当前 WebView…\n\n$report")
       .setPositiveButton("检查更新", null)
       .setNeutralButton("复制诊断", null)
       .setNegativeButton("关闭", null).create()
@@ -108,7 +116,7 @@ internal class HostWebViewDiagnostics(private val activity: AppCompatActivity) {
         "\n检测页: ${facts.optString("document_origin")}\n检测页安全上下文: ${facts.optBoolean("secure_context")}\nWebRTC: ${facts.optBoolean("web_rtc")}" +
         " / WebAudio: ${facts.optBoolean("web_audio")} / AudioWorklet: ${facts.optBoolean("audio_worklet")}" +
         " / WASM: ${facts.optBoolean("web_assembly")}\nUA: ${facts.optString("user_agent") }"
-      current.setMessage("$summary\n\n$report")
+      current.setMessage("${statusMessage(major, bridge, missing?.length())}\n\n$report")
     }
   }
 
