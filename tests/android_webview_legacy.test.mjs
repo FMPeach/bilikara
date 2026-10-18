@@ -75,7 +75,8 @@ test('actual pre-93 Chromium can render the Android compatibility message before
   await send('Page.navigate', { url: 'http://127.0.0.1:' + server.address().port + '/' });
   await loaded;
   const status = (await send('Runtime.evaluate', { expression: 'document.getElementById("bootstrap-status").textContent', returnByValue: true })).result.value;
-  assert.match(status, /Android System WebView.*请在系统应用商店更新/);
+  assert.match(status, /Android System WebView.*WebView 兼容性自检/);
+  assert.doesNotMatch(status, /系统应用商店|请更新/u);
   assert.match(status, /无需清除应用数据/);
   assert.deepEqual(errors, []);
 });

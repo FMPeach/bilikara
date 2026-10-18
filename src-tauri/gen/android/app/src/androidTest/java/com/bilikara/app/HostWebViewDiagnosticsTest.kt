@@ -1,6 +1,5 @@
 package com.bilikara.app
 
-import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.util.Log
 import android.webkit.WebView
@@ -8,6 +7,7 @@ import android.webkit.WebViewClient
 import androidx.test.core.app.ActivityScenario
 import androidx.test.espresso.Espresso.onView
 import androidx.test.espresso.action.ViewActions.click
+import androidx.test.espresso.assertion.ViewAssertions.doesNotExist
 import androidx.test.espresso.assertion.ViewAssertions.matches
 import androidx.test.espresso.matcher.ViewMatchers.isDisplayed
 import androidx.test.espresso.matcher.ViewMatchers.withId
@@ -22,16 +22,16 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicReference
 
 @RunWith(AndroidJUnit4::class)
 class HostWebViewDiagnosticsTest {
-  @Test fun adviceDoesNotAskPassedOrIncompleteChecksToUpdate() {
+  @Test fun adviceExplainsCompatibilityWithoutAskingForAnUpdate() {
     val passed = HostWebViewDiagnostics.statusMessage(113, true, 0)
     assertTrue(passed.contains("可以关闭此窗口继续使用"))
     assertFalse(passed.contains("请更新"))
-    assertTrue(HostWebViewDiagnostics.statusMessage(101, true, 4).contains("请更新"))
-    assertTrue(HostWebViewDiagnostics.statusMessage(113, false, 0).contains("请更新"))
+    assertTrue(HostWebViewDiagnostics.statusMessage(101, true, 4).contains("暂不兼容"))
+    assertFalse(HostWebViewDiagnostics.statusMessage(101, true, 4).contains("请更新"))
+    assertTrue(HostWebViewDiagnostics.statusMessage(113, false, 0).contains("暂不兼容"))
     val incomplete = HostWebViewDiagnostics.statusMessage(113, true, null)
     assertTrue(incomplete.contains("未能完成"))
     assertFalse(incomplete.contains("请更新"))
@@ -39,58 +39,56 @@ class HostWebViewDiagnosticsTest {
   }
 
   // Use the standard Espresso device setup (system animations off).
-  @Test fun updateActionTargetsActualProviderWithoutContactingAnyStore() {
+  @Test fun reportCanBeCopiedAndClosedWithoutAnyUpdateAction() {
     val instrumentation = InstrumentationRegistry.getInstrumentation()
     val context = instrumentation.targetContext
     val provider = WebViewCompat.getCurrentWebViewPackage(context)!!
-    val captured = AtomicReference<Intent>()
     val reportReady = CountDownLatch(1)
     ActivityScenario.launch<WindowTestActivity>(Intent(context, WindowTestActivity::class.java)).use { scenario ->
       lateinit var diagnostics: HostWebViewDiagnostics
       lateinit var webView: WebView
+      lateinit var clipboard: android.content.ClipboardManager
+      var previousClip: android.content.ClipData? = null
       scenario.onActivity { activity ->
-        activity.externalActivity = { intent -> captured.set(intent); true }
+        clipboard = activity.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+        previousClip = clipboard.primaryClip
         webView = WebView(activity)
         webView.settings.javaScriptEnabled = true
         activity.setContentView(webView)
         diagnostics = HostWebViewDiagnostics(activity)
         diagnostics.show(webView)
-        // The diagnostic probe updates message geometry asynchronously. Queue a
-        // renderer barrier after it before sending a real Espresso touch.
         webView.evaluateJavascript("true") { reportReady.countDown() }
       }
       try {
         assertTrue("Native diagnostic report settled", reportReady.await(5, TimeUnit.SECONDS))
         instrumentation.waitForIdleSync()
-        onView(withText("WebView 自诊断")).check(matches(isDisplayed()))
-        if (provider.versionName!!.substringBefore('.').toInt() >= HostWebViewDiagnostics.UI_CHROMIUM_BASELINE) {
-          onView(withId(android.R.id.message)).check { view, error ->
-            if (error != null) throw error
-            val message = (view as android.widget.TextView).text.toString()
+        onView(withText("WebView 兼容性自检")).check(matches(isDisplayed()))
+        onView(withText("检查更新")).check(doesNotExist())
+        onView(withId(android.R.id.message)).check { view, error ->
+          if (error != null) throw error
+          val message = (view as android.widget.TextView).text.toString()
+          assertTrue(message.contains(provider.packageName))
+          assertTrue(message.contains(provider.versionName!!))
+          assertFalse("No instruction to update the component", message.contains("请更新"))
+          if (provider.versionName!!.substringBefore('.').toInt() >= HostWebViewDiagnostics.UI_CHROMIUM_BASELINE)
             assertTrue("Supported engine must not look blocked", message.contains("可以关闭此窗口继续使用"))
-            assertFalse("No unconditional update advice after passing", message.contains("请更新"))
-          }
         }
-        onView(withText("检查更新")).perform(click())
-        assertEquals(Intent.ACTION_VIEW, captured.get()?.action)
-        assertEquals(provider.packageName, captured.get()?.data?.getQueryParameter("id"))
-        // No arbitrary browser URL, provider switch or package install is exposed.
-        assertEquals("market", captured.get()?.data?.scheme)
-        val component = HostWebViewDiagnostics.componentIntent(provider.packageName)
-        assertEquals("android.settings.APPLICATION_DETAILS_SETTINGS", component.action)
-        assertEquals("package:${provider.packageName}", component.data.toString())
-        // Exercise the actual failure/recovery branch, not only Intent factories.
-        scenario.onActivity { activity ->
-          activity.externalActivity = { intent ->
-            if (intent.data?.scheme == "market") throw ActivityNotFoundException("Isolated no-store fixture")
-            captured.set(intent); true
-          }
+        onView(withText("复制诊断")).perform(click())
+        scenario.onActivity {
+          val copied = clipboard.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString() ?: ""
+          assertTrue("Actual clipboard includes active provider", copied.contains(provider.packageName))
+          assertTrue("Actual clipboard includes full version", copied.contains(provider.versionName!!))
         }
-        onView(withText("检查更新")).perform(click())
-        assertEquals(component.action, captured.get()?.action)
-        assertEquals(component.data, captured.get()?.data)
+        onView(withText("关闭")).perform(click())
+        onView(withText("WebView 兼容性自检")).check(doesNotExist())
       } finally {
-        scenario.onActivity { it.externalActivity = null; diagnostics.destroy(); webView.destroy() }
+        scenario.onActivity {
+          diagnostics.destroy(); webView.destroy()
+          previousClip?.let { clipboard.setPrimaryClip(it) } ?: run {
+            if (android.os.Build.VERSION.SDK_INT >= 28) clipboard.clearPrimaryClip()
+            else clipboard.setPrimaryClip(android.content.ClipData.newPlainText("", ""))
+          }
+        }
       }
     }
   }

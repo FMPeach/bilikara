@@ -54,19 +54,20 @@ The catalog Worker must support the documented cursor-pagination contract.
 Android's `minSdk = 24` describes the native OS API floor, not the installed
 WebView's JavaScript, rendering or native-bridge support. The current full UI
 capability baseline is **Chromium 111**, derived from the unguarded capabilities
-listed in [WebView support and updates](android-webview-support.md). The former
+listed in [WebView support and compatibility checks](android-webview-support.md). The former
 93-era JavaScript baseline alone does not cover the current UI. This is a
-capability floor, not certification of every provider/device at that version;
-use a current provider supported by your device vendor.
+capability floor, not certification of every provider/device at that version.
+It does not require users to replace the system provider.
 
-Open **My → Settings → Diagnostics → WebView diagnostics and update** to see the
+Open **My → Settings → Diagnostics → WebView compatibility check** to see the
 actual provider/package/version, native message bridge and webpage capabilities.
 The startup document also has this action. A native dialog opens automatically
 for an old/unknown provider or missing message bridge, even if the shared
-frontend cannot parse. **Check for updates** opens the selected provider's store
-listing; without a store it opens that component's system information page.
-Updates and installation remain controlled by the system and the user. Reopen
-bilikara afterward; clearing its data is unnecessary.
+frontend cannot parse. It offers **Copy diagnostics** and **Close** only.
+It does not open a store or ask users to install another WebView; availability
+of component updates varies by ROM/vendor. Actual engine capabilities are
+checked at startup. APK `minSdk` cannot constrain the independently installed
+WebView's version, so the native OS floor remains 24.
 
 State loading and public-room creation use `AbortController` with bounded timers;
 they do not require the newer `AbortSignal.timeout`. The LAN entry and its QR

@@ -1,4 +1,4 @@
-# Android WebView support and updates
+# Android WebView support and compatibility checks
 
 The Android Host uses the system's **selected WebView provider**. Installing a
 new browser does not by itself change that provider. `minSdk = 24` is an Android
@@ -39,9 +39,9 @@ show a different origin/security context; it names the **document tested**.
 Media codecs, audio routing, external displays and real peer connectivity need
 separate device tests. Public Remote outside localhost requires HTTPS.
 
-## Diagnosis and update action
+## Diagnosis and startup checks
 
-Open **My → Settings → Diagnostics → WebView diagnostics and update**. There is
+Open **My → Settings → Diagnostics → WebView compatibility check**. There is
 also an action on the packaged startup screen. On an old/unknown provider or
 missing native bridge, a native Android dialog opens before shared frontend
 startup; its capability probe deliberately uses ES5 syntax.
@@ -52,32 +52,33 @@ secure-context status and media/RTC availability. “Basic capabilities pass” 
 not a claim that media, network, all devices or all features passed acceptance.
 Copying it does not collect room tokens, cookies or application records.
 
-**Check for updates** resolves the actual provider in native code and opens its
-`market://details?id=...` listing. With no usable store, it opens that package's
-system information page and suggests checking system updates. It does not
-silently install, select a different provider, bypass signatures, clear storage
-or accept a website-supplied package/URL. Store support varies by vendor; a
-component with no listing may need the manufacturer's system update. Reopen
-bilikara after updating, without clearing its data.
+The dialog only offers **Copy diagnostics** and **Close**. An incompatible or
+incomplete result identifies the issue for compatibility work; it does not ask
+the user to update WebView. There is no store, component-settings, download,
+installation or provider-switch action in this check. bilikara's own application
+updater is a separate existing feature.
 
-A store accepting the link does **not** prove that the package is listed or an
-update exists. Availability depends on the actual provider and device/region
-ROM, not just the MIUI, ColorOS or OriginOS name. If the vendor supplies neither
-an independent component update nor a suitable system update, this action
-cannot resolve compatibility. Installing a newer browser or an arbitrary
-WebView APK does not establish that the Host's provider changed: production
-devices enforce configured provider/package/signature restrictions. See
-[Chromium's provider requirements](https://chromium.googlesource.com/chromium/src/+/main/android_webview/docs/webview-providers.md)
+Android documents the [active-provider lookup](https://developer.android.com/reference/androidx/webkit/WebViewCompat#getCurrentWebViewPackage(android.content.Context)).
+Store/update availability depends on the actual provider and device/region ROM,
+not just the MIUI, ColorOS or OriginOS name. Production devices enforce
+configured provider/package/signature restrictions; installing a newer browser
+or an arbitrary WebView APK does not establish that the Host's provider changed.
+See [Chromium's provider requirements](https://chromium.googlesource.com/chromium/src/+/main/android_webview/docs/webview-providers.md)
 and [vendor update distribution](https://chromium.googlesource.com/chromium/src/+/main/android_webview/docs/aosp-system-integration.md).
-An emulator's successful provider update does not qualify that update path on
-a retail device. Supporting an engine that cannot be updated requires software
-compatibility work; diagnostics and update links alone do not provide it.
+An emulator's successful provider update diagnoses an engine dependency; it
+does not establish an update path on a retail device. Supporting an engine that
+cannot be updated requires software compatibility work.
 
-Android documents the [active-provider lookup and update lifecycle](https://developer.android.com/reference/androidx/webkit/WebViewCompat#getCurrentWebViewPackage(android.content.Context))
-and the [component settings action](https://developer.android.com/reference/android/provider/Settings#ACTION_APPLICATION_DETAILS_SETTINGS).
+APK [`minSdkVersion`](https://developer.android.com/guide/topics/manifest/uses-sdk-element)
+limits the Android OS API level. It cannot declare a minimum independently
+installed WebView package version. The native minimum remains 24. Startup checks
+test actual engine capabilities and the native message bridge before loading
+the shared UI; raising the OS floor would not establish WebView compatibility.
+The current 111 capability floor is not a newly certified device minimum.
+
 The full Host action uses the existing main-frame, exact local-origin bridge;
 the startup command is restricted to the local Android main window. Remote
-pages gain no update/diagnostics permission.
+pages gain no diagnostics permission.
 
 ## Validation limits
 
@@ -94,3 +95,12 @@ their bounded `AbortController` requests preserve cleanup, errors and recovery.
 A LAN QR is obtained from local Host state and generated locally. Public-room
 signaling is a separate operation. Neither the timeout fix nor an OS version
 alone establishes that an old frontend parser/native bridge can run the app.
+
+The specific `AbortSignal.timeout` defect came from calling an unguarded static
+API introduced in [Chromium 103](https://developer.chrome.com/blog/new-in-chrome-103).
+An absent method throws before the fetch can start. `/api/state` now uses a
+10-second controller/timer and public-room creation uses 15 seconds; `finally`
+clears each timer, including response-body handling. Timeout failures still
+surface through the existing error/recovery path. This removes that API
+dependency, not older-engine syntax, missing input/layout features or bridge
+requirements. The LAN QR comes from Host state, not the public-room POST.

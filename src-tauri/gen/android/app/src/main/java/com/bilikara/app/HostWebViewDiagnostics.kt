@@ -1,13 +1,9 @@
 package com.bilikara.app
 
-import android.content.ActivityNotFoundException
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
-import android.content.Intent
-import android.net.Uri
 import android.os.Build
-import android.provider.Settings
 import android.webkit.WebView
 import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
@@ -48,16 +44,10 @@ internal class HostWebViewDiagnostics(private val activity: AppCompatActivity) {
       })()
     """.trimIndent()
 
-    internal fun updateIntent(providerPackage: String) = Intent(Intent.ACTION_VIEW,
-      Uri.parse("market://details").buildUpon().appendQueryParameter("id", providerPackage).build())
-
-    internal fun componentIntent(providerPackage: String) = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-      Uri.fromParts("package", providerPackage, null))
-
     internal fun statusMessage(major: Int?, bridge: Boolean, missing: Int?): String = when {
       major == null -> "未能确认当前 WebView 版本，请复制诊断信息排查；这不代表检测通过。"
       major < UI_CHROMIUM_BASELINE || !bridge || (missing != null && missing > 0) ->
-        "当前 WebView 未满足已检查的界面能力要求。请更新当前实际使用的组件，再重新打开 bilikara。无需清除应用数据。"
+        "当前 WebView 未满足已检查的界面能力要求。当前版本暂不兼容，请复制诊断信息用于兼容性排查。无需清除应用数据。"
       missing == null -> "未能完成网页能力检测，请复制诊断信息排查；这不代表检测通过。"
       else -> "当前 WebView 已通过基础能力检查。可以关闭此窗口继续使用；若仍有故障，请复制诊断信息协助排查。"
     }
@@ -69,7 +59,7 @@ internal class HostWebViewDiagnostics(private val activity: AppCompatActivity) {
   fun checkOnCreate(webView: WebView) {
     val provider = WebViewCompat.getCurrentWebViewPackage(activity)
     val major = provider?.versionName?.substringBefore('.')?.toIntOrNull()
-    if (provider == null || (major != null && major < UI_CHROMIUM_BASELINE) ||
+    if (major == null || major < UI_CHROMIUM_BASELINE ||
       !WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {
       webView.post { if (!activity.isFinishing && !activity.isDestroyed) show(webView) }
     }
@@ -85,19 +75,13 @@ internal class HostWebViewDiagnostics(private val activity: AppCompatActivity) {
       "界面能力基线: Chromium $UI_CHROMIUM_BASELINE\n" +
       "原生消息桥: ${if (bridge) "支持" else "不支持"}"
     report = "$base\n网页能力: 检测中"
-    val current = AlertDialog.Builder(activity).setTitle("WebView 自诊断")
+    val current = AlertDialog.Builder(activity).setTitle("WebView 兼容性自检")
       .setMessage("正在检测当前 WebView…\n\n$report")
-      .setPositiveButton("检查更新", null)
       .setNeutralButton("复制诊断", null)
       .setNegativeButton("关闭", null).create()
     dialog = current
     current.setOnDismissListener { if (dialog === current) dialog = null }
     current.show()
-    current.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
-      if (provider == null) {
-        Toast.makeText(activity, "未识别当前组件，请通过系统设置检查 WebView 或系统更新", Toast.LENGTH_LONG).show()
-      } else openUpdate(provider.packageName)
-    }
     current.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener {
       val clipboard = activity.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
       clipboard.setPrimaryClip(ClipData.newPlainText("bilikara WebView", report))
@@ -117,27 +101,6 @@ internal class HostWebViewDiagnostics(private val activity: AppCompatActivity) {
         " / WebAudio: ${facts.optBoolean("web_audio")} / AudioWorklet: ${facts.optBoolean("audio_worklet")}" +
         " / WASM: ${facts.optBoolean("web_assembly")}\nUA: ${facts.optString("user_agent") }"
       current.setMessage("${statusMessage(major, bridge, missing?.length())}\n\n$report")
-    }
-  }
-
-  private fun openUpdate(providerPackage: String) {
-    try {
-      activity.startActivity(updateIntent(providerPackage))
-    } catch (_: ActivityNotFoundException) {
-      openComponent(providerPackage)
-    } catch (_: SecurityException) {
-      openComponent(providerPackage)
-    }
-  }
-
-  private fun openComponent(providerPackage: String) {
-    try {
-      activity.startActivity(componentIntent(providerPackage))
-      Toast.makeText(activity, "未找到可用商店，已打开组件信息；也可通过系统更新检查新版", Toast.LENGTH_LONG).show()
-    } catch (_: ActivityNotFoundException) {
-      Toast.makeText(activity, "无法打开组件信息，请在系统设置中检查该组件或系统更新", Toast.LENGTH_LONG).show()
-    } catch (_: SecurityException) {
-      Toast.makeText(activity, "系统限制了组件信息入口，请手动打开系统设置", Toast.LENGTH_LONG).show()
     }
   }
 

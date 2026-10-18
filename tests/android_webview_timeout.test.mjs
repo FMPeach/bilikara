@@ -110,7 +110,8 @@ for (const missing of ['AbortController', 'Object.hasOwn', 'Array.prototype.at',
     vm.runInContext(`${missing} = undefined`, context);
     await vm.runInContext(bootstrap, context);
     assert.equal(invoked, false); assert.equal(navigated, false);
-    assert.match(status.textContent, /Android System WebView.*更新/);
+    assert.match(status.textContent, /Android System WebView.*兼容性自检/);
+    assert.doesNotMatch(status.textContent, /系统应用商店|请更新/u);
     assert.match(status.textContent, /无需清除应用数据/);
   });
 }

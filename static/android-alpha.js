@@ -22,12 +22,12 @@
     if (typeof AbortController !== "function" || typeof Object.hasOwn !== "function"
       || typeof Array.prototype.at !== "function" || typeof String.prototype.replaceAll !== "function"
       || typeof Promise.allSettled !== "function") {
-      throw new Error("Android System WebView 过旧，缺少当前界面所需的 JavaScript 能力（完整界面要求 Chromium 111 及以上能力）。请在系统应用商店更新 Android System WebView 或系统当前使用的 Chrome/WebView 提供程序，然后重新打开 bilikara。无需清除应用数据；若仍失败，请提供 WebView 提供程序名称及完整版本号。");
+      throw new Error("Android System WebView 过旧，缺少当前界面所需的 JavaScript 能力（完整界面要求 Chromium 111 及以上能力）。请打开“WebView 兼容性自检”，复制实际提供程序及缺失能力信息，用于后续兼容性排查。无需清除应用数据。");
     }
     if (!("inert" in document.createElement("div")) || typeof CSS === "undefined"
       || !CSS.supports("selector(:has(*))") || !CSS.supports("height: 100dvh")
       || !CSS.supports("color: color-mix(in srgb, black, white)")) {
-      throw new Error("当前 WebView 缺少完整界面所需能力（Chromium 111 及以上能力基线）。请点击“WebView 自诊断与更新”，更新实际使用的组件后重新打开 bilikara；无需清除应用数据。");
+      throw new Error("当前 WebView 缺少完整界面所需能力（Chromium 111 及以上能力基线）。请点击“WebView 兼容性自检”，复制诊断信息用于后续兼容性排查；无需清除应用数据。");
     }
     const invoke = window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke;
     if (typeof invoke !== "function") throw new Error("请在 bilikara beta Android 应用中打开此页面。");
@@ -37,7 +37,7 @@
       || result.host_api_ready !== true || result.persistence_ready !== true || result.playback_ready !== true) {
       throw new Error("原生启动检查返回了不兼容的数据。");
     }
-    if (result.window_controls_ready !== true) throw new Error("当前 WebView 的原生消息桥未就绪，请打开“WebView 自诊断与更新”检查。这个结果不代表 Host 网络连接失败。");
+    if (result.window_controls_ready !== true) throw new Error("当前 WebView 的原生消息桥未就绪，请打开“WebView 兼容性自检”检查。这个结果不代表 Host 网络连接失败。");
     const destination = new URL(result.bootstrap_url);
     if (destination.protocol !== "http:" || destination.hostname !== "127.0.0.1"
       || !destination.port || destination.username || destination.password
