@@ -4,10 +4,12 @@
   var root = document.documentElement;
   var selected = location.hash === "#bilikara-legacy";
   var major = /(?:Chrome|Chromium)\/(\d+)/.exec(navigator.userAgent);
-  var legacy = selected && major && Number(major[1]) >= 91;
+  var legacy = selected && major && Number(major[1]) >= 83;
   root.setAttribute("data-webview-mode", legacy ? "legacy" : "latest");
   if (!legacy) return;
-  window.BilikaraWebViewCompatibility = { mode: "legacy", adapters: [
+  window.BilikaraWebViewCompatibility = { mode: "legacy", chromiumMajor: Number(major[1]), engine: Number(major[1]) < 91 ? 83 : 91, adapters: [
+    ["Element.replaceChildren", typeof Element.prototype.replaceChildren !== "function"],
+    ["String.replaceAll", typeof String.prototype.replaceAll !== "function"],
     ["Object.hasOwn", typeof Object.hasOwn !== "function"],
     ["Array.at", typeof Array.prototype.at !== "function"],
     ["crypto.randomUUID", typeof crypto.randomUUID !== "function"],
@@ -18,6 +20,33 @@
     ["CSS color-mix()", !CSS.supports("color: color-mix(in srgb, black, white)")]
   ].filter(function (entry) { return entry[1]; }).map(function (entry) { return entry[0]; }) };
 
+  [Element.prototype, DocumentFragment.prototype].forEach(function (prototype) {
+    if (typeof prototype.replaceChildren === "function") return;
+    Object.defineProperty(prototype, "replaceChildren", { configurable: true, writable: true, value: function () {
+      var parent = this, fragment = document.createDocumentFragment();
+      Array.from(arguments).forEach(function (child) {
+        if (child instanceof Node && (child === parent || child.contains(parent))) throw new DOMException("Invalid child", "HierarchyRequestError");
+      });
+      // Prepare before removing: moving retained children preserves their identity
+      // and handlers; invalid node conversions do not empty the existing parent.
+      fragment.append.apply(fragment, arguments);
+      while (parent.firstChild) parent.removeChild(parent.firstChild);
+      parent.appendChild(fragment);
+    }});
+  });
+  if (typeof String.prototype.replaceAll !== "function") Object.defineProperty(String.prototype, "replaceAll", {
+    configurable: true, writable: true, value: function (search, replacement) {
+      if (this == null) throw new TypeError("replaceAll requires a string");
+      // Application callers use literal strings. Retain native replacement-token
+      // and callback behavior, and reject a non-global regular expression.
+      if (search instanceof RegExp) {
+        if (!search.global) throw new TypeError("replaceAll requires a global RegExp");
+        return String(this).replace(search, replacement);
+      }
+      var escaped = String(search).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      return String(this).replace(new RegExp(escaped, "g"), replacement);
+    }
+  });
   if (typeof Object.hasOwn !== "function") Object.defineProperty(Object, "hasOwn", {
     configurable: true, writable: true, value: function (object, key) {
       if (object == null) throw new TypeError("Object.hasOwn requires an object");
@@ -54,11 +83,21 @@
   root.toggleAttribute("data-legacy-inert", inertMissing);
   root.toggleAttribute("data-legacy-containers", containerMissing);
   root.toggleAttribute("data-legacy-colors", colorsMissing);
-  var colorTheme;
+  var colorSignature;
+  // The 83 loader replaces stylesheets after this script has started. Theme
+  // identity alone cannot invalidate colors computed before those sheets load.
+  window.BilikaraWebViewCompatibility.refreshStyles = function () { colorSignature = undefined; schedule(); };
   function synchronizeColors() {
-    if (!colorsMissing || !document.body || colorTheme === root.getAttribute("data-theme")) return;
-    colorTheme = root.getAttribute("data-theme");
-    var style = getComputedStyle(root), context = document.createElement("canvas").getContext("2d");
+    if (!colorsMissing || !document.body) return;
+    var style = getComputedStyle(root);
+    var inputs = ["--sync-btn-bg", "--ink", "--btn-secondary-bg", "--accent"].map(function (name) { return style.getPropertyValue(name).trim(); });
+    // An in-flight stylesheet must not poison the cache with canvas's default
+    // black. Tokens may arrive/change without a data-theme attribute change.
+    if (inputs.some(function (value) { return !value; })) return;
+    var signature = [root.getAttribute("data-theme")].concat(inputs).join("|");
+    if (colorSignature === signature) return;
+    colorSignature = signature;
+    var context = document.createElement("canvas").getContext("2d");
     function color(name) {
       context.clearRect(0, 0, 1, 1);
       context.fillStyle = style.getPropertyValue(name).trim();
@@ -264,6 +303,10 @@
     "> .host-result-pager:not([hidden])"
   ]
 ];
+  if (window.BilikaraWebViewCompatibility.engine === 83) relations.forEach(function (rule) {
+    rule[1] = rule[1].replace(/:is\(/g, ":-webkit-any(");
+    rule[2] = rule[2].replace(/:is\(/g, ":-webkit-any(");
+  });
   function synchronizeRelations() {
     if (!hasMissing) return;
     var values = new Map();

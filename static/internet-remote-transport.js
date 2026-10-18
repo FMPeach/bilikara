@@ -296,7 +296,7 @@
             const match = /^(stun|turn|turns):([A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?|\[[0-9A-Fa-f:]+\])(?::([0-9]{1,5}))?(?:\?transport=(udp|tcp))?$/u.exec(url);
             if (!match || match[2].includes("..") || (match[3] && (+match[3] < 1 || +match[3] > 65535))
               || (match[1] === "stun" && match[4]) || (match[1] === "turns" && match[4] === "udp")) throw new Error();
-            turn ||= match[1] !== "stun";
+            if (!turn) turn = match[1] !== "stun";
             return url;
           });
           if (turn) {

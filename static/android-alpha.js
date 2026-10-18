@@ -26,10 +26,8 @@
     try {
       if (legacy && (typeof AbortController !== "function" || typeof crypto !== "object"
         || typeof crypto.getRandomValues !== "function" || typeof Promise.allSettled !== "function"
-        || typeof String.prototype.replaceAll !== "function" || typeof ResizeObserver !== "function"
-        || typeof Element.prototype.getAnimations !== "function" || !CSS.supports("inset: 0px")
-        || !CSS.supports("aspect-ratio: 16 / 9"))) {
-        throw new Error("当前内核未满足 legacy 的 WebView 91 能力要求，请复制自检信息。无需清除应用数据。");
+        || typeof ResizeObserver !== "function")) {
+        throw new Error("当前内核未满足 legacy 的 WebView 83 能力要求，请复制自检信息。无需清除应用数据。");
       }
       // Keep this bootstrap parseable by older WebViews so an unsupported engine
       // gets an actionable message before loading the shared modern Host scripts.

@@ -807,7 +807,7 @@
     const nextEpoch = typeof remoteState.state_epoch === "string" ? remoteState.state_epoch : "";
     if (state.retiredStateEpochs?.has(nextEpoch) || (state.stateEpoch && !nextEpoch)) return;
     if (nextEpoch && nextEpoch !== state.stateEpoch) {
-      state.retiredStateEpochs ||= new Set();
+      if (!state.retiredStateEpochs) state.retiredStateEpochs = new Set();
       if (state.stateEpoch) state.retiredStateEpochs.add(state.stateEpoch);
       state.stateEpoch = nextEpoch;
       state.stateRevision = -1;

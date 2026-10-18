@@ -43,20 +43,38 @@ separate device tests. Public Remote outside localhost requires HTTPS.
 
 Android automatically uses **latest** when its startup checks pass. Otherwise
 it opens the native compatibility report. When the actual provider is at least
-Chromium **91**, its native message bridge works, and the required legacy
+Chromium **83**, its native message bridge works, and the required legacy
 primitives are present, the report offers **Enter legacy mode**. It never enters
-legacy silently. Providers below 91, an unknown version, an incomplete probe or
-a missing bridge keep the diagnostic without an entry button. WebView 83 is
-not supported by this first legacy implementation.
+legacy silently. Providers below 83, an unknown version, an incomplete probe or
+a missing bridge keep the diagnostic without an entry button. Experimental WebView 83–90 additionally uses generated CSS syntax adapters and simplified
+CSS motion. Legacy 91 keeps its existing narrower adapters.
 
 Both modes use the same frontend, authenticated Rust Host and data formats.
-Legacy only supplies missing `Object.hasOwn`, `Array.at`, cryptographic UUIDs,
+Legacy supplies missing `replaceChildren`, `replaceAll`, `Object.hasOwn`,
+`Array.at`, cryptographic UUIDs,
 input/focus isolation and adapters for the relationships, viewport/container
 sizes and colors used by this UI. Existing native APIs are retained. A legacy
 choice crosses the ordinary authenticated entry as a fixed mode parameter;
 the resulting local page retains its mode on reload. It creates no persistent
 preference or alternate application data. Each cold start checks the provider
 again and uses latest automatically when it qualifies.
+
+On Chromium 83–90, the same authored CSS is compiled using pinned Lightning CSS,
+including selector/inset/focus/overflow syntax. Scoped runtime adapters supply
+flex spacing and aspect ratios. CSS transitions/animations are immediate in this
+mode; JavaScript Web Animations retain real finish/cancel completion. The pinned
+Signalsmith wrapper has a generated syntax-compatible module with identical
+embedded DSP/WASM bytes. No `eval`, runtime compiler, provider installation or
+second UI is used. After shared CSS changes run `npm run prepare:webview83`;
+`node scripts/build_webview83.mjs --check` rejects stale artifacts.
+
+The Android 11 / AOSP WebView 83.0.4103.120 test provider can render and operate
+the legacy UI, but its isolated WebRTC test gathers no ICE candidates and logs
+NETLINK permission failures. This remains an **unresolved WebRTC limitation in
+that tested environment**, not a missing JavaScript method. Generating a public room QR does
+not prove peer connectivity. LAN Remote uses the local HTTP/SSE Host separately.
+JavaScript adapters do not replace WebRTC or bypass Android network permissions.
+Do not treat experimental 83 UI compatibility as full public Remote acceptance.
 
 The original source capability floor above describes latest; it is not a reason
 to bypass the legacy gate or proof of device/media acceptance. Android 11 with

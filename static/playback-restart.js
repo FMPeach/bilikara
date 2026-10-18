@@ -495,7 +495,7 @@
     }
     if (firstUse) Promise.resolve().then(() => firstUse.read()).then(seen => {
       hintRead = true;
-      hintSeen ||= seen === true;
+      if (!hintSeen) hintSeen = seen === true;
       refresh();
     }).catch(() => { hintRead = hintSeen = true; });
     refresh();

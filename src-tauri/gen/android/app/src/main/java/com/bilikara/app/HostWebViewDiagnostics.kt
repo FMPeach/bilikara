@@ -18,7 +18,7 @@ internal class HostWebViewDiagnostics(private val activity: AppCompatActivity) {
   companion object {
     // Full Android UI requirement, not merely the JavaScript startup floor (93).
     const val UI_CHROMIUM_BASELINE = 111
-    const val LEGACY_CHROMIUM_BASELINE = 91
+    const val LEGACY_CHROMIUM_BASELINE = 83
 
     // ES5 syntax deliberately: diagnostics must execute on an unsupported engine.
     internal val PROBE = """
@@ -40,11 +40,7 @@ internal class HostWebViewDiagnostics(private val activity: AppCompatActivity) {
         legacyNeed('AbortController', typeof AbortController === 'function');
         legacyNeed('Web Crypto', typeof crypto === 'object' && typeof crypto.getRandomValues === 'function');
         legacyNeed('Promise.allSettled', typeof Promise.allSettled === 'function');
-        legacyNeed('String.replaceAll', typeof String.prototype.replaceAll === 'function');
         legacyNeed('ResizeObserver', typeof ResizeObserver === 'function');
-        legacyNeed('getAnimations', typeof Element.prototype.getAnimations === 'function');
-        legacyNeed('CSS inset', css('inset: 0px'));
-        legacyNeed('CSS aspect-ratio', css('aspect-ratio: 16 / 9'));
         return JSON.stringify({missing: missing, legacy_missing: legacyMissing,
           legacy_entry: typeof window.bilikaraStartLegacy === 'function',
           mode: document.documentElement.getAttribute('data-webview-mode') || 'latest',
@@ -138,6 +134,7 @@ internal class HostWebViewDiagnostics(private val activity: AppCompatActivity) {
       val activeLegacy = facts?.optString("mode") == "legacy"
       val advice = when {
         activeLegacy -> "当前正在使用 legacy 模式；缺失能力由兼容层补齐。基础检测不代表完整功能验收。"
+        eligible && !latest && major != null && major < 91 -> "当前 WebView 可尝试实验性 legacy 模式，动效将简化。局域网入口和公网 Remote 连接需要分别验证；基础检查不代表完整功能验收。无需清除应用数据。"
         eligible && !latest -> "当前 WebView 未满足 latest 要求。可以选择进入 legacy 模式，由兼容层补齐缺失能力。无需清除应用数据。"
         else -> statusMessage(major, bridge, missing?.length())
       }

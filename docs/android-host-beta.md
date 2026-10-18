@@ -65,10 +65,11 @@ The startup document also has this action. A native dialog opens automatically
 for an old/unknown provider or missing message bridge, even if the shared
 frontend cannot parse. It offers **Copy diagnostics** and **Close**. On the
 startup page it also offers **Enter legacy mode** when the actual provider is
-at least Chromium **91**, the native bridge works, and its legacy capability
+at least Chromium **83**, the native bridge works, and its legacy capability
 check passes. This is an explicit choice; a supported provider uses latest
 automatically. Legacy reuses the same UI and Rust Host with missing-capability
-adapters. WebView 83 remains outside this first legacy implementation.
+adapters. WebView 83–90 uses generated CSS syntax adapters and simplified CSS
+motion; legacy 91 keeps its existing path.
 It does not open a store or ask users to install another WebView; availability
 of component updates varies by ROM/vendor. Actual engine capabilities are
 checked at startup. APK `minSdk` cannot constrain the independently installed

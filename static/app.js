@@ -957,9 +957,9 @@ function setAppMessage(message, isError = false) {
 }
 
 function fullscreenRequestNotice() {
-  return state.fullscreenRequestNotice ||= window.BilikaraIncomingRequest.create(
+  return state.fullscreenRequestNotice || (state.fullscreenRequestNotice = window.BilikaraIncomingRequest.create(
     elements.fullscreenRequestToast, t,
-  );
+  ));
 }
 
 function hideFullscreenRequestToast() {
@@ -995,7 +995,7 @@ function renderPresentationFeedback() {
   state.presentationFeedbackSnapshot = next;
   const dualScreen = state.presentationSession?.mode === "localDualScreen"
     && ["activating", "active"].includes(state.presentationSession.phase);
-  state.presentationFeedbackView ||= feedback.create(elements.presentationFeedback, t);
+  if (!state.presentationFeedbackView) state.presentationFeedbackView = feedback.create(elements.presentationFeedback, t);
   if (previous && (previous.session !== next.session || previous.item !== next.item)) {
     state.presentationFeedbackView.hide();
     state.presentationActionFeedback = null;
@@ -1023,7 +1023,7 @@ function showPresentationOperationFeedback(changes) {
     expiresAt: Date.now() + feedback.durationMs,
   }));
   state.presentationActionFeedback = feedback.recent(state.presentationActionFeedback, notices);
-  state.presentationFeedbackView ||= feedback.create(elements.presentationFeedback, t);
+  if (!state.presentationFeedbackView) state.presentationFeedbackView = feedback.create(elements.presentationFeedback, t);
   if (isAudiencePlayerSurface()) state.presentationFeedbackView.show(state.presentationActionFeedback);
   publishPresentationOutputState();
 }
@@ -4798,7 +4798,7 @@ function rememberHostWorkspaceScrollPosition(workspace = state.activeHostWorkspa
   if (!normalized || !elements.hostWorkspaceRegion) {
     return;
   }
-  state.hostWorkspaceScrollPositions ||= {};
+  if (!state.hostWorkspaceScrollPositions) state.hostWorkspaceScrollPositions = {};
   state.hostWorkspaceScrollPositions[normalized] = Math.max(
     0,
     Number(elements.hostWorkspaceRegion.scrollTop || 0),
@@ -7947,16 +7947,16 @@ function d1BrowseItemKey(item) {
 
 function d1BrowseModeState(kind = state.d1BrowseKind || state.discoverMode) {
   const normalized = kind === "artist" ? "artist" : "name";
-  state.d1BrowseModes[normalized] ||= {
+  if (!state.d1BrowseModes[normalized]) state.d1BrowseModes[normalized] = {
     level: "alphabet", letter: "", tag: "", locale: "", query: "", data: null,
     tagData: null, itemData: null, loading: false, seq: 0, error: "",
     scrollPositions: { alphabet: 0, tags: 0, items: 0 },
   };
   const mode = state.d1BrowseModes[normalized];
   mode.level = normalizedD1BrowseLevel(mode.level);
-  mode.scrollPositions ||= { alphabet: 0, tags: 0, items: 0 };
-  mode.tagData ??= mode.level === "tags" ? mode.data : null;
-  mode.itemData ??= mode.level === "items" ? mode.data : null;
+  if (!mode.scrollPositions) mode.scrollPositions = { alphabet: 0, tags: 0, items: 0 };
+  if (mode.tagData == null) mode.tagData = mode.level === "tags" ? mode.data : null;
+  if (mode.itemData == null) mode.itemData = mode.level === "items" ? mode.data : null;
   return mode;
 }
 
@@ -16325,7 +16325,7 @@ function applyRemotePlayerControl(command, currentItem, playbackMode) {
 }
 
 async function ackRemotePlayerControl(seq) {
-  const pending = state.playerControlAckInFlight ??= new Set();
+  const pending = state.playerControlAckInFlight ?? (state.playerControlAckInFlight = new Set());
   if (pending.has(seq)) return;
   pending.add(seq);
   try {

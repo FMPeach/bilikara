@@ -1552,7 +1552,7 @@ window.visualViewport?.addEventListener("scroll", syncRemoteMenuBounds);
 window.addEventListener("remote-invitation-changed", () => renderRemoteAccess(state.data?.remote_access));
 
 function renderRemoteAccess(remoteAccess) {
-  remoteAccess ||= nativeRemoteAccess;
+  if (!remoteAccess) remoteAccess = nativeRemoteAccess;
   const internet = window.BilikaraRemoteTransport?.mode === "internet";
   if (!internet && document.documentElement.dataset.nativeHost === "true" && !remoteAccess) return;
   const invitation = internet ? window.BilikaraRemoteTransport.invitation?.() : null;
@@ -3351,7 +3351,7 @@ function applyStateSnapshot(snapshot, { forceRender = false } = {}) {
   const epochTransition = stateEpochTransition(snapshot);
   if (epochTransition === "stale") return false;
   if (epochTransition === "restart") {
-    state.retiredStateEpochs ||= new Set();
+    if (!state.retiredStateEpochs) state.retiredStateEpochs = new Set();
     if (state.data?.state_epoch) state.retiredStateEpochs.add(state.data.state_epoch);
     forceRender = true;
   }
@@ -4457,7 +4457,7 @@ async function executeCanonicalBilikaraSearch(queryStr) {
 
 function d1BrowseModeState(kind = state.remoteDiscoverMode) {
   const normalizedKind = kind === "artist" ? "artist" : "name";
-  state.d1BrowseModes[normalizedKind] ||= {
+  if (!state.d1BrowseModes[normalizedKind]) state.d1BrowseModes[normalizedKind] = {
     letter: "",
     tag: "",
     locale: "",
@@ -6371,8 +6371,8 @@ function schedulePlaybackSheetAdaptiveLayout({
     closePlaybackMetadataPopover();
   }
   state.playbackMetadataLayoutPendingSignature = signature;
-  state.playbackMetadataLayoutViewportChange ||= viewportChange;
-  state.playbackMetadataLayoutInteractionEnded ||= interactionEnded;
+  if (!state.playbackMetadataLayoutViewportChange) state.playbackMetadataLayoutViewportChange = viewportChange;
+  if (!state.playbackMetadataLayoutInteractionEnded) state.playbackMetadataLayoutInteractionEnded = interactionEnded;
   if (state.playbackMetadataLayoutFrame !== null) {
     return true;
   }
@@ -9479,7 +9479,7 @@ function remoteContextualTooltipForWrap(wrap) {
   if (button && !tooltipId) {
     const tooltip = wrap.querySelector(".remote-tooltip-bubble");
     if (tooltip) {
-      tooltip.id ||= `remote-contextual-info-${++remoteContextualInfoNextId}`;
+      if (!tooltip.id) tooltip.id = `remote-contextual-info-${++remoteContextualInfoNextId}`;
       tooltipId = tooltip.id;
       button.setAttribute("aria-describedby", tooltipId);
     }

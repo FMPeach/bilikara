@@ -6,21 +6,34 @@ import {chromium} from 'playwright';
 
 // Behavioral adapter tests on a current browser with isolated missing features.
 // These never qualify a historic Android WebView; the actual provider is tested separately.
-async function fixture(t, {legacy = false, missing = false} = {}) {
+async function fixture(t, {legacy = false, missing = false, userAgent} = {}) {
   const server = createServer((req, res) => {
+    if (req.url.endsWith('/native-fixture.css')) {
+      const compiled = req.url.startsWith('/compat83/');
+      const vars = compiled ? ':root{--sync-btn-bg:#fff;--ink:#000;--btn-secondary-bg:#fff;--accent:#f00}' : '';
+      res.setHeader('Content-Type', 'text/css');
+      const send = () => res.end(vars+'#native-gap{display:flex;gap:12px}#native-gap>span{display:block;width:10px;height:10px}#native-ratio{width:160px;aspect-ratio:16/9;--legacy-aspect-ratio:16/9}');
+      if (compiled) setTimeout(send, 80); else send();
+      return;
+    }
+    if (req.url === '/compat83/webview-legacy.css') return res.setHeader('Content-Type', 'text/css').end(readFileSync(new URL('../static/compat83/webview-legacy.css', import.meta.url)));
+    if (req.url === '/webview83.js') return res.setHeader('Content-Type', 'text/javascript').end(readFileSync(new URL('../static/webview83.js', import.meta.url)));
     if (req.url === '/webview-compat.js') return res.setHeader('Content-Type', 'text/javascript').end(readFileSync(new URL('../static/webview-compat.js', import.meta.url)));
     if (req.url === '/webview-legacy.css') return res.setHeader('Content-Type', 'text/css').end(readFileSync(new URL('../static/webview-legacy.css', import.meta.url)));
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.end('<!doctype html><html><head><script src="/webview-compat.js"></script><link rel="stylesheet" href="/webview-legacy.css"></head><body><div id="background" aria-hidden="false"><button id="first" tabindex="2">First</button></div><button id="outside">Outside</button><form class="source-uid-form"><input><button class="source-refresh-button">Refresh</button></form><div class="request-workspace" style="width:520px"></div></body></html>');
+    res.end('<!doctype html><html><head><script src="/webview-compat.js"></script><link rel="stylesheet" href="/webview-legacy.css"><link rel="stylesheet" href="/native-fixture.css"><script src="/webview83.js"></script></head><body><div id="background" aria-hidden="false"><button id="first" tabindex="2">First</button></div><button id="outside">Outside</button><div id="native-gap"><span></span><span></span></div><div id="native-ratio"></div><form class="source-uid-form"><input><button class="source-refresh-button">Refresh</button></form><div class="request-workspace" style="width:520px"></div></body></html>');
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   t.after(() => new Promise(resolve => server.close(resolve)));
   const browser = await chromium.launch({headless: true}); t.after(() => browser.close());
-  const context = await browser.newContext();
+  const context = await browser.newContext({userAgent});
   await context.route('**/*', route => new URL(route.request().url()).hostname === '127.0.0.1' ? route.continue() : route.abort());
   await context.addInitScript(({missing}) => {
     window.nativeHasOwn = Object.hasOwn;
     window.nativeAt = Array.prototype.at;
+    window.nativeChildren = Element.prototype.replaceChildren;
+    window.nativeReplace = String.prototype.replaceAll;
+    window.nativeAnimate = Element.prototype.animate;
     window.nativeUUID = crypto.randomUUID;
     if (!missing) return;
     Object.defineProperty(Object, 'hasOwn', {configurable: true, writable: true, value: undefined});
@@ -44,7 +57,8 @@ test('latest leaves native implementations and input semantics untouched', async
   const page = await fixture(t);
   assert.deepEqual(await page.evaluate(() => [document.documentElement.dataset.webviewMode,
     Object.hasOwn === nativeHasOwn, Array.prototype.at === nativeAt, crypto.randomUUID === nativeUUID,
-    document.documentElement.hasAttribute('data-legacy-inert')]), ['latest', true, true, true, false]);
+    Element.prototype.replaceChildren === nativeChildren, String.prototype.replaceAll === nativeReplace, Element.prototype.animate === nativeAnimate,
+    document.documentElement.hasAttribute('data-legacy-inert')]), ['latest', true, true, true, true, true, true, false]);
 });
 
 test('legacy fills only missing primitives with correct generic indexing and secure UUIDs', async t => {
@@ -115,4 +129,35 @@ test('every shared :has relationship retains a matching legacy adapter', () => {
       assert.ok(relations.some(([key, , query]) => key === fallback[1] && normalize(query) === normalize(relative)), name + ': adapter query drift');
     }
   }
+});
+
+// Modern-browser capability test only: the UA selects the legacy profile, but
+// real historic 83 qualification remains in android_webview83.test.mjs/Android.
+test('83–90 profile retains native flex gap, aspect ratio and animation APIs when present', async t => {
+  const page=await fixture(t,{legacy:true,userAgent:'Mozilla/5.0 Chrome/89.0.4389.0'});
+  await page.waitForFunction(()=>Array.from(document.querySelectorAll('link[rel=stylesheet]')).every(link=>link.href.includes('/compat83/')&&link.sheet));
+  assert.deepEqual(await page.evaluate(()=>{
+    const children=document.querySelector('#native-gap').children;
+    return [BilikaraWebViewCompatibility.chromiumMajor,Element.prototype.animate===nativeAnimate,
+      children[1].getBoundingClientRect().left-children[0].getBoundingClientRect().right,
+      document.querySelector('#native-ratio').getBoundingClientRect().height,
+      children[1].style.marginLeft,document.querySelector('#native-ratio').style.height];
+  }),[89,true,12,90,'','']);
+});
+
+test('legacy colors refresh after replacement styles load instead of caching startup black', async t => {
+  const page=await fixture(t,{legacy:true,missing:true,userAgent:'Mozilla/5.0 Chrome/89.0.4389.0'});
+  await page.waitForFunction(()=>getComputedStyle(document.documentElement).getPropertyValue('--sync-btn-bg').trim()==='#fff');
+  await page.waitForFunction(()=>getComputedStyle(document.documentElement).getPropertyValue('--legacy-pressed').trim()==='rgba(240,240,240,1)',null,{timeout:3000});
+  assert.equal(await page.evaluate(()=>getComputedStyle(document.documentElement).getPropertyValue('--legacy-pressed').trim()),'rgba(240,240,240,1)');
+});
+
+test('legacy colors follow late CSS token changes without a theme toggle', async t => {
+  const page=await fixture(t,{legacy:true,missing:true,userAgent:'Mozilla/5.0 Chrome/89.0.4389.0'});
+  await page.waitForFunction(()=>getComputedStyle(document.documentElement).getPropertyValue('--legacy-pressed').trim()==='rgba(240,240,240,1)',null,{timeout:3000});
+  await page.evaluate(()=>{
+    document.documentElement.style.setProperty('--sync-btn-bg','#00ff00');
+    document.querySelector('#background').classList.add('tokens-arrived');
+  });
+  await page.waitForFunction(()=>getComputedStyle(document.documentElement).getPropertyValue('--legacy-pressed').trim()==='rgba(0,240,0,1)',null,{timeout:3000});
 });

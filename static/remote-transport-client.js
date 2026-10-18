@@ -386,7 +386,7 @@
     resetPeer({ preserveDiagnostic: retainDiagnostic });
     const peer = new RTCPeerConnection(iceProvisioning.configuration());
     state.peer = peer;
-    state.diagnostic ||= lowLevel.createConnectionDiagnostics();
+    if (!state.diagnostic) state.diagnostic = lowLevel.createConnectionDiagnostics();
     state.diagnostic.attachPeer(peer);
     setConnectionStatus("正在建立设备连接…");
     stageDeadline("transport", 20_000, "设备连接超时。网络可能限制直连，请联系房间管理员检查中继配置。", "transport_timeout");
@@ -835,7 +835,7 @@
       && nextRevision < currentRevision
     ) return;
     if (restarted) {
-      state.retiredStateEpochs ||= new Set();
+      if (!state.retiredStateEpochs) state.retiredStateEpochs = new Set();
       if (currentEpoch) state.retiredStateEpochs.add(currentEpoch);
       state.remoteState = null;
       state.limitedNotices.clear();
