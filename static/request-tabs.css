@@ -117,7 +117,7 @@ html[data-host-layout="portrait"] .request-mode-tabs {
 
 /* The same source action row serves Host and Remote. Its text field yields
    width to the two actions, rather than switching to stacked phone controls. */
-:root .source-action-row:has(> .source-uid-form) { grid-template-columns: minmax(0, 1fr); }
+:root .source-action-row:is(:has(> .source-uid-form), :where([data-legacy-has~="r23"])) { grid-template-columns: minmax(0, 1fr); }
 :root .source-uid-form {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -127,7 +127,7 @@ html[data-host-layout="portrait"] .request-mode-tabs {
   align-items: stretch;
   gap: 8px;
 }
-:root .source-uid-form:has(> .source-refresh-button) { grid-template-columns: minmax(0, 1fr) auto auto; }
+:root .source-uid-form:is(:has(> .source-refresh-button), :where([data-legacy-has~="r24"])) { grid-template-columns: minmax(0, 1fr) auto auto; }
 :root .source-uid-form > input {
   min-width: 0;
   width: 100%;

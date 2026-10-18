@@ -72,8 +72,8 @@ html[data-host-layout="portrait"] .developer-mode .request-workspace-head { disp
 .request-workspace-modal { z-index: calc(var(--host-layer-modal) - 1); }
 :root .request-workspace-modal > .selection-modal-card {
   width: min(1280px, calc(100vw - 48px));
-  height: min(1000px, calc(100dvh - 48px));
-  max-height: calc(100dvh - 48px);
+  height: min(1000px, calc(calc(var(--legacy-vh, 1vh) * 100) - 48px)); height: min(1000px, calc(100dvh - 48px));
+  max-height: calc(calc(var(--legacy-vh, 1vh) * 100) - 48px); max-height: calc(100dvh - 48px);
   grid-template-rows: minmax(0, 1fr);
   padding: 0;
 }
@@ -128,8 +128,8 @@ html[data-host-layout="portrait"] .developer-mode .request-workspace-head { disp
   .request-workspace-modal { padding: 12px; }
   :root .request-workspace-modal > .selection-modal-card {
     width: calc(100vw - 24px);
-    height: calc(100dvh - 24px);
-    max-height: calc(100dvh - 24px);
+    height: calc(calc(var(--legacy-vh, 1vh) * 100) - 24px); height: calc(100dvh - 24px);
+    max-height: calc(calc(var(--legacy-vh, 1vh) * 100) - 24px); max-height: calc(100dvh - 24px);
   }
 }
 .audio-variant-popover .audio-variant-list {
@@ -574,12 +574,12 @@ html[data-host-layout="portrait"] .developer-mode .request-workspace-head { disp
 }
 :root .playback-restart-popover.is-hint .playback-restart-action:disabled { opacity: 1; cursor: default; }
 :root .playback-sheet-panel.is-spacious-transport .playback-song-actions { grid-area: next; }
-:root :is(.player-control-row, .presentation-host-transport-row):has(.playback-song-actions.is-expanded) {
+:root :is(.player-control-row, .presentation-host-transport-row):is(:has(.playback-song-actions.is-expanded), :where([data-legacy-has~="r0"])) {
   --playback-song-actions-width: 94px;
 }
 @media (hover: hover) and (pointer: fine) {
-  :root:has(.app-shell) .playback-restart-popover .playback-restart-action:not(:disabled):hover,
-  :root:has(.app-shell) .playback-song-actions.is-expanded .playback-restart-action:not(:disabled):hover { border-color: var(--accent); }
+  :root:is(:has(.app-shell), :where([data-legacy-has~="r1"])) .playback-restart-popover .playback-restart-action:not(:disabled):hover,
+  :root:is(:has(.app-shell), :where([data-legacy-has~="r1"])) .playback-song-actions.is-expanded .playback-restart-action:not(:disabled):hover { border-color: var(--accent); }
 }
 @media (prefers-reduced-motion: reduce) {
   :root .playback-restart-popover::before { animation-duration: 1ms !important; }
@@ -911,7 +911,7 @@ html[data-host-layout="portrait"] .developer-mode .request-workspace-head { disp
   line-height: 16px;
 }
 :root :is(#host-workspace-request, .request-workspace, .request-panel, .selection-modal, .binding-sheet)
-  .follow-up-button:has(.follow-up-avatar) .follow-up-count {
+  .follow-up-button:is(:has(.follow-up-avatar), :where([data-legacy-has~="r2"])) .follow-up-count {
   padding-inline-end: 32px;
 }
 :root :is(#host-workspace-request, .request-workspace, .request-panel, .selection-modal, .binding-sheet)
@@ -966,7 +966,7 @@ html[data-host-layout="portrait"] .developer-mode .request-workspace-head { disp
   overflow: hidden;
   white-space: pre;
 }
-.follow-up-button:has(.follow-up-avatar) .request-card-title-remainder {
+.follow-up-button:is(:has(.follow-up-avatar), :where([data-legacy-has~="r2"])) .request-card-title-remainder {
   width: calc(100% - 32px);
 }
 .request-card-title-track {
@@ -1137,5 +1137,5 @@ html[data-host-layout="portrait"] .developer-mode .request-workspace-head { disp
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
-:root:not([data-ui-client="remote"]) .browse-search-bar:has(> .category-browser-tabs) { --browse-track-inset: 2px; }
+:root:not([data-ui-client="remote"]) .browse-search-bar:is(:has(> .category-browser-tabs), :where([data-legacy-has~="r3"])) { --browse-track-inset: 2px; }
 :root:not([data-ui-client="remote"]) .category-browser-tabs { padding-top: 2px; }

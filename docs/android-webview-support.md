@@ -8,7 +8,7 @@ not recommended downloads.
 
 ## Current capability baseline
 
-The current complete Host/Remote UI has a **Chromium 111 capability floor**.
+The default **latest** Host/Remote UI has a **Chromium 111 capability floor**.
 The JavaScript-only floor is 93; treating it as the full application minimum
 misses input isolation and layout dependencies. The audit covers the shared
 Host entry, its scripts/styles/vendor media code, local/public Remote transport
@@ -39,6 +39,30 @@ show a different origin/security context; it names the **document tested**.
 Media codecs, audio routing, external displays and real peer connectivity need
 separate device tests. Public Remote outside localhost requires HTTPS.
 
+## Android latest and legacy modes
+
+Android automatically uses **latest** when its startup checks pass. Otherwise
+it opens the native compatibility report. When the actual provider is at least
+Chromium **91**, its native message bridge works, and the required legacy
+primitives are present, the report offers **Enter legacy mode**. It never enters
+legacy silently. Providers below 91, an unknown version, an incomplete probe or
+a missing bridge keep the diagnostic without an entry button. WebView 83 is
+not supported by this first legacy implementation.
+
+Both modes use the same frontend, authenticated Rust Host and data formats.
+Legacy only supplies missing `Object.hasOwn`, `Array.at`, cryptographic UUIDs,
+input/focus isolation and adapters for the relationships, viewport/container
+sizes and colors used by this UI. Existing native APIs are retained. A legacy
+choice crosses the ordinary authenticated entry as a fixed mode parameter;
+the resulting local page retains its mode on reload. It creates no persistent
+preference or alternate application data. Each cold start checks the provider
+again and uses latest automatically when it qualifies.
+
+The original source capability floor above describes latest; it is not a reason
+to bypass the legacy gate or proof of device/media acceptance. Android 11 with
+an updated provider may qualify; an Android OS number alone cannot select a
+mode. This mode does not install or change a WebView provider.
+
 ## Diagnosis and startup checks
 
 Open **My → Settings → Diagnostics → WebView compatibility check**. There is
@@ -52,9 +76,10 @@ secure-context status and media/RTC availability. “Basic capabilities pass” 
 not a claim that media, network, all devices or all features passed acceptance.
 Copying it does not collect room tokens, cookies or application records.
 
-The dialog only offers **Copy diagnostics** and **Close**. An incompatible or
-incomplete result identifies the issue for compatibility work; it does not ask
-the user to update WebView. There is no store, component-settings, download,
+The dialog offers **Copy diagnostics** and **Close**, plus **Enter legacy mode**
+only when its eligibility checks pass on the startup page. An incompatible or
+incomplete result identifies missing capabilities; it does not ask the user to
+update WebView. There is no store, component-settings, download,
 installation or provider-switch action in this check. bilikara's own application
 updater is a separate existing feature.
 

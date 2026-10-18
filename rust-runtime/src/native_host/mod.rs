@@ -819,6 +819,7 @@ async fn handle_inner(
 
 enum EntryPage {
     Host,
+    LegacyHost,
     Remote,
     DisplayIdentifier(String),
     Controller(u64),
@@ -830,6 +831,18 @@ fn host_entry_page(query: &str) -> Result<EntryPage, ApiError> {
         .iter()
         .filter(|(key, _)| key == "page")
         .collect::<Vec<_>>();
+    let modes = parameters
+        .iter()
+        .filter(|(key, _)| key == "webviewMode")
+        .collect::<Vec<_>>();
+    if !modes.is_empty() {
+        // A fixed presentation choice after the ordinary Host authorization.
+        // No caller-supplied destination, capability or persistent setting.
+        if pages.is_empty() && modes.len() == 1 && modes[0].1 == "legacy" {
+            return Ok(EntryPage::LegacyHost);
+        }
+        return Err(ApiError::invalid("Invalid WebView mode"));
+    }
     if pages.is_empty() {
         return Ok(EntryPage::Host);
     }
@@ -875,6 +888,7 @@ fn session_entry(page: EntryPage, token: &str) -> Response {
     );
     let (location, lifetime) = match page {
         EntryPage::Host => ("/".to_owned(), ""),
+        EntryPage::LegacyHost => ("/#bilikara-legacy".to_owned(), ""),
         // Preserve ordinary Remote recognition when the browser is closed.
         // This does not extend the lifetime of process-private Host authority.
         EntryPage::Remote => ("/remote".to_owned(), "; Max-Age=31536000"),
@@ -1064,6 +1078,36 @@ mod tests {
             "page=controller&presentationGeneration=1&presentationGeneration=2",
             "page=controller&presentationGeneration=1&page=display-identifier",
             "page=controller&presentationGeneration=%22%3E%3Cscript%3E",
+        ] {
+            assert!(host_entry_page(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn legacy_entry_keeps_the_host_cookie_and_a_fixed_local_mode_destination() {
+        let response = session_entry(
+            host_entry_page("webviewMode=legacy").unwrap(),
+            "private-host",
+        );
+        assert_eq!(
+            response.headers()["set-cookie"],
+            "bilikara_native=private-host; Path=/; HttpOnly; SameSite=Strict"
+        );
+        let body = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(axum::body::to_bytes(response.into_body(), 4096))
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(html.contains("url=/#bilikara-legacy"));
+        assert!(html.contains("href=\"/#bilikara-legacy\""));
+        assert!(!html.contains("private-host"));
+        for invalid in [
+            "webviewMode=unknown",
+            "webviewMode=legacy&webviewMode=legacy",
+            "page=controller&presentationGeneration=1&webviewMode=legacy",
+            "webviewMode=https://evil.invalid",
+            "webviewMode=%22%3E%3Cscript%3E",
         ] {
             assert!(host_entry_page(invalid).is_err(), "{invalid}");
         }

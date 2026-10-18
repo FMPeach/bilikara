@@ -15,10 +15,10 @@ function fixture({inert = true, css = () => true, invoke = async () => valid} = 
   const button = {disabled: false, addEventListener: (name, handler) => {listeners[name] = handler;},
     setAttribute: (key, value) => attributes.set(key, value), removeAttribute: key => attributes.delete(key)};
   let destination;
-  const context = vm.createContext({URL, AbortController, CSS: {supports: css},
+  const context = vm.createContext({URL, AbortController, crypto: {getRandomValues() {}}, ResizeObserver: function () {}, Element: {prototype: {getAnimations() {}}}, CSS: {supports: css},
     navigator: {userAgent: 'Fixture: no Android/device acceptance'},
     document: {getElementById: id => id === 'bootstrap-status' ? status : id === 'webview-diagnostics' ? button : null,
-      createElement: () => inert ? {inert: false} : {}},
+      documentElement: {getAttribute: () => null}, createElement: () => inert ? {inert: false} : {}},
     window: {__TAURI__: {core: {invoke}}, location: {replace: url => {destination = url;}}}});
   return {context, button, status, attributes, click: () => listeners.click(), destination: () => destination};
 }
@@ -43,6 +43,8 @@ test('diagnosis remains clickable when startup is blocked; duplicate activation 
     return new Promise((ok, bad) => {resolve = ok; reject = bad;});
   }});
   await vm.runInContext(bootstrap, f.context);
+  assert.equal(calls, 1, 'blocked startup automatically opens diagnostics');
+  resolve(); await Promise.resolve(); calls = 0;
   const first = f.click();
   assert.equal(f.button.disabled, true); assert.equal(f.attributes.get('aria-busy'), 'true');
   await f.click(); assert.equal(calls, 1);
@@ -64,4 +66,30 @@ test('supported capability fixture proceeds through the existing authenticated b
   const f = fixture(); await vm.runInContext(bootstrap, f.context);
   assert.equal(f.destination(), valid.bootstrap_url);
   assert.equal(JSON.parse(vm.runInContext(probe, f.context)).missing.length, 0);
+});
+
+test('legacy requires an explicit action, keeps authentication, and rejects duplicate startup', async () => {
+  let complete, hostCalls = 0, diagnoses = 0;
+  const f = fixture({inert: false, invoke(name) {
+    if (name === 'android_webview_diagnostics') { diagnoses++; return Promise.resolve(); }
+    assert.equal(name, 'android_alpha_status'); hostCalls++;
+    return new Promise(resolve => { complete = resolve; });
+  }});
+  await vm.runInContext(bootstrap, f.context);
+  assert.equal(diagnoses, 1); assert.equal(hostCalls, 0); assert.equal(f.destination(), undefined);
+  assert.equal(f.context.window.bilikaraStartLegacy(), true);
+  assert.equal(f.context.window.bilikaraStartLegacy(), false);
+  assert.equal(hostCalls, 1);
+  complete(valid); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.destination(), valid.bootstrap_url + '?webviewMode=legacy');
+});
+
+test('legacy cannot bypass native readiness or malformed bootstrap URLs', async () => {
+  for (const result of [{...valid, window_controls_ready: false}, {...valid, persistence_ready: false},
+    {...valid, bootstrap_url: 'https://untrusted.invalid/bootstrap/' + 'a'.repeat(43)}]) {
+    const f = fixture({inert: false, invoke: async name => name === 'android_alpha_status' ? result : undefined});
+    await vm.runInContext(bootstrap, f.context);
+    f.context.window.bilikaraStartLegacy(); await new Promise(resolve => setImmediate(resolve));
+    assert.equal(f.destination(), undefined); assert.match(f.status.textContent, /启动检查失败/u);
+  }
 });

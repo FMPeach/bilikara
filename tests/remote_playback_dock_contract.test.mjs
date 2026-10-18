@@ -408,7 +408,7 @@ assert.ok(!contains("overflow-y", rule));
 assert.ok(contains("@media (min-width: 700px)", this.styles));
 assert.ok(contains("@media (min-width: 700px) and (max-height: 520px)", this.styles));
 portrait_rule = this.styles.slice(sourceIndex(this.styles, "@media (max-width: 699px) and (min-height: 521px)"), sourceIndex(this.styles, "@media (max-width: 360px)"));
-assert.ok(contains("max-height: calc(100dvh - max(12px, var(--remote-safe-area-top)))", portrait_rule));
+assert.ok(contains("max-height: calc(calc(var(--legacy-vh, 1dvh) * 100) - max(12px, var(--remote-safe-area-top)))", portrait_rule));
 sheet_rule = this.styles.match(new RegExp("\\.playback-sheet\\s*\\{([^}]*)\\}",""))[1];
 assert.ok(contains("padding: max(12px, var(--remote-safe-area-top))", sheet_rule));
 assert.ok(contains("var(--remote-safe-area-left)", sheet_rule));

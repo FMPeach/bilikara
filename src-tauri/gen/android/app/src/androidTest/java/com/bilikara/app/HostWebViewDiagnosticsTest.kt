@@ -38,6 +38,25 @@ class HostWebViewDiagnosticsTest {
     assertTrue(HostWebViewDiagnostics.statusMessage(null, true, 0).contains("未能确认"))
   }
 
+  @Test fun legacyRequiresVerifiedBaselineBridgeAndStartupEntry() {
+    val context = InstrumentationRegistry.getInstrumentation().targetContext
+    ActivityScenario.launch<WindowTestActivity>(Intent(context, WindowTestActivity::class.java)).use { scenario ->
+      scenario.onActivity { activity ->
+        val diagnostics = HostWebViewDiagnostics(activity)
+        val facts = JSONObject().put("legacy_entry", true).put("legacy_missing", org.json.JSONArray())
+        assertTrue(diagnostics.canEnterLegacy(91, true, facts))
+        assertFalse(diagnostics.canEnterLegacy(83, true, facts))
+        assertFalse(diagnostics.canEnterLegacy(null, true, facts))
+        assertFalse(diagnostics.canEnterLegacy(91, false, facts))
+        assertFalse(diagnostics.canEnterLegacy(91, true, null))
+        facts.put("legacy_entry", false)
+        assertFalse(diagnostics.canEnterLegacy(91, true, facts))
+        facts.put("legacy_entry", true).put("legacy_missing", org.json.JSONArray().put("Web Crypto"))
+        assertFalse(diagnostics.canEnterLegacy(91, true, facts))
+      }
+    }
+  }
+
   // Use the standard Espresso device setup (system animations off).
   @Test fun reportCanBeCopiedAndClosedWithoutAnyUpdateAction() {
     val instrumentation = InstrumentationRegistry.getInstrumentation()

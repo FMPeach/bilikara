@@ -48,7 +48,7 @@
     "test:native-smoke": "node tests/run_native_smoke.mjs",
     "test:remote-load": "node --test tests/remote_sse_load.test.mjs",
     "test:frontend": "node --test tests/frontend_tests.test.mjs",
-    "test:android-webview": "node --test tests/android_webview_timeout.test.mjs tests/android_webview_browser.test.mjs tests/android_webview_legacy.test.mjs",
+    "test:android-webview": "node --test tests/android_webview_timeout.test.mjs tests/android_webview_browser.test.mjs tests/android_webview_legacy.test.mjs tests/android_webview_modes.test.mjs",
     "test:auxiliary": "node --test tests/signalsmith_vendor.test.mjs tests/tool_asset_metadata.test.mjs tests/tool_asset_workflows.test.mjs",
     "test:remote-sync": "node --test tests/internet_remote_frontend_contract.test.mjs tests/internet_remote_ice.test.mjs tests/internet_remote_deployment.test.mjs tests/internet_remote_host_lifecycle.test.mjs tests/internet_remote_provisioning.test.mjs",
     "test:automatic-volume": "node --test tests/automatic_volume.test.mjs",

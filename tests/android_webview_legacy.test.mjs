@@ -78,5 +78,14 @@ test('actual pre-93 Chromium can render the Android compatibility message before
   assert.match(status, /Android System WebView.*WebView 兼容性自检/);
   assert.doesNotMatch(status, /系统应用商店|请更新/u);
   assert.match(status, /无需清除应用数据/);
+  // An unsupported unit inside var()/env() survives parsing and fails only at
+  // computed-value time, discarding an earlier declaration. Exercise the actual
+  // shared safe-area bound in this genuinely old engine, not a modern mock.
+  const boundRule = readFileSync(new URL('../static/styles.css', import.meta.url), 'utf8').split('\n')
+    .find(line => line.includes('max-height:') && line.includes('env(safe-area-inset-top, 0px)') && line.includes('--legacy-vh'));
+  const computed = (await send('Runtime.evaluate', { expression:
+    '(function(){document.documentElement.style.setProperty("--legacy-vh","6px");var n=document.createElement("div");n.style.cssText='
+      + JSON.stringify(boundRule) + ';document.body.appendChild(n);return getComputedStyle(n).maxHeight;})()', returnByValue: true })).result.value;
+  assert.equal(computed, '552px', 'legacy safe-area bound survives computed-value validation');
   assert.deepEqual(errors, []);
 });

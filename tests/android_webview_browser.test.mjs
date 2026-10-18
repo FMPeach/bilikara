@@ -10,11 +10,12 @@ import { RunningHost, isolatedEnvironment } from './native_host_support.mjs';
 // Linux browser + actual isolated shared Rust Host; never Android device acceptance.
 // Optional historic executable is explicit, never downloaded by the test.
 const executablePath = process.env.BILIKARA_TEST_WEBVIEW_CHROMIUM;
+const legacyMode = process.env.BILIKARA_TEST_WEBVIEW_MODE === "legacy";
 const evidence = process.env.BILIKARA_TEST_SCREENSHOT_DIR;
 let binary;
 before(async () => { binary = await buildNativeAlpha(); }, { timeout: 300000 });
 
-for (const missingTimeout of [true, false]) test(`Host startup, LAN QR, fixture public room and recovery (timeout API ${missingTimeout ? 'absent' : 'unchanged'})`, {
+for (const missingTimeout of [true, false]) test(`Host startup, LAN QR, fixture public room and recovery in ${legacyMode ? "legacy" : "latest"} (timeout API ${missingTimeout ? 'absent' : 'unchanged'})`, {
   timeout: 90000,
 }, async t => {
   const home = mkdtempSync(path.join(root, '.tmp/webview-compat-'));
@@ -26,7 +27,13 @@ for (const missingTimeout of [true, false]) test(`Host startup, LAN QR, fixture 
   t.after(() => browser.close());
   const context = await browser.newContext({ viewport: { width: 700, height: 800 } });
   await context.addCookies([...host.cookies].map(([name, value]) => ({ name, value, url: host.base })));
-  await context.addInitScript(({ missingTimeout }) => {
+  await context.addInitScript(({ missingTimeout, legacyMode }) => {
+    if (legacyMode) {
+      Object.defineProperty(Object, "hasOwn", {configurable: true, value: undefined});
+      Object.defineProperty(Array.prototype, "at", {configurable: true, value: undefined});
+      Object.defineProperty(crypto, "randomUUID", {configurable: true, value: undefined});
+      delete HTMLElement.prototype.inert;
+    }
     if (missingTimeout) Object.defineProperty(AbortSignal, 'timeout', { configurable: true, value: undefined });
     localStorage.setItem('bilikara.update.automatic', 'false');
     // Socket lifecycle fixture: no production WebSocket, ICE or TURN traffic.
@@ -43,7 +50,7 @@ for (const missingTimeout of [true, false]) test(`Host startup, LAN QR, fixture 
     };
     window.clearTimeout = function (id) { active.delete(id); return originalClear(id); };
     window.issue117Deadlines = active;
-  }, { missingTimeout });
+  }, { missingTimeout, legacyMode });
   let stateFailure = false, roomFailure = false, creates = 0, qrRequests = 0;
   const errors = [], external = [], consoleMessages = [];
   await context.route('**/*', async route => {
@@ -72,9 +79,10 @@ for (const missingTimeout of [true, false]) test(`Host startup, LAN QR, fixture 
     if (['error', 'warning'].includes(message.type()) && consoleMessages.length < 30)
       consoleMessages.push(message.text().replace(/https?:\/\/\S+/gu, '[fixture URL]').slice(0, 250));
   });
-  await page.goto(host.base);
+  await page.goto(legacyMode ? host.bootstrapUrl + "?webviewMode=legacy" : host.base);
   await page.waitForFunction(() => typeof state !== 'undefined' && state.hasValidStateResponse);
   assert.equal(await page.title(), 'bilikara host');
+  assert.equal(await page.evaluate(() => document.documentElement.dataset.webviewMode), legacyMode ? 'legacy' : 'latest');
   assert.match(await page.locator('body').innerText(), /bilikara/);
   const facts = await page.evaluate(() => ({ ua: navigator.userAgent, timeout: typeof AbortSignal.timeout,
     hasOwn: typeof Object.hasOwn, at: typeof Array.prototype.at, platform: document.documentElement.dataset.hostPlatform }));

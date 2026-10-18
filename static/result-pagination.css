@@ -7,9 +7,9 @@
 }
 
 /* Match the 4px gap above a visible page footer; other views keep their padding. */
-.remote-shell .request-panel:has(> .remote-request-view:not([hidden])
+.remote-shell .request-panel:is(:has(> .remote-request-view:not([hidden])
   :is(.remote-search-mode-panel, .remote-discover-mode-panel, .remote-sources-mode-panel):not([hidden])
-  .result-pager:not([hidden])) {
+  .result-pager:not([hidden])), :where([data-legacy-has~="r13"])) {
   padding-bottom: 4px;
 }
 
@@ -36,7 +36,7 @@
 }
 
 /* A paged category home needs the same row gap as the search/source views. */
-.remote-shell .request-panel .category-browser-home:has(> .result-pager) {
+.remote-shell .request-panel .category-browser-home:is(:has(> .result-pager), :where([data-legacy-has~="r14"])) {
   display: grid;
   gap: 12px;
 }
@@ -60,7 +60,7 @@
   isolation: isolate;
   overflow-anchor: none;
 }
-.result-page-viewport:has(> .hidden) { display: none; }
+.result-page-viewport:is(:has(> .hidden), :where([data-legacy-has~="r15"])) { display: none; }
 .result-page-preview {
   position: absolute;
   top: 0;

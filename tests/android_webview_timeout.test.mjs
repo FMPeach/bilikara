@@ -103,10 +103,10 @@ for (const kind of ['state', 'room']) {
 
 const bootstrap = readFileSync(new URL('../static/android-alpha.js', import.meta.url), 'utf8');
 for (const missing of ['AbortController', 'Object.hasOwn', 'Array.prototype.at', 'String.prototype.replaceAll', 'Promise.allSettled']) {
-  test(`Android bootstrap explains missing ${missing} before invoking native IPC`, async () => {
+  test(`Android bootstrap explains missing ${missing} before Host IPC, with automatic diagnostics`, async () => {
     const status = { textContent: '' }; let invoked = false, navigated = false;
     const context = vm.createContext({ AbortController, document: { getElementById: id => id === "bootstrap-status" ? status : null },
-      window: { __TAURI__: { core: { invoke() { invoked = true; } } }, location: { replace() { navigated = true; } } } });
+      window: { __TAURI__: { core: { invoke(name) { if (name === "android_alpha_status") invoked = true; return Promise.resolve(); } } }, location: { replace() { navigated = true; } } } });
     vm.runInContext(`${missing} = undefined`, context);
     await vm.runInContext(bootstrap, context);
     assert.equal(invoked, false); assert.equal(navigated, false);

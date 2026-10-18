@@ -239,7 +239,8 @@ internal class HostPresentation(private val activity: AppCompatActivity) : Displ
         setSupportMultipleWindows(false)
       }
       installBridge(view, true, lease)
-      val url = "$origin/controller.html?presentationGeneration=$lease"
+      val legacy = Uri.parse(host?.url ?: "").fragment == "bilikara-legacy"
+      val url = "$origin/controller.html?presentationGeneration=$lease" + if (legacy) "#bilikara-legacy" else ""
       view.webViewClient = object : WebViewClient() {
         override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean = request.url.toString() != url
         override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {

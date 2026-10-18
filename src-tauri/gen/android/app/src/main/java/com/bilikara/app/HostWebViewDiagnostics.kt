@@ -18,6 +18,7 @@ internal class HostWebViewDiagnostics(private val activity: AppCompatActivity) {
   companion object {
     // Full Android UI requirement, not merely the JavaScript startup floor (93).
     const val UI_CHROMIUM_BASELINE = 111
+    const val LEGACY_CHROMIUM_BASELINE = 91
 
     // ES5 syntax deliberately: diagnostics must execute on an unsupported engine.
     internal val PROBE = """
@@ -34,7 +35,20 @@ internal class HostWebViewDiagnostics(private val activity: AppCompatActivity) {
         need('CSS :has()', css('selector(:has(*))'));
         need('CSS dvh', css('height: 100dvh'));
         need('CSS color-mix()', css('color: color-mix(in srgb, black, white)'));
-        return JSON.stringify({missing: missing, user_agent: navigator.userAgent,
+        var legacyMissing = [];
+        function legacyNeed(name, available) { if (!available) legacyMissing.push(name); }
+        legacyNeed('AbortController', typeof AbortController === 'function');
+        legacyNeed('Web Crypto', typeof crypto === 'object' && typeof crypto.getRandomValues === 'function');
+        legacyNeed('Promise.allSettled', typeof Promise.allSettled === 'function');
+        legacyNeed('String.replaceAll', typeof String.prototype.replaceAll === 'function');
+        legacyNeed('ResizeObserver', typeof ResizeObserver === 'function');
+        legacyNeed('getAnimations', typeof Element.prototype.getAnimations === 'function');
+        legacyNeed('CSS inset', css('inset: 0px'));
+        legacyNeed('CSS aspect-ratio', css('aspect-ratio: 16 / 9'));
+        return JSON.stringify({missing: missing, legacy_missing: legacyMissing,
+          legacy_entry: typeof window.bilikaraStartLegacy === 'function',
+          mode: document.documentElement.getAttribute('data-webview-mode') || 'latest',
+          adapters: window.BilikaraWebViewCompatibility ? window.BilikaraWebViewCompatibility.adapters : [], user_agent: navigator.userAgent,
           document_origin: typeof location === 'object' ? location.origin : '',
           secure_context: window.isSecureContext === true,
           web_rtc: typeof RTCPeerConnection === 'function',
@@ -55,6 +69,11 @@ internal class HostWebViewDiagnostics(private val activity: AppCompatActivity) {
 
   private var dialog: AlertDialog? = null
   private var report = ""
+  private var probeGeneration = 0
+
+  internal fun canEnterLegacy(major: Int?, bridge: Boolean, facts: JSONObject?): Boolean =
+    major != null && major >= LEGACY_CHROMIUM_BASELINE && bridge &&
+      facts?.optBoolean("legacy_entry") == true && facts.optJSONArray("legacy_missing")?.length() == 0
 
   fun checkOnCreate(webView: WebView) {
     val provider = WebViewCompat.getCurrentWebViewPackage(activity)
@@ -66,29 +85,43 @@ internal class HostWebViewDiagnostics(private val activity: AppCompatActivity) {
   }
 
   fun show(webView: WebView) {
-    if (dialog?.isShowing == true || activity.isFinishing || activity.isDestroyed) return
+    if (activity.isFinishing || activity.isDestroyed) return
+    dialog?.takeIf { it.isShowing }?.let { refresh(webView, it); return }
     val provider = WebViewCompat.getCurrentWebViewPackage(activity)
     val bridge = WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)
-    val major = provider?.versionName?.substringBefore('.')?.toIntOrNull()
     val base = "Android ${Build.VERSION.RELEASE} / API ${Build.VERSION.SDK_INT}\n" +
       "WebView: ${provider?.packageName ?: "未识别"}\n版本: ${provider?.versionName ?: "未知"}\n" +
-      "界面能力基线: Chromium $UI_CHROMIUM_BASELINE\n" +
+      "latest 能力基线: Chromium $UI_CHROMIUM_BASELINE / legacy 首批基线: $LEGACY_CHROMIUM_BASELINE\n" +
       "原生消息桥: ${if (bridge) "支持" else "不支持"}"
     report = "$base\n网页能力: 检测中"
     val current = AlertDialog.Builder(activity).setTitle("WebView 兼容性自检")
       .setMessage("正在检测当前 WebView…\n\n$report")
       .setNeutralButton("复制诊断", null)
-      .setNegativeButton("关闭", null).create()
+      .setNegativeButton("关闭", null)
+      .setPositiveButton("进入 legacy 模式", null).create()
     dialog = current
     current.setOnDismissListener { if (dialog === current) dialog = null }
     current.show()
+    current.getButton(AlertDialog.BUTTON_POSITIVE).visibility = android.view.View.GONE
     current.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener {
       val clipboard = activity.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
       clipboard.setPrimaryClip(ClipData.newPlainText("bilikara WebView", report))
       Toast.makeText(activity, "WebView 诊断信息已复制", Toast.LENGTH_SHORT).show()
     }
+    refresh(webView, current)
+  }
+
+  private fun refresh(webView: WebView, current: AlertDialog) {
+    val generation = ++probeGeneration
+    val provider = WebViewCompat.getCurrentWebViewPackage(activity)
+    val bridge = WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)
+    val major = provider?.versionName?.substringBefore('.')?.toIntOrNull()
+    val base = "Android ${Build.VERSION.RELEASE} / API ${Build.VERSION.SDK_INT}\n" +
+      "WebView: ${provider?.packageName ?: "未识别"}\n版本: ${provider?.versionName ?: "未知"}\n" +
+      "latest 能力基线: Chromium $UI_CHROMIUM_BASELINE / legacy 首批基线: $LEGACY_CHROMIUM_BASELINE\n" +
+      "原生消息桥: ${if (bridge) "支持" else "不支持"}"
     webView.evaluateJavascript(PROBE) { value ->
-      if (dialog !== current || !current.isShowing || activity.isDestroyed) return@evaluateJavascript
+      if (generation != probeGeneration || dialog !== current || !current.isShowing || activity.isDestroyed) return@evaluateJavascript
       val facts = try { JSONObject(JSONTokener(value).nextValue() as String) } catch (_: Exception) { null }
       val missing = facts?.optJSONArray("missing")
       val check = when {
@@ -100,7 +133,30 @@ internal class HostWebViewDiagnostics(private val activity: AppCompatActivity) {
         "\n检测页: ${facts.optString("document_origin")}\n检测页安全上下文: ${facts.optBoolean("secure_context")}\nWebRTC: ${facts.optBoolean("web_rtc")}" +
         " / WebAudio: ${facts.optBoolean("web_audio")} / AudioWorklet: ${facts.optBoolean("audio_worklet")}" +
         " / WASM: ${facts.optBoolean("web_assembly")}\nUA: ${facts.optString("user_agent") }"
-      current.setMessage("${statusMessage(major, bridge, missing?.length())}\n\n$report")
+      val eligible = canEnterLegacy(major, bridge, facts)
+      val latest = major != null && major >= UI_CHROMIUM_BASELINE && bridge && missing?.length() == 0
+      val activeLegacy = facts?.optString("mode") == "legacy"
+      val advice = when {
+        activeLegacy -> "当前正在使用 legacy 模式；缺失能力由兼容层补齐。基础检测不代表完整功能验收。"
+        eligible && !latest -> "当前 WebView 未满足 latest 要求。可以选择进入 legacy 模式，由兼容层补齐缺失能力。无需清除应用数据。"
+        else -> statusMessage(major, bridge, missing?.length())
+      }
+      report += "\n当前模式: ${if (activeLegacy) "legacy" else "latest"}" +
+        "\nlegacy 缺少的必要能力: ${facts?.optJSONArray("legacy_missing") ?: "未完成检测"}" +
+        "\n已启用的兼容能力: ${facts?.optJSONArray("adapters") ?: "未完成检测"}"
+      current.setMessage("$advice\n\n$report")
+      val enter = current.getButton(AlertDialog.BUTTON_POSITIVE)
+      enter.isAllCaps = false
+      enter.visibility = if (eligible && !latest) android.view.View.VISIBLE else android.view.View.GONE
+      enter.setOnClickListener {
+        enter.isEnabled = false
+        webView.evaluateJavascript("typeof window.bilikaraStartLegacy === 'function' && window.bilikaraStartLegacy()") { accepted ->
+          if (accepted == "true") current.dismiss() else {
+            enter.isEnabled = true
+            current.setMessage("启动入口未就绪，请关闭后重新打开自检。\n\n$report")
+          }
+        }
+      }
     }
   }
 

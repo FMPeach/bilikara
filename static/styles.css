@@ -356,7 +356,7 @@ p {
   max-width: min(440px, calc(100vw - 24px));
   white-space: normal;
   overflow-wrap: anywhere;
-  max-height: calc(100dvh - 24px);
+  max-height: calc(calc(var(--legacy-vh, 1vh) * 100) - 24px); max-height: calc(100dvh - 24px);
   padding: 14px;
   overflow-y: auto;
   overscroll-behavior: contain;
@@ -423,7 +423,7 @@ p {
 /* Binding has a header, a bounded scrolling body, and an always-visible footer. */
 #binding-modal .selection-modal-card {
   grid-template-rows: auto minmax(0, 1fr) auto;
-  max-height: calc(100dvh - 48px);
+  max-height: calc(calc(var(--legacy-vh, 1vh) * 100) - 48px); max-height: calc(100dvh - 48px);
 }
 
 .selection-modal-card-single {
@@ -5909,7 +5909,7 @@ body.is-presentation-stage-only {
 
 body.is-presentation-stage-only #app-shell {
   min-height: 100vh;
-  min-height: 100dvh;
+  min-height: calc(var(--legacy-vh, 1vh) * 100); min-height: 100dvh;
   padding: 0;
 }
 
@@ -5929,7 +5929,7 @@ body.is-presentation-stage-only .left-column {
   width: 100%;
   max-width: none;
   min-height: 100vh;
-  min-height: 100dvh;
+  min-height: calc(var(--legacy-vh, 1vh) * 100); min-height: 100dvh;
   margin: 0;
   padding: 0;
 }
@@ -5940,7 +5940,7 @@ body.is-presentation-stage-only .player-panel {
   z-index: var(--host-layer-fullscreen);
   width: 100vw;
   height: 100vh;
-  height: 100dvh;
+  height: calc(var(--legacy-vh, 1vh) * 100); height: 100dvh;
   min-height: 0;
   margin: 0;
   padding: 0;
@@ -6930,7 +6930,7 @@ body.is-presentation-stage-only.is-presentation-cursor-hidden * {
 
 .rating-body {
   max-height: calc(100vh - 48px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
-  max-height: calc(100dvh - 48px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
+  max-height: calc(calc(var(--legacy-vh, 1vh) * 100) - 48px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px)); max-height: calc(calc(var(--legacy-vh, 1dvh) * 100) - 48px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
   overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior: contain;
@@ -7853,7 +7853,7 @@ body {
   --host-rail-width: 80px;
   width: 100%;
   height: 100vh;
-  height: 100dvh;
+  height: calc(var(--legacy-vh, 1vh) * 100); height: 100dvh;
   min-height: 0;
   padding: 0 var(--host-shell-padding-inline) 12px;
   display: grid;
@@ -7995,7 +7995,7 @@ body {
 .topbar .cache-panel {
   /* Body scrolling retired with the shell, so the existing toolbar panels
      keep their own bounded reachability without becoming a Settings drawer. */
-  max-height: calc(100dvh - 90px);
+  max-height: calc(calc(var(--legacy-vh, 1vh) * 100) - 90px); max-height: calc(100dvh - 90px);
   overflow-y: auto;
   overscroll-behavior: contain;
   scrollbar-gutter: auto;
@@ -8011,7 +8011,7 @@ body {
   overflow: visible;
 }
 
-.critical-banner-region:has(.backup-banner:not(.hidden)) {
+.critical-banner-region:is(:has(.backup-banner:not(.hidden)), :where([data-legacy-has~="r4"])) {
   margin-bottom: 0;
 }
 
@@ -9045,14 +9045,14 @@ body[data-tauri-platform="macos"] .window-drag-region {
   box-shadow: none;
 }
 @media (hover: hover) and (pointer: fine) {
-  .topbar :is(.mode-control, .status-chip):has(> button:not(:disabled):hover) {
+  .topbar :is(.mode-control, .status-chip):is(:has(> button:not(:disabled):hover), :where([data-legacy-has~="r5"])) {
     border-color: var(--sync-button-hover-border);
   }
 }
-.topbar :is(.mode-control, .status-chip):has(> button:not(:disabled)[aria-expanded="true"]) {
+.topbar :is(.mode-control, .status-chip):is(:has(> button:not(:disabled)[aria-expanded="true"]), :where([data-legacy-has~="r6"])) {
   border-color: var(--sync-focus-border);
 }
-.topbar :is(.mode-control, .status-chip):has(> button:not(:disabled):active) {
+.topbar :is(.mode-control, .status-chip):is(:has(> button:not(:disabled):active), :where([data-legacy-has~="r7"])) {
   background: var(--host-control-pressed-bg);
   border-color: var(--sync-focus-border);
 }
@@ -10016,7 +10016,7 @@ body.is-presentation-stage-only .left-column {
   width: 100%;
   max-width: none;
   min-height: 100vh;
-  min-height: 100dvh;
+  min-height: calc(var(--legacy-vh, 1vh) * 100); min-height: 100dvh;
   margin: 0;
   padding: 0;
   overflow: hidden;
@@ -10106,13 +10106,13 @@ body.is-presentation-stage-only .left-column {
 }
 
 /* Dialogs without an eyebrow align their title and actions on one row. */
-.selection-modal-head.host-peer-head:not(:has(.section-tag)) {
+.selection-modal-head.host-peer-head:not(:is(:has(.section-tag), :where([data-legacy-has~="r8"]))) {
   grid-template-rows: auto;
   row-gap: 0;
 }
 
-.selection-modal-head.host-peer-head:not(:has(.section-tag)) :is(h2, .binding-modal-title-row),
-.selection-modal-head.host-peer-head:not(:has(.section-tag)) > :not(.host-peer-heading) {
+.selection-modal-head.host-peer-head:not(:is(:has(.section-tag), :where([data-legacy-has~="r8"]))) :is(h2, .binding-modal-title-row),
+.selection-modal-head.host-peer-head:not(:is(:has(.section-tag), :where([data-legacy-has~="r8"]))) > :not(.host-peer-heading) {
   grid-row: 1;
 }
 
@@ -10697,7 +10697,7 @@ body[data-tauri-platform="windows"] .app-shell {
   --window-frame-radius: 0px;
   --window-frame-border: transparent;
   width: 100%;
-  height: 100dvh;
+  height: calc(var(--legacy-vh, 1vh) * 100); height: 100dvh;
   margin: 0;
   border: 0;
   border-radius: 0;
@@ -10783,7 +10783,7 @@ body[data-tauri-platform="windows"].is-tauri-maximized .app-shell,
 body[data-tauri-platform="windows"].is-tauri-fullscreen-active .app-shell,
 body[data-tauri-platform="windows"].is-presentation-stage-only .app-shell {
   width: 100%;
-  height: 100dvh;
+  height: calc(var(--legacy-vh, 1vh) * 100); height: 100dvh;
   margin: 0;
   border: 0;
   border-radius: 0;
@@ -10796,7 +10796,7 @@ body[data-tauri-platform="windows"].is-presentation-stage-only .app-shell {
    fills that window; browser fullscreen keeps its existing top-layer path. */
 body.is-tauri-fullscreen-active .app-shell {
   width: 100%;
-  height: 100dvh;
+  height: calc(var(--legacy-vh, 1vh) * 100); height: 100dvh;
   margin: 0;
   padding: 0;
   border: 0;
@@ -10839,7 +10839,7 @@ body.is-tauri-fullscreen-active .left-column {
   width: 100vw;
   max-width: none;
   height: 100vh;
-  height: 100dvh;
+  height: calc(var(--legacy-vh, 1vh) * 100); height: 100dvh;
   max-height: none;
   margin: 0;
   padding: 0;
@@ -10926,7 +10926,7 @@ body.is-tauri-fullscreen-active .left-column {
   display: none;
 }
 
-.gatcha-main-view:has(.gatcha-prerequisite-notices:not([hidden])) .gatcha-state-view {
+.gatcha-main-view:is(:has(.gatcha-prerequisite-notices:not([hidden])), :where([data-legacy-has~="r9"])) .gatcha-state-view {
   flex-grow: 0;
   min-height: 128px;
 }
@@ -11405,7 +11405,7 @@ body.is-presentation-control-host .presentation-host-next-song-overlay {
 }
 
 body.is-presentation-control-host .presentation-host-next-song-overlay .player-delay-card {
-  gap: clamp(7px, 2.5cqh, 16px);
+  gap: clamp(7px, calc(var(--legacy-cqh, 1cqh) * 2.5), 16px);
   padding: 16px;
   transform: none;
   transition: none;
@@ -11428,47 +11428,47 @@ body.is-presentation-control-host .presentation-host-next-song-overlay .player-d
 body.is-presentation-control-host .presentation-host-next-song-overlay .player-delay-now-row,
 body.is-presentation-control-host .presentation-host-next-song-overlay .player-delay-list-row {
   grid-template-columns:
-    clamp(28px, 5cqw, 40px)
+    clamp(28px, calc(var(--legacy-cqw, 1cqw) * 5), 40px)
     minmax(0, 1fr)
-    minmax(64px, 18cqw)
-    clamp(48px, 10cqw, 76px);
-  gap: clamp(6px, 2cqw, 16px);
+    minmax(64px, calc(var(--legacy-cqw, 1cqw) * 18))
+    clamp(48px, calc(var(--legacy-cqw, 1cqw) * 10), 76px);
+  gap: clamp(6px, calc(var(--legacy-cqw, 1cqw) * 2), 16px);
 }
 
 body.is-presentation-control-host .presentation-host-next-song-overlay .player-delay-now-row {
-  min-height: clamp(60px, 23cqh, 104px);
-  padding: clamp(10px, 3cqh, 20px) clamp(12px, 3cqw, 24px);
-  border-radius: clamp(14px, 3cqw, 22px);
+  min-height: clamp(60px, calc(var(--legacy-cqh, 1cqh) * 23), 104px);
+  padding: clamp(10px, calc(var(--legacy-cqh, 1cqh) * 3), 20px) clamp(12px, calc(var(--legacy-cqw, 1cqw) * 3), 24px);
+  border-radius: clamp(14px, calc(var(--legacy-cqw, 1cqw) * 3), 22px);
 }
 
 body.is-presentation-control-host .presentation-host-next-song-overlay .player-delay-play-icon,
 body.is-presentation-control-host .presentation-host-next-song-overlay .player-delay-list-index {
-  --queue-order-size: clamp(28px, 5cqw, 40px);
-  --queue-order-font-size: clamp(14px, 4cqh, 20px);
+  --queue-order-size: clamp(28px, calc(var(--legacy-cqw, 1cqw) * 5), 40px);
+  --queue-order-font-size: clamp(14px, calc(var(--legacy-cqh, 1cqh) * 4), 20px);
 }
 
 body.is-presentation-control-host .presentation-host-next-song-overlay .player-delay-song-title {
-  font-size: clamp(15px, 5.5cqh, 27px);
+  font-size: clamp(15px, calc(var(--legacy-cqh, 1cqh) * 5.5), 27px);
   line-height: 1.28;
 }
 
 body.is-presentation-control-host .presentation-host-next-song-overlay .player-delay-requester,
 body.is-presentation-control-host .presentation-host-next-song-overlay .player-delay-duration {
-  font-size: clamp(11px, 3.6cqh, 17px);
+  font-size: clamp(11px, calc(var(--legacy-cqh, 1cqh) * 3.6), 17px);
 }
 
 body.is-presentation-control-host .presentation-host-next-song-overlay .player-delay-list {
-  gap: clamp(5px, 1.5cqh, 10px);
+  gap: clamp(5px, calc(var(--legacy-cqh, 1cqh) * 1.5), 10px);
 }
 
 body.is-presentation-control-host .presentation-host-next-song-overlay .player-delay-list-row {
-  min-height: clamp(42px, 13cqh, 64px);
-  padding: clamp(6px, 1.7cqh, 12px) clamp(10px, 2.5cqw, 18px);
-  border-radius: clamp(10px, 2cqw, 16px);
+  min-height: clamp(42px, calc(var(--legacy-cqh, 1cqh) * 13), 64px);
+  padding: clamp(6px, calc(var(--legacy-cqh, 1cqh) * 1.7), 12px) clamp(10px, calc(var(--legacy-cqw, 1cqw) * 2.5), 18px);
+  border-radius: clamp(10px, calc(var(--legacy-cqw, 1cqw) * 2), 16px);
 }
 
 body.is-presentation-control-host .presentation-host-next-song-overlay .player-delay-list-row .player-delay-song-title {
-  font-size: clamp(13px, 4.2cqh, 20px);
+  font-size: clamp(13px, calc(var(--legacy-cqh, 1cqh) * 4.2), 20px);
 }
 
 body.is-presentation-control-host .presentation-host-next-song-overlay .player-delay-total {
@@ -11972,7 +11972,7 @@ html .volume-adjust-popover::backdrop {
 
 /* The summary belongs to the card, outside its scrolling results. */
 .request-search-view > .request-mode-panel { position: relative; }
-:root #host-workspace-request .request-search-view > .request-mode-panel:has(> .host-search-summary:not([hidden])) { padding-bottom: 50px; }
+:root #host-workspace-request .request-search-view > .request-mode-panel:is(:has(> .host-search-summary:not([hidden])), :where([data-legacy-has~="r10"])) { padding-bottom: 50px; }
 .host-search-summary {
   position: absolute;
   right: 16px;
