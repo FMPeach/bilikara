@@ -37,7 +37,7 @@
 </p>
 
 <p align="center">
-  <img src="images/host_categories.png" alt="Host 发现页：类别封面列表可向下滚动" width="460"><br>
+  <img src="images/host_categories.png" alt="Host 发现页：类别封面列表可向下滚动" width="1000"><br>
   <sub>发现 → 类别：向下滚动浏览更多主题</sub>
 </p>
 
@@ -88,18 +88,15 @@
 
 原生 Host 会保留自动检查与预览版选择；开启自动检查后，每次启动检查一次，已有更新操作时等待结束后补查。详见[升级与更新说明](docs/upgrading.md)。
 
-<table>
-  <tr>
-    <td align="center" valign="top" width="40%">
-      <img src="images/server_settings.png" alt="运行设置：Bilibili 登录二维码与 1080P 高帧率清晰度" width="360"><br>
-      <sub>运行设置与扫码登录</sub>
-    </td>
-    <td align="center" valign="top" width="60%">
-      <img src="images/ui_settings.png" alt="Host 设置页：语言、主题、更新与维护" width="600"><br>
-      <sub>语言、外观与维护</sub>
-    </td>
-  </tr>
-</table>
+<p align="center">
+  <img src="images/server_settings.png" alt="当前 Host 运行设置：Rust Native、1080P 高帧率与 Bilibili 登录二维码" width="1000"><br>
+  <sub>运行设置与扫码登录</sub>
+</p>
+
+<p align="center">
+  <img src="images/ui_settings.png" alt="Host 设置页：语言、主题、更新与维护" width="1000"><br>
+  <sub>语言、外观与维护</sub>
+</p>
 
 - 歌曲会提前缓存，失败后可重试；退出后清理播放缓存，歌单和播放器设置会保留。
 - 默认使用内置 Rust Native，也可选择 BBDown 或 DownKyi / aria2c。Bilibili 登录二维码过期后自动刷新，凭据保存在本机，请勿分享登录凭据或完整数据目录。

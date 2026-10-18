@@ -46,7 +46,7 @@ Remote 播放抽屉既可点击底部播放栏展开、点击顶部横条或外�
 缓存或播放器尚未就绪时，仍可长按切歌展开胶囊，重唱键保持灰色；点按或滑入后松手均不会执行。普通状态刷新不会仅因重唱不可用而收起菜单。
 
 <p align="center">
-  <img src="../images/remote_restart.png" alt="375px 竖屏 Remote：长按切歌向左展开重唱胶囊" width="280"><br>
+  <img src="../images/remote_restart.png" alt="iPhone 17 Pro Max 竖屏 Remote：长按切歌向左展开重唱胶囊" width="280"><br>
   <sub>长按切歌展开；点重唱，或滑到重唱后松手执行</sub>
 </p>
 
