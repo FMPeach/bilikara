@@ -9,3 +9,4 @@ main {
   line-height: 1.7;
 }
 pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 0.9rem; }
+button { min-height: 44px; padding: 8px 16px; border-radius: 14px; font: inherit; cursor: pointer; }

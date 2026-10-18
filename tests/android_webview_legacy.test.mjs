@@ -40,8 +40,14 @@ test('actual pre-93 Chromium can render the Android compatibility message before
     });
     startupTimer = setTimeout(() => reject(new Error('Historic Chromium startup deadline')), 15000);
   }).finally(() => clearTimeout(startupTimer));
-  const targets = await (await fetch('http://127.0.0.1:' + new URL(endpoint).port + '/json/list')).json();
-  const socket = new WebSocket(targets.find(target => target.type === 'page').webSocketDebuggerUrl);
+  let target;
+  for (let attempt = 0; attempt < 50 && !target; attempt++) {
+    const targets = await (await fetch('http://127.0.0.1:' + new URL(endpoint).port + '/json/list')).json();
+    target = targets.find(candidate => candidate.type === 'page');
+    if (!target) await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  assert.ok(target, 'Historic browser must create the actual page target');
+  const socket = new WebSocket(target.webSocketDebuggerUrl);
   await new Promise((resolve, reject) => { socket.addEventListener('open', resolve, { once: true }); socket.addEventListener('error', reject, { once: true }); });
   t.after(() => socket.close());
   let sequence = 0;

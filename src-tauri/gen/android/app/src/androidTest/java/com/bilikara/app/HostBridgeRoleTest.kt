@@ -88,6 +88,9 @@ class HostBridgeRoleTest {
                 };
                 BilikaraHostWindow.postMessage('enter');
                 BilikaraHostPlatform.postMessage(JSON.stringify({id:'role-test',action:'environment'}));
+                if (!['/', '/index.html'].includes(location.pathname)) {
+                  BilikaraHostPlatform.postMessage(JSON.stringify({id:'diagnosticsDenied',action:'webview-diagnostics'}));
+                }
                 BilikaraHostPlatform.postMessage(JSON.stringify({id:'preferencesRead',action:'get-update-preferences'}));
                 BilikaraHostPlatform.postMessage(JSON.stringify({id:'preferencesSave',action:'save-update-preferences',preferences:{automatic:false,preview:true}}));
                 BilikaraHostPlatform.postMessage(JSON.stringify({id:'preferencesInvalid',action:'save-update-preferences',preferences:{automatic:'false',preview:true}}));
@@ -119,6 +122,7 @@ class HostBridgeRoleTest {
             } else {
               assertFalse("Window authority on $path", replies.has("window"))
               assertFalse("Platform authority on $path", replies.has("platform"))
+              assertFalse("WebView diagnostic authority on $path", replies.has("diagnosticsDenied"))
               assertFalse("UI preference authority on $path", replies.has("presentation"))
               assertFalse("Update preference read authority on $path", replies.has("preferencesRead"))
               assertFalse("Update preference write authority on $path", replies.has("preferencesSave"))

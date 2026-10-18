@@ -2,6 +2,7 @@
 import './frontend_static_contract.test.mjs';
 import './android_alpha_bootstrap_contract.test.mjs';
 import './android_webview_timeout.test.mjs';
+import './android_webview_diagnostics.test.mjs';
 import './frontend_command_contract.test.mjs';
 import './frontend_support.test.mjs';
 import './app_update_frontend_contract.test.mjs';

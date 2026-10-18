@@ -3,6 +3,7 @@
 .android-host-only { display: none; }
 .android-fullscreen-remote-button { display: none; }
 .android-display-settings[hidden] { display: none !important; }
+#webview-diagnostics-button[hidden] { display: none !important; }
 
 html[data-native-host="true"] .android-display-settings #presentation-settings {
   display: block;

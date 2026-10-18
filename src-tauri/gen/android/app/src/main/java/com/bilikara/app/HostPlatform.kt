@@ -11,7 +11,8 @@ import org.json.JSONObject
 
 /** Origin-scoped Android I/O only. Remote pages and subframes never get this bridge. */
 internal class HostPlatform(private val activity: AppCompatActivity,
-  private val updatePreferenceName: String = "bilikara-update-preferences-v1") {
+  private val updatePreferenceName: String = "bilikara-update-preferences-v1",
+  private val diagnostics: HostWebViewDiagnostics = HostWebViewDiagnostics(activity)) {
   private var installed = false
   private val updater = HostUpdate(activity)
 
@@ -43,6 +44,7 @@ internal class HostPlatform(private val activity: AppCompatActivity,
       try {
         val data = when (input.optString("action")) {
           "environment" -> environment()
+          "webview-diagnostics" -> { diagnostics.show(webView); JSONObject().put("shown", true) }
           "get-update-preferences" -> updatePreferences()
           "save-update-preferences" -> saveUpdatePreferences(input.getJSONObject("preferences"))
           else -> error("Unsupported platform action")

@@ -20469,6 +20469,7 @@ elements.updateAutomaticCheckbox?.addEventListener("change", async (event) => {
 });
 
 elements.diagnosticCopyButton?.addEventListener("click", copyDiagnosticsMarkdown);
+window.addEventListener("bilikara:webview-diagnostics-error", event => setAppMessage(event.detail, true));
 elements.diagnosticPackageButton?.addEventListener("click", downloadDiagnosticsPackage);
 
 elements.avSyncPanel?.addEventListener("click", async (event) => {
