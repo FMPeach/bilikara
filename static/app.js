@@ -6462,10 +6462,12 @@ async function fetchState() {
   const previousOffsetMs = currentAvOffsetMs();
   const previousData = state.data;
   const sequence = ++state.remoteAccessRequestSequence;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10_000);
   let response, payload;
   try {
     response = await fetch("/api/state", {
-      headers: clientHeaders(), signal: AbortSignal.timeout(10_000),
+      headers: clientHeaders(), signal: controller.signal,
     });
     payload = await parseApiResponse(response, "/api/state");
     if (!response.ok || !payload.ok || !validatedHostSnapshotIdentity(payload.data)) {
@@ -6477,6 +6479,8 @@ async function fetchState() {
       : ["TimeoutError", "AbortError"].includes(error.name) ? "timeout" : "network";
     updateRemoteAccessFailure({ kind, status: response?.status }, sequence);
     throw error;
+  } finally {
+    clearTimeout(timeout);
   }
   updateRemoteAccessFailure(null, sequence);
   if (!acceptHostStateSnapshot(payload.data)) {

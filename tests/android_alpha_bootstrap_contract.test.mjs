@@ -124,7 +124,7 @@ const valid = {schema_version: 3, stage: "native-host-alpha", backend: "rust", r
 async function render(invoke) {
   const nodes = {"bootstrap-status": {textContent: ""}, "bootstrap-details": {hidden: true}};
   let destination = null;
-  const context = {URL, window: {location: {replace: url => {destination = url;}},
+  const context = {URL, AbortController, window: {location: {replace: url => {destination = url;}},
     ...(invoke ? {__TAURI__: {core: {invoke}}} : {})},
     document: {getElementById: id => nodes[id]}};
   await vm.runInNewContext(source, context);

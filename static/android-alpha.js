@@ -3,10 +3,18 @@
   const status = document.getElementById("bootstrap-status");
   const details = document.getElementById("bootstrap-details");
   try {
-    const invoke = window.__TAURI__?.core?.invoke;
+    // Keep this bootstrap parseable by older WebViews so an unsupported engine
+    // gets an actionable message before loading the shared modern Host scripts.
+    // Chromium 93 supplies these existing frontend primitives; OS API != engine.
+    if (typeof AbortController !== "function" || typeof Object.hasOwn !== "function"
+      || typeof Array.prototype.at !== "function" || typeof String.prototype.replaceAll !== "function"
+      || typeof Promise.allSettled !== "function") {
+      throw new Error("Android System WebView 过旧，缺少当前界面所需的 JavaScript 能力（Chromium 93 及以上能力基线）。请在系统应用商店更新 Android System WebView 或系统当前使用的 Chrome/WebView 提供程序，然后重新打开 bilikara。无需清除应用数据；若仍失败，请提供 WebView 提供程序名称及完整版本号。");
+    }
+    const invoke = window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke;
     if (typeof invoke !== "function") throw new Error("请在 bilikara beta Android 应用中打开此页面。");
     const result = await invoke("android_alpha_status");
-    if (result?.schema_version !== 3 || result.stage !== "native-host-alpha" || result.backend !== "rust"
+    if (!result || result.schema_version !== 3 || result.stage !== "native-host-alpha" || result.backend !== "rust"
       || !Number.isSafeInteger(result.revision) || result.revision < 0
       || result.host_api_ready !== true || result.persistence_ready !== true || result.playback_ready !== true) {
       throw new Error("原生启动检查返回了不兼容的数据。");
@@ -23,6 +31,6 @@
     // entry document exchanges it for an HttpOnly cookie before loading shared UI.
     window.location.replace(destination.href);
   } catch (error) {
-    status.textContent = "启动检查失败：" + (error?.message || String(error));
+    status.textContent = "启动检查失败：" + ((error && error.message) || String(error));
   }
 })();

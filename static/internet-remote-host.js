@@ -967,22 +967,29 @@
       state.hostToken = transport.randomBase64Url(32);
       state.joinToken = transport.randomBase64Url(32);
       state.hostPeerId = transport.randomBase64Url(16);
-      const response = await fetch(`${SIGNAL_ORIGIN}/v1/rooms`, {
-        method: "POST",
-        signal: AbortSignal.timeout(15_000),
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          host_token_hash: await transport.sha256(state.hostToken),
-          join_token_hash: await transport.sha256(state.joinToken),
-          lifetime_hours: lifetimeHours,
-        }),
-      });
-      httpStatus = response.status;
-      recordDiagnostic("room.create", "response", {
-        httpStatus: response.status,
-        elapsedMs: performance.now() - startedAt,
-      });
-      const payload = await response.json();
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 15_000);
+      let response, payload;
+      try {
+        response = await fetch(`${SIGNAL_ORIGIN}/v1/rooms`, {
+          method: "POST",
+          signal: controller.signal,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            host_token_hash: await transport.sha256(state.hostToken),
+            join_token_hash: await transport.sha256(state.joinToken),
+            lifetime_hours: lifetimeHours,
+          }),
+        });
+        httpStatus = response.status;
+        recordDiagnostic("room.create", "response", {
+          httpStatus: response.status,
+          elapsedMs: performance.now() - startedAt,
+        });
+        payload = await response.json();
+      } finally {
+        clearTimeout(timeout);
+      }
       if (!response.ok) {
         throw new Error(payload.error === "room_capacity_reached"
           ? tr("internetRemote.capacityReached", "公网房间已达临时上限（10 间），请稍后再试。")
