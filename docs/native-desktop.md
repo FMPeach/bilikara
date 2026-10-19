@@ -638,6 +638,20 @@ neither startup nor the updater silently imports them. Existing native checkpoin
 bypass external discovery, and no candidate produces no dialog. Shell logs and
 WebView directories do not count as initialized application data.
 
+Detection checks record contents, not just filenames. On Windows it considers
+the installation's `runtime` and known `%LOCALAPPDATA%/bilikara` and
+`%APPDATA%/bilikara` homes; AppData never replaces the portable data default.
+Read-only inspection reuses the native schema/chunk reader and legacy converter
+without creating locks or migration backups. Only supported, validated records
+are offered for import. Rejected external candidates remain untouched and show
+their path and diagnostic; fresh startup continues and subsequent native
+reopening does not rediscover them. An invalid current native checkpoint remains
+protected rather than being reclassified as legacy or replaced with empty data.
+Checkpoint errors identify missing fields or JSON error class/line/column,
+without exposing saved values. Ordinary reopening uses a bounded, buffered
+envelope check before the Host's full validation, avoiding an extra inspection
+process or external-directory scan.
+
 Keep the installation in a writable directory and move its complete `runtime`
 directory with it. Read-only installations fail rather than falling back to
 AppData. macOS retains its user-data location outside the signed app.
