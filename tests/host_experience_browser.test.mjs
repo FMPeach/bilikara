@@ -1303,7 +1303,7 @@ for (const [name, engine] of [['Chromium', chromium], ['WebKit', webkit]]) {
     }
   });
 
-  test(`${name} ordinary user guidance stays neutral and drag deletion retains a stable target through snapshots`, {
+  test(`${name} empty-session prerequisite stays accented, guidance stays muted and drag deletion retains a stable target through snapshots`, {
     skip: nativeLimit, timeout: 60000,
   }, async t => {
     const { page, host } = await open(t, engine);
@@ -1312,12 +1312,17 @@ for (const [name, engine] of [['Chromium', chromium], ['WebKit', webkit]]) {
     for (const theme of ['light', 'dark', 'blue']) {
       const colors = await page.evaluate(theme => {
         applyTheme(theme); state.sessionUserEditor.render({ ...state.data, session_user_entries: [] });
-        const guidance = getComputedStyle(document.querySelector('.session-user-empty'));
-        const queue = getComputedStyle(document.querySelector('.queue-empty'));
-        return { guidance: guidance.color, queue: queue.color, weight: guidance.fontWeight };
+        const guidance = getComputedStyle(document.querySelector('.session-user-guidance'));
+        const prerequisite = getComputedStyle(document.querySelector('.session-user-prerequisite'));
+        const request = getComputedStyle(document.getElementById('gatcha-session-user-notice'));
+        const probe = document.createElement('span'); probe.style.color = 'var(--muted)'; document.body.append(probe);
+        const muted = getComputedStyle(probe).color; probe.remove();
+        return { guidance: guidance.color, muted, weight: guidance.fontWeight,
+          prerequisite: [prerequisite.color, prerequisite.fontWeight], request: [request.color, request.fontWeight] };
       }, theme);
-      assert.equal(colors.guidance, colors.queue, theme);
+      assert.equal(colors.guidance, colors.muted, theme);
       assert.equal(colors.weight, '400');
+      assert.deepEqual(colors.prerequisite, colors.request, theme);
     }
     await page.evaluate(() => state.sessionUserEditor.render(state.data));
     const drag = await page.evaluate(() => {

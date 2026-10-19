@@ -172,7 +172,13 @@
         if (!entries.length) {
           const empty = document.createElement("div");
           empty.className = "request-session-user-notice session-user-empty";
-          empty.textContent = `${this.t("session.empty")} ${this.t("session.help")}`; empty.setAttribute("role", "status");
+          for (const [key, className] of [["session.empty", "session-user-prerequisite"], ["session.help", "session-user-guidance"]]) {
+            const line = document.createElement("p");
+            line.className = className;
+            line.textContent = this.t(key);
+            empty.append(line);
+          }
+          empty.setAttribute("role", "status");
           this.list.append(empty);
         }
         this.list.scrollTop = scrollTop;
@@ -186,7 +192,10 @@
       this.stage.dataset.editMode = this.mode;
       this.list.classList.toggle("is-empty", !this.entries.length);
       const empty = this.list.querySelector(".session-user-empty");
-      if (empty) empty.textContent = `${this.t("session.empty")} ${this.t("session.help")}`;
+      if (empty) {
+        empty.querySelector(".session-user-prerequisite").textContent = this.t("session.empty");
+        empty.querySelector(".session-user-guidance").textContent = this.t("session.help");
+      }
       this.all.hidden = this.mode !== "select";
       this.all.disabled = this.busy || !this.entries.length;
       this.all.textContent = this.t(this.selected.size && this.selected.size === this.entries.length ? "session.clearSelection" : "session.selectAll");

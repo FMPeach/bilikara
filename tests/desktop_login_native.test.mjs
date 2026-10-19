@@ -57,9 +57,15 @@ test('real shared desktop login ABI: QR decoding, credentials, failures and gene
         const remote = new HttpClient(host.base); await remote.request('/remote');
         assert.equal((await remote.request('/api/bbdown/login/start', {})).status, 403);
         await host.api('/api/bbdown/login/start', {}); await waitFor(async () => (await control('stats')).held.length === 1, 'first HTTP login did not reach held generation');
+        if (stage === 'poll') {
+          assert.equal((await host.api('/api/state')).bbdown.login.login_url, payload, 'Authenticated Host sees exactly its active QR webpage');
+          const publicState = await remote.request('/api/state');
+          assert.equal(publicState.status, 200);
+          assert.equal(publicState.body.toString().includes('passport.bilibili.com/scan'), false, 'Remote snapshots never expose the login capability URL');
+        }
         await host.api('/api/bbdown/login/start', {}); assert.equal((await control('stats')).held.length, 1);
         await host.api('/api/bbdown/login/start', { force: true }); await waitFor(async () => (await control('stats')).held.length === 2, 'replacement HTTP login did not reach fixture');
-        await host.api('/api/bbdown/logout', {}); assert.equal((await host.api('/api/state')).bbdown.login.state, 'idle');
+        await host.api('/api/bbdown/logout', {}); assert.equal((await host.api('/api/state')).bbdown.login.state, 'idle'); assert.equal((await host.api('/api/state')).bbdown.login.login_url ?? '', '');
         await host.api('/api/bbdown/login/start', {}); await waitFor(async () => (await control('stats')).held.length === 3, 'shutdown login not in flight');
         // Keep response pending until real shutdown has invalidated its owner.
         await host.close(async () => { await control('release?index=0'); await control('release?index=1'); await control('release?index=2'); });

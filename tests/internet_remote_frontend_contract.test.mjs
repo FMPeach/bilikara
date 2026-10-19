@@ -103,7 +103,7 @@ assert.ok(!contains("import qrcode", this.server_source));
 qr_rule = splitOnce(firstMatch(Array.from(Array.from(iterableValues(this.remote_access_css.split(".remote-access-qr {").slice(1, undefined))) .filter((rule) => (contains("width: 160px", splitOnce(rule, "}")[0])))).map((rule) => rule)), "}")[0];
 assert.ok(contains("width: 160px", qr_rule));
 assert.ok(contains("height: 160px", qr_rule));
-assert.ok(contains("padding: 3px", qr_rule));
+assert.ok(contains("padding: var(--qr-frame-padding)", qr_rule));
 assert.ok(!contains(".remote-access-entry--public .remote-access-qr img", this.remote_access_css));
 local_qr_rule = this.remote_access_css.match(new RegExp("\\.remote-access-entry--local \\.remote-access-qr\\s*\\{([^}]*)\\}",""))[1];
 assert.ok(contains("justify-self: start", local_qr_rule));

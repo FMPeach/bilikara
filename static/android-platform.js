@@ -33,6 +33,7 @@
       load: () => call("get-update-preferences"),
       save: preferences => call("save-update-preferences", {preferences}),
     },
+    openLoginLink: url => call("open-bilibili-login", {url}),
     environment: () => call("environment"),
     webviewDiagnostics: () => call("webview-diagnostics"),
     installUpdate: candidate => call("install-update", {package:candidate}, 540000),

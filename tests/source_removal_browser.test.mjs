@@ -117,7 +117,7 @@ async function sources(page, android=false, remote=false) {
 async function settleSourceFit(page,source='uid') {
   await page.waitForFunction(source=>{
     const editor=sourceRemovalEditors.get(source);if(!editor?.active||editor.loading||editor.pending)return false;
-    const grid=editor.grid,card=grid.firstElementChild,style=getComputedStyle(grid),pager=editor.panel.querySelector('.host-result-pager');
+    const grid=editor.grid,card=grid.firstElementChild,style=getComputedStyle(grid),pager=editor.panel.querySelector('.source-frame-footer > .host-result-pager');
     if(!editor.records.some(row=>!row.placeholder))return !editor.loading;
     if(!card)return false;
     if(!editor.mobile)return !pager&&grid.querySelectorAll('.source-removal-card').length===editor.records.filter(row=>!row.placeholder).length&&!editor.loading;
@@ -222,7 +222,7 @@ async function footerBounds(page, source='uid') {
     const scroll=panel.querySelector('.source-browse-scroll');
     const box=n=>{const b=n.getBoundingClientRect();return {top:b.top,bottom:b.bottom,left:b.left,right:b.right,height:b.height};};
     const style=getComputedStyle(footer);
-    const pager=panel.querySelector('.host-result-pager');
+    const pager=panel.querySelector('.source-frame-footer > .host-result-pager');
     return {footer:box(footer),scroll:box(scroll),panel:box(panel),pager:pager&&!pager.hidden?box(pager):null,editing:footer.querySelector('.source-select-mode').getAttribute('aria-pressed')==='true',hidden:footer.hidden,mobile:document.documentElement.dataset.hostPlatform==='android',position:style.position,background:style.backgroundColor,shadow:style.boxShadow,paddingBottom:parseFloat(getComputedStyle(panel).paddingBottom),window:innerHeight,dock:document.querySelector('#android-host-nav')?.getBoundingClientRect().top||innerHeight};
   },source);
   assert.equal(value.position,'static','resident tools use the Session Users footer layout');
@@ -243,7 +243,7 @@ async function footerSpacing(page, session=false, label='') {
     const tools=document.querySelector(session?'.session-user-tools':'.source-tools[data-source="uid"]');
     const owner=tools.closest(session?'.session-users-panel':'.source-mode-panel');
     const list=owner.querySelector(session?'.session-user-list':'.source-browse-scroll');
-    const pager=owner.querySelector('.host-result-pager'),button=tools.querySelector(session?'[data-mode="select"]':'.source-select-mode');
+    const pager=owner.querySelector('.source-frame-footer > .host-result-pager'),button=tools.querySelector(session?'[data-mode="select"]':'.source-select-mode');
     const box=node=>{const b=node.getBoundingClientRect();return {top:b.top,bottom:b.bottom,height:b.height};};
     const style=node=>{const s=getComputedStyle(node);return {gap:s.rowGap,top:s.paddingTop,bottom:s.paddingBottom,marginTop:s.marginTop,marginBottom:s.marginBottom};};
     const t=box(tools),l=box(list),o=box(owner),b=box(button),p=pager?box(pager):null;
@@ -265,7 +265,7 @@ async function pagerGeometry(pager) {
 async function assertNativeSourceFrame(page, {source='uid', fits=true}={}) {
   const value=await page.evaluate(({source,fits})=>{
     const panel=document.querySelector(source==='uid'?'#request-sources-uids':'#request-sources-favorites');
-    const scroll=panel.querySelector('.source-browse-scroll'),pager=panel.querySelector('.host-result-pager');
+    const scroll=panel.querySelector('.source-browse-scroll'),pager=panel.querySelector('.source-frame-footer > .host-result-pager');
     const form=panel.querySelector('.source-uid-form'),inputs=[...form.children],rect=node=>{const b=node.getBoundingClientRect();return {top:b.top,bottom:b.bottom,left:b.left,right:b.right,width:b.width,height:b.height};};
     const body=rect(scroll),footer=pager?rect(pager):null,cardNodes=[...panel.querySelectorAll('.source-removal-card')];
     return {panel:rect(panel),body,footer,external:!pager||pager.parentElement===panel.querySelector('.source-frame-footer')&&!scroll.contains(pager),
@@ -673,10 +673,10 @@ test('mobile Host long press selects without moving its resident footer; swipe, 
   assert.equal(await page.locator('#request-sources-followed-scroll').evaluate(node=>node.scrollTop),0,'a fitted page needs no overlay scroll reach');
   assert.equal(requests.mutations.length,0,'canceling the card drag cannot submit an edit');
   assert.deepEqual(await page.locator('#request-sources-uids > .source-frame-footer > .result-pager').boundingBox(),fixedPagerBefore,'the native footer never scrolls with the content');
-  await page.locator('#request-sources-uids [data-page-action="next"]').tap();
+  await page.locator('#request-sources-uids > .source-frame-footer [data-page-action="next"]').tap();
   await page.waitForFunction(()=>document.querySelector('#request-sources-uids > .source-frame-footer > .result-pager').dataset.page==='2');
   await assertNativeSourceFrame(page,{fits:false});
-  await page.locator('#request-sources-uids [data-page-action="previous"]').tap();
+  await page.locator('#request-sources-uids > .source-frame-footer [data-page-action="previous"]').tap();
   await page.waitForFunction(()=>document.querySelector('#request-sources-uids > .source-frame-footer > .result-pager').dataset.page==='1');
   const bottomLayout=await sourceLayout(page,'320-page-footer');assert.equal(bottomLayout.page,'1');assert.equal(bottomLayout.items,6);
   await screenshot(page,'host-touch-320-page-footer');
@@ -784,7 +784,7 @@ for(const android of [false,true])test(`${android?'mobile':'desktop'} native Sou
     for(const [width,height] of [[700,600],[1000,900],[700,650]]) {
       await page.setViewportSize({width,height});await settleSourceFit(page);await assertNativeSourceFrame(page);
       assert.equal(await grid.locator('.source-removal-card').count(),54);
-      assert.equal(await panel.locator('.host-result-pager').count(),0);
+      assert.equal(await panel.locator('.source-frame-footer > .host-result-pager').count(),0);
       assert.equal(await panel.locator('.source-browse-scroll').evaluate(node=>node.scrollHeight>node.clientHeight),true);
       assert.equal(await page.locator('#modal-follow-uid-input').inputValue(),'123456');
     }
@@ -831,15 +831,15 @@ for(const android of [false,true])test(`${android?'mobile':'desktop'} native Sou
   for(const theme of ['dark','blue','light']){
     await page.evaluate(theme=>applyTheme(theme),theme);await assertNativeSourceFrame(page);
   }
-  await panel.locator('[data-page-action="next"]').click();
+  await panel.locator('.source-frame-footer [data-page-action="next"]').click();
   await page.waitForFunction(()=>document.querySelector('#request-sources-uids > .source-frame-footer > .host-result-pager').dataset.page==='2');
   const anchor=await grid.locator('.source-removal-card').first().getAttribute('data-source-id');
   await page.setViewportSize(android?{width:320,height:844}:{width:1000,height:900});await settleSourceFit(page);
   assert.equal(await grid.locator(`[data-source-id="${anchor}"]`).count(),1,'the former first item stays in the new visible page');
-  const pageBefore=await panel.locator('.host-result-pager').getAttribute('data-page'),idsBefore=await grid.locator('.source-removal-card').evaluateAll(nodes=>nodes.map(node=>node.dataset.sourceId));
+  const pageBefore=await panel.locator('.source-frame-footer > .host-result-pager').getAttribute('data-page'),idsBefore=await grid.locator('.source-removal-card').evaluateAll(nodes=>nodes.map(node=>node.dataset.sourceId));
   await host.api('/api/session-users/add',{name:'Unrelated fixture user'});
   await page.waitForFunction(()=>state.data.session_users?.length===2);
-  assert.equal(await panel.locator('.host-result-pager').getAttribute('data-page'),pageBefore);
+  assert.equal(await panel.locator('.source-frame-footer > .host-result-pager').getAttribute('data-page'),pageBefore);
   assert.deepEqual(await grid.locator('.source-removal-card').evaluateAll(nodes=>nodes.map(node=>node.dataset.sourceId)),idsBefore,'unrelated native snapshots retain page contents');
   await enterSelection(page,grid,footer,android);
   await grid.locator('.source-checkbox').nth(0).check();await grid.locator('.source-checkbox').nth(1).check();
@@ -847,16 +847,16 @@ for(const android of [false,true])test(`${android?'mobile':'desktop'} native Sou
   await page.setViewportSize(android?{width:390,height:640}:{width:700,height:600});await settleSourceFit(page);
   assert.deepEqual(await page.evaluate(()=>[...sourceRemovalEditors.get('uid').selected]),selected,'cross-page selections survive a capacity change');
   await assertNativeSourceFrame(page,{fits:false});await footerBounds(page);
-  await panel.locator('[data-page-action="next"]').click();await settleSourceFit(page);
+  await panel.locator('.source-frame-footer [data-page-action="next"]').click();await settleSourceFit(page);
   assert.deepEqual(await page.evaluate(()=>[...sourceRemovalEditors.get('uid').selected]),selected,'fixed page navigation remains usable during selection');
-  await panel.locator('[data-page-action="previous"]').click();await settleSourceFit(page);
+  await panel.locator('.source-frame-footer [data-page-action="previous"]').click();await settleSourceFit(page);
   // A larger fitted page can put the preserved selection on the first page.
   // Navigate through real controls before testing the next drag; resizing
   // preserves the former page anchor, not an arbitrary selected member.
   if(!await grid.locator('.source-checkbox:checked').count()) {
-    const firstPage=panel.locator('[data-page-action="first"]');
+    const firstPage=panel.locator('.source-frame-footer [data-page-action="first"]');
     if(await firstPage.isEnabled()){await firstPage.click();await settleSourceFit(page);}
-    if(!await grid.locator('.source-checkbox:checked').count()){await panel.locator('[data-page-action="next"]').click();await settleSourceFit(page);}
+    if(!await grid.locator('.source-checkbox:checked').count()){await panel.locator('.source-frame-footer [data-page-action="next"]').click();await settleSourceFit(page);}
     assert.deepEqual(await page.evaluate(()=>[...sourceRemovalEditors.get('uid').selected]),selected);
   }
   const visibleSelected=await grid.locator('.source-checkbox:checked').count();
@@ -873,11 +873,11 @@ for(const android of [false,true])test(`${android?'mobile':'desktop'} native Sou
   assert.equal(await page.evaluate(()=>document.querySelector('#request-sources-uids > .source-frame-footer > .host-result-pager')===sourceFramePager),true,'resizing keeps the shared pager node');
   await screenshot(page,android?'host-mobile-native-source-frame':'host-desktop-native-source-frame');
   await grid.locator('.follow-up-button').first().click();await page.locator('#follow-up-items-view').waitFor({state:'visible'});
-  assert.equal(await panel.locator('.host-result-pager').isVisible(),false,'the source page footer does not leak into a detail view');
+  assert.equal(await panel.locator('.source-frame-footer > .host-result-pager').isVisible(),false,'the source page footer does not leak into a detail view');
   await page.locator('#follow-browse-back').click();await settleSourceFit(page);await assertNativeSourceFrame(page);
   await page.locator('[data-sources-mode="favorites"]').click();await page.locator('#favlist-grid .source-removal-card').first().waitFor({state:'visible'});
   await settleSourceFit(page,'favlist');await assertNativeSourceFrame(page,{source:'favlist'});await footerBounds(page,'favlist');
-  assert.equal(await panel.locator('.host-result-pager').isVisible(),false,'inactive source tabs do not reserve a footer');
+  assert.equal(await panel.locator('.source-frame-footer > .host-result-pager').isVisible(),false,'inactive source tabs do not reserve a footer');
   await assertMedia(page);assert.equal(requests.mutations.length,0);assert.equal(requests.blocked,0);assert.deepEqual(errors,[]);assert.deepEqual(consoleLogs,[]);
   if(android){
     const nativePager=await pagerGeometry(page.locator('#request-sources-favorites .result-pager'));
@@ -904,9 +904,10 @@ for(const android of [false,true])test(`${android?'mobile':'desktop'} native Sou
 test('mobile Host fits 360px and 320px Source frames through 640–1000px heights and keeps rows during selection',{timeout:90000},async t=>{
   const {host}=await fixture(t,{android:true,size:60}),{page,requests,errors}=await browser(t,host,{android:true});
   await sources(page,true);
-  // Keep threshold checks alongside the minimum supported width and the
-  // smaller fallback. Expected counts are independent of the fitting helper.
-  for(const [width,height,count] of [[390,844,15],[320,844,10],[390,870,15],[390,880,18],[390,950,18],[390,1024,21]]){
+  // The bilingual heading lives above the tabs; the empty former header no
+  // longer consumes another row. Keep independent capacities and prove that
+  // no additional complete 72px row fits below them.
+  for(const [width,height,count] of [[390,844,15],[320,844,10],[390,870,15],[390,880,15],[390,950,18],[390,1024,21]]){
     await page.setViewportSize({width,height});await settleSourceFit(page);
     const layout=await sourceLayout(page,`capacity-${width}x${height}`);
     assert.equal(layout.items,count,`${width}x${height} displays every available complete row`);
@@ -915,7 +916,7 @@ test('mobile Host fits 360px and 320px Source frames through 640–1000px height
   await page.locator('#modal-follow-uid-input').fill('123456');
   for(const language of ['zh','en','ja']){
     await page.evaluate(language=>setLanguage(language),language);
-    for(const [width,height,count] of [[360,640,6],[360,800,10],[360,1000,14],[320,640,6],[320,800,10],[320,1000,14],[390,844,15],[390,1000,21]]){
+    for(const [width,height,count] of [[360,640,6],[360,800,8],[360,1000,14],[320,640,6],[320,800,8],[320,1000,14],[390,844,15],[390,1000,21]]){
       await page.setViewportSize({width,height});await settleSourceFit(page);
       const normal=await sourceLayout(page,`${language}-capacity-${width}x${height}`);
       assert.equal(normal.items,count);
@@ -1050,7 +1051,7 @@ for(const android of [false,true])test(`${android?'touch portrait shared Android
   if(!android)for(const checkbox of await grid.locator('.source-checkbox').all().then(nodes=>nodes.slice(-3)))await checkbox.uncheck();
   const selected=new Set(await grid.locator('.follow-up-button[aria-pressed="true"]').evaluateAll(nodes=>nodes.map(n=>n.closest('.source-removal-card').dataset.sourceId)));
   if(android) {
-    await page.locator('#request-sources-uids [data-page-action="next"]').click();
+    await page.locator('#request-sources-uids > .source-frame-footer [data-page-action="next"]').click();
     await page.waitForFunction(()=>document.querySelector('#request-sources-uids .result-pager').dataset.page==='2');
     const offPage=grid.locator('.source-removal-card').first();const offId=await offPage.getAttribute('data-source-id');selected.add(offId);await offPage.locator('.follow-up-button').click();
   } else assert.equal(await page.locator('#request-sources-uids .result-pager').count(),0);
@@ -1456,4 +1457,33 @@ for(const [android,width] of [[false,700],[true,360],[true,320]])test(`${android
     assert.equal(await outer.evaluate(n=>n.scrollTop),0);assert.deepEqual(await back.boundingBox(),header);
     await screenshot(page,`${android?'android':'desktop'}-${width}-${favorite?'favorite':'up'}-detail-scroll`);await back.click();
   }assert.deepEqual(errors,[]);completed.add(t);
+});
+
+test('Android source cards allow browse swipes while long press and editing retain the gesture',{skip:process.platform!=='linux',timeout:90000},async t=>{
+  const {host,data}=await fixture(t,{android:true,size:40});
+  const {page,requests}=await browser(t,host,{android:true});await sources(page,true);
+  const grid=page.locator('#follow-up-grid'),frame=page.locator('#request-sources-uids'),pager=frame.locator('.source-frame-footer > .host-result-pager');
+  const cdp=await page.context().newCDPSession(page);
+  try{
+    const first=await grid.locator('.source-removal-card').first().getAttribute('data-source-id');
+    const card=await grid.locator('.follow-up-button').first().boundingBox(),bounds=await grid.boundingBox();
+    const x=bounds.x+bounds.width*.85,y=card.y+card.height/2;
+    // Start on a real card, rather than the only narrow gaps that used to swipe.
+    assert.equal(await page.evaluate(({x,y})=>Boolean(document.elementFromPoint(x,y)?.closest('.follow-up-button')),{x,y}),true);
+    await cdp.send('Input.dispatchTouchEvent',{type:'touchStart',touchPoints:[{x,y}]});
+    for(const distance of [25,65,125])await cdp.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:x-distance,y:y+2}]});
+    await cdp.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});
+    await page.waitForFunction(()=>document.querySelector('#request-sources-uids > .source-frame-footer [data-page-input]').value==='2');
+    assert.notEqual(await grid.locator('.source-removal-card').first().getAttribute('data-source-id'),first);
+    assert.equal(await page.evaluate(()=>state.followBrowseSelectedUid),'');assert.equal(requests.mutations.length,0);
+    assert.equal(await page.evaluate(()=>sourceRemovalEditors.get('uid').editing),false);
+    const p=await grid.locator('.follow-up-button').first().boundingBox();
+    await cdp.send('Input.dispatchTouchEvent',{type:'touchStart',touchPoints:[{x:p.x+22,y:p.y+22}]});
+    await page.waitForFunction(()=>sourceRemovalEditors.get('uid').editing);
+    await cdp.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});
+    assert.equal(await pager.locator('[data-page-input]').inputValue(),'2');assert.equal(requests.mutations.length,0);
+    assert.equal(await page.evaluate(()=>sourceRemovalEditors.get('uid').selected.size),1);
+    assert.equal(existsSync(path.join(data,'gatcha_source_order.json')),false);await assertMedia(page);
+    completed.add(t);
+  }finally{await cdp.detach().catch(()=>{});}
 });

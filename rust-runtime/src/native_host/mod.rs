@@ -259,12 +259,11 @@ pub(crate) fn token() -> Result<String, ApiError> {
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 pub(crate) fn qr_image(value: &str) -> Result<String, ApiError> {
-    render_qr(value, true)
+    access_qr_image(value)
 }
 
 pub(crate) fn access_qr_image(value: &str) -> Result<String, ApiError> {
-    // Access cards supply the legacy desktop's 3px outer frame. Login QR
-    // images keep their own four-module quiet zone via qr_image instead.
+    // Access and login cards share the UI's fixed 3px white frame.
     render_qr(value, false)
 }
 
@@ -1196,10 +1195,10 @@ mod tests {
             .quiet_zone(false)
             .build();
         assert_eq!(String::from_utf8(svg).unwrap(), expected);
-        assert_ne!(
+        assert_eq!(
             image,
             qr_image(url).unwrap(),
-            "Login codes retain their internal quiet zone"
+            "Login and access codes share the UI-provided quiet zone"
         );
     }
 }

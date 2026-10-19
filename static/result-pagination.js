@@ -302,6 +302,8 @@
     let inputDraft = false;
     let viewportWidth = 0;
     let layoutFrame = null;
+    const ignoresSwipe = target => typeof ignoreSwipe === "function"
+      ? ignoreSwipe(target) : Boolean(ignoreSwipe && target.closest(ignoreSwipe));
 
     function scheduleLayout() {
       if (layoutFrame !== null) return;
@@ -643,13 +645,16 @@
       else void restoreDrag(displacement);
     }
     viewport.addEventListener("pointerdown", event => {
-      if (ignoreSwipe && event.target.closest(ignoreSwipe)) return;
+      if (ignoresSwipe(event.target)) return;
       suppressClick = false;
       if (event.pointerType === "touch" || !event.isPrimary || model.loading || settling || (event.pointerType === "mouse" && event.button !== 0)) return;
       drag = { id: event.pointerId, x: event.clientX, y: event.clientY, horizontal: false };
     }, { passive: true });
     function moveDrag(event) {
       if (!drag || drag.id !== event.pointerId) return;
+      // A source-card long press can enter editing after touchstart. Retire
+      // pagination before the editor acquires that gesture.
+      if (ignoresSwipe(event.target || container)) { cancelNavigation(); return; }
       const dx = Math.abs(event.clientX - drag.x), dy = Math.abs(event.clientY - drag.y);
       if (!drag.horizontal && dy >= 8 && dy > dx * 1.15) { drag = null; return; }
       if (!drag.horizontal && dx >= 8 && dx > dy * 1.15) {
@@ -678,7 +683,7 @@
     // intent is clear. Passive Pointer Events alone cannot stop Safari from
     // taking a diagonal drag and issuing pointercancel partway through it.
     viewport.addEventListener("touchstart", event => {
-      if (ignoreSwipe && event.target.closest(ignoreSwipe)) return;
+      if (ignoresSwipe(event.target)) return;
       if (event.touches.length !== 1) {
         if (drag?.id === "touch") finishDrag({pointerId:"touch"}, true);
         return;

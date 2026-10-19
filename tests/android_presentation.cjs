@@ -61,7 +61,7 @@ async function stageTests() {
   class Element {
     constructor() {
       this.dataset = {}; this.children = []; this.style = {setProperty(){}};
-      this.classList = {add(){},remove(){},toggle(){}}; this.listeners = {};
+      this.classes = new Set(); this.classList = {add:n=>this.classes.add(n),remove:n=>this.classes.delete(n),toggle:(n,on)=>on?this.classes.add(n):this.classes.delete(n)}; this.listeners = {};
       this.paused = true; this.ended = false; this.readyState = 4; this.currentTime = 0;
       this.duration = 300; this.playbackRate = 1; this.scrollWidth = 20;
     }
@@ -108,9 +108,10 @@ async function stageTests() {
   await settle();
   assert.ok(listeners["master-state"], "Stage must subscribe to the Android transport");
   let sequence = 0;
-  const send = (id,time,paused=false,generation=7) => listeners["master-state"]({payload:sync.makeEnvelope("master-state", {
+  const send = (id,time,paused=false,generation=7,remoteMenuVisible=false) => listeners["master-state"]({payload:sync.makeEnvelope("master-state", {
     scene:{generation,revision:sequence,currentItemIdentity:id,videoUrl:`/media/${id}.mp4`,title:id},
     clock:{itemIdentity:id,mediaTime:time,paused,playbackRate:1,sampledAt:now},
+    remoteMenuVisible,
     internetRemote:{active:true,qr_image:"data:image/svg+xml;base64,PHN2Zy8+"},
   }, {senderId:"host",sequence:++sequence,sentAt:now})});
   send("first",20);
@@ -121,6 +122,12 @@ async function stageTests() {
   assert.equal(video.currentTime,20);
   assert.equal(get("controller-internet-remote-qr-image").src,"data:image/svg+xml;base64,PHN2Zy8+",
     "Native room QR is a local SVG and must reach the audience stage");
+  send("first",20,false,7,true);
+  assert.equal(get("controller-output-control").classes.has("is-qr-pinned"),true,"Host menu opens the Android audience QR panel");
+  send("first",20,false,6,false);
+  assert.equal(get("controller-output-control").classes.has("is-qr-pinned"),true,"Stale generations cannot close the QR panel");
+  send("first",20,false,7,false);
+  assert.equal(get("controller-output-control").classes.has("is-qr-pinned"),false,"Host close synchronously retires the audience QR panel");
   send("second",40);
   const second = frame.children[0];
   assert.notEqual(video,second); assert.equal(video.paused,true); assert.equal(video.src,"");

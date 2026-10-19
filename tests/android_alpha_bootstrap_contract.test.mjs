@@ -99,13 +99,15 @@ let activity, kind, manifest, source;
 activity = readFileSync(path.join(TAURI, "gen/android/app/src/main/java/com/bilikara/app/MainActivity.kt"), "utf8");
 assert.ok(contains("HostWindowInsets.install(findViewById(android.R.id.content))", activity));
 manifest = readFileSync(path.join(TAURI, "gen/android/app/src/main/AndroidManifest.xml"), "utf8");
-assert.ok(contains("android:windowSoftInputMode=\"adjustResize\"", manifest));
+assert.ok(contains("android:windowSoftInputMode=\"adjustNothing\"", manifest));
 source = readFileSync(path.join(TAURI, "gen/android/app/src/main/java/com/bilikara/app/HostWindowInsets.kt"), "utf8");
 for (const kind of iterableValues(["systemBars", "displayCutout", "ime"])) {
 assert.ok(contains(("WindowInsetsCompat.Type." + String(kind) + "()"), source));
 }
 assert.ok(contains(".setInsets(handled, Insets.NONE)", source));
 assert.ok(contains("ViewCompat.requestApplyInsets(content)", source));
+assert.ok(contains("publishKeyboard(view, keyboard)", source));
+assert.ok(contains("bilikara:ime", source));
 },
 async test_bootstrap_page_reports_native_success_failure_and_wrong_schema() {
 let node, program, result;

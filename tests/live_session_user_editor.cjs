@@ -49,7 +49,8 @@ const [exe, directory, executablePath] = process.argv.slice(2);
       await host.waitForFunction(name=>state.data.session_users.includes(name),name);
     }
     assert.equal(await host.locator(".session-user-badge").count(),3);
-    assert.equal(await host.locator('.session-user-empty, [data-i18n="session.help"]').count(),0);
+    assert.equal(await host.locator('.session-user-empty').count(),0);
+    assert.equal(await host.locator('.session-user-guidance').count(),0);
     const originalHeight=await host.locator(".session-user-badge").first().evaluate(node=>node.getBoundingClientRect().height);
     const aliceId=await host.evaluate(()=>state.data.session_user_entries.find(user=>user.name==="Alice").id);
     await host.evaluate(()=>{globalThis.originalAliceNode=document.querySelector('.session-user-badge[data-name="Alice"]');elements.requesterSelect.value="Alice";});

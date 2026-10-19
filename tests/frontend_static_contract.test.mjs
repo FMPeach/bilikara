@@ -47,7 +47,8 @@ test('shared desktop layout stays responsive and Android follows system rotation
 test('Android pages/languages/visibility reuse native desktop source defaults and keep Remote separate', () => {
   includes(host, ['/android-host.js', '/host-layout.css', '/host-layout.js', '/native-session.js']); excludes(remote, ['/android-host.js']);
   for (const page of ['playback', 'queue', 'request', 'users', 'my']) assert.equal(host.split(`data-android-page="${page}"`).length - 1, 1);
-  for (const locale of ['zh', 'ja', 'en']) for (const key of ['navigation', 'playback', 'queue', 'me', 'backToMe', 'settingsHint', 'downloadSettings', 'loginPersistence']) assert.ok(translations[locale][`mobile.${key}`]);
+  for (const locale of ['zh', 'ja', 'en']) for (const key of ['navigation', 'playback', 'queue', 'me', 'backToMe', 'settingsHint', 'downloadSettings', 'betaLabel', 'betaNotice']) assert.ok(translations[locale][`mobile.${key}`]);
+  excludes(host, ['android-login-hint', 'android-login-persistence']);
   assert.ok(host.indexOf('/app.js') < host.indexOf('/android-playback.js')); assert.ok(host.indexOf('/android-playback.js') < host.indexOf('/android-host.js'));
   const expected = ['3145040', '671767', '33091201', '3494356589742209', '44627483', '8474818', '10077309', '74089392', '1879151', '87101327', '99061404', '602998', '1159885664', '215040', '31624333', '21129450', '2625848', '29955371', '3014315', '80148988', '464873', '41924655', '356716', '174980119', '1326466', '13775191', '524220885'];
   const native = JSON.parse(read('rust-runtime/src/native_host/default_uids.json')); assert.deepEqual(native, expected); assert.equal(native.length, new Set(native).size);

@@ -39,7 +39,7 @@ fn run(context: &HostContext, generation: u64) -> Result<(), ApiError> {
                     login_service::LoginError::new(502, "login_qr", "无法生成二维码")
                 })?;
             }
-            update_waiting(context, generation, &image, message)
+            update_waiting(context, generation, &image, qr, message)
                 .map_err(|e| login_service::LoginError::new(e.status, &e.code, e.message))
         },
         record,
@@ -293,6 +293,7 @@ pub(super) fn begin(
                         state: BilibiliLoginStatus::Failed,
                         message: "无法启动登录线程".into(),
                         qr_image: String::new(),
+                        login_url: String::new(),
                     },
                 );
                 session.revision += 1;
@@ -364,6 +365,7 @@ pub(super) fn configure(
                     state: BilibiliLoginStatus::LoggedIn,
                     message: "Bilibili 已登录".into(),
                     qr_image: String::new(),
+                    login_url: String::new(),
                 },
             );
             session.revision += 1;
@@ -405,6 +407,7 @@ fn update_waiting(
     context: &HostContext,
     generation: u64,
     image: &str,
+    login_url: &str,
     message: &str,
 ) -> Result<(), ApiError> {
     if !active(context, generation) {
@@ -419,6 +422,7 @@ fn update_waiting(
                     state: BilibiliLoginStatus::Waiting,
                     message: message.into(),
                     qr_image: image.into(),
+                    login_url: login_url.into(),
                 },
             );
             session.revision += 1;
@@ -461,12 +465,14 @@ fn finish(
                     state: BilibiliLoginStatus::LoggedIn,
                     message: "Bilibili 已登录".into(),
                     qr_image: String::new(),
+                    login_url: String::new(),
                 }
             }
             Err(error) => BilibiliLoginUpdate {
                 state: BilibiliLoginStatus::Failed,
                 message: error.message,
                 qr_image: String::new(),
+                login_url: String::new(),
             },
         };
         session.login.set_bilibili_login(Some(generation), update);
@@ -549,8 +555,22 @@ mod tests {
         })
         .unwrap();
         assert_ne!(generation, replacement);
-        update_waiting(&context, replacement, "new-qr", "new login").unwrap();
-        update_waiting(&context, generation, "old-qr", "old login").unwrap();
+        update_waiting(
+            &context,
+            replacement,
+            "new-qr",
+            "https://account.bilibili.com/fixture-new",
+            "new login",
+        )
+        .unwrap();
+        update_waiting(
+            &context,
+            generation,
+            "old-qr",
+            "https://account.bilibili.com/fixture-old",
+            "old login",
+        )
+        .unwrap();
         finish(
             &context,
             generation,
@@ -562,6 +582,17 @@ mod tests {
         with_app(|app| {
             let session = app.native();
             assert_eq!(session.login_generation, Some(replacement));
+            assert_eq!(
+                session
+                    .login
+                    .bilibili_snapshot(crate::status_service::BilibiliLoginFacts {
+                        logged_in: false,
+                        data_exists: false,
+                        data_path: String::new()
+                    })
+                    .login_url,
+                "https://account.bilibili.com/fixture-new"
+            );
             assert!(session.cookie.is_empty());
             assert_eq!(
                 session

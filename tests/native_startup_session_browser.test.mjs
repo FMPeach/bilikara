@@ -112,6 +112,16 @@ for (const android of [false, true]) test(`pending native session keeps settings
     const banner = page.locator('#native-session-choice'); await banner.waitFor({ state: 'visible' });
     // A real keyboard focus pauses the existing countdown without changing its state.
     const accept = page.locator('[data-session-choice="continue"]'), dismiss = page.locator('#native-session-dismiss');
+    if (android) {
+      await page.evaluate(() => document.activeElement?.blur());
+      await banner.hover();
+      await page.evaluate(() => window.BilikaraNativeSession.syncSessionChoice());
+      assert.equal(await dismiss.evaluate(node => node.classList.contains('is-close-glyph')), false,
+        'a touch browser sticky hover must not pause the startup countdown');
+      await accept.focus();
+      assert.equal(await dismiss.evaluate(node => node.classList.contains('is-close-glyph')), true,
+        'explicit focus still pauses the startup countdown');
+    }
     async function pauseChoice() { await accept.focus(); await banner.hover(); }
     await accept.focus();
     if (android) await page.locator('[data-android-page="my"]').click();

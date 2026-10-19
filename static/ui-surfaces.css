@@ -1082,7 +1082,7 @@ html[data-host-layout="portrait"] .developer-mode .request-workspace-head { disp
 }
 
 /* Related browse back actions share one role across Host and Remote. */
-:root :is(.tag-browser-back, #follow-browse-back, #favlist-browse-back, #catalog-advanced-back, #sources-follow-back) {
+:root :is(.tag-browser-back, .android-settings-back, #follow-browse-back, #favlist-browse-back, #catalog-advanced-back, #sources-follow-back) {
   height: var(--host-control-height, 44px);
   min-height: var(--host-control-height, 44px);
   padding: 0 14px;
@@ -1095,14 +1095,14 @@ html[data-host-layout="portrait"] .developer-mode .request-workspace-head { disp
   line-height: 1;
   box-shadow: none;
 }
-:root:not([data-ui-client="remote"]) :is(.tag-letter-button, .tag-browser-back,
+:root:not([data-ui-client="remote"]) :is(.tag-letter-button, .tag-browser-back, .android-settings-back,
   #follow-browse-back, #favlist-browse-back, #catalog-advanced-back,
   .av-sync-step-button, .av-sync-reset-button, [data-volume-step], [data-volume-reset],
   .critical-banner-region .banner-action) {
   transition: transform 120ms ease, background 120ms ease, border-color 120ms ease;
 }
 @media (hover: hover) and (pointer: fine) {
-  :root:not([data-ui-client="remote"]) :is(.tag-letter-button, .tag-browser-back,
+  :root:not([data-ui-client="remote"]) :is(.tag-letter-button, .tag-browser-back, .android-settings-back,
     #follow-browse-back, #favlist-browse-back, #catalog-advanced-back,
     .av-sync-step-button, .av-sync-reset-button, [data-volume-step], [data-volume-reset],
     .critical-banner-region .banner-action):hover:not(:disabled) {
@@ -1114,7 +1114,7 @@ html[data-host-layout="portrait"] .developer-mode .request-workspace-head { disp
     transform: translateY(-2px);
   }
 }
-:root:not([data-ui-client="remote"]) :is(.tag-letter-button, .tag-browser-back,
+:root:not([data-ui-client="remote"]) :is(.tag-letter-button, .tag-browser-back, .android-settings-back,
   #follow-browse-back, #favlist-browse-back, #catalog-advanced-back,
   .av-sync-step-button, .av-sync-reset-button, [data-volume-step], [data-volume-reset],
   .critical-banner-region .banner-action):active:not(:disabled) {
@@ -1123,14 +1123,14 @@ html[data-host-layout="portrait"] .developer-mode .request-workspace-head { disp
   border-color: var(--sync-focus-border);
 }
 @media (prefers-reduced-motion: reduce) {
-  :root:not([data-ui-client="remote"]) :is(.tag-letter-button, .tag-browser-back,
+  :root:not([data-ui-client="remote"]) :is(.tag-letter-button, .tag-browser-back, .android-settings-back,
     #follow-browse-back, #favlist-browse-back, #catalog-advanced-back,
     .av-sync-step-button, .av-sync-reset-button, [data-volume-step], [data-volume-reset],
     .critical-banner-region .banner-action) {
     transition: none;
   }
 }
-:root :is(.tag-letter-button, .tag-browser-back, #follow-browse-back,
+:root :is(.tag-letter-button, .tag-browser-back, .android-settings-back, #follow-browse-back,
   #favlist-browse-back, #sources-follow-back, #catalog-advanced-back):focus-visible,
 :root:not([data-ui-client="remote"]) :is(.av-sync-step-button, .av-sync-reset-button,
   .critical-banner-region .banner-action):focus-visible {

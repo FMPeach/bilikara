@@ -1,5 +1,6 @@
 package com.bilikara.app
 
+import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.webkit.WebView
@@ -43,6 +44,11 @@ internal class HostPlatform(private val activity: AppCompatActivity,
       }
       try {
         val data = when (input.optString("action")) {
+          "open-bilibili-login" -> {
+            val url = HostLoginLink.validated(input.optString("url")) ?: error("invalid_login_url")
+            activity.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)).addCategory(Intent.CATEGORY_BROWSABLE))
+            JSONObject().put("opened", true)
+          }
           "environment" -> environment()
           "webview-diagnostics" -> { diagnostics.show(webView); JSONObject().put("shown", true) }
           "get-update-preferences" -> updatePreferences()

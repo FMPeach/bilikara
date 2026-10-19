@@ -24,7 +24,8 @@ async function fixture(t, {legacy = false, missing = false, userAgent} = {}) {
     res.end('<!doctype html><html><head><script src="/webview-compat.js"></script><link rel="stylesheet" href="/webview-legacy.css"><link rel="stylesheet" href="/native-fixture.css"><script src="/webview83.js"></script></head><body><div id="background" aria-hidden="false"><button id="first" tabindex="2">First</button></div><button id="outside">Outside</button><div id="native-gap"><span></span><span></span></div><div id="native-ratio"></div><form class="source-uid-form"><input><button class="source-refresh-button">Refresh</button></form><div class="request-workspace" style="width:520px"></div></body></html>');
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-  t.after(() => new Promise(resolve => server.close(resolve)));
+  // Browser cleanup runs later; retire its fixture connections before waiting.
+  t.after(() => new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }));
   const browser = await chromium.launch({headless: true}); t.after(() => browser.close());
   const context = await browser.newContext({userAgent});
   await context.route('**/*', route => new URL(route.request().url()).hostname === '127.0.0.1' ? route.continue() : route.abort());

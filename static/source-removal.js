@@ -126,7 +126,7 @@
       document.addEventListener('visibilitychange', () => { if (document.hidden) this.finishDrag(); });
       this.pager = this.mobile ? root.BilikaraResultPager.create(grid, {
         footer:this.frame, fit:this.scroll,
-        ignoreSwipe:".follow-up-button, .source-select-target",
+        ignoreSwipe:target => this.editing || Boolean(target.closest(".source-select-target")),
         translate:this.t, reportError:options.reportError,
         renderItems:(rows, message, target = grid) => {
           if (target !== grid) return options.renderPage(rows, message, target, null);
