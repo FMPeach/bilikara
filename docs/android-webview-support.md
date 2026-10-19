@@ -8,7 +8,7 @@ not recommended downloads.
 
 ## Current capability baseline
 
-The default **latest** Host/Remote UI has a **Chromium 111 capability floor**.
+The default **standard mode** Host/Remote UI has a **Chromium 111 capability floor**.
 The JavaScript-only floor is 93; treating it as the full application minimum
 misses input isolation and layout dependencies. The audit covers the shared
 Host entry, its scripts/styles/vendor media code, local/public Remote transport
@@ -39,25 +39,44 @@ show a different origin/security context; it names the **document tested**.
 Media codecs, audio routing, external displays and real peer connectivity need
 separate device tests. Public Remote outside localhost requires HTTPS.
 
-## Android latest and legacy modes
+## Android standard and compatibility modes
 
-Android automatically uses **latest** when its startup checks pass. Otherwise
-it opens the native compatibility report. When the actual provider is at least
-Chromium **83**, its native message bridge works, and the required legacy
-primitives are present, the report offers **Enter legacy mode**. It never enters
-legacy silently. Providers below 83, an unknown version, an incomplete probe or
-a missing bridge keep the diagnostic without an entry button. Experimental WebView 83–90 additionally uses generated CSS syntax adapters and simplified
-CSS motion. Legacy 91 keeps its existing narrower adapters.
+The displayed names are **标准模式** (standard mode) and **兼容模式**
+(compatibility mode). Internal protocol identifiers remain `latest` and `legacy`.
+
+Android automatically uses **standard mode** when its startup checks pass.
+Otherwise it opens the native compatibility report. When the actual provider is
+at least Chromium **83**, its native message bridge works, and the required
+compatibility primitives are present, the report offers **Enter compatibility
+mode** (进入兼容模式). It never enters compatibility mode silently. Providers below
+83, an unknown version, an incomplete probe or a missing bridge keep the
+diagnostic without an entry button. Experimental WebView 83–90 additionally uses
+generated CSS syntax adapters and simplified CSS motion. Compatibility mode on
+91 keeps its existing narrower adapters.
 
 Both modes use the same frontend, authenticated Rust Host and data formats.
-Legacy supplies missing `replaceChildren`, `replaceAll`, `Object.hasOwn`,
-`Array.at`, cryptographic UUIDs,
-input/focus isolation and adapters for the relationships, viewport/container
-sizes and colors used by this UI. Existing native APIs are retained. A legacy
-choice crosses the ordinary authenticated entry as a fixed mode parameter;
-the resulting local page retains its mode on reload. It creates no persistent
+Standard mode keeps the Chromium 111 capability floor. The compatibility
+scripts return before installing adapters unless compatibility mode was
+explicitly selected; missing APIs alone never enable it. Generated 83 styles,
+simplified motion and the generated Signalsmith wrapper are selected only by
+the compatibility profile. Standard mode retains the original resources and
+native browser APIs.
+
+Request deadlines are shared application behavior, not a compatibility-mode
+polyfill. Both modes use `AbortController` with a 10-second timer for state
+startup and a 15-second timer for public room creation, cleared in `finally`
+after response-body handling. Standard mode does not switch back to
+`AbortSignal.timeout`, and this shared implementation does not lower its
+capability floor or modify browser globals.
+
+Compatibility mode supplies missing `replaceChildren`, `replaceAll`,
+`Object.hasOwn`, `Array.at`, cryptographic UUIDs, input/focus isolation and
+adapters for the relationships, viewport/container
+sizes and colors used by this UI. Existing native APIs are retained. Choosing
+compatibility mode crosses the ordinary authenticated entry as a fixed mode
+parameter; the resulting local page retains its mode on reload. It creates no persistent
 preference or alternate application data. Each cold start checks the provider
-again and uses latest automatically when it qualifies.
+again and uses standard mode automatically when it qualifies.
 
 On Chromium 83–90, the same authored CSS is compiled using pinned Lightning CSS,
 including selector/inset/focus/overflow syntax. Scoped runtime adapters supply
@@ -69,16 +88,16 @@ second UI is used. After shared CSS changes run `npm run prepare:webview83`;
 `node scripts/build_webview83.mjs --check` rejects stale artifacts.
 
 The Android 11 / AOSP WebView 83.0.4103.120 test provider can render and operate
-the legacy UI, but its isolated WebRTC test gathers no ICE candidates and logs
-NETLINK permission failures. This remains an **unresolved WebRTC limitation in
+the UI in compatibility mode, but its isolated WebRTC test gathers no ICE
+candidates and logs NETLINK permission failures. This remains an **unresolved WebRTC limitation in
 that tested environment**, not a missing JavaScript method. Generating a public room QR does
 not prove peer connectivity. LAN Remote uses the local HTTP/SSE Host separately.
 JavaScript adapters do not replace WebRTC or bypass Android network permissions.
 Do not treat experimental 83 UI compatibility as full public Remote acceptance.
 
-The original source capability floor above describes latest; it is not a reason
-to bypass the legacy gate or proof of device/media acceptance. Android 11 with
-an updated provider may qualify; an Android OS number alone cannot select a
+The original source capability floor above describes standard mode; it is not a
+reason to bypass the compatibility mode gate or proof of device/media acceptance.
+Android 11 with an updated provider may qualify; an Android OS number alone cannot select a
 mode. This mode does not install or change a WebView provider.
 
 ## Diagnosis and startup checks
@@ -94,7 +113,7 @@ secure-context status and media/RTC availability. “Basic capabilities pass” 
 not a claim that media, network, all devices or all features passed acceptance.
 Copying it does not collect room tokens, cookies or application records.
 
-The dialog offers **Copy diagnostics** and **Close**, plus **Enter legacy mode**
+The dialog offers **Copy diagnostics** and **Close**, plus **Enter compatibility mode**
 only when its eligibility checks pass on the startup page. An incompatible or
 incomplete result identifies missing capabilities; it does not ask the user to
 update WebView. There is no store, component-settings, download,

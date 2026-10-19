@@ -52,8 +52,8 @@ The catalog Worker must support the documented cursor-pagination contract.
 ## Android System WebView compatibility
 
 Android's `minSdk = 24` describes the native OS API floor, not the installed
-WebView's JavaScript, rendering or native-bridge support. The default latest UI
-capability baseline is **Chromium 111**, derived from the unguarded capabilities
+WebView's JavaScript, rendering or native-bridge support. The default standard
+mode UI capability baseline is **Chromium 111**, derived from the unguarded capabilities
 listed in [WebView support and compatibility checks](android-webview-support.md). The former
 93-era JavaScript baseline alone does not cover the current UI. This is a
 capability floor, not certification of every provider/device at that version.
@@ -64,12 +64,15 @@ actual provider/package/version, native message bridge and webpage capabilities.
 The startup document also has this action. A native dialog opens automatically
 for an old/unknown provider or missing message bridge, even if the shared
 frontend cannot parse. It offers **Copy diagnostics** and **Close**. On the
-startup page it also offers **Enter legacy mode** when the actual provider is
-at least Chromium **83**, the native bridge works, and its legacy capability
-check passes. This is an explicit choice; a supported provider uses latest
-automatically. Legacy reuses the same UI and Rust Host with missing-capability
-adapters. WebView 83–90 uses generated CSS syntax adapters and simplified CSS
-motion; legacy 91 keeps its existing path.
+startup page it also offers **Enter compatibility mode** (进入兼容模式) when the
+actual provider is at least Chromium **83**, the native bridge works, and the
+required compatibility primitives are present. This is an explicit choice;
+a supported provider uses standard mode automatically. Compatibility mode reuses
+the same UI and Rust Host with missing-capability adapters. WebView 83–90 uses
+generated CSS syntax adapters and simplified CSS motion; compatibility mode on
+91 keeps its existing path. The displayed mode names are 标准模式 (standard mode)
+and 兼容模式 (compatibility mode); their internal `latest` / `legacy` identifiers
+remain unchanged.
 It does not open a store or ask users to install another WebView; availability
 of component updates varies by ROM/vendor. Actual engine capabilities are
 checked at startup. APK `minSdk` cannot constrain the independently installed

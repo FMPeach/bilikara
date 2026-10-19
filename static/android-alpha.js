@@ -27,7 +27,7 @@
       if (legacy && (typeof AbortController !== "function" || typeof crypto !== "object"
         || typeof crypto.getRandomValues !== "function" || typeof Promise.allSettled !== "function"
         || typeof ResizeObserver !== "function")) {
-        throw new Error("当前内核未满足 legacy 的 WebView 83 能力要求，请复制自检信息。无需清除应用数据。");
+        throw new Error("当前内核未满足兼容模式的 WebView 83 能力要求，请复制自检信息。无需清除应用数据。");
       }
       // Keep this bootstrap parseable by older WebViews so an unsupported engine
       // gets an actionable message before loading the shared modern Host scripts.
@@ -37,13 +37,13 @@
         || typeof Array.prototype.at !== "function" || typeof String.prototype.replaceAll !== "function"
         || typeof Promise.allSettled !== "function")) {
         needsDiagnostics = true;
-        throw new Error("Android System WebView 过旧，缺少当前界面所需的 JavaScript 能力（完整界面要求 Chromium 111 及以上能力）。请打开“WebView 兼容性自检”，复制实际提供程序及缺失能力信息，符合 legacy 要求时可选择“进入 legacy 模式”。无需清除应用数据。");
+        throw new Error("Android System WebView 过旧，缺少标准模式所需的 JavaScript 能力（要求 Chromium 111 及以上能力）。请打开“WebView 兼容性自检”，复制实际提供程序及缺失能力信息，符合兼容模式要求时可选择“进入兼容模式”。无需清除应用数据。");
       }
       if (!legacy && (!("inert" in document.createElement("div")) || typeof CSS === "undefined"
         || !CSS.supports("selector(:has(*))") || !CSS.supports("height: 100dvh")
         || !CSS.supports("color: color-mix(in srgb, black, white)"))) {
         needsDiagnostics = true;
-        throw new Error("当前 WebView 缺少完整界面所需能力（Chromium 111 及以上能力基线）。请点击“WebView 兼容性自检”，复制诊断信息；符合 legacy 要求时可选择“进入 legacy 模式”；无需清除应用数据。");
+        throw new Error("当前 WebView 缺少标准模式所需能力（Chromium 111 及以上能力基线）。请点击“WebView 兼容性自检”，复制诊断信息；符合兼容模式要求时可选择“进入兼容模式”；无需清除应用数据。");
       }
       const invoke = window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke;
       if (typeof invoke !== "function") throw new Error("请在 bilikara beta Android 应用中打开此页面。");

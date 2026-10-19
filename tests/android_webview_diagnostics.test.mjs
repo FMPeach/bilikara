@@ -32,6 +32,9 @@ for (const [label, options] of [
   await vm.runInContext(bootstrap, f.context);
   assert.equal(f.destination(), undefined);
   assert.match(f.status.textContent, /Chromium 111.*兼容性自检/u);
+  assert.match(f.status.textContent, /标准模式/u);
+  assert.match(f.status.textContent, /进入兼容模式/u);
+  assert.doesNotMatch(f.status.textContent, /latest|legacy/u);
   const report = JSON.parse(vm.runInContext(probe, f.context));
   assert.equal(report.missing.length, 1);
 });

@@ -61,6 +61,28 @@ test('latest leaves native implementations and input semantics untouched', async
     document.documentElement.hasAttribute('data-legacy-inert')]), ['latest', true, true, true, true, true, true, false]);
 });
 
+// UA strings select a profile only; these isolated missing-feature checks do
+// not qualify a real Chromium 83 or 111 engine.
+for (const major of [83, 111]) test(`standard mode never enables adapters implicitly (UA ${major}, missing APIs)`, async t => {
+  const page = await fixture(t, {missing: true, userAgent: `Mozilla/5.0 Chrome/${major}.0.0.0`});
+  assert.deepEqual(await page.evaluate(() => ({
+    mode: document.documentElement.dataset.webviewMode,
+    compatibility: typeof window.BilikaraWebViewCompatibility,
+    missing: [typeof Object.hasOwn, typeof Array.prototype.at, typeof crypto.randomUUID,
+      'inert' in HTMLElement.prototype],
+    nativePaths: [Element.prototype.replaceChildren === nativeChildren,
+      String.prototype.replaceAll === nativeReplace, Element.prototype.animate === nativeAnimate],
+    legacyAttributes: document.querySelectorAll('[data-legacy-inert], [data-legacy-has], [data-legacy-engine], [data-legacy-colors], [data-legacy-containers]').length,
+    redirectedStyles: Array.from(document.querySelectorAll('link[rel=stylesheet]')).some(link => new URL(link.href).pathname.startsWith('/compat83/')),
+    compiledRequests: performance.getEntriesByType('resource').some(entry => new URL(entry.name).pathname.startsWith('/compat83/')),
+    viewportOverride: document.documentElement.style.getPropertyValue('--legacy-vh'),
+  })), {
+    mode: 'latest', compatibility: 'undefined', missing: ['undefined', 'undefined', 'undefined', false],
+    nativePaths: [true, true, true], legacyAttributes: 0, redirectedStyles: false,
+    compiledRequests: false, viewportOverride: '',
+  });
+});
+
 test('legacy fills only missing primitives with correct generic indexing and secure UUIDs', async t => {
   const page = await fixture(t, {legacy: true, missing: true});
   assert.deepEqual(await page.evaluate(() => {
