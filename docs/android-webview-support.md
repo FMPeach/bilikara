@@ -87,13 +87,11 @@ embedded DSP/WASM bytes. No `eval`, runtime compiler, provider installation or
 second UI is used. After shared CSS changes run `npm run prepare:webview83`;
 `node scripts/build_webview83.mjs --check` rejects stale artifacts.
 
-The Android 11 / AOSP WebView 83.0.4103.120 test provider can render and operate
-the UI in compatibility mode, but its isolated WebRTC test gathers no ICE
-candidates and logs NETLINK permission failures. This remains an **unresolved WebRTC limitation in
-that tested environment**, not a missing JavaScript method. Generating a public room QR does
-not prove peer connectivity. LAN Remote uses the local HTTP/SSE Host separately.
-JavaScript adapters do not replace WebRTC or bypass Android network permissions.
-Do not treat experimental 83 UI compatibility as full public Remote acceptance.
+WebView 83 UI compatibility does not establish public Remote connectivity.
+The compatibility adapters cover JavaScript and layout; they do not replace
+WebRTC or bypass Android network permissions. Generating a public-room QR is
+separate from connecting a peer. LAN Remote uses the local HTTP/SSE Host.
+Qualify WebRTC separately on each supported provider/device.
 
 The original source capability floor above describes standard mode; it is not a
 reason to bypass the compatibility mode gate or proof of device/media acceptance.
@@ -144,10 +142,10 @@ pages gain no diagnostics permission.
 
 ## Validation limits
 
-111 is the source-audited capability floor. A provider exactly at 111 and the
-reporter's MIUI hardware have not been qualified. Real emulator/provider
-results and remaining native-shell errors must be reported separately; a
-modern desktop browser is not a substitute. An offline, same-package/signer
+111 is the source-audited capability floor, not blanket device certification.
+Report actual emulator/provider and physical-device results separately,
+including any remaining native-shell errors; a modern desktop browser is not
+a substitute. An offline, same-package/signer
 provider update can prove recovery without certifying an app-store download or
 a vendor's update availability. Historical test providers belong only in
 isolated emulators, never in the product's download recommendations.

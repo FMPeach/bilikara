@@ -4,6 +4,10 @@
 
 [下载桌面版](https://github.com/VZRXS/bilikara/releases) · [开始使用](#开始使用) · [快速说明与常见问题](docs/quick-start.md) · [开发文档](#开发)
 
+> [!NOTE]
+> 自 v0.8.0 系列起提供 Android Host 测试版 APK。后续计划推出 Android 正式版及 iOS 版，具体版本与时间待定。
+> Android 版要求 WebView 111 及以上，Android 14 及以上系统通常满足要求；兼容模式最低适配 WebView 83（Android 11 初始版本）。实际兼容性取决于设备的 WebView。
+
 > [!IMPORTANT]
 > **从 v0.8.0-preview.2 及更早版本升级时，请下载对应系统与架构的完整包，并保留旧数据。** 简要步骤见 [升级说明](docs/upgrading.md)。
 
@@ -14,7 +18,7 @@
 
 ## 开始使用
 
-1. 从 [Releases](https://github.com/VZRXS/bilikara/releases) 下载并解压对应平台的完整包，Windows 打开 `bilikara-desktop.exe`，macOS 打开 `bilikara-desktop.app`。
+1. 桌面端从 [Releases](https://github.com/VZRXS/bilikara/releases) 下载并解压对应平台的完整包，Windows 打开 `bilikara-desktop.exe`，macOS 打开 `bilikara-desktop.app`；Android 端安装与设备架构匹配的测试版 APK。
 2. 在「本场用户」添加参与者，选择点歌人，再粘贴 Bilibili / YouTube 视频链接或 BV / av 号；也可搜索和浏览曲库。缓存完成后开始播放。
 3. 手机与电脑连接同一网络，打开电脑右上角「手机点歌」并扫码。异地使用时，先创建公网房间，再通过公网入口和房间密码连接。
 

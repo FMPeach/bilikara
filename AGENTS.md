@@ -330,6 +330,7 @@ Choose a component by role, then reuse its shared definition. This table describ
 
 - **Context Inspection**: Inspect the latest branch HEAD and `git status` before editing files.
 - **Minimal Changes**: Make the smallest coherent change necessary to accomplish the user request.
+- **Repository Documentation**: Commit development guidelines, user instructions, and necessary established architecture, interface, behavior and maintenance contracts. Keep exploratory plans, investigation notes, implementation diaries, one-off validation results, screenshots, traces and engineering receipts in ignored `.tmp/` or another noncommitted evidence location. Extract durable decisions into the relevant guideline or usage document instead of committing the development narrative; retain reproducible verification instructions, but report run-specific outcomes separately.
 - **Product Name**: Use lowercase `bilikara` in user-facing text, window titles and documentation. Preserve established protocol headers, environment variables, public symbols and historical compatibility fixtures when their spelling is part of a contract.
 - **Domain Boundaries**: Do not begin work on an unrelated business domain or migration area.
 - **Behavior Preservation**: Preserve existing fallback behaviors and user-visible functionality unless explicitly directed to alter them.
