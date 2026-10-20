@@ -6,7 +6,7 @@ import {chromium, webkit} from 'playwright';
 import {root} from './desktop_construction_support.mjs';
 import {ownedDirectory} from './libav_prerequisite_support.mjs';
 import {buildNativeAlpha, buildNativeHost} from './native_runtime_artifacts.mjs';
-import {RunningHost, isolatedEnvironment} from './native_host_support.mjs';
+import {RunningHost, isolatedEnvironment, waitFor} from './native_host_support.mjs';
 
 let alpha, desktop;
 before(async()=>{
@@ -65,7 +65,7 @@ for(const engine of [chromium,webkit])for(const platform of ['desktop','android'
   }
   async function complete(key){
     await page.waitForFunction(()=>!state.bbdownLoginRequesting);
-    assert.equal(await image.getAttribute('src'),qr(key));assert.equal(await link.getAttribute('href'),login(key).login_url);
+    assert.equal(await image.getAttribute('src'),qr(key));assert.equal(await link.getAttribute('href'),android?login(key).login_url:'https://account.bilibili.com/login');
     assert.equal(await action.isDisabled(),false);assert.equal(await action.getAttribute('aria-busy'),null);
   }
   await action.click();await pending();assert.equal(calls,1);release();await complete('1');
@@ -77,16 +77,42 @@ for(const engine of [chromium,webkit])for(const platform of ['desktop','android'
   nextFailure=true;await action.click();await pending();assert.equal(calls,4);release();await complete('3');
   await page.evaluate(()=>renderBBDownLogin(state.data.bbdown.login));assert.equal(calls,4);
   await action.focus();await page.keyboard.press('Enter');await pending();assert.equal(calls,5);release();await complete('5');
-  const opened=[];await page.exposeFunction('fixtureOpenLogin',url=>opened.push(url));
+  const opened=[];let finishLogin;
+  await page.exposeFunction('fixtureOpenLogin',async url=>{
+    opened.push(url);
+    if(!android)await new Promise(resolve=>{finishLogin=resolve;});
+  });
   await page.evaluate(platform=>{
     if(platform==='android')window.BilikaraAndroidPlatform={openLoginLink:url=>fixtureOpenLogin(url)};
-    else window.__TAURI__={core:{invoke:(command,args)=>{if(command==='open_external_web_url')return fixtureOpenLogin(args.url);return Promise.resolve({});}}};
+    else window.__TAURI__={core:{invoke:(command,args)=>{if(command==='open_bilibili_login')return fixtureOpenLogin('native-login-window');if(command==='open_external_web_url')throw new Error('desktop login must not open the QR payload in a browser');return Promise.resolve({});}}};
   },platform);
-  await link.click();await page.waitForFunction(()=>!document.getElementById('bbdown-login-link').hasAttribute('aria-busy'));
-  assert.deepEqual(opened,[login('5').login_url]);assert.equal(new URL(page.url()).origin,host.base);
+  await link.click();
+  if(!android){
+    await page.waitForFunction(()=>state.bbdownWebLoginRequesting);
+    await page.evaluate(()=>{
+      document.getElementById('bbdown-login-link').click();
+      document.getElementById('bbdown-login-refresh').click();
+      document.getElementById('bbdown-login-button').click();
+    });
+    assert.equal(calls,5);assert.equal(await action.isDisabled(),true);
+    await waitFor(()=>Boolean(finishLogin),'native login command must be pending');
+    finishLogin();
+  }
+  await page.waitForFunction(()=>!document.getElementById('bbdown-login-link').hasAttribute('aria-busy'));
+  assert.deepEqual(opened,[android?login('5').login_url:'native-login-window']);assert.equal(new URL(page.url()).origin,host.base);
+  if(!android){
+    await page.evaluate(()=>{
+      window.__TAURI__.core.invoke=()=>Promise.reject('isolated login unavailable');
+      fetchState=async()=>{throw new Error('isolated reconnect unavailable');};
+    });
+    await link.click();
+    await page.waitForFunction(()=>!state.bbdownWebLoginRequesting&&!document.getElementById('bbdown-login-link').hasAttribute('aria-busy'));
+    assert.equal(await action.isDisabled(),false);
+    assert.equal(await action.getAttribute('aria-busy'),null);
+  }
   for(const value of [{state:'starting'},{state:'failed'},{state:'logged_in',logged_in:true}]){
     await page.evaluate(value=>{state.data.bbdown.login={...value,login_url:'https://account.bilibili.com/old'};renderBBDownLogin(state.data.bbdown.login,{startIfNeeded:false});},value);
-    assert.equal(await link.getAttribute('href'),null);assert.equal(await link.isVisible(),false);
+    if(android||value.logged_in){assert.equal(await link.getAttribute('href'),null);assert.equal(await link.isVisible(),false);}else{assert.equal(await link.getAttribute('href'),'https://account.bilibili.com/login');assert.equal(await link.isVisible(),true);}
   }
   assert.deepEqual(errors,[]);
 });

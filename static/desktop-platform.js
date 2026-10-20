@@ -24,6 +24,7 @@
     startUpdate(includePreview) { return invoke("start_desktop_update", { includePreview }); },
     cancelUpdate() { return invoke("cancel_desktop_update"); },
     openExternal(url) { return invoke("open_external_web_url", { url }); },
+    openBilibiliLogin() { return invoke("open_bilibili_login"); },
     async applyUpdate(status) {
       const operation = status?.operation;
       if (status?.state !== "prepared" || !Number.isSafeInteger(operation) || activating.has(operation)) return;

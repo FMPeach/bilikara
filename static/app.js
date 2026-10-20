@@ -11200,12 +11200,15 @@ function renderBBDownLogin(login, { startIfNeeded = true } = {}) {
     setClassToggle(elements.bbdownLoginPanel, "hidden", loggedIn);
     if (elements.bbdownLoginLink) {
       let loginUrl = "";
+      const desktopLogin = document.documentElement.dataset.hostPlatform === "desktop"
+        && Boolean(window.BilikaraDesktopPlatform?.openBilibiliLogin);
       try {
         const url = new URL(login?.login_url || "");
         if (!state.bbdownLoginRequesting && !loggedIn && login?.state === "waiting" && url.href.length <= 4096 && url.protocol === "https:"
           && ["account.bilibili.com", "passport.bilibili.com"].includes(url.hostname)
           && !url.username && !url.password && (!url.port || url.port === "443")) loginUrl = url.href;
       } catch { /* Older Hosts do not publish a login link. */ }
+      if (desktopLogin && !loggedIn && !state.bbdownLoginRequesting) loginUrl = "https://account.bilibili.com/login";
       elements.bbdownLoginLink.hidden = !loginUrl;
       document.getElementById("bbdown-login-alternative").hidden = !loginUrl;
       if (loginUrl) elements.bbdownLoginLink.href = loginUrl;
@@ -11258,7 +11261,7 @@ function maybeStartBBDownLogin(login, options = {}) {
   if (state.data?.session_flags?.startup_choice_pending) return;
   const loginState = String(login?.state || "idle");
   if (loginState !== "failed") state.bbdownExpiredRetryHandled = false;
-  if (!state.cacheSettingsOpen || state.bbdownLoginRequesting || login?.logged_in) {
+  if (!state.cacheSettingsOpen || state.bbdownLoginRequesting || state.bbdownWebLoginRequesting || login?.logged_in) {
     return;
   }
   // Refresh only the backend's explicit expiry result. Network/API failures
@@ -11284,7 +11287,7 @@ function maybeStartBBDownLogin(login, options = {}) {
 }
 
 async function startBBDownLogin(options = {}) {
-  if (state.bbdownLoginRequesting) return;
+  if (state.bbdownLoginRequesting || state.bbdownWebLoginRequesting) return;
   state.bbdownLoginRequesting = true;
   const controls = [elements.bbdownLoginButton, elements.bbdownLoginRefresh]
     .filter(Boolean).map(button => ({button, disabled: button.disabled}));
@@ -20547,15 +20550,28 @@ elements.bbdownLoginLink?.addEventListener("click", async event => {
   if (link.hidden || !link.hasAttribute("href") || link.getAttribute("aria-busy") === "true") return;
   const url = link.href;
   link.setAttribute("aria-busy", "true");
+  const desktop = document.documentElement.dataset.hostPlatform === "desktop";
+  const controls = desktop ? [elements.bbdownLoginButton, elements.bbdownLoginRefresh]
+    .filter(Boolean).map(button => ({button, disabled: button.disabled})) : [];
+  if (desktop) state.bbdownWebLoginRequesting = true;
+  for (const {button} of controls) { button.disabled = true; button.setAttribute("aria-busy", "true"); }
   try {
     if (document.documentElement.dataset.hostPlatform === "android") {
       if (!window.BilikaraAndroidPlatform?.openLoginLink) throw new Error(t("service.loginLinkUnavailable"));
       await window.BilikaraAndroidPlatform.openLoginLink(url);
-    } else if (document.documentElement.dataset.hostPlatform === "desktop") {
-      await window.BilikaraDesktopPlatform.openExternal(url);
+    } else if (desktop) {
+      await window.BilikaraDesktopPlatform.openBilibiliLogin();
     } else window.open(url, "_blank", "noopener,noreferrer");
-  } catch { setAppMessage(t("service.loginLinkUnavailable"), true); }
-  finally { link.removeAttribute("aria-busy"); }
+  } catch (error) { setAppMessage(desktop && typeof error === "string" ? error : t("service.loginLinkUnavailable"), true); }
+  finally {
+    if (desktop) state.bbdownWebLoginRequesting = false;
+    for (const {button, disabled} of controls) { button.disabled = disabled; button.removeAttribute("aria-busy"); }
+    link.removeAttribute("aria-busy");
+    if (desktop) {
+      try { await fetchState(); }
+      catch (error) { setAppMessage(error.message || t("error.stateFailed"), true); }
+    }
+  }
 });
 
 elements.bbdownLoginRefresh?.addEventListener("click", async () => {

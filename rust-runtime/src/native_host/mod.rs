@@ -701,6 +701,9 @@ async fn handle_inner(
             | "/api/app/update/activate"
             | "/api/app/update/install"
             | "/api/app/update/cancel"
+            | "/api/app/bilibili-login/begin"
+            | "/api/app/bilibili-login/complete"
+            | "/api/app/bilibili-login/cancel"
     ) && method == Method::POST
         && context.desktop
     {
@@ -721,6 +724,19 @@ async fn handle_inner(
                 200,
                 json!({"ok":true,"data":{"active":context.export_slots.available_permits() == 0,"language":language}}),
             ));
+        }
+        if let Some(operation) = path.strip_prefix("/api/app/bilibili-login/") {
+            let operation = operation.to_owned();
+            let bytes = axum::body::to_bytes(request.into_body(), 20 * 1024)
+                .await
+                .map_err(|_| ApiError::invalid("Invalid login operation"))?;
+            let body: Value = serde_json::from_slice(&bytes)
+                .map_err(|_| ApiError::invalid("Invalid login operation"))?;
+            let result =
+                tokio::task::spawn_blocking(move || login::web_login(&context, &operation, &body))
+                    .await
+                    .map_err(|_| ApiError::invalid("Login operation failed"))??;
+            return Ok(json_response(200, json!({"ok":true,"data":result})));
         }
         if path.starts_with("/api/app/update/") {
             let bytes = axum::body::to_bytes(request.into_body(), 1024)

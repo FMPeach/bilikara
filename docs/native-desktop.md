@@ -1131,6 +1131,24 @@ override. Desktop QR credentials remain in `BBDown.data`; active credentials are
 passed to BBDown through its `-c` argument. `bilikara_native` is a separate local
 Host/Remote browser identity cookie and is never a Bilibili credential.
 
+Desktop **Open login page** opens Bilibili's normal website in a separate,
+ephemeral native window, rather than opening the QR confirmation URL in an
+external browser. Complete the official login there; the shell reads only the
+required Bilibili cookies, and the Rust Host verifies them before saving the
+existing `BBDown.data` format. Closing the window cancels that attempt. QR login
+remains available. The website receives no application IPC permissions; app
+launches, downloads and unrelated top-level navigation are blocked. This window
+is an exception to the shared Host/audience WebView store: it never reads an
+external browser's profile. Official verification/CAPTCHA availability still
+depends on Bilibili and the platform WebView.
+
+`npm run test:native-login` checks the private import/verification/persistence
+boundary against isolated TLS fixtures. `npm run test:native-login-window`
+additionally requires Linux X11 tools (`Xvfb`, `openbox`, `scrot`, `xdotool`) and
+checks an actual ephemeral Tauri WebView against a local HTTP fixture, including
+HttpOnly reads, denied IPC/downloads and store isolation. Neither gate logs into
+a real Bilibili account or qualifies Windows/macOS website compatibility.
+
 Zero or missing playback duration is accepted as a transient observation.
 Playback commands keep working; history-start and rating-threshold transitions
 wait for a positive observed duration. No duration from an earlier observation

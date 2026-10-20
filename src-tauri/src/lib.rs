@@ -5,6 +5,8 @@ mod backend_download;
 #[cfg(desktop)]
 mod backend_process;
 #[cfg(desktop)]
+mod bilibili_login;
+#[cfg(desktop)]
 mod desktop;
 #[cfg(desktop)]
 mod desktop_diagnostics;

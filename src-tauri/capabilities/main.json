@@ -35,6 +35,7 @@
     "allow-start-desktop-update",
     "allow-cancel-desktop-update",
     "allow-open-external-web-url",
+    "allow-open-bilibili-login",
     "allow-get-presentation-displays",
     "allow-get-presentation-session",
     "allow-show-presentation-display-identifiers",

@@ -50,7 +50,7 @@ fn run(context: &HostContext, generation: u64) -> Result<(), ApiError> {
         },
     );
     match result {
-        Ok(Some(cookie)) => finish(context, generation, Ok(cookie)),
+        Ok(Some(cookie)) => finish(context, generation, Ok(cookie)).map(|_| ()),
         Ok(None) => Ok(()),
         Err(error) => Err(error.into()),
     }
@@ -435,7 +435,7 @@ fn finish(
     context: &HostContext,
     generation: u64,
     result: Result<String, ApiError>,
-) -> Result<(), ApiError> {
+) -> Result<bool, ApiError> {
     let logged_in = with_app(|app| {
         let session = app.native();
         if context.stop.load(Ordering::Acquire) || session.login_generation != Some(generation) {
@@ -484,7 +484,82 @@ fn finish(
     if logged_in {
         library::refresh_after_login(context);
     }
-    Ok(())
+    Ok(logged_in)
+}
+
+/// Reached only through the desktop shell's private process capability. The
+/// remote website never receives Host authority or transports cookies in JS.
+pub(super) fn web_login(
+    context: &HostContext,
+    operation: &str,
+    body: &Value,
+) -> Result<Value, ApiError> {
+    if operation == "begin" {
+        let generation = with_app(|app| {
+            reserve_generation(app.native(), true)
+                .ok_or_else(|| ApiError::invalid("Bilibili 已登录"))
+        })?;
+        update_waiting(
+            context,
+            generation,
+            "",
+            "",
+            "请在登录窗口中完成 Bilibili 登录",
+        )?;
+        return Ok(json!({"generation":generation}));
+    }
+    let generation = body["generation"]
+        .as_u64()
+        .ok_or_else(|| ApiError::invalid("Invalid login generation"))?;
+    if operation == "cancel" {
+        finish(
+            context,
+            generation,
+            Err(ApiError::invalid("网页登录已结束，可重新打开或扫码登录")),
+        )?;
+        return Ok(json!({"cancelled":true}));
+    }
+    if operation != "complete" || !active(context, generation) {
+        return Err(ApiError::new(
+            409,
+            "login_stale",
+            "登录已取消或被新的登录操作替代",
+        ));
+    }
+    let cookie = body["cookie"]
+        .as_str()
+        .and_then(crate::desktop_login::login_cookie)
+        .ok_or_else(|| ApiError::invalid("登录信息不完整，请重新登录"))?;
+    let value = crate::bilibili_service::BilibiliHttpClient::for_video(
+        &cookie,
+        crate::native_video::USER_AGENT,
+        "https://www.bilibili.com/",
+        5000,
+    )
+    .and_then(|client| {
+        client.get_api_json(
+            "https://api.bilibili.com/x/web-interface/nav",
+            "无法验证 Bilibili 登录",
+        )
+    })
+    .map_err(|_| ApiError::new(502, "login_verify", "无法验证网页登录，请重试或扫码登录"))?;
+    if value["data"]["isLogin"] != true {
+        return Err(ApiError::new(
+            400,
+            "authentication",
+            "登录信息无效或已过期，请重新登录",
+        ));
+    }
+    // finish checks the generation again after HTTP verification, persists the
+    // existing credential format, then publishes the authoritative snapshot.
+    if !finish(context, generation, Ok(cookie))? {
+        return Err(ApiError::new(
+            409,
+            "login_finish",
+            "登录已取消或登录信息无法保存，请重试",
+        ));
+    }
+    Ok(json!({"logged_in":true}))
 }
 
 #[cfg(test)]

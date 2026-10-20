@@ -34,6 +34,7 @@ fn main() {
         "start_desktop_update",
         "cancel_desktop_update",
         "open_external_web_url",
+        "open_bilibili_login",
         "get_presentation_displays",
         "get_presentation_session",
         "show_presentation_display_identifiers",

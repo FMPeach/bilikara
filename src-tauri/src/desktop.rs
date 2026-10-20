@@ -51,6 +51,7 @@ pub(crate) fn run() {
     let startup_log_for_setup = startup_log.clone();
     let run_result = tauri::Builder::default()
         .manage(presentation::PresentationState::default())
+        .manage(crate::bilibili_login::LoginWindows::default())
         .manage(window_lifecycle::ApplicationLifecycleState::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
@@ -69,6 +70,7 @@ pub(crate) fn run() {
             backend_process::start_desktop_update,
             backend_process::cancel_desktop_update,
             platform::open_external_web_url,
+            crate::bilibili_login::open_bilibili_login,
             backend_download::save_backend_download,
             presentation::get_presentation_displays,
             presentation::get_presentation_session,
