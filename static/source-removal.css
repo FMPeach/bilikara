@@ -96,3 +96,4 @@
 }
 
 .source-removal-card.is-draggable > .follow-up-button { touch-action: none; }
+:root[data-host-platform="android"] .source-removal-card.is-draggable > .follow-up-button { touch-action: pan-y pinch-zoom; }

@@ -273,6 +273,9 @@
           width: `${bounds[index].width}px`, height: `${bounds[index].height}px`, zIndex: String(index + 1),
         });
       });
+      // Absolute card bounds restore the scroller's real viewport. Restore its
+      // offset now, before the first animation frame, rather than only on exit.
+      if (!forward) myScroll.scrollTop = myScrollTop;
       const sign = forward ? 1 : -1;
       const animations = [
         outgoing.animate([{transform: "translateX(0)"}, {transform: `translateX(${-sign * 20}%)`}], {duration: 200, easing: "ease-out"}),

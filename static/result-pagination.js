@@ -515,7 +515,7 @@
         preview?.remove();
         preview = container.cloneNode(false);
         preview.removeAttribute("id");
-        preview.classList.remove("has-result-pages", "is-page-dragging", "hidden");
+        preview.classList.remove("is-page-dragging", "hidden");
         preview.classList.add("result-page-preview");
         preview.dataset.previewPage = String(next);
         preview.inert = true;

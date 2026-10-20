@@ -71,9 +71,6 @@
         if (["Enter", " "].includes(event.key) && event.target.matches(".session-user-name")) {
           event.preventDefault(); this.click(event);
         }
-        if (this.mode === "select" && event.altKey && ["ArrowUp", "ArrowDown"].includes(event.key)) {
-          event.preventDefault(); this.moveSelection(event.key === "ArrowUp" ? -1 : 1);
-        }
       });
       // WebKit can begin native HTML dragging without a pointerdown. Record
       // the same checkbox exclusion from its mouse press before dragstart.
@@ -374,21 +371,28 @@
       this.beginDrag(badge);
       event.dataTransfer.effectAllowed = "move";
       event.dataTransfer.setData("text/plain", this.drag.ids.join(","));
+      const dragImage = this.createDragImage(badge);
+      const box = badge.getBoundingClientRect();
+      // The 2px inset preserves the selected outline in the native snapshot.
+      event.dataTransfer.setDragImage(dragImage, box.width / 2 + 2, box.height / 2 + 2);
+    }
+
+    createDragImage(badge) {
       const dragImage = document.createElement("div");
       dragImage.className = "session-user-drag-image";
       dragImage.setAttribute("aria-hidden", "true");
       dragImage.dataset.editMode = this.mode;
       dragImage.style.setProperty("--session-user-row-height", getComputedStyle(this.stage).getPropertyValue("--session-user-row-height"));
       const clone = badge.cloneNode(true);
+      for (const node of [clone, ...clone.querySelectorAll("*")]) node.removeAttribute("id");
       clone.classList.remove("dragging"); clone.draggable = false;
       const box = badge.getBoundingClientRect();
       clone.style.width = `${box.width}px`;
       clone.style.height = `${box.height}px`;
       dragImage.append(clone);
       document.body.append(dragImage);
-      // The 2px inset preserves the selected outline in the native snapshot.
-      event.dataTransfer.setDragImage(dragImage, box.width / 2 + 2, box.height / 2 + 2);
       this.drag.image = dragImage;
+      return dragImage;
     }
 
     dragOver(event) {
@@ -439,14 +443,21 @@
       if (event.pointerType === "mouse" || this.busy || this.mode === "rename") return;
       const badge = event.target.closest(".session-user-badge");
       if (!badge || (this.mode === "select" ? this.checkboxPress : !event.target.closest(".session-user-order-number"))) return;
-      this.pointer = { id: event.pointerId, x: event.clientX, y: event.clientY, badge };
+      const box = badge.getBoundingClientRect();
+      this.pointer = { id: event.pointerId, x: event.clientX, y: event.clientY, badge,
+        offsetX: event.clientX - box.left + 2, offsetY: event.clientY - box.top + 2 };
       badge.setPointerCapture(event.pointerId);
     }
 
     pointerMove(event) {
       if (!this.pointer || this.pointer.id !== event.pointerId) return;
       if (!this.drag && Math.hypot(event.clientX - this.pointer.x, event.clientY - this.pointer.y) < 6) return;
-      if (!this.drag) this.beginDrag(this.pointer.badge);
+      if (!this.drag) {
+        this.beginDrag(this.pointer.badge);
+        this.createDragImage(this.pointer.badge).classList.add("is-pointer-drag-preview");
+      }
+      this.drag.image.style.left = `${event.clientX - this.pointer.offsetX}px`;
+      this.drag.image.style.top = `${event.clientY - this.pointer.offsetY}px`;
       event.preventDefault();
       this.pointer.overTrash = this.isOverTrash(event.clientX, event.clientY);
       this.trash.classList.toggle("drag-over", this.pointer.overTrash);
@@ -474,15 +485,7 @@
       else if (drag.overList) void this.commit({ action: "reorder", user_ids: drag.ids, before_user_id: drag.before }, drag.version);
     }
 
-    moveSelection(direction) {
-      if (!this.selected.size || this.busy) return;
-      const selectedIndexes = this.entries.map((user, index) => this.selected.has(user.id) ? index : -1).filter(index => index >= 0);
-      const edge = direction < 0 ? selectedIndexes[0] : selectedIndexes.at(-1);
-      const index = edge + direction;
-      if (index < 0 || index >= this.entries.length) return;
-      const before = direction < 0 ? this.entries[index] : this.entries[index + 1];
-      void this.commit({ action: "reorder", user_ids: [...this.selected], before_user_id: before?.id || null });
-    }
+
   }
 
   global.BilikaraSessionUserEditor = SessionUserEditor;

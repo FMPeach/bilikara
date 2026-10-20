@@ -1370,7 +1370,14 @@ mod tests {
                         let mut byte=[0];
                         // The peer must actually close its HTTP connection; no
                         // detached reader is allowed to outlive cancellation.
-                        assert_eq!(socket.read(&mut byte).unwrap(),0,"stalled socket did not close");
+                        // Cancelling an unread response can close with TCP RST
+                        // (notably on macOS), rather than a graceful EOF. Both
+                        // prove the peer released the socket; a timeout does not.
+                        match socket.read(&mut byte) {
+                            Ok(0) => {}
+                            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+                            result => panic!("stalled socket did not close: {result:?}"),
+                        }
                     }));
                 }
                 for client in clients {

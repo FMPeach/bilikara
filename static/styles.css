@@ -3848,6 +3848,10 @@ html[data-host-touch-users="true"] .session-user-badge {
   white-space: nowrap;
   pointer-events: none;
 }
+.session-user-drag-image.is-pointer-drag-preview {
+  z-index: var(--host-layer-modal, 80);
+  opacity: .65;
+}
 
 .remote-panel {
   display: grid;

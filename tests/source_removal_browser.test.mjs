@@ -100,6 +100,9 @@ async function browser(t, host, {android=false, remote=false, origin=host.base, 
   return {page,context,errors,requests,consoleLogs};
 }
 async function sources(page, android=false, remote=false) {
+  // Reload must finish the same Host bootstrap that browser() awaits on entry;
+  // otherwise initializeHostShell() can reset a navigation click made early.
+  await page.waitForFunction(()=>typeof state!=='undefined'&&Boolean(state.data));
   if(remote)await page.locator('[data-remote-request-view="sources"]').click();
   else {
     if(!await page.locator('#request-sources-panel').isVisible()) {
@@ -182,7 +185,7 @@ async function dragRemoval(page,grid,footer,android=false,{outside=false,cancel=
   const session=android?await page.context().newCDPSession(page):null;
   const touch=(type,p)=>session.send('Input.dispatchTouchEvent',{type,touchPoints:p?[p]:[]});
   try {
-    if(android){await touch('touchStart',start);await touch('touchMove',{x:start.x+8,y:start.y});}
+    if(android){await touch('touchStart',start);await holdOrder(page);await touch('touchMove',{x:start.x+8,y:start.y});}
     else {await page.mouse.move(start.x,start.y);await page.mouse.down();await page.mouse.move(start.x+8,start.y);}
     const trash=await footer.locator('.source-trash-slot').boundingBox(),end=outside?{x:1,y:1}:{x:trash.x+trash.width/2,y:trash.y+trash.height/2};
     if(android){for(let step=1;step<=6;step++){await touch('touchMove',{x:start.x+(end.x-start.x)*step/6,y:start.y+(end.y-start.y)*step/6});await page.waitForTimeout(16);}}
@@ -459,7 +462,7 @@ test('favorite chooser puts the count beside its heading and keeps equal footer 
   completed.add(t);
 });
 
-test('phone selection mode owns touch ordering and keeps long press for entry', {timeout:30000},async t=>{
+test('phone selection mode keeps swipes and requires a long press before touch ordering', {timeout:30000},async t=>{
   const {host,data}=await fixture(t,{android:true,size:12}),{page,requests,errors}=await browser(t,host,{android:true,mobileBrowser:true});
   await page.setViewportSize({width:375,height:667});await sources(page,true);
   const grid=page.locator('#follow-up-grid'),footer=page.locator('.source-tools[data-source="uid"]');
@@ -472,6 +475,7 @@ test('phone selection mode owns touch ordering and keeps long press for entry', 
     await page.waitForFunction(()=>sourceRemovalEditors.get('uid').editing);
     const from=await grid.locator('[data-source-id="43"]').boundingBox(),to=await grid.locator('[data-source-id="42"]').boundingBox();
     await press(from.x+22,from.y+22);
+    await holdOrder(page);
     await session.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:to.x+1,y:to.y+to.height/2,force:1}]});
     assert.equal(await grid.locator('.is-dragging').count(),1);assert.equal(await grid.locator('.drop-before').count(),1);
     await release();
@@ -659,6 +663,7 @@ test('mobile Host long press selects without moving its resident footer; swipe, 
   const scrollPoint={x:scrollTitle.x+scrollTitle.width/2,y:scrollTitle.y+8};
   assert.equal(await page.evaluate(p=>Boolean(document.elementFromPoint(p.x,p.y)?.closest('.source-select-target,.source-tools')),scrollPoint),false,'card dragging starts outside the checkbox and tools');
   await start(scrollPoint);
+  await holdOrder(page);
   if(process.env.BILIKARA_SOURCE_TEST_DEBUG)console.log('Native scroll gesture',await page.evaluate(p=>{
     const editor=sourceRemovalEditors.get('uid'),scroll=editor.scroll,nodes=[];let node=document.elementFromPoint(p.x,p.y);
     while(node){const style=getComputedStyle(node);nodes.push({id:node.id,class:node.className,touchAction:style.touchAction,overflow:style.overflow,height:node.clientHeight,scrollHeight:node.scrollHeight});node=node.parentElement;}
@@ -1017,13 +1022,18 @@ for(const android of [false,true])test(`${android?'touch portrait shared Android
   });
   timings.push({name:android?'portrait-mouse-drag-save':'mouse-drag-save',ms:Math.round(performance.now()-start)});
   assert.deepEqual(read(data,'gatcha_uids.json').uids,ids);
+  const oldOrder=read(data,'gatcha_source_order.json').uid;
   await handle.focus();await page.keyboard.press('Alt+ArrowDown');
-  await waitFor(()=>read(data,'gatcha_source_order.json').uid[0]==='42','keyboard alternative saves');
-  await waitFor(async()=>!(await handle.isDisabled()),'keyboard move settled');
-  await handle.focus();await page.keyboard.press('Alt+ArrowDown');
-  await waitFor(()=>read(data,'gatcha_source_order.json').uid[2]==='43','keyboard reorder saves');
-  await waitFor(async()=>!(await handle.isDisabled()),'keyboard move settled');
+  assert.deepEqual(read(data,'gatcha_source_order.json').uid,oldOrder,'Alt-arrow is no longer a reorder shortcut');
+  assert.equal(await handle.getAttribute('aria-keyshortcuts'),null);
+  await edit(host,'uid',{action:'move',id:'43',before_id:'45'});
+  await waitFor(()=>read(data,'gatcha_source_order.json').uid[2]==='43','next persisted order is saved by native Host');
   await assertMedia(page);
+  // Exercise navigation after a reload whose translations have not arrived yet.
+  await page.route('**/i18n.json', async route => {
+    await new Promise(resolve => setTimeout(resolve, 500));
+    await route.continue();
+  }, {times:1});
   await page.reload();await sources(page,android);
   await page.evaluate(()=>{window.sourceMediaNodes=[...document.querySelectorAll('video,audio')];});
   assert.deepEqual(await grid.locator('.source-removal-card').evaluateAll(nodes=>nodes.slice(0,3).map(n=>n.dataset.sourceId)),['42','44','43']);
@@ -1483,6 +1493,32 @@ test('Android source cards allow browse swipes while long press and editing reta
     await cdp.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});
     assert.equal(await pager.locator('[data-page-input]').inputValue(),'2');assert.equal(requests.mutations.length,0);
     assert.equal(await page.evaluate(()=>sourceRemovalEditors.get('uid').selected.size),1);
+    const selected=await page.evaluate(()=>[...sourceRemovalEditors.get('uid').selected]);
+    const selectedCard=await grid.locator('.follow-up-button').first().boundingBox();
+    const sx=bounds.x+bounds.width*.85,sy=selectedCard.y+selectedCard.height/2;
+    await cdp.send('Input.dispatchTouchEvent',{type:'touchStart',touchPoints:[{x:sx,y:sy}]});
+    await cdp.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:sx-25,y:sy+2}]});
+    const geometry=await page.evaluate(()=>{
+      const current=document.querySelector('#follow-up-grid .source-removal-card').getBoundingClientRect();
+      const next=document.querySelector('.result-page-preview .source-removal-card').getBoundingClientRect();
+      return {current:{top:current.top,height:current.height},next:{top:next.top,height:next.height}};
+    });
+    assert.ok(Math.abs(geometry.current.top-geometry.next.top)<1&&Math.abs(geometry.current.height-geometry.next.height)<1,JSON.stringify(geometry));
+    for(const distance of [65,125])await cdp.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:sx-distance,y:sy+2}]});
+    await cdp.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});
+    await page.waitForFunction(()=>document.querySelector('#request-sources-uids > .source-frame-footer [data-page-input]').value==='3');
+    await settleSourceFit(page);
+    assert.deepEqual(await page.evaluate(()=>[...sourceRemovalEditors.get('uid').selected]),selected,'Paging in selection mode retains selections');
+    const landed=await grid.locator('.source-removal-card').first().boundingBox();
+    assert.ok(Math.abs(landed.y-geometry.current.top)<1&&Math.abs(landed.height-geometry.current.height)<1,'Landing preserves the preview vertical geometry');
+    const held=await grid.locator('.follow-up-button').first().boundingBox();
+    await cdp.send('Input.dispatchTouchEvent',{type:'touchStart',touchPoints:[{x:held.x+22,y:held.y+22}]});
+    await holdOrder(page);
+    await cdp.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:held.x+34,y:held.y+22}]});
+    assert.equal(await page.locator('.source-drag-preview').isVisible(),true);
+    await cdp.send('Input.dispatchTouchEvent',{type:'touchCancel',touchPoints:[]});
+    assert.equal(await page.locator('.source-drag-preview').count(),0);
+    assert.equal(requests.mutations.length,0);
     assert.equal(existsSync(path.join(data,'gatcha_source_order.json')),false);await assertMedia(page);
     completed.add(t);
   }finally{await cdp.detach().catch(()=>{});}

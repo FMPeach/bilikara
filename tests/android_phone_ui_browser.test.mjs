@@ -140,8 +140,20 @@ for (const engine of [chromium,webkit]) test(`${engine.name()} Android phone kee
   const scrolled=await page.locator('#stage-control-tray').evaluate(n=>{n.scrollTop=n.scrollHeight;return {top:n.scrollTop,overflow:n.scrollHeight-n.clientHeight};});
   assert.ok(scrolled.top>0&&scrolled.overflow>0,'Only the controls region scrolls on a short phone');
   assert.deepEqual(await page.locator('#player-frame').boundingBox(),frame,'Scrolling controls must not move playback');
-  await page.evaluate(()=>{document.querySelector('.player-panel').classList.add('is-tauri-fullscreen');document.getElementById('player-fullscreen-button').disabled=false;});
-  await page.mouse.move(0,500);await page.waitForTimeout(180);
+  await page.evaluate(()=>{
+    const button=document.getElementById('player-fullscreen-button');
+    getComputedStyle(button).backgroundColor;
+    document.querySelector('.player-panel').classList.add('is-tauri-fullscreen');button.disabled=false;
+    getComputedStyle(button).backgroundColor;
+    // Exercise a transition that outlives the former 180ms sampling delay,
+    // as can happen while the CI WebKit renderer waits for its next frame.
+    for(const animation of button.getAnimations())animation.playbackRate=.25;
+  });
+  await page.mouse.move(0,500);
+  await page.evaluate(()=>Promise.all(
+    ['player-fullscreen-button','android-fullscreen-remote-button'].flatMap(id=>
+      document.getElementById(id).getAnimations().map(animation=>animation.finished)),
+  ));
   const fullscreen=await page.evaluate(()=>['player-fullscreen-button','android-fullscreen-remote-button'].map(id=>{
     const n=document.getElementById(id),s=getComputedStyle(n),r=n.getBoundingClientRect();
     return [s.opacity,s.backgroundColor,s.color,s.borderRadius,s.border,s.boxShadow,r.width,r.height];
@@ -303,12 +315,13 @@ test('Android My keeps its scroll frame, cache lines, login link and settings an
       const outgoing=forward?document.getElementById('android-my-page'):document.getElementById('host-workspace-region');
       const previous=outgoing.getBoundingClientRect();document.getElementById(forward?'android-open-settings':'android-settings-back').click();
       const incoming=forward?document.getElementById('host-workspace-region'):document.getElementById('android-my-page');
-      const animation=incoming.getAnimations()[0],tops=[];
+      const animation=incoming.getAnimations()[0],tops=[],scrolls=[];
       while(animation&&animation.playState!=='finished'&&animation.playState!=='idle'){
-        tops.push([outgoing.getBoundingClientRect().top,incoming.getBoundingClientRect().top]);await new Promise(requestAnimationFrame);
+        tops.push([outgoing.getBoundingClientRect().top,incoming.getBoundingClientRect().top]);scrolls.push(document.querySelector('.android-my-scroll').scrollTop);await new Promise(requestAnimationFrame);
       }
-      await Promise.allSettled(incoming.getAnimations().map(a=>a.finished));return {previous:previous.top,final:incoming.getBoundingClientRect().top,tops};
+      await Promise.allSettled(incoming.getAnimations().map(a=>a.finished));return {previous:previous.top,final:incoming.getBoundingClientRect().top,tops,scrolls};
     },forward);
+    if(!forward)assert.ok(result.scrolls.every(value=>Math.abs(value-frame.scroll)<1),JSON.stringify(result.scrolls));
     assert.ok(result.tops.length>1);for(const [oldTop,newTop]of result.tops){assert.ok(Math.abs(oldTop-result.previous)<1,JSON.stringify(result));assert.ok(Math.abs(newTop-result.final)<1,JSON.stringify(result));}
   }
   assert.equal(await page.locator('.android-my-scroll').evaluate(n=>n.scrollTop),frame.scroll,'Settings return preserves My scroll position');

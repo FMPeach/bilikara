@@ -942,14 +942,20 @@ for (const [name, engine] of [['Chromium', chromium], ['WebKit', webkit]]) {
     }
     await page.route('**/fixture-cover', route => route.fulfill({ contentType: 'image/svg+xml', body:
       '<svg xmlns="http://www.w3.org/2000/svg" width="90" height="500"><rect width="90" height="500" fill="orange"/></svg>' }));
-    for (const width of [700, 1280, 1920]) {
-      await page.setViewportSize({ width, height: 1080 });
+    for (const [width, height] of [[700, 600], [700, 1080], [1280, 1080], [1920, 1080]]) {
+      await page.setViewportSize({ width, height });
+      // Resizing into the narrow desktop layout folds an idle tool sheet.
+      // Settle that layout and open it before measuring its cover contents.
+      await page.waitForFunction(() => !state.hostWorkspaceTransition);
+      await page.evaluate(() => renderHostWorkspaceSelection());
+      if (await rail.getAttribute('aria-expanded') === 'false') await rail.click();
       const covers = [];
       for (const [title, artwork] of [['短标题', false], ['Long title 中文'.repeat(25), true]]) {
         await page.evaluate(({ title, artwork }) => {
           state.gatchaCandidate = { bvid: 'BV1xx411c7mD', title, owner_name: 'Artist', cover_url: artwork ? location.origin + '/fixture-cover' : '' };
           state.gatchaView = 'candidate'; renderGatchaWorkspace();
         }, { title, artwork });
+        await page.locator('#gatcha-candidate-card').waitFor({ state: 'visible' });
         if (artwork) await page.locator('#gatcha-candidate-card img').evaluate(image => image.decode());
         await page.evaluate(() => Promise.allSettled(document.getAnimations()
           .filter(animation => animation.effect?.getTiming().iterations !== Infinity).map(animation => animation.finished)));

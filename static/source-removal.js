@@ -101,6 +101,11 @@
       });
       grid.addEventListener('pointerdown', event => this.pointerDown(event));
       grid.addEventListener('pointermove', event => this.pointerMove(event));
+      // Keep native vertical scrolling until a long press claims the drag.
+      // Once claimed, prevent the browser from cancelling that pointer stream.
+      grid.addEventListener('touchmove', event => {
+        if (this.pointer && event.cancelable) event.preventDefault();
+      }, {passive:false});
       grid.addEventListener('pointerup', event => this.pointerUp(event));
       grid.addEventListener('pointercancel', () => this.finishDrag());
       grid.addEventListener('lostpointercapture', () => this.finishDrag());
@@ -114,22 +119,21 @@
         if (this.hold && event.pointerId !== this.hold.id) this.cancelHold();
         if (this.pointer && event.pointerId !== this.pointer.id) this.finishDrag();
       }, true);
-      grid.addEventListener('keydown', event => {
-        const button = event.target.closest('.follow-up-button');
-        if (!button?.closest('.source-removal-card') || !event.altKey || !['ArrowUp','ArrowDown'].includes(event.key)) return;
-        event.preventDefault(); this.focusId = button.closest('.source-removal-card').dataset.sourceId;
-        void this.moveBy(event.key === 'ArrowUp' ? -1 : 1);
-      });
       root.addEventListener('blur', () => this.finishDrag());
       root.addEventListener('resize', () => this.finishDrag());
       root.addEventListener('pagehide', () => this.finishDrag());
       document.addEventListener('visibilitychange', () => { if (document.hidden) this.finishDrag(); });
       this.pager = this.mobile ? root.BilikaraResultPager.create(grid, {
         footer:this.frame, fit:this.scroll,
-        ignoreSwipe:target => this.editing || Boolean(target.closest(".source-select-target")),
+        ignoreSwipe:target => Boolean(this.pointer || this.hold?.triggered || target.closest(".source-select-target")),
         translate:this.t, reportError:options.reportError,
         renderItems:(rows, message, target = grid) => {
-          if (target !== grid) return options.renderPage(rows, message, target, null);
+          if (target !== grid) {
+            const cards = new Map();
+            options.renderPage(rows, message, target, {card:(button, record) => this.card(button, record, cards)});
+            for (const card of cards.values()) this.paintCard(card);
+            return;
+          }
           const signature = rows.map(row => row.id).join(',');
           if (this.pageSignature !== signature) this.finishDrag();
           this.pageSignature = signature; this.pageRecords = rows;
@@ -194,15 +198,15 @@
       // Count/status-only updates retain the page and card nodes during a drag.
       this.options.renderPage(this.pageRecords, emptyText, this.grid, this); this.paint();
     }
-    card(button, {id, title, placeholder = false}) {
+    card(button, {id, title, placeholder = false}, cards = this.cards) {
       if (placeholder) return button;
-      let card = this.cards.get(id);
+      let card = cards.get(id);
       if (!card) {
         card = document.createElement('div'); card.className = 'source-removal-card'; card.dataset.sourceId = id;
         card.setAttribute('role','listitem');
         const target = document.createElement('label'); target.className = 'source-select-target'; target.hidden = true;
         const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.className = 'source-checkbox';
-        target.append(checkbox); card.append(button,target); this.cards.set(id, card);
+        target.append(checkbox); card.append(button,target); cards.set(id, card);
       } else {
         const current = card.querySelector('.follow-up-button');
         // Preserve pointer capture and ordinary card focus.
@@ -246,23 +250,25 @@
       this.footer.hidden = !this.active;
       this.frame.hidden = !this.active;
       for (const [button, syncHelp] of this.help) syncHelp(button === this.toggle && !this.editing
-        ? `${this.t('sources.selectMode')} · ${this.t('sources.orderCard')}`
+        ? `${this.t('sources.selectMode')} · ${this.t(this.mobile ? 'sources.holdToReorder' : 'sources.orderCard')}`
         : button.getAttribute('aria-label') || button.textContent);
       for (const card of this.cards.values()) {
-        const id = card.dataset.sourceId, button = card.querySelector('.follow-up-button');
-        const target = card.querySelector('.source-select-target'), checkbox = target.querySelector('input');
-        button.disabled = this.pending;
-        target.hidden = !this.editing; checkbox.checked = this.selected.has(id); checkbox.disabled = this.blocked;
-        checkbox.setAttribute('aria-label',this.t('sources.selectSource',{name:card.dataset.sourceTitle}));
-        checkbox.setAttribute('aria-description',this.t('sources.selectMode'));
-        if (this.editing) button.setAttribute('aria-pressed',String(this.selected.has(id)));
-        else button.removeAttribute('aria-pressed');
-        button.setAttribute('aria-keyshortcuts','Alt+ArrowUp Alt+ArrowDown');
-        button.setAttribute('aria-description',this.t(this.editing ? 'sources.orderCard' : this.mobile ? 'sources.longPressToSelect' : 'sources.browseCard'));
-        card.classList.toggle('is-draggable',!this.blocked && this.editing);
-        card.classList.toggle('is-selecting',this.editing);
-        card.classList.toggle('is-selected',this.selected.has(id));
+        this.paintCard(card);
       }
+    }
+    paintCard(card) {
+      const id = card.dataset.sourceId, button = card.querySelector('.follow-up-button');
+      const target = card.querySelector('.source-select-target'), checkbox = target.querySelector('input');
+      button.disabled = this.pending;
+      target.hidden = !this.editing; checkbox.checked = this.selected.has(id); checkbox.disabled = this.blocked;
+      checkbox.setAttribute('aria-label',this.t('sources.selectSource',{name:card.dataset.sourceTitle}));
+      checkbox.setAttribute('aria-description',this.t('sources.selectMode'));
+      if (this.editing) button.setAttribute('aria-pressed',String(this.selected.has(id)));
+      else button.removeAttribute('aria-pressed');
+      button.setAttribute('aria-description',this.t(this.editing ? (this.mobile ? 'sources.holdToReorder' : 'sources.orderCard') : this.mobile ? 'sources.longPressToSelect' : 'sources.browseCard'));
+      card.classList.toggle('is-draggable',!this.blocked && this.editing);
+      card.classList.toggle('is-selecting',this.editing);
+      card.classList.toggle('is-selected',this.selected.has(id));
     }
     click(event) {
       const card = event.target.closest('.source-removal-card'); if (!card) return;
@@ -312,18 +318,6 @@
         if (focusId && this.active) this.cards.get(focusId)?.querySelector('.follow-up-button')?.focus({preventScroll:true});
       }
     }
-    moveBy(direction) {
-      if (this.blocked) return;
-      const members = this.records.filter(row => !row.placeholder);
-      const ids = this.editing && this.selected.size ? members.filter(row => this.selected.has(row.id)).map(row => row.id) : [this.focusId];
-      const indexes = members.flatMap((row,i) => ids.includes(row.id) ? [i] : []);
-      if (!indexes.length) return;
-      const edge = direction < 0 ? indexes[0] : indexes.at(-1);
-      if (edge + direction < 0 || edge + direction >= members.length) return;
-      const anchor = direction < 0 ? members[edge-1] : members[edge+2];
-      return this.commit(ids.length === 1 ? {action:'move',id:ids[0],before_id:anchor?.id || null}
-        : {action:'move_many',ids,before_id:anchor?.id || null});
-    }
     pointerDown(event) {
       // Suppress only the release click of a retired drag, never a deliberate
       // new press on that card after canceling its confirmation.
@@ -337,7 +331,7 @@
       if (event.pointerType !== 'mouse' && !this.editing && !(event.pointerType === 'touch' && this.mobile)) return;
       this.finishDrag(); this.suppressClick = null;
       const id = target.closest('.source-removal-card').dataset.sourceId;
-      if (this.editing) {
+      if (this.editing && !(this.mobile && event.pointerType === 'touch')) {
         this.focusId = id;
         this.pointer = {kind:'move',id:event.pointerId,sourceId:id,x:event.clientX,y:event.clientY,version:this.version,filter:this.filter,target};
         target.setPointerCapture(event.pointerId); this.paint();
@@ -351,6 +345,12 @@
           if (this.blocked || hold.version !== this.version || !target.isConnected
             || !this.pageRecords.some(row => row.id === id && !row.placeholder)) { this.cancelHold(); return; }
           this.hold = null; hold.timer = null;
+          if (this.editing) {
+            this.focusId = id;
+            this.pointer = {kind:'move',id:event.pointerId,sourceId:id,x:hold.x,y:hold.y,version:this.version,filter:this.filter,target};
+            target.setPointerCapture(event.pointerId);
+            return;
+          }
           this.setEditing(true); this.selected.add(id);
           hold.triggered = true; this.hold = hold; this.paint();
         },450);
