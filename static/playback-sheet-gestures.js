@@ -191,7 +191,6 @@
         // remain clickable until a deliberate vertical drag claims the press.
         if (event.target.closest("input, a, select, textarea, label, [role='slider'], [role='spinbutton'], [contenteditable]:not([contenteditable='false'])")) return;
         fromControl = Boolean(event.target.closest("button, [role='button']") && !collapse.contains(event.target));
-        if (!header.contains(event.target) && body.scrollHeight > body.clientHeight + 1) return;
         // Any scrollable content ancestor owns its whole gesture, including
         // at the top edge. Never change an in-flight scroll into a sheet drag.
         for (let node = event.target; node && node !== panel; node = node.parentElement) {

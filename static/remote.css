@@ -4914,6 +4914,34 @@ html.remote-modal-scroll-locked {
   }
 }
 
+/* A short landscape sheet has two independent scroll owners. The settings
+   column must not make the song/transport column scroll with it. */
+@media (min-width: 700px) {
+  .playback-sheet-body {
+    grid-template-rows: minmax(0, 1fr);
+    overflow-y: hidden;
+  }
+
+  .playback-sheet-primary,
+  .playback-sheet-secondary {
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .playback-sheet-primary > * { flex: 0 0 auto; }
+  .playback-sheet-primary .player-control-row {
+    /* Let the seek track yield the last few pixels at the two-column floor;
+       the fixed transport targets must remain inside their scroll owner. */
+    grid-template-columns: 44px 48px 44px minmax(0, 1fr) var(--playback-song-actions-width, 44px);
+  }
+  .playback-sheet-primary:not(.is-scrollable) {
+    overflow-y: hidden;
+    touch-action: pan-x;
+  }
+}
+
 @media (orientation: landscape) {
   .playback-sheet {
     padding: max(8px, var(--remote-safe-area-top))

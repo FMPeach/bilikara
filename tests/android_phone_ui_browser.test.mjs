@@ -94,6 +94,9 @@ for(const engine of [chromium,webkit])test(`${engine.name()} touch Host gates ho
 
 for (const engine of [chromium,webkit]) test(`${engine.name()} Android phone keeps chrome, contextual tabs, stage and translations bounded`, {timeout:120000,skip:process.platform!=='linux'}, async t=>{
   const {page}=await open(t,engine);
+  // This layout case injects synthetic update states below. Live authoritative
+  // snapshots must not overwrite them between the render and DOM assertion.
+  await page.evaluate(()=>{state.eventSource?.close();fetchState=async()=>{};});
   for(const width of [320,393]) for(const language of ['zh','en','ja']) {
     await page.setViewportSize({width,height:736});await page.evaluate(language=>setLanguage(language),language);
     const dock=await page.locator('[data-android-page="users"]').evaluate(n=>{

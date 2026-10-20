@@ -6298,7 +6298,14 @@ function applyPlaybackSheetAdaptiveLayout({ preserveTransportMode = false } = {}
   }
 
   panel.dataset.transportLayout = spacious ? "spacious" : "compact";
-  panel.classList.toggle("has-scrollable-body", body.scrollHeight > body.clientHeight + 1);
+  for (const column of [primary, secondary]) {
+    const scrollable = twoColumns && column.scrollHeight > column.clientHeight + 1;
+    column.classList.toggle("is-scrollable", scrollable);
+    if (!scrollable) column.scrollTop = 0;
+  }
+  if (twoColumns) body.scrollTop = 0;
+  panel.classList.toggle("has-scrollable-body", (twoColumns ? [primary, secondary] : [body])
+    .some(node => node.scrollHeight > node.clientHeight + 1));
   panel.dataset.metadataTruncated = truncatedFields.join(",");
   state.playbackMetadataLayoutRunCount += 1;
   const primaryRect = primary.getBoundingClientRect();
@@ -6326,6 +6333,8 @@ function applyPlaybackSheetAdaptiveLayout({ preserveTransportMode = false } = {}
     ),
     truncatedFields,
     twoColumns,
+    primaryScrollable: primary.classList.contains("is-scrollable"),
+    secondaryScrollable: secondary.classList.contains("is-scrollable"),
     headerActionsStacked,
     transportLayout: panel.dataset.transportLayout,
     compactProgressWidth,
@@ -9754,14 +9763,16 @@ window.addEventListener("resize", handlePlaybackSheetViewportChange);
 window.addEventListener("resize", schedulePlaybackDockMarquee);
 window.visualViewport?.addEventListener("resize", handlePlaybackSheetViewportChange);
 window.addEventListener("scroll", scheduleRemoteContextualTooltipPositionSync, true);
-elements.playbackSheetBody?.addEventListener("scroll", () => {
-  if (state.audioVariantBarExpanded) {
-    setAudioVariantPopoverOpen(false);
-  }
-  if (state.playbackMetadataPopoverField) {
-    positionPlaybackMetadataPopover();
-  }
-}, { passive: true });
+for (const scroller of [elements.playbackSheetBody, elements.playbackSheetPrimary, elements.playbackSheetSecondary]) {
+  scroller?.addEventListener("scroll", () => {
+    if (state.audioVariantBarExpanded && scroller.contains(elements.audioVariantBar)) {
+      setAudioVariantPopoverOpen(false);
+    }
+    if (state.playbackMetadataPopoverField) {
+      positionPlaybackMetadataPopover();
+    }
+  }, { passive: true });
+}
 elements.playbackSheetBody?.addEventListener("change", (event) => {
   if (event.target.matches?.('input[type="range"], input[type="number"]')) {
     schedulePlaybackSheetAdaptiveLayout({ force: true, interactionEnded: true });
