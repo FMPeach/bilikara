@@ -48,6 +48,18 @@ android {
     }
     // No signing material lives in the repository. A tag build must supply all
     // four secrets; manual/PR builds remain clearly marked .alpha test packages.
+    // Trusted manual CI restores a separate, pinned beta signer. Local/PR
+    // builds retain default debug signing and receive no beta secret.
+    val betaSigningPath = System.getenv("ANDROID_BETA_KEYSTORE_PATH")
+    if (!betaSigningPath.isNullOrBlank()) {
+        signingConfigs.getByName("debug") {
+            storeFile = file(betaSigningPath)
+            storeType = "PKCS12"
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+    }
     val signingPath = System.getenv("ANDROID_KEYSTORE_PATH")
     if (!signingPath.isNullOrBlank()) {
         signingConfigs.create("release") {

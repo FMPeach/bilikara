@@ -658,9 +658,11 @@ jobs:
           add-job-summary: never
           cache-read-only: ${{ github.event_name == 'pull_request' }}
 
-      - name: Resolve APK and require signing for tags
+      - name: Resolve APK and prepare signing
         id: android
         env:
+          # Never expose the persistent beta key to pull-request builds or tags.
+          ANDROID_BETA_KEYSTORE_BASE64: ${{ github.event_name == 'workflow_dispatch' && !startsWith(github.ref, 'refs/tags/') && secrets.ANDROID_BETA_KEYSTORE_BASE64 || '' }}
           ANDROID_KEYSTORE_BASE64: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.ANDROID_KEYSTORE_BASE64 || '' }}
           ANDROID_KEYSTORE_PASSWORD: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.ANDROID_KEYSTORE_PASSWORD || '' }}
           ANDROID_KEY_ALIAS: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.ANDROID_KEY_ALIAS || '' }}
@@ -670,7 +672,7 @@ jobs:
       - name: Validate native Host and Android packaging contract
         run: |
           cargo test --manifest-path rust-runtime/Cargo.toml --features native-host --locked
-          node --test tests/android_release.test.mjs
+          BILIKARA_REQUIRE_ANDROID_SIGNING_TESTS=1 node --test tests/android_release.test.mjs
           npm ci
 
       - name: Build APK
@@ -691,12 +693,15 @@ jobs:
         env:
           APK_NAME: ${{ steps.android.outputs.apk }}
           RELEASE_APK: ${{ steps.android.outputs.release }}
+          APK_SIGNING_MODE: ${{ steps.android.outputs.signing }}
         run: |
           variant=debug
           if [ "$RELEASE_APK" = "true" ]; then variant=release; fi
           mapfile -t apks < <(find src-tauri/gen/android/app/build/outputs/apk -type f -name "*${variant}.apk")
           test "${#apks[@]}" = 1
-          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose "${apks[0]}"
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose --print-certs "${apks[0]}" > "$RUNNER_TEMP/android-apk-signature.txt"
+          cat "$RUNNER_TEMP/android-apk-signature.txt"
+          node scripts/android_release.mjs --verify-signature "$RUNNER_TEMP/android-apk-signature.txt" "$APK_SIGNING_MODE"
           "$ANDROID_HOME/build-tools/36.0.0/zipalign" -c -P 16 -v 4 "${apks[0]}"
           cp "${apks[0]}" "$APK_NAME"
 
@@ -722,6 +727,7 @@ jobs:
           if [ -n "${ANDROID_KEYSTORE_PATH:-}" ] && [ "$ANDROID_KEYSTORE_PATH" = "$RUNNER_TEMP/bilikara-android-release.jks" ]; then
             rm -f -- "$ANDROID_KEYSTORE_PATH"
           fi
+          rm -f -- "$RUNNER_TEMP/bilikara-android-beta.p12"
 
   mirror-release-r2:
     name: Mirror Release To R2

@@ -1,8 +1,8 @@
 # Android Host preview
 
 The launcher name is **bilikara beta** and uses the desktop artwork. The test APK retains
-`com.bilikara.app.alpha` and the existing local debug signer so it can replace
-Alpha without uninstalling or erasing login/settings. It is **not** a production
+`com.bilikara.app.alpha`. Updating an existing installation requires the same
+signing certificate and a non-decreasing versionCode. It is **not** a production
 signed release. The technical bootstrap names `android-alpha.html` and
 `android_alpha_status` remain compatible implementation identifiers.
 
@@ -101,7 +101,22 @@ reliability is claimed by desktop browser or emulator tests.
 
 `CI And Bundles` now builds an Android ARM64 APK after its existing test jobs.
 PR/manual builds produce clearly named **debug test artifacts**; they do not
-upload APKs to a Release or R2. Tags require all four Android signing secrets,
+upload APKs to a Release or R2. Manual Actions builds restore the independent
+beta key from `ANDROID_BETA_KEYSTORE_BASE64` (PKCS12, alias `androiddebugkey`,
+standard debug passwords `android`). Both the restored certificate and final
+APK must match the public pin in `scripts/android_release.mjs`; missing or
+mismatched signing material fails the manual build. Keep the private key backed
+up outside Git and build caches; do not regenerate it between runs or branches.
+
+PR artifacts have `ephemeral-debug` in their names and receive no persistent
+signing key. Local builds retain the developer's debug signer unless an explicit
+`ANDROID_BETA_KEYSTORE_PATH` is supplied. These packages, and older CI packages
+signed with a runner's temporary debug key, are not necessarily upgrade-compatible
+with manual beta builds. Changing to a fixed key cannot repair an existing
+signature mismatch without the old key; preserve data before planning migration.
+This does not introduce an automatic uninstall or data reset.
+
+Tags require all four separate release signing secrets,
 with no fallback to publishing a debug package:
 
 | Secret | Value |
@@ -111,8 +126,7 @@ with no fallback to publishing a debug package:
 | `ANDROID_KEY_ALIAS` | Signing entry alias |
 | `ANDROID_KEY_PASSWORD` | Signing entry password |
 
-The user has not provided a release key; **formal signing/key backup remains a
-separate decision**. Until configured, the tag Android job fails explicitly and
+If release signing is not configured, the tag Android job fails explicitly and
 the combined R2 mirror waits rather than advertising an incomplete bundle.
 No new Cloudflare secret is required: R2 continues using `R2_ACCOUNT_ID`,
 `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` and `R2_BUCKET`.
@@ -127,7 +141,8 @@ test installation expecting its local data to transfer into a new release app.
 
 ## Device acceptance
 
-1. Install the test APK over Alpha, without uninstalling. Confirm icon/name and
+1. Install a newer beta APK over a beta signed with the same certificate,
+   without uninstalling. Confirm icon/name and
    that login/settings survive. Continue an existing session once, then restart
    and choose new; export both the old session and the new empty/current session.
 2. Queue several songs; move to top/bottom and verify ordering. Download, retry,
