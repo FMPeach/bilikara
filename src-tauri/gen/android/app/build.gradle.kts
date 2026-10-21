@@ -52,7 +52,9 @@ android {
     // builds retain default debug signing and receive no beta secret.
     val betaSigningPath = System.getenv("ANDROID_BETA_KEYSTORE_PATH")
     if (!betaSigningPath.isNullOrBlank()) {
-        signingConfigs.getByName("debug") {
+        // Tauri locates getByName("debug") blocks to inject the app-id suffix.
+        // Keep this signing action distinct from the buildTypes debug block.
+        signingConfigs.named("debug") {
             storeFile = file(betaSigningPath)
             storeType = "PKCS12"
             storePassword = "android"

@@ -146,6 +146,15 @@ test("a real beta key restores identically in clean runner directories and rejec
   assert.throws(() => verifyBetaSigner(run(apksigner, ["verify", "--verbose", "--print-certs", wrongApk]).toString("utf8"), pin), /refusing to upload/);
 });
 
+test("Tauri debug suffix discovery reaches the build type rather than a signing configuration", () => {
+  const gradle = readSourceText(new URL("../src-tauri/gen/android/app/build.gradle.kts", import.meta.url));
+  // Tauri CLI 2.11 locates the first debug DSL declaration before injecting
+  // applicationIdSuffix. A signing-config action must not look like that DSL.
+  const debug = /(?:\bgetByName\(\s*"debug"\s*\)|\bdebug\b)\s*\{/.exec(gradle);
+  assert.ok(debug, "Android debug build type must be discoverable by Tauri");
+  assert.ok(debug.index > gradle.indexOf("buildTypes {"), "Tauri must not inject applicationIdSuffix into signingConfigs");
+});
+
 test("manual CI wires the pinned beta signer into Gradle and verifies the final APK before upload", () => {
   const workflow = readSourceText(new URL("../.github/workflows/ci-bundle.yml", import.meta.url));
   const beta = workflow.split("\n").find(line => line.includes("ANDROID_BETA_KEYSTORE_BASE64:"));
@@ -155,6 +164,6 @@ test("manual CI wires the pinned beta signer into Gradle and verifies the final 
   assert.ok(workflow.indexOf("--verify-signature") < workflow.indexOf("- name: Upload APK test artifact"));
   assert.match(workflow, /rm -f -- "\$RUNNER_TEMP\/bilikara-android-beta.p12"/);
   const gradle = readSourceText(new URL("../src-tauri/gen/android/app/build.gradle.kts", import.meta.url));
-  assert.match(gradle, /signingConfigs.getByName\("debug"\)\s*\{\s*storeFile = file\(betaSigningPath\)\s*storeType = "PKCS12"/);
+  assert.match(gradle, /signingConfigs.named\("debug"\)\s*\{\s*storeFile = file\(betaSigningPath\)\s*storeType = "PKCS12"/);
   assert.match(gradle, /applicationIdSuffix = "\.alpha"/);
 });
