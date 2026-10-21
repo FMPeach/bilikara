@@ -362,7 +362,8 @@ test('CI exercises actual import entry and native-feature recovery checks on the
   const steps = matrix.split(/\n      - /);
   const check = steps.findIndex(s => s.includes('npm run test:native-import'));
   assert.ok(check >= 0); assert.equal(matrix.split('npm run test:native-import').length - 1, 1);
-  assert.ok(steps.findIndex(s => s.includes('rustup toolchain install')) < check);
+  const rust = steps.findIndex(s => s.includes('uses: ./.github/actions/rust-toolchain'));
+  assert.ok(rust >= 0 && rust < check);
   assert.ok(steps.findIndex(s => s.includes('npm ci')) < check);
   assert.ok(steps[check].includes('--features native-host --locked --target host-tuple --lib native_host::desktop_import'));
   assert.doesNotMatch(steps[check], /continue-on-error|if:|python|--port/);

@@ -286,7 +286,7 @@ test('one local/CI command executes these construction contracts after native bo
   const workflow = readFileSync(path.join(root, '.github/workflows/ci-bundle.yml'), 'utf8');
   const job = workflow.slice(workflow.indexOf('\n  test:'), workflow.indexOf('\n  bundle:'));
   const command = job.indexOf('npm run test:desktop-build'); assert.ok(command >= 0);
-  for (const prerequisite of ['actions/setup-node@v6', 'node-version: 24', 'rustup toolchain install', 'cargo build --manifest-path xtask/Cargo.toml --locked --target host-tuple']) {
+  for (const prerequisite of ['actions/setup-node@v6', 'node-version: 24', 'uses: ./.github/actions/rust-toolchain', 'cargo build --manifest-path xtask/Cargo.toml --locked --target host-tuple']) {
     assert.ok(job.indexOf(prerequisite) >= 0 && job.indexOf(prerequisite) < command, prerequisite);
   }
   assert.equal(job.split('npm run test:desktop-build').length, 2, 'execute the suite once');

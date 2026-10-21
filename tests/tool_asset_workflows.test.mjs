@@ -10,6 +10,7 @@ import { archiveMetadata, serializeMetadata } from '../scripts/tool_asset_metada
 
 const read = file => readSourceText(path.join(root, file));
 const bundle = read('.github/workflows/ci-bundle.yml'), tools = read('.github/workflows/tool-assets.yml');
+const android = read('.github/workflows/android.yml');
 const recipe = read('scripts/build_portable_macos_aria2.sh');
 const includes = (text, values) => { for (const value of values) assert.ok(text.includes(value), value); };
 const excludes = (text, values) => { for (const value of values) assert.ok(!text.includes(value), value); };
@@ -188,8 +189,9 @@ test('native matrices and assembly preserve prerequisites, extracted gates and t
     ['Expand-Archive -Path $env:BUNDLE_ARCHIVE', "uses: actions/upload-artifact@v7"],
   ]) assert.ok(position(before) < position(after), `${before} before ${after}`);
   includes(job, ['BILIKARA_REQUIRE_TAURI_SMOKE=1', 'node --test tests/macos_tauri_smoke.test.mjs']);
-  assert.equal(bundle.split("if: startsWith(github.ref, 'refs/tags/v')").length - 1, 3);
-  includes(bundle, ['needs: [bundle, android-bundle]', 'Upload signed APK to GitHub Release']);
+  assert.equal((bundle + android).split("if: startsWith(github.ref, 'refs/tags/v')").length - 1, 3);
+  includes(bundle, ['needs: [bundle, android-bundle]', 'uses: ./.github/workflows/android.yml']);
+  includes(android, ['Upload signed APK to GitHub Release']);
 });
 
 test('tool recipe/manual publication keep exact source and immutable transport rules with native metadata', () => {
@@ -255,4 +257,27 @@ test('actual immutable publication script is exercised offline for reuse/upload/
       else includes(result.stdout, [`publication status: ${scenario === 'race' ? 'reused-after-race' : scenario}`]);
     } finally { rmSync(directory, {recursive: true, force: true}); }
   }
+});
+
+
+test('trusted main maintains reusable caches and Android has an independent same-commit entry', () => {
+  for (const workflow of [bundle, android]) {
+    const trigger = workflow.split('\non:\n')[1].split('\npermissions:\n')[0];
+    includes(trigger, ['branches: [main]', 'paths-ignore:', "'images/**'", 'workflow_dispatch:', 'pull_request:']);
+  }
+  const caller = bundle.split('\n  android-bundle:\n')[1].split('\n  mirror-release-r2:\n')[0];
+  includes(caller, ['uses: ./.github/workflows/android.yml', "github.event_name == 'workflow_dispatch'", "startsWith(github.ref, 'refs/tags/v')"]);
+  excludes(caller, ['needs:', '@main', 'runs-on:', 'steps:']);
+  const implementation = android.split('\n  android-bundle:\n')[1];
+  excludes(implementation, ['needs: test']);
+  includes(implementation, ['cargo test --manifest-path rust/Cargo.toml --locked',
+    'cargo test --manifest-path rust-runtime/Cargo.toml --features native-host --locked', 'npm run test:frontend',
+    'BILIKARA_REQUIRE_ANDROID_SIGNING_TESTS=1', 'apksigner', 'zipalign', 'key: android-36-ndk-27.0.12077973']);
+  includes(android, ['workflow_call:']);
+  const toolchain = read('.github/actions/rust-toolchain/action.yml');
+  includes(toolchain, ['RUSTUP_HOME=%s/bilikara-ci-rustup', '"$RUNNER_TEMP"', 'rustup toolchain install', 'rustup toolchain list']);
+  excludes(toolchain, ['toolchain uninstall', 'rustup default', 'RUSTUP_TOOLCHAIN=']);
+  assert.equal(bundle.split('uses: ./.github/actions/rust-toolchain').length - 1, 2);
+  assert.equal(android.split('uses: ./.github/actions/rust-toolchain').length - 1, 1);
+  includes(bundle, ["github.event_name == 'push' && github.ref == 'refs/heads/main'", 'needs: test', 'needs: [bundle, android-bundle]']);
 });

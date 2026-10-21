@@ -41,7 +41,7 @@ test('real local and CI entries keep required native validation after the prefix
   const wrapper = job.indexOf('npm run test:libav-wrapper'), real = job.indexOf('npm run test:libav-prerequisites');
   const prefix = job.indexOf('echo "BILIKARA_TEST_LIBAV_COMPANION=');
   assert.ok(wrapper >= 0 && prefix > wrapper && real > prefix);
-  for (const setup of ['actions/setup-node@v6', 'node-version: 24', 'rustup toolchain install', 'cargo build --manifest-path xtask/Cargo.toml --locked --target host-tuple']) assert.ok(job.indexOf(setup) >= 0 && job.indexOf(setup) < wrapper, setup);
+  for (const setup of ['actions/setup-node@v6', 'node-version: 24', 'uses: ./.github/actions/rust-toolchain', 'cargo build --manifest-path xtask/Cargo.toml --locked --target host-tuple']) assert.ok(job.indexOf(setup) >= 0 && job.indexOf(setup) < wrapper, setup);
   assert.ok(job.indexOf('bash media-libav/build-posix-libraries.sh') < prefix);
   assert.ok(job.indexOf('libav-companion --prefix') < prefix);
   const block = job.split(/^      - name:/m).find(step => step.includes('npm run test:libav-prerequisites'));

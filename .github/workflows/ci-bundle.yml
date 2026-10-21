@@ -2,6 +2,12 @@ name: CI And Bundles
 
 on:
   push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'images/**'
+      - 'LICENSE'
     tags:
       - "v*"
   pull_request:
@@ -65,20 +71,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf ffmpeg
 
-      - name: Reset incomplete Rust toolchain on macOS
-        if: runner.os == 'macOS'
-        run: |
-          if rustup toolchain list | grep -q '^1\.97\.0-'; then
-            rustup toolchain uninstall 1.97.0
-          fi
-
       - name: Setup repository Rust toolchain
-        run: |
-          rustup toolchain install
-          rustup show active-toolchain
-          rustc --version
+        uses: ./.github/actions/rust-toolchain
 
       - name: Cache Rust builds
+        id: rust-cache
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
@@ -226,10 +223,20 @@ jobs:
           npm run test:native-transport
           npm run test:native-media
 
+      - name: Summarize build caches
+        if: always()
+        shell: bash
+        env:
+          RUST_CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
+          LIBAV_CACHE_HIT: ${{ steps.test-libav-cache.outputs.cache-hit }}
+          LIBAV_CACHE_KEY: ${{ steps.test-libav-key.outputs.key }}
+        run: |
+          printf '### Build caches\n\n| Cache | Exact hit |\n| --- | --- |\n| Rust | `%s` |\n| libav | `%s` |\n\nlibav key: `%s`\n\nSee restore/save logs and step timings for details.\n' "${RUST_CACHE_HIT:-unavailable}" "${LIBAV_CACHE_HIT:-unavailable}" "${LIBAV_CACHE_KEY:-unavailable}" >> "$GITHUB_STEP_SUMMARY"
+
   bundle:
     name: Bundle (${{ matrix.label }})
     needs: test
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ${{ matrix.os }}
     env:
       BILIKARA_EXPECT_RELEASE_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || inputs.bundle_version || '' }}
@@ -281,20 +288,11 @@ jobs:
         if: runner.os == 'macOS'
         run: brew list gnupg >/dev/null 2>&1 || brew install gnupg
 
-      - name: Reset incomplete Rust toolchain on macOS
-        if: runner.os == 'macOS'
-        run: |
-          if rustup toolchain list | grep -q '^1\.97\.0-'; then
-            rustup toolchain uninstall 1.97.0
-          fi
-
       - name: Setup repository Rust toolchain
-        run: |
-          rustup toolchain install
-          rustup show active-toolchain
-          rustc --version
+        uses: ./.github/actions/rust-toolchain
 
       - name: Cache Rust builds
+        id: rust-cache
         uses: Swatinem/rust-cache@v2
         with:
           # The native bundle never builds rust/target; it links the core through Runtime.
@@ -598,136 +596,26 @@ jobs:
           prerelease: ${{ contains(github.ref_name, '-preview.') }}
           draft: true
 
-  android-bundle:
-    name: Android ARM64 APK
-    needs: test
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: 24
-          cache: npm
-
-      - name: Setup Java
-        uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: 17
-
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v4
-        with:
-          # The action's default also requests the unavailable legacy "tools" package.
-          packages: platform-tools
-
-      - name: Prepare native YouTube binding generator
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libclang-dev
-
-      - name: Install pinned Android tools
-        run: |
-          sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;27.0.12077973"
-          echo "NDK_HOME=$ANDROID_HOME/ndk/27.0.12077973" >> "$GITHUB_ENV"
-          yt_ndk="$ANDROID_HOME/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64"
-          echo "BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android=--target=aarch64-linux-android24 --sysroot=$yt_ndk/sysroot -resource-dir=$yt_ndk/lib/clang/18" >> "$GITHUB_ENV"
-
-      - name: Setup repository Rust toolchain
-        run: |
-          rustup toolchain install
-          rustup target add aarch64-linux-android
-
-      - name: Cache Rust builds
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            ./rust-runtime -> target
-            ./src-tauri -> target
-          cache-workspace-crates: true
-          shared-key: android-apk-workspace-v1
-
-      - name: Cache Gradle dependencies
-        uses: gradle/actions/setup-gradle@v5
-        with:
-          add-job-summary: never
-          cache-read-only: ${{ github.event_name == 'pull_request' }}
-
-      - name: Resolve APK and prepare signing
-        id: android
-        env:
-          # Never expose the persistent beta key to pull-request builds or tags.
-          ANDROID_BETA_KEYSTORE_BASE64: ${{ github.event_name == 'workflow_dispatch' && !startsWith(github.ref, 'refs/tags/') && secrets.ANDROID_BETA_KEYSTORE_BASE64 || '' }}
-          ANDROID_KEYSTORE_BASE64: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.ANDROID_KEYSTORE_BASE64 || '' }}
-          ANDROID_KEYSTORE_PASSWORD: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.ANDROID_KEYSTORE_PASSWORD || '' }}
-          ANDROID_KEY_ALIAS: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.ANDROID_KEY_ALIAS || '' }}
-          ANDROID_KEY_PASSWORD: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.ANDROID_KEY_PASSWORD || '' }}
-        run: node scripts/android_release.mjs
-
-      - name: Validate native Host and Android packaging contract
-        run: |
-          cargo test --manifest-path rust-runtime/Cargo.toml --features native-host --locked
-          BILIKARA_REQUIRE_ANDROID_SIGNING_TESTS=1 node --test tests/android_release.test.mjs
-          npm ci
-
-      - name: Build APK
-        env:
-          ANDROID_KEYSTORE_PASSWORD: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.ANDROID_KEYSTORE_PASSWORD || '' }}
-          ANDROID_KEY_ALIAS: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.ANDROID_KEY_ALIAS || '' }}
-          ANDROID_KEY_PASSWORD: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.ANDROID_KEY_PASSWORD || '' }}
-          RELEASE_APK: ${{ steps.android.outputs.release }}
-        run: |
-          chmod +x src-tauri/gen/android/gradlew
-          if [ "$RELEASE_APK" = "true" ]; then
-            npm exec -- tauri android build --apk --target aarch64 --ci
-          else
-            npm run android:build:debug
-          fi
-
-      - name: Stage and verify APK
-        env:
-          APK_NAME: ${{ steps.android.outputs.apk }}
-          RELEASE_APK: ${{ steps.android.outputs.release }}
-          APK_SIGNING_MODE: ${{ steps.android.outputs.signing }}
-        run: |
-          variant=debug
-          if [ "$RELEASE_APK" = "true" ]; then variant=release; fi
-          mapfile -t apks < <(find src-tauri/gen/android/app/build/outputs/apk -type f -name "*${variant}.apk")
-          test "${#apks[@]}" = 1
-          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose --print-certs "${apks[0]}" > "$RUNNER_TEMP/android-apk-signature.txt"
-          cat "$RUNNER_TEMP/android-apk-signature.txt"
-          node scripts/android_release.mjs --verify-signature "$RUNNER_TEMP/android-apk-signature.txt" "$APK_SIGNING_MODE"
-          "$ANDROID_HOME/build-tools/36.0.0/zipalign" -c -P 16 -v 4 "${apks[0]}"
-          cp "${apks[0]}" "$APK_NAME"
-
-      - name: Upload APK test artifact
-        uses: actions/upload-artifact@v7
-        with:
-          path: ${{ steps.android.outputs.apk }}
-          archive: false
-          if-no-files-found: error
-
-      - name: Upload signed APK to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v3
-        with:
-          files: ${{ steps.android.outputs.apk }}
-          generate_release_notes: ${{ contains(github.ref_name, '-preview.') }}
-          prerelease: ${{ contains(github.ref_name, '-preview.') }}
-          draft: true
-
-      - name: Remove temporary signing file
+      - name: Summarize build caches
         if: always()
+        shell: bash
+        env:
+          RUST_CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
+          LIBAV_CACHE_HIT: ${{ steps.libav-cache.outputs.cache-hit }}
+          LIBAV_CACHE_KEY: ${{ steps.libav-cache-key.outputs.key }}
         run: |
-          if [ -n "${ANDROID_KEYSTORE_PATH:-}" ] && [ "$ANDROID_KEYSTORE_PATH" = "$RUNNER_TEMP/bilikara-android-release.jks" ]; then
-            rm -f -- "$ANDROID_KEYSTORE_PATH"
-          fi
-          rm -f -- "$RUNNER_TEMP/bilikara-android-beta.p12"
+          printf '### Build caches\n\n| Cache | Exact hit |\n| --- | --- |\n| Rust | `%s` |\n| libav | `%s` |\n\nlibav key: `%s`\n\nSee restore/save logs and step timings for details.\n' "${RUST_CACHE_HIT:-unavailable}" "${LIBAV_CACHE_HIT:-unavailable}" "${LIBAV_CACHE_KEY:-unavailable}" >> "$GITHUB_STEP_SUMMARY"
+
+  android-bundle:
+    # PR/main Android builds run independently; only manual/tag aggregation calls this entry.
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/android.yml
+    secrets:
+      ANDROID_BETA_KEYSTORE_BASE64: ${{ github.event_name == 'workflow_dispatch' && !startsWith(github.ref, 'refs/tags/') && secrets.ANDROID_BETA_KEYSTORE_BASE64 || '' }}
+      ANDROID_KEYSTORE_BASE64: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.ANDROID_KEYSTORE_BASE64 || '' }}
+      ANDROID_KEYSTORE_PASSWORD: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.ANDROID_KEYSTORE_PASSWORD || '' }}
+      ANDROID_KEY_ALIAS: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.ANDROID_KEY_ALIAS || '' }}
+      ANDROID_KEY_PASSWORD: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.ANDROID_KEY_PASSWORD || '' }}
 
   mirror-release-r2:
     name: Mirror Release To R2

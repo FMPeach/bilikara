@@ -24,11 +24,11 @@ test("only tag APKs use the installable release name", () => {
   assert.equal(release.apk, "bilikara-v0.8.0-preview.1-android-arm64.apk");
 });
 test("Android SDK bootstrap excludes the unavailable legacy tools package", () => {
-  const workflow = readSourceText(new URL("../.github/workflows/ci-bundle.yml", import.meta.url));
+  const workflow = readSourceText(new URL("../.github/workflows/android.yml", import.meta.url));
   const job = workflow.match(/\n  android-bundle:\n([\s\S]*?)(?=\n  [\w-]+:|$)/)?.[1];
   assert.ok(job, "Android APK job must exist");
-  assert.match(job, /^    needs: test$/m);
-  assert.doesNotMatch(job, /^    if:/m, "Android must build after tests on every CI branch");
+  assert.doesNotMatch(job, /^    needs:/m, "Android must run its own gates independently of desktop tests");
+  assert.doesNotMatch(job, /^    if:/m, "Independent Android entry must not omit PR builds");
   const setup = workflow.match(/- name: Setup Android SDK\n([\s\S]*?)(?=\n      - name:)/)?.[1];
   assert.ok(setup, "Android SDK setup step must exist");
   assert.match(setup, /uses: android-actions\/setup-android@v4/);
@@ -156,8 +156,8 @@ test("Tauri debug suffix discovery reaches the build type rather than a signing 
 });
 
 test("manual CI wires the pinned beta signer into Gradle and verifies the final APK before upload", () => {
-  const workflow = readSourceText(new URL("../.github/workflows/ci-bundle.yml", import.meta.url));
-  const beta = workflow.split("\n").find(line => line.includes("ANDROID_BETA_KEYSTORE_BASE64:"));
+  const workflow = readSourceText(new URL("../.github/workflows/android.yml", import.meta.url));
+  const beta = workflow.split("\n").find(line => line.includes("ANDROID_BETA_KEYSTORE_BASE64: ${{"));
   assert.match(beta, /github.event_name == 'workflow_dispatch' && !startsWith\(github.ref, 'refs\/tags\/'\) && secrets.ANDROID_BETA_KEYSTORE_BASE64/);
   assert.match(workflow, /apksigner" verify --verbose --print-certs/);
   assert.match(workflow, /node scripts\/android_release.mjs --verify-signature/);

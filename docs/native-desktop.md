@@ -446,6 +446,17 @@ signature and public archive round-trip gates remain required on macOS. AWS CLI
 still uses third-party Python for the independent R2 publication jobs. The broader
 CI Python setup stays while source/FFI and other live verification consumers remain.
 
+Pushes to `main` run desktop validation and nonpublishing bundles to maintain
+default-branch caches; documentation/image-only pushes skip these builds.
+Rustup uses a job-local home containing the repository-pinned toolchain, leaving
+preinstalled runner toolchains untouched and outside the Rust cache identity.
+Android has its own PR/main/manual workflow in `.github/workflows/android.yml`,
+including its Rust/frontend and APK signing checks, without waiting for desktop
+jobs. Manual and tag desktop runs call that same workflow at the caller's commit.
+Tag publication still waits for all desktop and Android packages; ordinary branch
+runs only upload workflow artifacts. Cache summaries report hits and keys, while
+the restore/save steps and job timings remain the source for performance diagnosis.
+
 `npm run test:native-http` runs the current Rust HTTP integration binary with
 diagnostic requests terminated by a local rejecting proxy. `test:remote-load`
 checks the read-only Node SSE load tool, its deadlines/reconnections and native

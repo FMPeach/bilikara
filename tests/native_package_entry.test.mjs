@@ -34,7 +34,7 @@ test('both native gates verify the extracted artifact and then run actual instal
   const roundTrip = steps.findIndex(step => step.includes('ditto -x -k "$BUNDLE_ARCHIVE" test_extract/'));
   assert.ok(extraction >= 0 && extraction < steps.indexOf(windows));
   assert.ok(roundTrip >= 0 && roundTrip < steps.indexOf(macos));
-  const rust = steps.findIndex(step => step.includes('rustup toolchain install'));
+  const rust = steps.findIndex(step => step.includes('uses: ./.github/actions/rust-toolchain'));
   const msvc = steps.findIndex(step => step.includes('./scripts/setup_msvc.ps1'));
   assert.ok(rust >= 0 && rust < steps.indexOf(windows) && rust < steps.indexOf(macos));
   assert.ok(msvc >= 0 && msvc < steps.indexOf(windows));
