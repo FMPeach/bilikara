@@ -7,8 +7,8 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 const root = resolve(fileURLToPath(new URL('..', import.meta.url)));
-const workflow = readFileSync(new URL('../.github/workflows/ci-bundle.yml', import.meta.url), 'utf8');
-const bundle = workflow.slice(workflow.indexOf('\n  bundle:'), workflow.indexOf('\n  android-bundle:'));
+const workflow = readFileSync(new URL('../.github/workflows/desktop.yml', import.meta.url), 'utf8');
+const bundle = workflow.slice(workflow.indexOf('\n  bundle:'), workflow.length);
 const steps = bundle.split(/\n      - /).slice(1);
 const verify = 'cargo run --manifest-path xtask/Cargo.toml --locked --target host-tuple -- verify-native-desktop';
 const installed = 'cargo test --manifest-path xtask/Cargo.toml --locked --target host-tuple native_package::installed:: -- --ignored --nocapture';

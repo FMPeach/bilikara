@@ -450,11 +450,14 @@ Pushes to `main` run desktop validation and nonpublishing bundles to maintain
 default-branch caches; documentation/image-only pushes skip these builds.
 Rustup uses a job-local home containing the repository-pinned toolchain, leaving
 preinstalled runner toolchains untouched and outside the Rust cache identity.
-Android has its own PR/main/manual workflow in `.github/workflows/android.yml`,
-including its Rust/frontend and APK signing checks, without waiting for desktop
-jobs. Manual and tag desktop runs call that same workflow at the caller's commit.
-Tag publication still waits for all desktop and Android packages; ordinary branch
-runs only upload workflow artifacts. Cache summaries report hits and keys, while
+The single `.github/workflows/ci-bundle.yml` entry starts independent Desktop and
+Mobile groups at the caller's commit. Each group runs its own Test matrix before
+its Bundle matrix; neither waits for the other group's tests. Desktop keeps the
+native Windows/macOS package matrix. Mobile currently validates on Linux and
+bundles Android ARM64, including actual APK signing checks; iOS is not yet part
+of the matrix. The reusable `desktop.yml` and `mobile.yml` have no standalone
+push/PR/manual triggers. Tag publication still waits for both groups; ordinary
+branch runs only upload workflow artifacts. Cache summaries report hits and keys, while
 the restore/save steps and job timings remain the source for performance diagnosis.
 
 `npm run test:native-http` runs the current Rust HTTP integration binary with

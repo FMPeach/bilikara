@@ -24,10 +24,14 @@ test("only tag APKs use the installable release name", () => {
   assert.equal(release.apk, "bilikara-v0.8.0-preview.1-android-arm64.apk");
 });
 test("Android SDK bootstrap excludes the unavailable legacy tools package", () => {
-  const workflow = readSourceText(new URL("../.github/workflows/android.yml", import.meta.url));
-  const job = workflow.match(/\n  android-bundle:\n([\s\S]*?)(?=\n  [\w-]+:|$)/)?.[1];
+  const workflow = readSourceText(new URL("../.github/workflows/mobile.yml", import.meta.url));
+  const job = workflow.match(/\n  bundle:\n([\s\S]*?)(?=\n  [\w-]+:|$)/)?.[1];
   assert.ok(job, "Android APK job must exist");
-  assert.doesNotMatch(job, /^    needs:/m, "Android must run its own gates independently of desktop tests");
+  assert.match(job, /^    needs: test$/m, "APK build must wait for its own Android test matrix");
+  const checks = workflow.match(/\n  test:\n([\s\S]*?)(?=\n  [\w-]+:|$)/)?.[1];
+  assert.ok(checks);
+  assert.doesNotMatch(checks, /^    needs:/m, "Android tests must not wait for desktop tests");
+  for (const matrix of [checks, job]) assert.match(matrix, /    strategy:\n      fail-fast: false\n      matrix:/);
   assert.doesNotMatch(job, /^    if:/m, "Independent Android entry must not omit PR builds");
   const setup = workflow.match(/- name: Setup Android SDK\n([\s\S]*?)(?=\n      - name:)/)?.[1];
   assert.ok(setup, "Android SDK setup step must exist");
@@ -39,7 +43,7 @@ test("Android SDK bootstrap excludes the unavailable legacy tools package", () =
 });
 test("mirror waits for APK and publishes the release index; tag build fails closed without signing", () => {
   const workflow = readSourceText(new URL("../.github/workflows/ci-bundle.yml", import.meta.url));
-  assert.match(workflow, /needs: \[bundle, android-bundle\]/);
+  assert.match(workflow, /needs: \[desktop, mobile\]/);
   assert.match(workflow, /aws s3 cp release-metadata\/releases.json/);
   const packaging = fs.readFileSync(new URL("../scripts/android_release.mjs", import.meta.url), "utf8");
   for (const secret of ["ANDROID_KEYSTORE_BASE64", "ANDROID_KEYSTORE_PASSWORD", "ANDROID_KEY_ALIAS", "ANDROID_KEY_PASSWORD"]) assert.ok(packaging.includes(secret));
@@ -156,7 +160,7 @@ test("Tauri debug suffix discovery reaches the build type rather than a signing 
 });
 
 test("manual CI wires the pinned beta signer into Gradle and verifies the final APK before upload", () => {
-  const workflow = readSourceText(new URL("../.github/workflows/android.yml", import.meta.url));
+  const workflow = readSourceText(new URL("../.github/workflows/mobile.yml", import.meta.url));
   const beta = workflow.split("\n").find(line => line.includes("ANDROID_BETA_KEYSTORE_BASE64: ${{"));
   assert.match(beta, /github.event_name == 'workflow_dispatch' && !startsWith\(github.ref, 'refs\/tags\/'\) && secrets.ANDROID_BETA_KEYSTORE_BASE64/);
   assert.match(workflow, /apksigner" verify --verbose --print-certs/);

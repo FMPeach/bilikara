@@ -283,7 +283,7 @@ test('driver timeout terminates the actual xtask and its blocked native Cargo de
 test('one local/CI command executes these construction contracts after native bootstrap', () => {
   const pkg = json(path.join(root, 'package.json'));
   assert.equal(pkg.scripts['test:desktop-build'], 'node --test tests/desktop_prepare_entry.test.mjs tests/bbdown_prepare_entry.test.mjs tests/msvc_bash_env.test.mjs tests/native_package_entry.test.mjs tests/desktop_construction_contract.test.mjs');
-  const workflow = readFileSync(path.join(root, '.github/workflows/ci-bundle.yml'), 'utf8');
+  const workflow = readFileSync(path.join(root, '.github/workflows/desktop.yml'), 'utf8');
   const job = workflow.slice(workflow.indexOf('\n  test:'), workflow.indexOf('\n  bundle:'));
   const command = job.indexOf('npm run test:desktop-build'); assert.ok(command >= 0);
   for (const prerequisite of ['actions/setup-node@v6', 'node-version: 24', 'uses: ./.github/actions/rust-toolchain', 'cargo build --manifest-path xtask/Cargo.toml --locked --target host-tuple']) {

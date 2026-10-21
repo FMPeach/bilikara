@@ -91,7 +91,7 @@ test('Linux/macOS caption controls and shared palette stay native', () => {
 });
 
 test('manual bundle labels do not authorize publication/mirroring', () => {
-  const workflow = read('.github/workflows/ci-bundle.yml'); includes(workflow, ['bundle_version:', "BILIKARA_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.bundle_version || '' }}", "github.ref_name || inputs.bundle_version || ''", "-preview\\.[0-9]+)?$'"]);
+  const workflow = read('.github/workflows/ci-bundle.yml') + read('.github/workflows/desktop.yml'); includes(workflow, ['bundle_version:', "BILIKARA_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.bundle_version || '' }}", "github.ref_name || inputs.bundle_version || ''", "-preview\\.[0-9]+)?$'"]);
   const release = workflow.slice(workflow.indexOf('- name: Upload bundle to GitHub Release')); assert.ok(release.split('\n')[1].includes("if: startsWith(github.ref, 'refs/tags/v')")); assert.ok(workflow.slice(workflow.indexOf('  mirror-release-r2:'), workflow.indexOf('  mirror-release-r2:') + 400).includes("if: startsWith(github.ref, 'refs/tags/v')"));
 });
 

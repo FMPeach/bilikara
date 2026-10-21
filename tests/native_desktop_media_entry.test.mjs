@@ -91,7 +91,7 @@ test('native browser media caller runs once after required prefix, test oracle a
   assert.equal(scripts['test:native-media'],'node --test tests/native_desktop_media.test.mjs');
   assert.equal(scripts['test:native-shared'],'node tests/run_desktop_rust_host.mjs');
   assert.equal(existsSync(path.join(root,'tests/run_desktop_rust_host.py')),false);
-  const workflow=readFileSync(path.join(root,'.github/workflows/ci-bundle.yml'),'utf8');
+  const workflow=readFileSync(path.join(root,'.github/workflows/desktop.yml'),'utf8');
   const job=workflow.slice(workflow.indexOf('\n  test:'),workflow.indexOf('\n  bundle:'));
   const call='npm run test:native-media',invocation=`\n          ${call}\n`;assert.equal(job.split('\n').filter(line=>line.trim()===call).length,1);
   assert.ok(job.indexOf('BILIKARA_TEST_LIBAV_COMPANION=')<job.indexOf(invocation));

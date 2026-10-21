@@ -2,8 +2,8 @@ import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
 import test from 'node:test';
 
-const workflow = readFileSync(new URL('../.github/workflows/ci-bundle.yml', import.meta.url), 'utf8');
-const bundle = workflow.slice(workflow.indexOf('\n  bundle:'), workflow.indexOf('\n  android-bundle:'));
+const workflow = readFileSync(new URL('../.github/workflows/desktop.yml', import.meta.url), 'utf8');
+const bundle = workflow.slice(workflow.indexOf('\n  bundle:'), workflow.length);
 const steps = bundle.split(/\n      - /).slice(1);
 const index = pattern => {
   const found = steps.findIndex(step => pattern.test(step));

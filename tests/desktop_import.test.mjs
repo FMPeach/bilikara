@@ -357,7 +357,7 @@ test('offline mode rejects startup/network flags and unknown targets without ove
 });
 
 test('CI exercises actual import entry and native-feature recovery checks on the platform test matrix', () => {
-  const workflow = readFileSync(path.join(root, '.github/workflows/ci-bundle.yml'), 'utf8');
+  const workflow = readFileSync(path.join(root, '.github/workflows/desktop.yml'), 'utf8');
   const matrix = workflow.slice(workflow.indexOf('\n  test:'), workflow.indexOf('\n  bundle:'));
   const steps = matrix.split(/\n      - /);
   const check = steps.findIndex(s => s.includes('npm run test:native-import'));
