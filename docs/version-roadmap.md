@@ -4,7 +4,7 @@ This roadmap records current product direction and ownership. It is not a build 
 
 ## v0.8 — convergence and release stabilization
 
-**Preview 2 has shipped. Stable v0.8.0 is in preparation.** Preserve approved Preview 1 behavior and subsequent fixes. A source commit or an Actions development artifact is not a public release.
+**Stable v0.8.0 has shipped. The Android Host APK remains a beta.** Preserve approved Preview 1 behavior and subsequent fixes. A source commit or an Actions development artifact is not a public release.
 
 ### Delivered ownership
 
@@ -23,7 +23,7 @@ This roadmap records current product direction and ownership. It is not a build 
 - Host source management combines persistent ordering and batch removal with selection. Pull completion waits for captured gestures; real edit conflicts still cancel stale work. Remote gains Restart and touch playback-sheet gestures, with native inputs and scrolling retaining priority.
 - Startup update/channel preferences persist across native restarts and port changes; a busy update operation defers rather than loses the startup check. Quality and HiRes changes apply to newly created downloads, while cancellation closes an old transfer before replacement.
 - Internet Remote reports transport, authentication and synchronization stages. Trusted optional TURN configuration is application-ready; the independent signaling service still needs its companion issuance contract before relay activation. Local relay tests do not establish public deployment or venue reachability.
-- Stable v0.8.0 remains unpublished until the release artifacts are tested and publication is explicitly approved. Passing CI does not establish venue audio/video, physical dual-screen behavior or every network/provider condition.
+- Subsequent releases require artifact qualification and explicit publication approval. Passing CI does not establish venue audio/video, physical dual-screen behavior or every network/provider condition.
 
 ### Remaining Python and retirement
 
