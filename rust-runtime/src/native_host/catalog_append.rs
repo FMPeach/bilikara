@@ -1,0 +1,118 @@
+//! Post-commit catalog append, using the desktop's bounded background service.
+//! A sharing failure must never undo a successful local song request.
+use super::*;
+use crate::app_state::PlaylistItem;
+use crate::cloudflare_service::{
+    CloudflareOperation, CloudflareServiceRequest, execute_cloudflare,
+};
+
+pub(super) fn completion() -> crate::gatcha_refresh::CatalogCompletion {
+    crate::gatcha_refresh::CatalogCompletion {
+        base_url: crate::shared_catalog::CatalogRequest::for_host().base_url,
+        user_agent: crate::native_video::USER_AGENT.into(),
+        timeout_ms: 10_000,
+    }
+}
+
+/// Source operations publish locally before handing candidates to the bounded
+/// review queue. Admission failure must not undo that successful local write.
+pub(super) fn source_result(value: &mut Value) {
+    let entries = value
+        .as_object_mut()
+        .and_then(|value| value.remove("entries"));
+    let entries = entries
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+    let entries: Vec<_> = entries.into_iter().filter(Value::is_object).collect();
+    if entries.is_empty() {
+        return;
+    }
+    let config = completion();
+    let _ = execute_cloudflare(&CloudflareServiceRequest {
+        schema_version: 1,
+        base_url: config.base_url,
+        user_agent: config.user_agent,
+        timeout_ms: config.timeout_ms,
+        operation: CloudflareOperation::EnqueueAppend { entries },
+    });
+}
+
+fn request(item: &PlaylistItem) -> Option<CloudflareServiceRequest> {
+    if !item.media_source.is_bilibili() {
+        return None;
+    }
+    Some(CloudflareServiceRequest {
+        schema_version: 1,
+        base_url: crate::shared_catalog::CatalogRequest::for_host().base_url,
+        user_agent: crate::native_video::USER_AGENT.into(),
+        timeout_ms: 10_000,
+        operation: CloudflareOperation::EnqueueAppend {
+            entries: vec![json!({
+                "mid":if item.owner_mid == 0 {String::new()} else {item.owner_mid.to_string()}, "bvid":item.bvid,
+                "title":if item.title.is_empty() {&item.display_title} else {&item.title},
+                "url":if item.resolved_url.is_empty() {&item.original_url} else {&item.resolved_url}, "owner_name":item.owner_name,
+                "owner_url":item.owner_url, "cover_url":item.cover_url,
+            })],
+        },
+    })
+}
+
+/// Called under AppState's lock only after an explicit add has committed.
+pub(super) fn accepted_item(
+    app: &crate::app_state::AppState,
+    id: &str,
+) -> Result<PlaylistItem, ApiError> {
+    let snapshot = app.native_core_snapshot()?;
+    snapshot
+        .current_item
+        .iter()
+        .chain(snapshot.playlist.iter())
+        .find(|item| item.id == id)
+        .cloned()
+        .ok_or_else(|| ApiError::new(500, "accepted_item_missing", "无法读取已点歌曲"))
+}
+
+pub(super) fn enqueue(item: &PlaylistItem) {
+    let Some(request) = request(item) else {
+        return;
+    };
+    // No SQL, credentials, media URLs or source-library bulk upload here.
+    // The service normalizes entries and writes through the same /batch-add API.
+    if !matches!(execute_cloudflare(&request), Ok(result) if result["accepted"] == true) {
+        eprintln!("native catalog append could not be scheduled");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn append_is_bounded_background_metadata_only() {
+        let item: PlaylistItem = serde_json::from_value(json!({
+            "id":"test","bvid":"BV1zm41117sU","title":"Song", "owner_mid":123,
+            "owner_name":"UP", "resolved_url":"https://www.bilibili.com/video/BV1zm41117sU",
+            "original_url":"https://www.bilibili.com/video/BV1zm41117sU", "aid":1, "cid":1,
+            "part_title":"Song", "display_title":"Song", "embed_url":"", "cover_url":"",
+            "video_relative_path":"private/media.mp4", "video_media_url":"private/audio.m4a"
+        }))
+        .unwrap();
+        let mut youtube = item.clone();
+        youtube.media_source = bilikara_rust::media_source::MediaSource::YouTube {
+            video_id: "YE7VzlLtp-4".into(),
+        };
+        assert!(
+            request(&youtube).is_none(),
+            "YouTube must not even construct a D1 append request"
+        );
+        let request = request(&item).unwrap();
+        assert_eq!(request.base_url, "https://api.kevinx96.icu");
+        let CloudflareOperation::EnqueueAppend { entries } = request.operation else {
+            panic!()
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["mid"], "123");
+        assert_eq!(entries[0]["bvid"], item.bvid);
+        assert!(!entries[0].to_string().contains("private"));
+        assert_eq!(entries[0].as_object().unwrap().len(), 7);
+    }
+}

@@ -1,7 +1,8 @@
 {
   "$schema": "../gen/schemas/remote-schema.json",
   "identifier": "main",
-  "description": "Allow the local Bilikara backend page to use fullscreen and native export save APIs.",
+  "platforms": ["windows", "linux", "macOS"],
+  "description": "Allow the local bilikara Host to use native exports and coordinate local presentation mode.",
   "windows": [
     "main"
   ],
@@ -14,8 +15,36 @@
   },
   "permissions": [
     "core:default",
-    "core:window:allow-set-fullscreen",
+    "core:window:allow-close",
+    "core:window:allow-minimize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-start-dragging",
     "clipboard-manager:allow-write-text",
-    "allow-save-backend-download"
+    "allow-save-backend-download",
+    "allow-set-window-fullscreen",
+    "allow-set-window-maximize-region",
+    "allow-set-window-chrome-theme",
+    "allow-restart-application",
+    "allow-apply-desktop-update",
+    "allow-get-host-layout",
+    "allow-set-host-layout",
+    "allow-get-playback-restart-hint-seen",
+    "allow-mark-playback-restart-hint-seen",
+    "allow-get-host-update-preferences",
+    "allow-set-host-update-preferences",
+    "allow-start-desktop-update",
+    "allow-cancel-desktop-update",
+    "allow-open-external-web-url",
+    "allow-open-bilibili-login",
+    "allow-get-presentation-displays",
+    "allow-get-presentation-session",
+    "allow-show-presentation-display-identifiers",
+    "allow-dismiss-presentation-display-identifiers",
+    "allow-activate-local-presentation",
+    "allow-mark-presentation-host-ready",
+    "allow-acknowledge-presentation-command",
+    "allow-publish-presentation-playback-state",
+    "allow-publish-presentation-output-state",
+    "allow-deactivate-local-presentation"
   ]
 }

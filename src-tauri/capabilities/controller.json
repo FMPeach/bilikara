@@ -1,0 +1,25 @@
+{
+  "$schema": "../gen/schemas/remote-schema.json",
+  "identifier": "controller",
+  "platforms": ["windows", "linux", "macOS"],
+  "description": "Allow the trusted backend-origin audience output window to read its presentation session and exit dual-screen mode.",
+  "windows": [
+    "controller"
+  ],
+  "remote": {
+    "urls": [
+      "http://127.0.0.1:*/*",
+      "http://localhost:*/*",
+      "http://*:*/*"
+    ]
+  },
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "allow-get-presentation-session",
+    "allow-mark-presentation-controller-ready",
+    "allow-request-presentation-output-state",
+    "allow-record-presentation-video-geometry",
+    "allow-deactivate-local-presentation"
+  ]
+}

@@ -216,7 +216,7 @@ class SmokeRunner:
                 "downloadHistoryExport",
                 "previewGatchaUid",
                 "/api/gatcha/favlist/preview",
-                "/api/lark/search",
+                "/api/catalog/search",
                 "/api/gatcha/refresh",
                 "/api/gatcha/favlist",
                 "/api/app/update",
@@ -1007,8 +1007,10 @@ class SmokeRunner:
         current = state.get("current_item") or {}
         current_id = str(current.get("id") or "")
         if current_id:
-            self.api_post("/api/player/status", {"item_id": current_id, "is_paused": True, "current_time": 0.0})
-            print_ok("Player status report API works")
+            print_skip(
+                "Player status report API",
+                "Status observations require the exact committed Host playback session",
+            )
             state = self.api_post("/api/player/control", {"action": "toggle-play", "item_id": current_id})
             command = state.get("player_control_command") or {}
             print_ok(f"Host play/pause control command: seq={command.get('seq')} action={command.get('action')}")

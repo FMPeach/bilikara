@@ -1,0 +1,1552 @@
+from __future__ import annotations
+
+import base64
+import binascii
+import ctypes
+import json
+import math
+import os
+import platform
+import sys
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+EXPECTED_RUNTIME_ABI_VERSION = 1
+_PROGRESS_CALLBACK = ctypes.CFUNCTYPE(
+    ctypes.c_int,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+    ctypes.c_void_p,
+)
+
+
+class RustRuntimeUnavailableError(RuntimeError):
+    pass
+
+
+class RustDownloadError(RuntimeError):
+    def __init__(self, kind: str, message: str, *, response: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.response = response
+
+
+class RustDownloadCancelledError(RustDownloadError):
+    pass
+
+
+class RustMediaError(RuntimeError):
+    def __init__(self, kind: str, message: str, *, response: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.response = response
+
+
+class RustStatusServiceError(RuntimeError):
+    pass
+
+
+class RustRuntimeServiceError(RuntimeError):
+    def __init__(self, kind: str, message: str, *, response: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.response = response
+
+
+@dataclass(frozen=True)
+class QrImage:
+    png: bytes
+    data_url: str
+
+
+def generate_qr_image(payload: str, *, border: int) -> QrImage:
+    """One native image request; Python only validates and adapts its PNG payload."""
+    result = _call_runtime_service(
+        "qr_image", {"payload": payload, "module_scale": 10, "border": border}
+    )
+    encoded = result.get("png_base64")
+    try:
+        # The native renderer is bounded to 3344 square, packed monochrome pixels.
+        if not isinstance(encoded, str) or len(encoded) > 2_000_000:
+            raise ValueError
+        png = base64.b64decode(encoded, validate=True)
+        if (
+            len(png) < 67
+            or png[:16] != b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+            or not 1 <= int.from_bytes(png[16:20], "big") <= 3344
+            or png[16:20] != png[20:24]
+            or png[24:29] != b"\x01\x00\x00\x00\x00"
+            or png[-12:] != b"\x00\x00\x00\x00IEND\xaeB`\x82"
+        ):
+            raise ValueError
+    except (ValueError, binascii.Error) as exc:
+        raise RustRuntimeServiceError(
+            "invalid_response", "Rust QR service returned an invalid PNG", response={}
+        ) from exc
+    return QrImage(png=png, data_url="data:image/png;base64," + encoded)
+
+
+def export_playlist_artifact(request: dict[str, Any]) -> tuple[bytes, str, str]:
+    """Transport a complete export; validate the native artifact envelope."""
+    result = _call_runtime_service("playlist_export", request)
+    try:
+        encoded = result.get("data_base64")
+        mime, filename = result.get("mime_type"), result.get("filename")
+        missing = result.get("missing_glyphs")
+        if (not isinstance(encoded, str) or not isinstance(missing, list)
+                or any(not isinstance(codepoint, str) for codepoint in missing)):
+            raise ValueError
+        payload = base64.b64decode(encoded, validate=True)
+        contracts = {
+            "text/csv; charset=utf-8": ("bilikara-playlist.csv", b"\xef\xbb\xbf"),
+            "image/png": ("bilikara-playlist.png", b"\x89PNG\r\n\x1a\n"),
+            "application/zip": ("bilikara-playlist-images.zip", b"PK\x03\x04"),
+        }
+        if (not isinstance(mime, str) or mime not in contracts
+                or filename != contracts[mime][0] or not payload.startswith(contracts[mime][1])
+                or (request["operation"] == "csv") != (mime == "text/csv; charset=utf-8")):
+            raise ValueError
+        if mime == "image/png" and (
+            len(payload) < 67 or payload[8:16] != b"\x00\x00\x00\rIHDR"
+            or int.from_bytes(payload[16:20], "big") != 1600
+            or not 760 <= int.from_bytes(payload[20:24], "big") <= 2**31 - 1
+            or payload[24:29] != b"\x08\x02\x00\x00\x00"
+            or payload[-12:] != b"\x00\x00\x00\x00IEND\xaeB`\x82"
+        ):
+            raise ValueError
+    except (KeyError, TypeError, ValueError, binascii.Error) as exc:
+        raise RustRuntimeServiceError(
+            "invalid_response", "Rust export service returned an invalid artifact", response={}
+        ) from exc
+    if missing:
+        import logging
+        logging.getLogger(__name__).warning(
+            "Export fonts lack %s; visible codepoint labels were rendered", ", ".join(missing)
+        )
+    return payload, mime, filename
+
+
+def prewarm_playlist_fonts(font_path: Path) -> None:
+    result = _call_runtime_service("playlist_export", {
+        "operation": "prewarm", "font_path": str(font_path),
+    })
+    if result != {"prewarmed": True}:
+        raise RustRuntimeServiceError(
+            "invalid_response", "Rust export font prewarm returned an invalid result", response={}
+        )
+
+
+class RustAppStateError(RuntimeError):
+    def __init__(
+        self,
+        status: str,
+        kind: str,
+        message: str,
+        *,
+        response: dict[str, Any],
+    ) -> None:
+        super().__init__(message)
+        self.status = status
+        self.kind = kind
+        self.response = response
+
+
+class RustAppStateRejectedError(RustAppStateError):
+    pass
+
+
+def _runtime_library_name() -> str:
+    system = platform.system()
+    if system == "Windows":
+        return "bilikara_runtime.dll"
+    if system == "Darwin":
+        return "libbilikara_runtime.dylib"
+    return "libbilikara_runtime.so"
+
+
+def _runtime_library_candidates() -> list[Path]:
+    root_dir = Path(__file__).resolve().parent.parent
+    lib_name = _runtime_library_name()
+    candidates: list[Path] = []
+    explicit_path = str(os.environ.get("BILIKARA_RUST_RUNTIME_LIBRARY") or "").strip()
+    if explicit_path:
+        candidates.append(Path(explicit_path).expanduser())
+    candidates.extend([
+        root_dir / "rust-runtime" / "target" / "release" / lib_name,
+        root_dir / "rust-runtime" / "target" / "debug" / lib_name,
+    ])
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.append(Path(meipass) / "rust" / lib_name)
+    candidates.extend(
+        [
+            Path(sys.executable).resolve().parent / "rust" / lib_name,
+            Path(sys.executable).resolve().parent / lib_name,
+        ]
+    )
+    return candidates
+
+
+def _get_runtime_lib_path() -> Path | None:
+    candidates = _runtime_library_candidates()
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _load_runtime_library(path: Path | None):
+    details: dict[str, Any] = {
+        "stage": "locate_library" if path is None else "load_library",
+        "selected_path": str(path or ""),
+        "exception_type": "",
+        "exception_message": "",
+        "actual_abi_version": None,
+    }
+    if path is None:
+        return None, "Rust runtime library not found", details
+    try:
+        library = ctypes.CDLL(str(path))
+        details["stage"] = "resolve_symbols"
+        library.bilikara_runtime_abi_version.argtypes = []
+        library.bilikara_runtime_abi_version.restype = ctypes.c_uint32
+        actual_abi_version = int(library.bilikara_runtime_abi_version())
+        details["actual_abi_version"] = actual_abi_version
+        if actual_abi_version != EXPECTED_RUNTIME_ABI_VERSION:
+            details["stage"] = "validate_abi"
+            return (
+                None,
+                "Rust runtime ABI version mismatch",
+                details,
+            )
+        library.bilikara_runtime_download.argtypes = [
+            ctypes.c_char_p,
+            _PROGRESS_CALLBACK,
+            ctypes.c_void_p,
+        ]
+        library.bilikara_runtime_download.restype = ctypes.c_void_p
+        library.bilikara_runtime_media_probe.argtypes = [ctypes.c_char_p]
+        library.bilikara_runtime_media_probe.restype = ctypes.c_void_p
+        library.bilikara_runtime_media_normalize.argtypes = [ctypes.c_char_p]
+        library.bilikara_runtime_media_normalize.restype = ctypes.c_void_p
+        library.bilikara_runtime_media_inspect.argtypes = [ctypes.c_char_p, _PROGRESS_CALLBACK, ctypes.c_void_p]
+        library.bilikara_runtime_media_inspect.restype = ctypes.c_void_p
+        library.bilikara_runtime_media_startup.argtypes = [ctypes.c_char_p]
+        library.bilikara_runtime_media_startup.restype = ctypes.c_void_p
+        library.bilikara_runtime_status_service.argtypes = [ctypes.c_char_p]
+        library.bilikara_runtime_status_service.restype = ctypes.c_void_p
+        library.bilikara_runtime_service.argtypes = [ctypes.c_char_p]
+        library.bilikara_runtime_service.restype = ctypes.c_void_p
+        library.bilikara_runtime_app_state_request.argtypes = [ctypes.c_char_p]
+        library.bilikara_runtime_app_state_request.restype = ctypes.c_void_p
+        library.bilikara_runtime_free_string.argtypes = [ctypes.c_void_p]
+        library.bilikara_runtime_free_string.restype = None
+        details["stage"] = "ready"
+        return library, "", details
+    except (AttributeError, OSError, TypeError, ValueError) as exc:
+        details["exception_type"] = type(exc).__name__
+        details["exception_message"] = str(exc)
+        return None, f"Rust runtime load failed: {type(exc).__name__}", details
+
+
+_runtime_lib_candidates = _runtime_library_candidates()
+_runtime_python_executable = str(Path(sys.executable).resolve())
+_runtime_process_bits = ctypes.sizeof(ctypes.c_void_p) * 8
+_runtime_machine = platform.machine()
+_runtime_frozen_bundle = bool(getattr(sys, "frozen", False))
+_runtime_lib_path = next(
+    (candidate for candidate in _runtime_lib_candidates if candidate.is_file()),
+    None,
+)
+_runtime_lib, _runtime_error, _runtime_load_diagnostics = _load_runtime_library(
+    _runtime_lib_path
+)
+
+
+def runtime_status() -> dict[str, Any]:
+    candidates = []
+    for path in _runtime_lib_candidates:
+        try:
+            exists = path.is_file()
+        except OSError:
+            exists = False
+        candidates.append({"path": str(path), "exists": exists})
+    return {
+        "loaded": _runtime_lib is not None,
+        "path": str(_runtime_lib_path or ""),
+        "error": _runtime_error,
+        "abi_version": EXPECTED_RUNTIME_ABI_VERSION if _runtime_lib is not None else None,
+        "expected_abi_version": EXPECTED_RUNTIME_ABI_VERSION,
+        "load_diagnostics": {
+            **_runtime_load_diagnostics,
+            "candidate_paths": candidates,
+            "process_bits": _runtime_process_bits,
+            "machine": _runtime_machine,
+            "python_executable": _runtime_python_executable,
+            "frozen_bundle": _runtime_frozen_bundle,
+        },
+        "capabilities": {
+            "app_state": _runtime_lib is not None,
+            "bilibili_service": _runtime_lib is not None,
+            "cache_runtime": _runtime_lib is not None,
+            "cloudflare_service": _runtime_lib is not None,
+            "shared_catalog": _runtime_lib is not None,
+            "gatcha_repository": _runtime_lib is not None,
+            "http_download": _runtime_lib is not None,
+            "media_backend": _runtime_lib is not None,
+            "status_service": _runtime_lib is not None,
+            "json_http": _runtime_lib is not None,
+            "networking": _runtime_lib is not None,
+            "update_installer": _runtime_lib is not None,
+            "diagnostics": _runtime_lib is not None,
+        },
+    }
+
+
+def http_download_available() -> bool:
+    return _runtime_lib is not None
+
+
+def media_backend_available() -> bool:
+    return _runtime_lib is not None
+
+
+def status_service_available() -> bool:
+    return _runtime_lib is not None
+
+
+def app_state_available() -> bool:
+    return _runtime_lib is not None
+
+
+def app_state_request(command: str, **fields: Any) -> dict[str, Any]:
+    if _runtime_lib is None:
+        raise RustRuntimeUnavailableError(
+            _runtime_error or "Rust AppState runtime is unavailable"
+        )
+    request = {
+        "schema_version": 1,
+        "command": str(command),
+        **fields,
+    }
+    payload = json.dumps(
+        request,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    pointer = _runtime_lib.bilikara_runtime_app_state_request(payload)
+    if not pointer:
+        raise RustAppStateError(
+            "internal_error",
+            "no_response",
+            "Rust AppState returned no response",
+            response={},
+        )
+    try:
+        response_bytes = ctypes.string_at(pointer)
+    finally:
+        _runtime_lib.bilikara_runtime_free_string(pointer)
+    try:
+        response = json.loads(response_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RustAppStateError(
+            "internal_error",
+            "invalid_json",
+            "Rust AppState returned malformed JSON",
+            response={},
+        ) from exc
+    if not isinstance(response, dict) or response.get("schema_version") != 1:
+        raise RustAppStateError(
+            "internal_error",
+            "invalid_response",
+            "Rust AppState returned an invalid response",
+            response=response if isinstance(response, dict) else {},
+        )
+    status = response.get("status")
+    if status != "completed":
+        error = response.get("error") if isinstance(response.get("error"), dict) else {}
+        exception_type = (
+            RustAppStateRejectedError if status == "rejected" else RustAppStateError
+        )
+        raise exception_type(
+            str(status or "internal_error"),
+            str(error.get("kind") or "app_state_failed"),
+            str(error.get("message") or "Rust AppState request failed"),
+            response=response,
+        )
+    if (
+        not isinstance(response.get("committed"), bool)
+        or not isinstance(response.get("effects"), dict)
+        or not isinstance(response.get("result"), dict)
+    ):
+        raise RustAppStateError(
+            "internal_error",
+            "invalid_response",
+            "Rust AppState returned an invalid success response",
+            response=response,
+        )
+    effects = response["effects"]
+    required_effects = {
+        "write_core",
+        "write_session_played",
+        "write_backup",
+        "delete_backup",
+        "delete_runtime_files",
+    }
+    if not required_effects.issubset(effects) or any(
+        not isinstance(effects[key], bool) for key in required_effects
+    ):
+        raise RustAppStateError(
+            "internal_error",
+            "invalid_effects",
+            "Rust AppState returned invalid persistence effects",
+            response=response,
+        )
+    snapshot = response.get("snapshot")
+    persistence = response.get("persistence")
+    if snapshot is not None and not isinstance(snapshot, dict):
+        raise RustAppStateError(
+            "internal_error",
+            "invalid_snapshot",
+            "Rust AppState returned an invalid snapshot",
+            response=response,
+        )
+    if persistence is not None and not isinstance(persistence, dict):
+        raise RustAppStateError(
+            "internal_error",
+            "invalid_persistence",
+            "Rust AppState returned invalid persistence state",
+            response=response,
+        )
+    return response
+
+
+def cache_runtime_request(command: str, **fields: Any) -> dict[str, Any]:
+    if _runtime_lib is not None and _media_startup_error:
+        raise RustRuntimeServiceError("invalid_request", _media_startup_error, response={})
+    request = {"command": str(command), **fields}
+    return _call_runtime_service("cache_runtime", request)
+
+
+def start_monthly_refresh_in_background(secret: str, *, requested_by: str = "") -> dict[str, Any]:
+    """Source Host transport; Rust owns execution and the duplicate-run guard."""
+    from . import config, shared_catalog
+
+    result = _call_runtime_service("catalog_refresh", {
+        "options": {
+            "uid_source": str(config.DATA_DIR / "gatcha_uids.json"),
+            "api_url": shared_catalog._CLOUDFLARE_API_URL,
+            "cookie": config.COOKIE,
+            "cookie_path": str(config.BB_DOWN_DIR / "BBDown.data"),
+            "version": config.APP_VERSION,
+        },
+        "secret": str(secret or ""),
+        "requested_by": str(requested_by or ""),
+    })
+    if (type(result.get("success")) is not bool or result.get("job") != "monthly-d1-refresh"
+            or (result["success"] and (result.get("execution") != "local"
+                or result.get("status") != "running"
+                or not isinstance(result.get("instance_id"), str)))
+            or (not result["success"] and not isinstance(result.get("error"), str))):
+        raise RustRuntimeServiceError("invalid_response", "Invalid monthly maintenance response", response={})
+    return result
+
+
+def configure_bbdown(*, owner: str, prepared_path: Path | None) -> dict[str, Any]:
+    """Transport a trusted Host preparation result, never public request fields."""
+    result = _call_runtime_service("native_cache", {
+        "command": "configure_bbdown", "owner": owner,
+        "prepared_path": str(prepared_path.resolve()) if prepared_path is not None else None,
+    })
+    if type(result.get("ready")) is not bool or not isinstance(result.get("message"), str):
+        raise RustRuntimeServiceError("invalid_response", "Invalid BBDown readiness", response={})
+    return result
+
+
+def configure_aria2(*, owner: str, directory: Path, override_path: Path | None,
+                    vendor_roots: list[Path], install: bool) -> dict[str, Any]:
+    """Trusted source configuration/preparation transport, never HTTP fields."""
+    result = _call_runtime_service("native_cache", {
+        "command": "configure_aria2", "owner": owner, "directory": str(directory.resolve()),
+        "override_path": str(override_path.resolve()) if override_path is not None else None,
+        "vendor_roots": [str(p.resolve()) for p in vendor_roots], "install": install,
+    })
+    if (type(result.get("ready")) is not bool or type(result.get("auto_prepare_supported")) is not bool
+        or any(not isinstance(result.get(k), str) for k in ("message", "path", "version"))):
+        raise RustRuntimeServiceError("invalid_response", "Invalid aria2c readiness", response={})
+    return result
+
+
+def native_cache_request(command: str, **fields: Any) -> dict[str, Any]:
+    if (_runtime_lib is not None and _media_startup_error
+        and command not in {"stop", "clear", "prepare", "handoff"}):
+        raise RustRuntimeServiceError("invalid_request", _media_startup_error, response={})
+    result = _call_runtime_service("native_cache", {"command": command, **fields})
+    if (not isinstance(result.get("snapshot"), dict)
+        or any(not isinstance(result.get(key), list) for key in
+               ("desired_ids", "ordered_ids", "current_ids", "external_retries"))
+        or any(not isinstance(value, str) for key in ("desired_ids", "ordered_ids", "current_ids")
+               for value in result[key])
+        or any(not isinstance(value, dict) or not isinstance(value.get("item_id"), str)
+               or type(value.get("cache_attempt_token")) is not int
+               or value["cache_attempt_token"] <= 0
+               or type(value.get("handoff", False)) is not bool for value in result["external_retries"])):
+        raise RustRuntimeServiceError("invalid_response", "Invalid Native cache observation", response={})
+    return result
+
+
+def artifact_lifetime_request(command: str, **fields: Any) -> dict[str, Any]:
+    try:
+        result = _call_runtime_service("artifact_lifetime", {"command": command, **fields})
+    except RustRuntimeServiceError as exc:
+        if "invalid Host" in str(exc):
+            raise ValueError(str(exc)) from exc
+        raise
+    key = {"open": "owner", "acquire": "handle", "collect": "collected"}.get(command, "accepted")
+    value = result.get(key)
+    if key == "owner":
+        valid = isinstance(value, str) and len(value) == 64
+    elif key == "handle":
+        valid = value is None or (isinstance(value, str) and len(value) == 64)
+    elif key == "collected":
+        valid = type(value) is int and value >= 0
+    else:
+        valid = type(value) is bool
+    if not valid:
+        raise RustRuntimeServiceError("invalid_response", "Invalid Rust artifact lifetime response", response={})
+    return result
+
+
+def json_http_request(
+    method: str,
+    url: str,
+    *,
+    headers: dict[str, str] | None = None,
+    payload: Any = None,
+    timeout: float = 12.0,
+) -> Any:
+    request: dict[str, Any] = {
+        "method": str(method),
+        "url": str(url),
+        "headers": [
+            {"name": str(name), "value": str(value)}
+            for name, value in (headers or {}).items()
+        ],
+        "timeout_ms": max(100, int(float(timeout) * 1000)),
+    }
+    if payload is not None:
+        request["payload"] = payload
+    result = _call_runtime_service("json_http", request)
+    if "payload" not in result:
+        raise RustRuntimeServiceError(
+            "invalid_response",
+            "Rust JSON HTTP service returned no payload",
+            response=result,
+        )
+    return result["payload"]
+
+
+def detect_lan_ipv4_addresses(
+    *,
+    platform_name: str = "",
+    candidates: list[dict[str, Any]] | None = None,
+    route_sources: list[str] | None = None,
+) -> list[str]:
+    request: dict[str, Any] = {"platform_name": str(platform_name)}
+    if candidates is not None:
+        request["candidates"] = candidates
+    if route_sources is not None:
+        request["route_sources"] = [str(value) for value in route_sources]
+    result = _call_runtime_service("network_addresses", request)
+    addresses = result.get("addresses")
+    if not isinstance(addresses, list) or not all(
+        isinstance(address, str) for address in addresses
+    ):
+        raise RustRuntimeServiceError(
+            "invalid_response",
+            "Rust networking service returned invalid addresses",
+            response=result,
+        )
+    return addresses
+
+
+def prepare_update_install(request: dict[str, Any]) -> list[str]:
+    result = _call_runtime_service("prepare_update", request)
+    command = result.get("command")
+    if not isinstance(command, list) or not command or not all(
+        isinstance(value, str) and value for value in command
+    ):
+        raise RustRuntimeServiceError(
+            "invalid_response",
+            "Rust update installer returned an invalid helper command",
+            response=result,
+        )
+    return command
+
+
+def launch_update_helper(command: list[str]) -> None:
+    result = _call_runtime_service(
+        "launch_update_helper", {"command": [str(value) for value in command]}
+    )
+    if result.get("launched") is not True:
+        raise RustRuntimeServiceError(
+            "invalid_response",
+            "Rust update installer did not launch the helper",
+            response=result,
+        )
+
+
+def build_diagnostic_artifact(request: dict[str, Any]) -> dict[str, Any]:
+    result = _call_runtime_service("build_diagnostics", request)
+    if not isinstance(result.get("markdown"), str):
+        raise RustRuntimeServiceError(
+            "invalid_response",
+            "Rust diagnostics service returned invalid markdown",
+            response=result,
+        )
+    if not isinstance(result.get("files"), dict) or not isinstance(
+        result.get("zip_base64"), str
+    ):
+        raise RustRuntimeServiceError(
+            "invalid_response",
+            "Rust diagnostics service returned invalid files",
+            response=result,
+        )
+    return result
+
+
+def video_service_request(operation: str, url: str, *, cookie: str, user_agent: str,
+                          referer: str, **options: Any) -> dict[str, Any]:
+    """Whole video operation; no Python metadata or binding implementation."""
+    try:
+        result = _call_runtime_service("video", {
+            "operation": operation, "url": url, "cookie": cookie,
+            "user_agent": user_agent, "referer": referer, "timeout_ms": 15_000,
+            **options,
+        })
+    except RustRuntimeServiceError as exc:
+        if exc.kind == "manual_binding_required":
+            binding = (exc.response.get("error") or {}).get("binding")
+            if (not isinstance(binding, dict)
+                    or not isinstance(binding.get("title"), str)
+                    or type(binding.get("preferred_page")) is not int
+                    or not isinstance(binding.get("pages"), list)
+                    or not binding["pages"]
+                    or any(not isinstance(page, dict) or set(page) != {"page", "cid", "duration", "part"}
+                           or any(type(page[key]) is not int for key in ("page", "cid", "duration"))
+                           or not isinstance(page["part"], str) for page in binding["pages"])):
+                raise RustRuntimeServiceError("invalid_response", "Rust video service returned invalid binding data", response={}) from exc
+        raise
+    required = {
+        "reference": {"original_url": str, "resolved_url": str, "bvid": str, "aid": int, "page": int},
+        "owner": {"owner_mid": int, "owner_name": str, "owner_url": str},
+        "item": {"id": str, "original_url": str, "resolved_url": str, "bvid": str,
+                 "aid": int, "cid": int, "page": int, "title": str, "part_title": str,
+                 "display_title": str, "cover_url": str, "embed_url": str,
+                 "selected_audio_variant_id": str, "video_page": int, "manual_selection": bool,
+                 "owner_mid": int, "owner_name": str, "owner_url": str},
+    }.get(operation, {})
+    valid = bool(required) and all(type(result.get(key)) is kind for key, kind in required.items())
+    if operation == "item":
+        for prefix in ("selected", "available"):
+            values = [result.get(f"{prefix}_{suffix}") for suffix in ("pages", "cids", "durations", "parts")]
+            valid = valid and all(isinstance(v, list) and v for v in values)
+            if valid:
+                valid = len({len(v) for v in values}) == 1 and all(
+                    type(value) is (str if index == 3 else int)
+                    for index, array in enumerate(values) for value in array
+                )
+    if not valid:
+        raise RustRuntimeServiceError("invalid_response", "Rust video service returned invalid data", response={})
+    return result
+
+
+def fetch_bilibili_dash_playurl(
+    *,
+    bvid: str,
+    cid: int,
+    avid: int = 0,
+    cookie: str = "",
+    user_agent: str = "",
+    referer: str = "https://www.bilibili.com/",
+    qn: int = 127,
+    fnval: int = 4048,
+    timeout_ms: int = 15_000,
+) -> dict[str, Any]:
+    result = _call_runtime_service(
+        "bilibili_dash",
+        {
+            "schema_version": 1,
+            "bvid": str(bvid or "").strip(),
+            "cid": int(cid),
+            "avid": int(avid),
+            "cookie": str(cookie or "").strip(),
+            "user_agent": str(user_agent or "").strip() or "Mozilla/5.0 bilikara Rust Runtime",
+            "referer": str(referer or "").strip() or "https://www.bilibili.com/",
+            "qn": int(qn),
+            "fnval": int(fnval),
+            "timeout_ms": max(100, int(timeout_ms)),
+        },
+    )
+    if not isinstance(result, dict):
+        raise RustRuntimeServiceError(
+            "invalid_response",
+            "Rust Bilibili service returned an invalid response",
+            response={},
+        )
+    for key in ("video", "audio"):
+        if not isinstance(result.get(key), list):
+            raise RustRuntimeServiceError(
+                "invalid_response",
+                f"Rust Bilibili service omitted {key} streams",
+                response=result,
+            )
+    streams = [*result["video"], *result["audio"]]
+    for key in ("flac", "dolby"):
+        if result.get(key) is not None:
+            streams.append(result[key])
+    for stream in streams:
+        if (
+            not isinstance(stream, dict)
+            or not isinstance(stream.get("url"), str)
+            or not stream["url"].strip()
+            or not isinstance(stream.get("backup_urls"), list)
+            or any(not isinstance(url, str) for url in stream["backup_urls"])
+            or any(
+                key in stream and not isinstance(stream[key], str)
+                for key in ("codec_name", "codecs", "mime_type")
+            )
+            or any(
+                key in stream and type(stream[key]) is not int
+                for key in ("codec_id", "width", "height", "quality_id", "bandwidth", "order")
+            )
+        ):
+            raise RustRuntimeServiceError(
+                "invalid_response", "Rust Bilibili service returned an invalid stream", response={}
+            )
+    return result
+
+
+def resolve_bilibili_redirect(
+    url: str,
+    *,
+    cookie: str = "",
+    user_agent: str = "",
+    referer: str = "https://www.bilibili.com/",
+    timeout_ms: int = 15_000,
+) -> str:
+    result = _call_runtime_service(
+        "bilibili_redirect",
+        {
+            "schema_version": 1,
+            "url": str(url).strip(),
+            "cookie": str(cookie).strip(),
+            "user_agent": str(user_agent).strip() or "Mozilla/5.0 bilikara Rust Runtime",
+            "referer": str(referer).strip() or "https://www.bilibili.com/",
+            "timeout_ms": max(100, int(timeout_ms)),
+        },
+    )
+    resolved_url = str(result.get("url") or "").strip()
+    if not resolved_url:
+        raise RustRuntimeServiceError(
+            "invalid_response",
+            "Rust Bilibili redirect service omitted the final URL",
+            response=result,
+        )
+    return resolved_url
+
+
+def gatcha_repository_request(
+    operation: str,
+    *,
+    uid_file: Path,
+    cache_file: Path,
+    favlist_file: Path,
+    pool_config_file: Path,
+    **fields: Any,
+) -> dict[str, Any]:
+    request = {
+        "schema_version": 1,
+        "paths": {
+            "uid_file": str(Path(uid_file).resolve()),
+            "cache_file": str(Path(cache_file).resolve()),
+            "favlist_file": str(Path(favlist_file).resolve()),
+            "pool_config_file": str(Path(pool_config_file).resolve()),
+        },
+        "operation": str(operation),
+        **fields,
+    }
+    result = _call_runtime_service("gatcha_repository", request)
+    if not isinstance(result, dict):
+        raise RustRuntimeServiceError(
+            "invalid_response",
+            "Rust Gacha repository returned an invalid response",
+            response={},
+        )
+    return result
+
+
+def shared_catalog_request(operation: str, *, base_url: str, user_agent: str, timeout: float = 12.0, **fields: Any) -> dict[str, Any]:
+    result = _call_runtime_service("shared_catalog", {
+        "schema_version":1, "base_url":str(base_url).rstrip("/"),
+        "user_agent":str(user_agent), "timeout_ms":max(100, int(float(timeout)*1000)),
+        "operation":operation, **fields,
+    })
+    if not isinstance(result, dict):
+        raise RustRuntimeServiceError("invalid_response", "Rust catalog returned an invalid response", response={})
+    return result
+
+
+def cloudflare_service_request(
+    operation: str,
+    *,
+    base_url: str,
+    user_agent: str,
+    timeout: float = 12.0,
+    **fields: Any,
+) -> dict[str, Any]:
+    result = _call_runtime_service(
+        "cloudflare",
+        {
+            "schema_version": 1,
+            "base_url": str(base_url).rstrip("/"),
+            "user_agent": str(user_agent),
+            "timeout_ms": max(100, int(float(timeout) * 1000)),
+            "operation": str(operation),
+            **fields,
+        },
+    )
+    if not isinstance(result, dict):
+        raise RustRuntimeServiceError(
+            "invalid_response",
+            "Rust Cloudflare service returned an invalid response",
+            response={},
+        )
+    return result
+
+
+def probe_connectivity(
+    targets: dict[str, str],
+    *,
+    timeout: float = 5.0,
+    local_usernames: list[str] | None = None,
+) -> dict[str, Any]:
+    result = _call_runtime_service(
+        "probe_connectivity",
+        {
+            "targets": {str(name): str(url) for name, url in targets.items()},
+            "timeout_ms": max(100, int(float(timeout) * 1000)),
+            "local_usernames": [str(value) for value in (local_usernames or [])],
+        },
+    )
+    return result
+
+
+def gatcha_task_snapshot() -> dict[str, Any]:
+    return _validated_gatcha_snapshot(
+        _call_status_service({"command": "gacha_snapshot"})
+    )
+
+
+def try_begin_gatcha_refresh(
+    *,
+    busy_message: str,
+    task: dict[str, Any] | None = None,
+    exclusive: bool = False,
+) -> bool:
+    request: dict[str, Any] = {
+        "command": "gacha_try_begin",
+        "busy_message": str(busy_message),
+    }
+    if task is not None:
+        request["task"] = _gatcha_task_update(task)
+    if exclusive:
+        request["exclusive"] = True
+    result = _call_status_service(request)
+    if not isinstance(result.get("started"), bool):
+        raise RustStatusServiceError("Rust status service returned an invalid lease result")
+    _validated_gatcha_snapshot(result.get("snapshot"))
+    return bool(result["started"])
+
+
+def set_gatcha_task_status(
+    status: str,
+    *,
+    message: str = "",
+    error: str = "",
+    result: dict[str, Any] | None = None,
+    blocking: bool = True,
+    busy_message: str = "",
+) -> dict[str, Any]:
+    task = _gatcha_task_update(
+        {
+            "status": status,
+            "message": message,
+            "error": error,
+            "result": result,
+            "blocking": blocking,
+        }
+    )
+    return _validated_gatcha_snapshot(
+        _call_status_service(
+            {
+                "command": "gacha_set",
+                "task": task,
+                "busy_message": str(busy_message),
+            }
+        )
+    )
+
+
+def release_gatcha_refresh() -> dict[str, Any]:
+    return _validated_gatcha_snapshot(
+        _call_status_service({"command": "gacha_release"})
+    )
+
+
+def reset_gatcha_status_service() -> dict[str, Any]:
+    return _validated_gatcha_snapshot(
+        _call_status_service({"command": "gacha_reset"})
+    )
+
+
+def desktop_login(command: str, **fields: Any) -> dict[str, Any]:
+    """Private desktop request/result adapter; Rust owns all login policy."""
+    result = _call_runtime_service("desktop_login", {"command": command, **fields})
+    if not isinstance(result, dict):
+        raise RustStatusServiceError("Invalid desktop login result")
+    if command == "start":
+        generation = result.get("generation")
+        if "generation" not in result or (
+            generation is not None and (type(generation) is not int or generation <= 0)
+        ):
+            raise RustStatusServiceError("Invalid desktop login generation")
+    elif command == "snapshot":
+        if (type(result.get("logged_in")) is not bool
+                or result.get("state") not in {"idle", "starting", "waiting", "logged_in", "failed"}
+                or any(not isinstance(result.get(key), str) for key in ("message", "data_path", "qr_image"))):
+            raise RustStatusServiceError("Invalid desktop login snapshot")
+    elif command == "download_access":
+        if "message" not in result or (result["message"] is not None and not isinstance(result["message"], str)):
+            raise RustStatusServiceError("Invalid download login decision")
+    elif command == "read_cookie":
+        if not isinstance(result.get("cookie"), str):
+            raise RustStatusServiceError("Invalid desktop credential result")
+    elif command == "take_success":
+        if type(result.get("notify")) is not bool:
+            raise RustStatusServiceError("Invalid desktop login notification")
+    elif command in {"cancel", "logout"}:
+        if result.get("reset") is not True:
+            raise RustStatusServiceError("Invalid desktop login reset")
+    elif command == "run":
+        rows = result.get("diagnostics")
+        if not isinstance(rows, list) or len(rows) > 100:
+            raise RustStatusServiceError("Invalid desktop login diagnostics")
+        diagnostic_fields = {
+            "at", "generation", "stage", "result", "elapsed_ms", "error_kind",
+            "transport_hint", "http_status", "api_code", "poll_code",
+        }
+        for row in rows:
+            if (not isinstance(row, dict) or set(row) != diagnostic_fields
+                    or row["generation"] != fields.get("generation")
+                    or row["stage"] not in ("generate", "poll", "finish")
+                    or row["result"] not in (
+                        "ok", "network_error", "http_error", "body_error", "invalid_json",
+                        "api_error", "client_error", "invalid_qr", "missing_cookie",
+                        "unknown_poll_code", "expired", "storage_error", "internal_error",
+                    )
+                    or row["error_kind"] not in (None, "timeout", "connect", "body", "decode", "request")
+                    or row["transport_hint"] not in (None, "tls_certificate", "tls", "dns", "connection_reset")
+                    or type(row["at"]) not in {int, float}
+                    or type(row["elapsed_ms"]) is not int
+                    or any(row[key] is not None and type(row[key]) is not int
+                           for key in ("http_status", "api_code", "poll_code"))):
+                raise RustStatusServiceError("Invalid desktop login diagnostics")
+    return result
+
+
+def begin_bilibili_login(*, message: str) -> int:
+    result = _call_status_service(
+        {"command": "bilibili_begin", "message": str(message)}
+    )
+    generation = result.get("generation")
+    if not isinstance(generation, int) or isinstance(generation, bool) or generation <= 0:
+        raise RustStatusServiceError("Rust status service returned an invalid login generation")
+    return generation
+
+
+def set_bilibili_login_status(
+    state: str,
+    *,
+    message: str = "",
+    qr_image: str = "",
+    generation: int | None = None,
+) -> bool:
+    request: dict[str, Any] = {
+        "command": "bilibili_set",
+        "state": str(state),
+        "message": str(message),
+        "qr_image": str(qr_image),
+    }
+    if generation is not None:
+        request["generation"] = int(generation)
+    result = _call_status_service(request)
+    if not isinstance(result.get("applied"), bool):
+        raise RustStatusServiceError("Rust status service returned an invalid update result")
+    return bool(result["applied"])
+
+
+def bilibili_login_snapshot(
+    *, logged_in: bool, data_exists: bool, data_path: Path
+) -> dict[str, Any]:
+    result = _call_status_service(
+        {
+            "command": "bilibili_snapshot",
+            "facts": {
+                "logged_in": bool(logged_in),
+                "data_exists": bool(data_exists),
+                "data_path": str(data_path),
+            },
+        }
+    )
+    required = {"logged_in", "state", "message", "data_path", "qr_image"}
+    if not isinstance(result, dict) or not required.issubset(result):
+        raise RustStatusServiceError("Rust status service returned an invalid login snapshot")
+    if not isinstance(result.get("logged_in"), bool):
+        raise RustStatusServiceError("Rust status service returned an invalid login flag")
+    return {
+        "logged_in": result["logged_in"],
+        "state": str(result["state"]),
+        "message": str(result["message"]),
+        "data_path": str(result["data_path"]),
+        "qr_image": str(result["qr_image"]),
+    }
+
+
+def reset_bilibili_login_status() -> None:
+    result = _call_status_service({"command": "bilibili_reset"})
+    if result.get("reset") is not True:
+        raise RustStatusServiceError("Rust status service did not reset login state")
+
+
+def _call_status_service(request: dict[str, Any]) -> dict[str, Any]:
+    if _runtime_lib is None:
+        raise RustRuntimeUnavailableError(_runtime_error or "Rust runtime is unavailable")
+    payload = json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    pointer = _runtime_lib.bilikara_runtime_status_service(payload)
+    if not pointer:
+        raise RustStatusServiceError("Rust status service returned no response")
+    try:
+        response_bytes = ctypes.string_at(pointer)
+    finally:
+        _runtime_lib.bilikara_runtime_free_string(pointer)
+    try:
+        response = json.loads(response_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RustStatusServiceError("Rust status service returned malformed JSON") from exc
+    if (
+        not isinstance(response, dict)
+        or response.get("schema_version") != 1
+        or response.get("status") != "completed"
+        or not isinstance(response.get("result"), dict)
+    ):
+        raise RustStatusServiceError("Rust status service returned an invalid response")
+    return response["result"]
+
+
+def _call_runtime_service(service: str, request: dict[str, Any]) -> dict[str, Any]:
+    if _runtime_lib is None:
+        raise RustRuntimeUnavailableError(_runtime_error or "Rust runtime is unavailable")
+    payload = json.dumps(
+        {"service": str(service), "request": request},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    pointer = _runtime_lib.bilikara_runtime_service(payload)
+    if not pointer:
+        raise RustRuntimeServiceError(
+            "no_response", "Rust runtime service returned no response", response={}
+        )
+    try:
+        response_bytes = ctypes.string_at(pointer)
+    finally:
+        _runtime_lib.bilikara_runtime_free_string(pointer)
+    try:
+        response = json.loads(response_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RustRuntimeServiceError(
+            "invalid_json", "Rust runtime service returned malformed JSON", response={}
+        ) from exc
+    if not isinstance(response, dict) or response.get("schema_version") != 1:
+        raise RustRuntimeServiceError(
+            "invalid_response",
+            "Rust runtime service returned an invalid response",
+            response=response if isinstance(response, dict) else {},
+        )
+    if response.get("status") != "completed":
+        error = response.get("error") if isinstance(response.get("error"), dict) else {}
+        raise RustRuntimeServiceError(
+            str(error.get("kind") or "service_failed"),
+            str(error.get("message") or "Rust runtime service failed"),
+            response=response,
+        )
+    result = response.get("result")
+    if not isinstance(result, dict):
+        raise RustRuntimeServiceError(
+            "invalid_response",
+            "Rust runtime service returned an invalid result",
+            response=response,
+        )
+    return result
+
+
+def _gatcha_task_update(task: dict[str, Any]) -> dict[str, Any]:
+    status = str(task.get("status") or "").strip().lower()
+    if status not in {"idle", "running", "success", "partial", "failed"}:
+        raise ValueError(f"unsupported gatcha task status: {status}")
+    result = task.get("result")
+    if result is not None and not isinstance(result, dict):
+        raise ValueError("gatcha task result must be an object or null")
+    return {
+        "status": status,
+        "message": str(task.get("message") or ""),
+        "error": str(task.get("error") or ""),
+        "result": result,
+        "blocking": bool(task.get("blocking", True)),
+    }
+
+
+def _validated_gatcha_snapshot(snapshot: object) -> dict[str, Any]:
+    required = {
+        "busy",
+        "background_busy",
+        "blocking",
+        "message",
+        "last_status",
+        "last_message",
+        "last_error",
+        "last_updated_at",
+        "last_result",
+    }
+    if not isinstance(snapshot, dict) or not required.issubset(snapshot):
+        raise RustStatusServiceError("Rust status service returned an invalid gatcha snapshot")
+    if any(
+        not isinstance(snapshot.get(key), bool)
+        for key in ("busy", "background_busy", "blocking")
+    ):
+        raise RustStatusServiceError("Rust status service returned invalid gatcha flags")
+    try:
+        updated_at = float(snapshot.get("last_updated_at") or 0)
+    except (TypeError, ValueError) as exc:
+        raise RustStatusServiceError("Rust status service returned an invalid timestamp") from exc
+    last_result = snapshot.get("last_result")
+    if last_result is not None and not isinstance(last_result, dict):
+        raise RustStatusServiceError("Rust status service returned an invalid task result")
+    return {
+        "busy": snapshot["busy"],
+        "background_busy": snapshot["background_busy"],
+        "blocking": snapshot["blocking"],
+        "message": str(snapshot["message"]),
+        "last_status": str(snapshot["last_status"]),
+        "last_message": str(snapshot["last_message"]),
+        "last_error": str(snapshot["last_error"]),
+        "last_updated_at": updated_at,
+        "last_result": last_result,
+    }
+
+
+def download_to_path(
+    *,
+    urls: list[str],
+    destination: Path,
+    headers: list[tuple[str, str]] | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+    connect_timeout_ms: int = 15_000,
+    request_timeout_ms: int = 30 * 60 * 1000,
+) -> dict[str, Any]:
+    if _runtime_lib is None:
+        raise RustRuntimeUnavailableError(_runtime_error or "Rust runtime is unavailable")
+
+    normalized_headers = [
+        {"name": str(name), "value": str(value)}
+        for name, value in (headers or [])
+    ]
+    request = {
+        "schema_version": 1,
+        "candidates": [
+            {"url": str(url), "headers": normalized_headers}
+            for url in urls
+        ],
+        "destination": str(destination.resolve()),
+        "connect_timeout_ms": int(connect_timeout_ms),
+        "request_timeout_ms": int(request_timeout_ms),
+        "attempts_per_candidate": 1,
+    }
+    payload = json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+    @_PROGRESS_CALLBACK
+    def progress_callback(downloaded_bytes, total_bytes, _context):
+        try:
+            if should_cancel is not None and should_cancel():
+                return 1
+            if on_progress is not None:
+                on_progress(int(downloaded_bytes), int(total_bytes))
+            return 0
+        except Exception:
+            return 1
+
+    pointer = _runtime_lib.bilikara_runtime_download(payload, progress_callback, None)
+    if not pointer:
+        raise RustDownloadError(
+            "invalid_response",
+            "Rust downloader returned no response",
+            response={},
+        )
+    try:
+        response_bytes = ctypes.string_at(pointer)
+    finally:
+        _runtime_lib.bilikara_runtime_free_string(pointer)
+    try:
+        response_text = response_bytes.decode("utf-8")
+        response = json.loads(response_text)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RustDownloadError(
+            "invalid_response",
+            "Rust downloader returned malformed JSON",
+            response={},
+        ) from exc
+    if not isinstance(response, dict) or response.get("schema_version") != 1:
+        raise RustDownloadError(
+            "invalid_response",
+            "Rust downloader returned an unsupported response",
+            response={},
+        )
+
+    status = str(response.get("status") or "")
+    if status == "completed":
+        result = response.get("result")
+        if not isinstance(result, dict):
+            raise RustDownloadError(
+                "invalid_response",
+                "Rust downloader omitted its result",
+                response=response,
+            )
+        result_path = Path(str(result.get("destination") or ""))
+        if result_path.resolve() != destination.resolve() or int(result.get("bytes_written") or 0) <= 0:
+            raise RustDownloadError(
+                "invalid_response",
+                "Rust downloader returned an invalid result",
+                response=response,
+            )
+        return result
+
+    error = response.get("error")
+    error = error if isinstance(error, dict) else {}
+    kind = str(error.get("kind") or "unknown")
+    message = str(error.get("message") or "Rust download failed")
+    error_type = RustDownloadCancelledError if status == "cancelled" else RustDownloadError
+    raise error_type(kind, message, response=response)
+
+
+def probe_media(*, source: Path, expected_kind: str) -> dict[str, Any]:
+    request = {
+        "schema_version": 1,
+        "source": str(source.resolve()),
+        "expected_kind": _normalized_media_kind(expected_kind),
+    }
+    result = _call_media_api("bilikara_runtime_media_probe", request)
+    _validate_media_probe(result, expected_path=source, expected_kind=expected_kind)
+    return result
+
+
+def normalize_media(
+    *, source: Path, destination: Path, expected_kind: str
+) -> dict[str, Any]:
+    if _media_startup_error:
+        raise RustMediaError("invalid_request", _media_startup_error, response={})
+    request = {
+        "schema_version": 1,
+        "source": str(source.resolve()),
+        "destination": str(destination.resolve()),
+        "expected_kind": _normalized_media_kind(expected_kind),
+    }
+    result = _call_media_api("bilikara_runtime_media_normalize", request)
+    _validate_media_diagnostic(result.get("diagnostic"), outcome="success")
+    if result["diagnostic"]["operation"] not in {"mp4", "flac"}:
+        raise RustMediaError("invalid_response", "Invalid normalization operation", response={})
+    source_result = result.get("source")
+    output_result = result.get("output")
+    if not isinstance(source_result, dict) or not isinstance(output_result, dict):
+        raise RustMediaError(
+            "invalid_response",
+            "Rust media backend omitted normalization metadata",
+            response=result,
+        )
+    _validate_media_probe(source_result, expected_path=source, expected_kind=expected_kind)
+    _validate_media_probe(output_result, expected_path=destination, expected_kind=expected_kind)
+    if not bool(output_result.get("fast_start")):
+        raise RustMediaError(
+            "invalid_response",
+            "Rust media backend returned a non-fast-start output",
+            response=result,
+        )
+    return result
+
+
+def _normalized_media_kind(expected_kind: str) -> str:
+    value = str(expected_kind or "").strip().lower()
+    if value not in {"video", "audio"}:
+        raise ValueError("expected_kind must be video or audio")
+    return value
+
+
+def _call_media_api(symbol: str, request: dict[str, Any]) -> dict[str, Any]:
+    if _runtime_lib is None:
+        raise RustRuntimeUnavailableError(_runtime_error or "Rust runtime is unavailable")
+    payload = json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    function = getattr(_runtime_lib, symbol)
+    pointer = function(payload)
+    if not pointer:
+        raise RustMediaError(
+            "invalid_response",
+            "Rust media backend returned no response",
+            response={},
+        )
+    try:
+        response_bytes = ctypes.string_at(pointer)
+    finally:
+        _runtime_lib.bilikara_runtime_free_string(pointer)
+    try:
+        response = json.loads(response_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RustMediaError(
+            "invalid_response",
+            "Rust media backend returned malformed JSON",
+            response={},
+        ) from exc
+    if not isinstance(response, dict) or response.get("schema_version") != 1:
+        raise RustMediaError(
+            "invalid_response",
+            "Rust media backend returned an unsupported response",
+            response={},
+        )
+    if response.get("status") == "completed":
+        result = response.get("result")
+        if isinstance(result, dict):
+            return result
+        raise RustMediaError(
+            "invalid_response",
+            "Rust media backend omitted its result",
+            response=response,
+        )
+    error = response.get("error")
+    error = error if isinstance(error, dict) else {}
+    raise RustMediaError(
+        str(error.get("kind") or "unknown"),
+        str(error.get("message") or "Rust media operation failed"),
+        response=response,
+    )
+
+
+def _validate_media_probe(
+    probe: dict[str, Any], *, expected_path: Path, expected_kind: str
+) -> None:
+    if (not isinstance(probe.get("path"), str) or not isinstance(probe.get("codec"), str)
+            or type(probe.get("duration_seconds")) not in {int, float}
+            or any(type(probe.get(k)) is not int for k in ("sample_count", "sample_bytes", "file_bytes"))
+            or any(type(probe.get(k)) is not bool for k in ("fast_start", "fragmented"))):
+        raise RustMediaError("invalid_response", "Rust media backend returned invalid probe field types", response={})
+    try:
+        result_path = Path(str(probe.get("path") or "")).resolve()
+        duration = float(probe.get("duration_seconds") or 0)
+        sample_count = int(probe.get("sample_count") or 0)
+        sample_bytes = int(probe.get("sample_bytes") or 0)
+        file_bytes = int(probe.get("file_bytes") or 0)
+    except (OSError, TypeError, ValueError) as exc:
+        raise RustMediaError(
+            "invalid_response",
+            "Rust media backend returned invalid probe metadata",
+            response=probe,
+        ) from exc
+    if (
+        result_path != expected_path.resolve()
+        or str(probe.get("kind") or "") != _normalized_media_kind(expected_kind)
+        or not str(probe.get("codec") or "")
+        or duration <= 0
+        or not math.isfinite(duration)
+        or sample_count <= 0
+        or sample_bytes <= 0
+        or file_bytes <= 0
+    ):
+        raise RustMediaError(
+            "invalid_response",
+            "Rust media backend returned invalid probe metadata",
+            response=probe,
+        )
+
+
+def inspect_media(
+    *, source: Path, expected_kind: str, operation: str,
+    container_hint: str | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+    compatibility: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Transport Rust's media decision; never infer fallback from an error."""
+    if _runtime_lib is None:
+        raise RustRuntimeUnavailableError(_runtime_error or "Rust runtime is unavailable")
+    if _media_startup_error:
+        raise RustMediaError("invalid_request", _media_startup_error, response={})
+    request = {"schema_version": 1, "source": str(source.resolve()),
+               "expected_kind": _normalized_media_kind(expected_kind),
+               "operation": operation, "container_hint": container_hint, "compatibility": compatibility}
+
+    @_PROGRESS_CALLBACK
+    def cancelled(_done, _total, _context):
+        try:
+            return int(should_cancel is not None and should_cancel())
+        except Exception:
+            return 1
+
+    payload = json.dumps(request, ensure_ascii=False).encode("utf-8")
+    pointer = _runtime_lib.bilikara_runtime_media_inspect(payload, cancelled, None)
+    if not pointer:
+        raise RustMediaError("invalid_response", "Rust media routing returned no response", response={})
+    try:
+        raw = ctypes.string_at(pointer)
+    finally:
+        _runtime_lib.bilikara_runtime_free_string(pointer)
+    try:
+        response = json.loads(raw)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise RustMediaError("invalid_response", "Malformed Rust media response", response={}) from exc
+    if not isinstance(response, dict) or type(response.get("schema_version")) is not int or response["schema_version"] != 1:
+        raise RustMediaError("invalid_response", "Invalid Rust media envelope", response={})
+    if response.get("status") == "failed" and isinstance(response.get("error"), dict):
+        failure = response["error"]
+        if failure.get("diagnostic") is not None:
+            _validate_media_diagnostic(failure["diagnostic"], outcome="failed")
+        raise RustMediaError(str(failure.get("kind") or "unknown"), "Rust media operation failed", response=response)
+    result = response.get("result")
+    if response.get("status") != "completed" or not isinstance(result, dict):
+        raise RustMediaError("invalid_response", "Invalid Rust media result", response={})
+    return _validate_inspection(result, source=source, expected_kind=expected_kind, operation=operation)
+
+
+_MEDIA_REASONS = {"legacy_override", "not_provisioned", "unavailable", "unsupported_format",
+                  "unsupported_codec", "unsupported_container_layout"}
+
+
+def _validate_media_diagnostic(value, *, outcome):
+    if (not isinstance(value, dict)
+            or set(value) != {"operation", "backend", "outcome", "compatibility_reason"}
+            or any(not isinstance(value.get(k), str) for k in ("operation", "backend", "outcome"))
+            or (value.get("compatibility_reason") is not None and not isinstance(value["compatibility_reason"], str))
+            or value.get("operation") not in {"metadata", "validate", "packet_scan", "mp4", "flac"}
+            or value.get("backend") not in {"libav", "pure_rust", "ffprobe", "ffmpeg"}
+            or value.get("outcome") != outcome
+            or value.get("compatibility_reason") not in _MEDIA_REASONS | {None}):
+        raise RustMediaError("invalid_response", "Invalid media diagnostic", response={})
+
+
+def _validate_inspection(result, *, source, expected_kind, operation):
+    def invalid():
+        raise RustMediaError("invalid_response", "Invalid Rust media result shape", response={})
+    if result.get("action") == "compatibility":
+        backend, reason = result.get("backend"), result.get("reason")
+        if not isinstance(reason, str) or not isinstance(backend, str) or reason not in _MEDIA_REASONS or backend not in {"legacy", "ffprobe", "ffmpeg"}:
+            invalid()
+        if (backend == "legacy") != (reason in {"legacy_override", "not_provisioned"}):
+            invalid()
+        if backend != "legacy" and (backend == "ffmpeg") != (operation == "packet_scan"):
+            invalid()
+        return result
+    if result.get("action") != "completed":
+        invalid()
+    metadata, diagnostic = result.get("metadata"), result.get("diagnostic")
+    if not isinstance(metadata, dict) or not isinstance(diagnostic, dict):
+        invalid()
+    _validate_media_diagnostic(diagnostic, outcome="success")
+    if (not isinstance(metadata.get("backend"), str) or metadata["backend"] not in {"libav", "pure_rust", "ffprobe"}
+            or diagnostic.get("backend") != metadata["backend"]
+            or diagnostic.get("operation") != operation or diagnostic.get("outcome") != "success"
+            or diagnostic.get("compatibility_reason") not in _MEDIA_REASONS | {None}
+            or metadata.get("path") != str(source.resolve())
+            or type(metadata.get("size")) is not int or metadata["size"] <= 0
+            or type(metadata.get("stream_count")) is not int or metadata["stream_count"] != 1 or not isinstance(metadata.get("container"), str)
+            or not metadata["container"]):
+        invalid()
+    depth = metadata.get("inspection_level")
+    if not {"duration_seconds", "streams", "inspection_level"}.issubset(metadata):
+        invalid()
+    if not isinstance(depth, str) or depth not in {"stream_metadata", "packet_scan", "sample_traversal"} or (operation != "metadata" and depth == "stream_metadata"):
+        invalid()
+    streams = metadata.get("streams")
+    if not isinstance(streams, list) or len(streams) != 1 or not isinstance(streams[0], dict):
+        invalid()
+    stream = streams[0]
+    if not {"kind", "codec", "duration_seconds"}.issubset(stream):
+        invalid()
+    if stream.get("kind") != expected_kind or (stream.get("codec") is not None and not isinstance(stream["codec"], str)):
+        invalid()
+    for duration in (metadata.get("duration_seconds"), stream.get("duration_seconds")):
+        if duration is not None and (type(duration) not in {int, float} or not math.isfinite(duration) or duration < 0):
+            invalid()
+    return result
+
+
+def media_compatibility_tool(name: str, existing: Path | None) -> Path | None:
+    """Same-package path facts for existing Host subprocess effects."""
+    from .media_cli import require_media_cli
+    require_media_cli()
+    if not _media_companion_provisioned:
+        return existing
+    if _media_tool_directory is None:
+        raise RustMediaError("unavailable", "Same-build media CLI path is unavailable", response={})
+    return _media_tool_directory / (name + (".exe" if os.name == "nt" else ""))
+
+
+def media_compatibility_env(env: dict[str, str]) -> dict[str, str]:
+    if (platform.system() == "Linux" and _media_tool_directory is not None
+            and not (_media_tool_directory / "ffmpeg-runtime.json").is_file()):
+        return {**env, "LD_LIBRARY_PATH": str(_media_tool_directory.parent / "lib")}
+    return env
+
+
+def _configure_media_routing() -> tuple[bool, Path | None, str]:
+    companion = None
+    tool_directory = None
+    from .config import VENDOR_DIR, INTERNAL_VENDOR_DIR
+    names = {"Windows": "bilikara_media_libav.dll", "Darwin": "libbilikara_media_libav.dylib",
+             "Linux": "libbilikara_media_libav.so"}
+    name = names.get(platform.system())
+    if name is not None:
+        for vendor in (VENDOR_DIR, INTERNAL_VENDOR_DIR):
+            # The manifest identifies provisioning even when an optional library
+            # is missing. Rust negotiates that library at the operation boundary.
+            if (vendor / "ffmpeg-runtime.json").is_file():
+                companion = vendor.resolve() / name
+                tool_directory = vendor.resolve()
+                break
+    if companion is None and platform.system() in {"Linux", "Darwin"}:
+        path = os.environ.get("BILIKARA_LIBAV_COMPANION", "")
+        if path:
+            companion = Path(path).expanduser()
+            prefix = os.environ.get("BILIKARA_LIBAV_FFMPEG_PREFIX", "")
+            if prefix and Path(prefix).is_absolute():
+                tool_directory = Path(prefix) / "bin"
+    try:
+        result = _call_media_api("bilikara_runtime_media_startup", {
+            "mode": os.environ.get("BILIKARA_MEDIA_BACKEND", "default"),
+            "companion": str(companion) if companion is not None else None,
+        })
+        if result != {"configured": True}:
+            raise RustMediaError("invalid_response", "Invalid media startup response", response={})
+    except (RustMediaError, RustRuntimeUnavailableError):
+        return companion is not None, tool_directory, "Rust media startup configuration failed"
+    return companion is not None, tool_directory, ""
+
+
+_media_companion_provisioned, _media_tool_directory, _media_startup_error = _configure_media_routing()

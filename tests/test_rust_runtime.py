@@ -1,0 +1,1201 @@
+import base64
+import ctypes
+import ipaddress
+import json
+import os
+import threading
+import unittest
+import zipfile
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import Mock, patch
+
+from bilikara import rust_runtime
+from bilikara.cache import CacheManager, DEFAULT_VIDEO_QUALITY
+
+
+class FakeRuntimeLibrary:
+    def __init__(self, response: dict) -> None:
+        self.buffer = ctypes.create_string_buffer(
+            json.dumps(response).encode("utf-8")
+        )
+
+    def bilikara_runtime_download(self, _payload, callback, _context):
+        callback(4, 8, None)
+        callback(8, 8, None)
+        return ctypes.addressof(self.buffer)
+
+    def bilikara_runtime_free_string(self, _pointer):
+        return None
+
+
+class FakeMediaLibrary:
+    def __init__(self, responses: dict[str, dict]) -> None:
+        self.responses = responses
+        self.buffers = []
+
+    def _response(self, name: str):
+        buffer = ctypes.create_string_buffer(
+            json.dumps(self.responses[name]).encode("utf-8")
+        )
+        self.buffers.append(buffer)
+        return ctypes.addressof(buffer)
+
+    def bilikara_runtime_media_probe(self, _payload):
+        return self._response("probe")
+
+    def bilikara_runtime_media_normalize(self, _payload):
+        return self._response("normalize")
+
+    def bilikara_runtime_free_string(self, _pointer):
+        return None
+
+
+class FakeServiceLibrary:
+    def __init__(self, response: dict) -> None:
+        self.buffer = ctypes.create_string_buffer(json.dumps(response).encode("utf-8"))
+        self.request = None
+
+    def bilikara_runtime_service(self, payload):
+        self.request = json.loads(payload.decode("utf-8"))
+        return ctypes.addressof(self.buffer)
+
+    def bilikara_runtime_free_string(self, _pointer):
+        return None
+
+
+class FakeAppStateLibrary:
+    def __init__(self, response: dict) -> None:
+        self.buffer = ctypes.create_string_buffer(json.dumps(response).encode("utf-8"))
+        self.request = None
+
+    def bilikara_runtime_app_state_request(self, payload):
+        self.request = json.loads(payload.decode("utf-8"))
+        return ctypes.addressof(self.buffer)
+
+    def bilikara_runtime_free_string(self, _pointer):
+        return None
+
+
+class RustRuntimeAdapterTest(unittest.TestCase):
+    def test_source_networking_delegates_to_current_rust_and_fails_closed(self):
+        from bilikara import networking
+        with patch.object(rust_runtime, "detect_lan_ipv4_addresses", return_value=["192.168.1.50"]) as detect:
+            self.assertEqual(networking.detect_lan_ipv4_addresses(platform_name="DaRwIn"), ["192.168.1.50"])
+        detect.assert_called_once_with(platform_name="darwin")
+        with patch.object(rust_runtime, "_runtime_lib", None):
+            with self.assertRaises(rust_runtime.RustRuntimeUnavailableError):
+                networking.detect_lan_ipv4_addresses(platform_name="linux")
+
+    def test_source_monthly_transport_uses_selected_runtime_data_and_native_result(self):
+        from bilikara import config, shared_catalog
+        result = {"success": True, "job": "monthly-d1-refresh", "instance_id": "local-monthly-42",
+                  "status": "running", "execution": "local"}
+        library = FakeServiceLibrary({"schema_version": 1, "status": "completed", "result": result})
+        with patch.object(rust_runtime, "_runtime_lib", library), patch.object(config, "DATA_DIR", Path("runtime 中文/data")):
+            self.assertEqual(rust_runtime.start_monthly_refresh_in_background("worker-secret", requested_by="VZRXS"), result)
+        self.assertEqual(library.request, {"service": "catalog_refresh", "request": {
+            "options": {"uid_source": str(Path("runtime 中文/data/gatcha_uids.json")),
+                        "api_url": shared_catalog._CLOUDFLARE_API_URL, "cookie": config.COOKIE,
+                        "cookie_path": str(config.BB_DOWN_DIR / "BBDown.data"), "version": config.APP_VERSION},
+            "secret": "worker-secret", "requested_by": "VZRXS"}})
+
+    def test_source_monthly_transport_fails_closed_without_rust_or_on_malformed_result(self):
+        with patch.object(rust_runtime, "_runtime_lib", None):
+            with self.assertRaises(rust_runtime.RustRuntimeUnavailableError):
+                rust_runtime.start_monthly_refresh_in_background("secret")
+        for result in [{}, {"success": True, "job": "monthly-d1-refresh"},
+                       {"success": False, "job": "monthly-d1-refresh", "error": 1}]:
+            with self.subTest(result=result), patch.object(rust_runtime, "_call_runtime_service", return_value=result):
+                with self.assertRaises(rust_runtime.RustRuntimeServiceError):
+                    rust_runtime.start_monthly_refresh_in_background("secret")
+
+    def test_public_dash_adapter_forwards_credentials_options_and_representation(self):
+        from bilikara import bilibili
+        result = {
+            "video": [{"url": "https://video", "backup_urls": ["https://b2", "https://b1"], "order": 2}],
+            "audio": [], "flac": None, "dolby": None,
+        }
+        for bbdown_cookie, config_cookie, expected in [
+            ("SESSDATA=fixture", "SESSDATA=config", "SESSDATA=fixture"),
+            ("", "SESSDATA=config", "SESSDATA=config"), ("", "", ""),
+        ]:
+            with self.subTest(cookie_source=expected):
+                library = FakeServiceLibrary({"schema_version": 1, "status": "completed", "result": result})
+                with patch.object(rust_runtime, "_runtime_lib", library), patch.object(
+                    bilibili, "effective_bilibili_cookie", return_value=expected
+                ), patch.object(bilibili.cfg, "COOKIE", config_cookie), patch.dict(
+                    bilibili.BILIBILI_HEADERS,
+                    {"User-Agent": "fixture-agent", "Referer": "https://www.bilibili.com/video/BVfixture", "Cookie": "stale"},
+                ), patch.object(bilibili, "request_json", side_effect=AssertionError("retired HTTP")), patch.object(
+                    bilibili, "get_cached_wbi_keys", side_effect=AssertionError("retired WBI")
+                ):
+                    actual = bilibili.fetch_dash_playurl("BVfixture", 456, avid=123, qn=80, fnval=16)
+                self.assertEqual(actual, result)
+                self.assertEqual(library.request, {"service": "bilibili_dash", "request": {
+                    "schema_version": 1, "bvid": "BVfixture", "cid": 456, "avid": 123,
+                    "qn": 80, "fnval": 16, "cookie": expected, "user_agent": "fixture-agent",
+                    "referer": "https://www.bilibili.com/video/BVfixture", "timeout_ms": 15000,
+                }})
+
+    def test_public_dash_errors_keep_type_codes_chain_and_retry_classification(self):
+        from bilikara import bilibili
+        for kind, api_code, status, terminal in [
+            ("authentication", -101, None, True), ("forbidden", -403, None, True),
+            ("unavailable", 62002, None, True), ("risk_control", -352, None, True),
+            ("risk_control", -412, None, True), ("authentication", None, 401, True),
+            ("unavailable", None, 402, True), ("forbidden", None, 403, True),
+            ("http", None, 429, False), ("http", None, 503, False),
+            ("network", None, None, False), ("invalid_response", None, None, False),
+        ]:
+            with self.subTest(kind=kind, api=api_code, status=status):
+                library = FakeServiceLibrary({"schema_version": 1, "status": "failed", "error": {
+                    "kind": kind, "message": "fixture failure", "api_code": api_code, "status_code": status,
+                }})
+                with patch.object(rust_runtime, "_runtime_lib", library), patch.object(
+                    bilibili, "effective_bilibili_cookie", return_value=""
+                ), self.assertRaises(bilibili.BilibiliError) as raised:
+                    bilibili.fetch_dash_playurl("BVfixture", 456)
+                error = raised.exception
+                self.assertEqual((error.kind, error.api_code, error.status_code), (kind, api_code, status))
+                self.assertIsInstance(error.__cause__, rust_runtime.RustRuntimeServiceError)
+                self.assertEqual(CacheManager._is_terminal_track_failure(error), terminal)
+
+    def test_public_dash_unavailable_has_no_python_fallback(self):
+        from bilikara import bilibili
+        with patch.object(rust_runtime, "_runtime_lib", None), patch.object(
+            bilibili, "effective_bilibili_cookie", return_value=""
+        ), patch.object(bilibili, "request_json") as http, patch.object(bilibili, "get_cached_wbi_keys") as wbi:
+            with self.assertRaises(rust_runtime.RustRuntimeUnavailableError):
+                bilibili.fetch_dash_playurl("BVfixture", 456)
+        http.assert_not_called()
+        wbi.assert_not_called()
+
+    def test_public_dash_rejects_malformed_native_streams(self):
+        from bilikara import bilibili
+        for stream in [None, {}, {"url": "x", "backup_urls": "bad"},
+                       {"url": "x", "backup_urls": [], "quality_id": "80"},
+                       {"url": "x", "backup_urls": [None]}]:
+            for key in ("video", "audio", "flac", "dolby"):
+                result = {"video": [], "audio": [], "flac": None, "dolby": None}
+                if stream is None and key in ("flac", "dolby"):
+                    continue  # None is a valid absent special stream.
+                result[key] = [stream] if key in ("video", "audio") else stream
+                with self.subTest(stream=stream, key=key), patch.object(
+                    rust_runtime, "_call_runtime_service", return_value=result
+                ), patch.object(bilibili, "effective_bilibili_cookie", return_value=""):
+                    with self.assertRaises(bilibili.BilibiliError) as raised:
+                        bilibili.fetch_dash_playurl("BVfixture", 456)
+                    self.assertEqual(raised.exception.kind, "invalid_response")
+
+    @unittest.skipUnless(
+        os.getenv("BILIKARA_REQUIRE_RUST_LIB", "").strip().lower() in {"1", "true", "yes", "on"},
+        "native Rust runtime is optional outside the release gate",
+    )
+    def test_public_dash_invalid_request_uses_real_abi_without_network(self):
+        from bilikara import bilibili
+        self.assertIsNotNone(rust_runtime._runtime_lib)
+        with patch.object(bilibili, "effective_bilibili_cookie", return_value=""), patch.object(
+            bilibili, "request_json", side_effect=AssertionError("retired HTTP")
+        ):
+            for bvid, cid in [("BVfixture", 0), ("", 456)]:
+                with self.subTest(bvid=bvid, cid=cid), self.assertRaises(bilibili.BilibiliError) as raised:
+                    bilibili.fetch_dash_playurl(bvid, cid)
+                self.assertEqual(raised.exception.kind, "invalid_request")
+                self.assertIsInstance(raised.exception.__cause__, rust_runtime.RustRuntimeServiceError)
+
+    def test_app_state_adapter_sends_one_strict_request_and_returns_full_result(self):
+        response = {
+            "schema_version": 1,
+            "status": "completed",
+            "committed": False,
+            "snapshot": {"revision": 7},
+            "persistence": {"updated_at": 1},
+            "effects": {
+                "write_core": False,
+                "write_session_played": False,
+                "write_backup": False,
+                "delete_backup": False,
+                "delete_runtime_files": False,
+            },
+            "result": {"snapshot": True},
+        }
+        library = FakeAppStateLibrary(response)
+        with patch("bilikara.rust_runtime._runtime_lib", library):
+            actual = rust_runtime.app_state_request("snapshot")
+
+        self.assertEqual(actual, response)
+        self.assertEqual(
+            library.request,
+            {"schema_version": 1, "command": "snapshot"},
+        )
+
+    def test_app_state_adapter_preserves_domain_rejection_without_fallback(self):
+        library = FakeAppStateLibrary(
+            {
+                "schema_version": 1,
+                "status": "rejected",
+                "error": {
+                    "kind": "duplicate_session_request",
+                    "message": "duplicate",
+                    "details": {"identity_key": "BV1:p1"},
+                },
+            }
+        )
+        with patch("bilikara.rust_runtime._runtime_lib", library):
+            with self.assertRaises(rust_runtime.RustAppStateRejectedError) as raised:
+                rust_runtime.app_state_request("add_item", item={})
+
+        self.assertEqual(raised.exception.kind, "duplicate_session_request")
+        self.assertEqual(
+            raised.exception.response["error"]["details"]["identity_key"],
+            "BV1:p1",
+        )
+
+    def test_app_state_adapter_fails_when_runtime_is_unavailable(self):
+        with patch("bilikara.rust_runtime._runtime_lib", None):
+            with self.assertRaises(rust_runtime.RustRuntimeUnavailableError):
+                rust_runtime.app_state_request("snapshot")
+
+    def test_cache_runtime_adapter_sends_flattened_command(self):
+        library = FakeServiceLibrary(
+            {
+                "schema_version": 1,
+                "status": "completed",
+                "result": {"events": [], "snapshot": {}},
+            }
+        )
+        with patch("bilikara.rust_runtime._runtime_lib", library):
+            result = rust_runtime.cache_runtime_request(
+                "drain_events", max_events=32
+            )
+
+        self.assertEqual(result, {"events": [], "snapshot": {}})
+        self.assertEqual(library.request["service"], "cache_runtime")
+        self.assertEqual(
+            library.request["request"],
+            {"command": "drain_events", "max_events": 32},
+        )
+
+    def test_runtime_service_sends_structured_json_http_request(self):
+        library = FakeServiceLibrary(
+            {
+                "schema_version": 1,
+                "status": "completed",
+                "result": {"status_code": 200, "payload": {"ok": True}},
+            }
+        )
+        with patch("bilikara.rust_runtime._runtime_lib", library):
+            result = rust_runtime.json_http_request(
+                "POST",
+                "https://example.test/api",
+                headers={"Authorization": "Bearer secret"},
+                payload={"bvid": "BV1xx411c7mD"},
+                timeout=3,
+            )
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(library.request["service"], "json_http")
+        self.assertEqual(library.request["request"]["timeout_ms"], 3000)
+        self.assertEqual(
+            library.request["request"]["headers"],
+            [{"name": "Authorization", "value": "Bearer secret"}],
+        )
+
+    def test_runtime_service_preserves_typed_native_failure(self):
+        library = FakeServiceLibrary(
+            {
+                "schema_version": 1,
+                "status": "failed",
+                "error": {
+                    "kind": "http_status",
+                    "message": "HTTP 503",
+                    "status_code": 503,
+                },
+            }
+        )
+        with patch("bilikara.rust_runtime._runtime_lib", library):
+            with self.assertRaises(rust_runtime.RustRuntimeServiceError) as raised:
+                rust_runtime.json_http_request("GET", "https://example.test/api")
+
+        self.assertEqual(raised.exception.kind, "http_status")
+        self.assertEqual(raised.exception.response["error"]["status_code"], 503)
+
+    def test_library_lookup_prefers_release_and_supports_bundle(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            release = root / "rust-runtime" / "target" / "release" / "libbilikara_runtime.so"
+            release.parent.mkdir(parents=True)
+            release.touch()
+            with patch.dict(os.environ, {"BILIKARA_RUST_RUNTIME_LIBRARY": ""}), patch.object(
+                rust_runtime.Path, "resolve", return_value=root / "bilikara" / "rust_runtime.py"
+            ), patch("bilikara.rust_runtime.platform.system", return_value="Linux"):
+                self.assertEqual(rust_runtime._get_runtime_lib_path(), release)
+
+    def test_library_lookup_supports_explicit_development_override(self):
+        with TemporaryDirectory() as temp_dir:
+            explicit = Path(temp_dir) / "bilikara_runtime.dll"
+            explicit.touch()
+            with patch.dict(
+                os.environ,
+                {"BILIKARA_RUST_RUNTIME_LIBRARY": str(explicit)},
+            ):
+                self.assertEqual(rust_runtime._get_runtime_lib_path(), explicit)
+
+    def test_cloudflare_service_adapter_sends_owned_request(self):
+        library = FakeServiceLibrary(
+            {
+                "schema_version": 1,
+                "status": "completed",
+                "result": {"payload": {"ok": True}},
+            }
+        )
+        with patch("bilikara.rust_runtime._runtime_lib", library):
+            result = rust_runtime.cloudflare_service_request(
+                "request",
+                base_url="https://api.example.test",
+                user_agent="bilikara/test",
+                method="GET",
+                path="/search?q=song",
+            )
+
+        self.assertEqual(result, {"payload": {"ok": True}})
+        self.assertEqual(library.request["service"], "cloudflare")
+        self.assertEqual(library.request["request"]["operation"], "request")
+
+    def test_gatcha_repository_adapter_sends_all_owned_paths(self):
+        library = FakeServiceLibrary(
+            {
+                "schema_version": 1,
+                "status": "completed",
+                "result": {"uids": [], "count": 0},
+            }
+        )
+        with patch("bilikara.rust_runtime._runtime_lib", library):
+            result = rust_runtime.gatcha_repository_request(
+                "uid_snapshot",
+                uid_file=Path("data/uids.json"),
+                cache_file=Path("data/cache.json"),
+                favlist_file=Path("data/favlist.json"),
+                pool_config_file=Path("data/pool.json"),
+            )
+
+        self.assertEqual(result["count"], 0)
+        self.assertEqual(library.request["service"], "gatcha_repository")
+        self.assertTrue(library.request["request"]["paths"]["uid_file"].endswith("uids.json"))
+
+    def test_source_removal_is_only_an_exclusive_native_transport(self):
+        from bilikara import bilibili
+        result = {"operation": "remove_source", "source": "uid", "id": "42", "removed": True}
+        done = Mock()
+        with patch.object(rust_runtime, "try_begin_gatcha_refresh", return_value=True) as begin, \
+                patch.object(rust_runtime, "release_gatcha_refresh") as release, \
+                patch.object(bilibili, "_rust_gatcha_repository", return_value=result) as repository, \
+                patch.object(bilibili, "_set_gatcha_task_status") as status, \
+                patch.object(bilibili, "append_catalog_entries_in_background") as append:
+            self.assertEqual(bilibili.remove_gatcha_source("uid", "42", on_done=done), result)
+        begin.assert_called_once_with(busy_message=bilibili.GATCHA_TASK_BUSY_MESSAGE, exclusive=True)
+        repository.assert_called_once_with("remove_source", source="uid", id="42")
+        status.assert_called_once_with(status="success", result=result)
+        release.assert_called_once_with()
+        done.assert_called_once_with()
+        append.assert_not_called()
+        # Rust failure is surfaced without a Python fallback, releasing the lease.
+        with patch.object(rust_runtime, "try_begin_gatcha_refresh", return_value=True), \
+                patch.object(rust_runtime, "release_gatcha_refresh") as release, \
+                patch.object(bilibili, "_rust_gatcha_repository", side_effect=rust_runtime.RustRuntimeUnavailableError("unavailable")):
+            with self.assertRaises(rust_runtime.RustRuntimeUnavailableError):
+                bilibili.remove_gatcha_source("uid", "42")
+        release.assert_called_once_with()
+
+    def test_source_batch_adapter_forwards_once_and_preserves_committed_cleanup_truth(self):
+        from bilikara import bilibili
+        edit = {"action": "remove", "ids": ["42", "43"]}
+        result = {"operation": "remove_sources", "committed": True, "removed_ids": ["42", "43"], "cleanup_pending": ["cache"]}
+        done = Mock()
+        with patch.object(rust_runtime, "try_begin_gatcha_refresh", return_value=True) as begin, \
+                patch.object(rust_runtime, "release_gatcha_refresh") as release, \
+                patch.object(bilibili, "_rust_gatcha_repository", return_value=result) as repository, \
+                patch.object(bilibili, "_set_gatcha_task_status") as status:
+            self.assertEqual(bilibili.edit_gatcha_sources("uid", "a" * 64, edit, on_done=done), result)
+        begin.assert_called_once_with(busy_message=bilibili.GATCHA_TASK_BUSY_MESSAGE, exclusive=True)
+        repository.assert_called_once_with("edit_sources", source="uid", expected_version="a" * 64, edit=edit)
+        status.assert_called_once_with(status="partial", result=result)
+        release.assert_called_once_with()
+        done.assert_called_once_with()
+        with patch.object(rust_runtime, "try_begin_gatcha_refresh", return_value=False), \
+                patch.object(bilibili, "_rust_gatcha_repository") as repository:
+            with self.assertRaises(bilibili.BilibiliError):
+                bilibili.edit_gatcha_sources("uid", "a" * 64, edit)
+        repository.assert_not_called()
+
+    def test_source_order_noop_uses_readonly_rust_preview_without_lease_or_notification(self):
+        from bilikara import bilibili
+        edit = {"action": "move", "id": "42", "before_id": "42"}
+        done = Mock()
+        with patch.object(bilibili, "gatcha_task_snapshot", return_value={"busy": False}), \
+                patch.object(bilibili, "_rust_gatcha_repository", return_value={"changed": False}) as repository, \
+                patch.object(rust_runtime, "try_begin_gatcha_refresh") as begin:
+            self.assertEqual(bilibili.edit_gatcha_sources("uid", "a" * 64, edit, on_done=done), {"changed": False})
+        repository.assert_called_once_with("preview_source_edit", source="uid", expected_version="a" * 64, edit=edit)
+        begin.assert_not_called()
+        done.assert_not_called()
+        for task in ({"busy": True}, {"busy": False, "background_busy": True}):
+            with patch.object(bilibili, "gatcha_task_snapshot", return_value=task), \
+                    patch.object(bilibili, "_rust_gatcha_repository") as repository:
+                with self.assertRaises(bilibili.BilibiliError):
+                    bilibili.edit_gatcha_sources("uid", "a" * 64, edit)
+            repository.assert_not_called()
+
+    def test_runtime_load_failure_records_actionable_details(self):
+        path = Path("C:/bundle/rust/bilikara_runtime.dll")
+        with patch(
+            "bilikara.rust_runtime.ctypes.CDLL",
+            side_effect=OSError("VCRUNTIME140.dll was not found"),
+        ):
+            library, error, details = rust_runtime._load_runtime_library(path)
+
+        self.assertIsNone(library)
+        self.assertEqual(error, "Rust runtime load failed: OSError")
+        self.assertEqual(details["stage"], "load_library")
+        self.assertEqual(details["exception_type"], "OSError")
+        self.assertIn("VCRUNTIME140.dll", details["exception_message"])
+        self.assertEqual(details["selected_path"], str(path))
+
+    def test_download_validates_success_and_reports_progress(self):
+        with TemporaryDirectory() as temp_dir:
+            destination = Path(temp_dir) / "track.m4s"
+            response = {
+                "schema_version": 1,
+                "status": "completed",
+                "result": {
+                    "destination": str(destination.resolve()),
+                    "bytes_written": 8,
+                    "content_length": 8,
+                    "candidate_index": 1,
+                    "attempt": 1,
+                },
+            }
+            progress = []
+            with patch("bilikara.rust_runtime._runtime_lib", FakeRuntimeLibrary(response)):
+                result = rust_runtime.download_to_path(
+                    urls=["https://primary.invalid", "https://backup.invalid"],
+                    destination=destination,
+                    headers=[("Cookie", "SESSDATA=secret")],
+                    on_progress=lambda current, total: progress.append((current, total)),
+                )
+
+        self.assertEqual(result["candidate_index"], 1)
+        self.assertEqual(progress, [(4, 8), (8, 8)])
+
+    def test_download_raises_typed_failure_without_exposing_request(self):
+        response = {
+            "schema_version": 1,
+            "status": "failed",
+            "error": {
+                "kind": "http_status",
+                "message": "HTTP request returned status 403",
+                "candidate_index": 0,
+                "http_status": 403,
+            },
+        }
+        with TemporaryDirectory() as temp_dir, patch(
+            "bilikara.rust_runtime._runtime_lib", FakeRuntimeLibrary(response)
+        ):
+            with self.assertRaises(rust_runtime.RustDownloadError) as raised:
+                rust_runtime.download_to_path(
+                    urls=["https://media.invalid/secret-token"],
+                    destination=Path(temp_dir) / "track.m4s",
+                    headers=[("Cookie", "SESSDATA=secret")],
+                )
+
+        self.assertEqual(raised.exception.kind, "http_status")
+        self.assertNotIn("secret-token", str(raised.exception))
+        self.assertNotIn("SESSDATA", str(raised.exception))
+
+    def test_media_probe_and_normalize_validate_native_metadata(self):
+        with TemporaryDirectory() as temp_dir:
+            source = (Path(temp_dir) / "source.mp4").resolve()
+            destination = (Path(temp_dir) / "output.mp4").resolve()
+            source.write_bytes(b"source")
+
+            def probe(path: Path, *, fast_start: bool) -> dict:
+                return {
+                    "path": str(path),
+                    "kind": "video",
+                    "codec": "h264",
+                    "duration_seconds": 12.5,
+                    "sample_count": 375,
+                    "sample_bytes": 1024,
+                    "file_bytes": 1200,
+                    "fragmented": not fast_start,
+                    "fast_start": fast_start,
+                }
+
+            responses = {
+                "probe": {
+                    "schema_version": 1,
+                    "status": "completed",
+                    "result": probe(source, fast_start=False),
+                },
+                "normalize": {
+                    "schema_version": 1,
+                    "status": "completed",
+                    "result": {
+                        "source": probe(source, fast_start=False),
+                        "output": probe(destination, fast_start=True),
+                        "diagnostic": {"operation": "mp4", "backend": "pure_rust",
+                                       "outcome": "success", "compatibility_reason": "not_provisioned"},
+                    },
+                },
+            }
+            with patch(
+                "bilikara.rust_runtime._runtime_lib", FakeMediaLibrary(responses)
+            ):
+                probed = rust_runtime.probe_media(
+                    source=source, expected_kind="video"
+                )
+                normalized = rust_runtime.normalize_media(
+                    source=source,
+                    destination=destination,
+                    expected_kind="video",
+                )
+
+        self.assertEqual(probed["sample_count"], 375)
+        self.assertTrue(normalized["output"]["fast_start"])
+
+    @unittest.skipUnless(
+        os.getenv("BILIKARA_REQUIRE_RUST_LIB", "").strip().lower()
+        in {"1", "true", "yes", "on"},
+        "native Rust runtime is optional outside the release gate",
+    )
+    def test_native_runtime_downloads_through_the_real_abi(self):
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = b"native-runtime"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format, *_args):
+                return
+
+        self.assertTrue(rust_runtime.http_download_available())
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with TemporaryDirectory() as temp_dir:
+                destination = Path(temp_dir) / "track.m4s"
+                result = rust_runtime.download_to_path(
+                    urls=[f"http://127.0.0.1:{server.server_port}/track"],
+                    destination=destination,
+                )
+                self.assertEqual(destination.read_bytes(), b"native-runtime")
+                self.assertEqual(result["bytes_written"], len(b"native-runtime"))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    @unittest.skipUnless(
+        os.getenv("BILIKARA_REQUIRE_RUST_LIB", "").strip().lower()
+        in {"1", "true", "yes", "on"},
+        "native Rust runtime is optional outside the release gate",
+    )
+    def test_native_cloudflare_enqueue_accepts_before_loopback_delivery(self):
+        from bilikara import shared_catalog
+
+        received = threading.Event()
+        release_response = threading.Event()
+        responded = threading.Event()
+        gate_expired = threading.Event()
+        requests = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                requests.append((self.path, payload, self.headers.get("Authorization")))
+                received.set()
+                if not release_response.wait(timeout=10):
+                    gate_expired.set()
+                body = b'{"added": 1}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                responded.set()
+
+            def log_message(self, _format, *_args):
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            base_url = f"http://127.0.0.1:{server.server_port}"
+            empty = rust_runtime.cloudflare_service_request(
+                "enqueue_append", base_url=base_url, user_agent="bilikara-test",
+                entries=[{"bvid": "invalid", "title": "fixture"}],
+            )
+            self.assertEqual(empty, {"accepted": False, "count": 0})
+            # No adapter/library mock: this exercises the actual loaded C ABI.
+            self.assertIsInstance(rust_runtime._runtime_lib, ctypes.CDLL)
+            with patch.object(shared_catalog, "_CLOUDFLARE_API_URL", base_url):
+                accepted = shared_catalog.append_catalog_entries_in_background([
+                    {"bvid": "BV1xx411c7mD", "title": " fixture ",
+                     "mid": "", "owner_mid": "42", "owner_name": "", "author": "ignored"},
+                    {"bvid": "BV1xx411c7mD", "title": "duplicate"},
+                    {"bvid": "invalid", "title": "invalid"},
+                ])
+            self.assertIs(accepted, True)
+            self.assertTrue(received.wait(timeout=5), "Rust worker did not reach loopback")
+            self.assertFalse(gate_expired.is_set(), "caller waited for HTTP delivery")
+            self.assertFalse(responded.is_set(), "acceptance must precede fixture response")
+            self.assertEqual(requests, [("/batch-add", {"records": [{
+                "mid": "", "bvid": "BV1xx411c7mD", "title": "fixture",
+                "url": "https://www.bilibili.com/video/BV1xx411c7mD",
+                "owner_name": "", "owner_url": "",
+            }]}, None)])
+            release_response.set()
+            self.assertTrue(responded.wait(timeout=5))
+        finally:
+            release_response.set()
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    @unittest.skipUnless(
+        os.getenv("BILIKARA_REQUIRE_RUST_LIB", "").strip().lower()
+        in {"1", "true", "yes", "on"},
+        "native Rust runtime is optional outside the release gate",
+    )
+    def test_native_windows_virtual_only_network_address_uses_real_abi(self):
+        addresses = rust_runtime.detect_lan_ipv4_addresses(
+            platform_name="win32",
+            candidates=[
+                {
+                    "name": "vEthernet (WSL)",
+                    "address": "172.28.32.1",
+                    "is_up": True,
+                    "interface_type": "virtual",
+                },
+            ],
+            route_sources=["172.28.32.1"],
+        )
+        self.assertEqual(addresses, ["172.28.32.1"])
+
+    @unittest.skipUnless(
+        os.getenv("BILIKARA_REQUIRE_RUST_LIB", "").strip().lower()
+        in {"1", "true", "yes", "on"},
+        "native Rust runtime is optional outside the release gate",
+    )
+    def test_native_network_addresses_accept_interface_facts_over_real_abi(self):
+        # A generic TAP adapter selected by the route probe must not replace
+        # the phone-hotspot WLAN that owns the default gateway.
+        addresses = rust_runtime.detect_lan_ipv4_addresses(
+            platform_name="win32",
+            candidates=[
+                {
+                    "name": "以太网 2",
+                    "address": "10.8.0.2",
+                    "is_up": True,
+                    "interface_type": "ethernet",
+                    "description": "TAP-Windows Adapter V9",
+                    "hardware": False,
+                },
+                {
+                    "name": "WLAN",
+                    "address": "172.20.10.2",
+                    "is_up": True,
+                    "has_default_route": True,
+                    "interface_type": "wifi",
+                    "hardware": True,
+                    "route_metric": 35,
+                },
+                {
+                    "name": "Cellular",
+                    "address": "10.176.4.9",
+                    "is_up": True,
+                    "interface_type": "cellular",
+                },
+            ],
+            route_sources=["10.8.0.2"],
+        )
+        self.assertEqual(addresses, ["172.20.10.2"])
+        with self.assertRaises(rust_runtime.RustRuntimeServiceError):
+            rust_runtime.detect_lan_ipv4_addresses(
+                candidates=[{"name": "WLAN", "address": "172.20.10.2", "mac": "x"}],
+            )
+
+    @unittest.skipUnless(
+        os.getenv("BILIKARA_REQUIRE_RUST_LIB", "").strip().lower()
+        in {"1", "true", "yes", "on"},
+        "native Rust runtime is optional outside the release gate",
+    )
+    def test_native_network_addresses_enumerate_this_machine_over_real_abi(self):
+        addresses = rust_runtime.detect_lan_ipv4_addresses(route_sources=[])
+        self.assertIsInstance(addresses, list)
+        self.assertEqual(len(addresses), len(set(addresses)))
+        for address in addresses:
+            parsed = ipaddress.ip_address(address)
+            self.assertEqual(parsed.version, 4)
+            self.assertFalse(parsed.is_loopback or parsed.is_unspecified, address)
+
+    @unittest.skipUnless(
+        os.getenv("BILIKARA_REQUIRE_RUST_LIB", "").strip().lower()
+        in {"1", "true", "yes", "on"},
+        "native Rust runtime is optional outside the release gate",
+    )
+    def test_native_runtime_services_use_the_real_abi(self):
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = json.dumps({"ok": True, "source": "rust"}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format, *_args):
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            result = rust_runtime.json_http_request(
+                "POST",
+                f"http://127.0.0.1:{server.server_port}/json",
+                payload={"request": True},
+            )
+            addresses = rust_runtime.detect_lan_ipv4_addresses(
+                platform_name="win32",
+                candidates=[
+                    {
+                        "name": "vEthernet (WSL)",
+                        "address": "172.28.32.1",
+                        "is_up": True,
+                        "interface_type": "virtual",
+                    },
+                    {
+                        "name": "Wi-Fi",
+                        "address": "192.168.31.8",
+                        "is_up": True,
+                        "interface_type": "physical",
+                    },
+                ],
+                route_sources=["192.168.31.8"],
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        self.assertEqual(result, {"ok": True, "source": "rust"})
+        self.assertEqual(addresses, ["192.168.31.8"])
+
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            archive_path = root / "update.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("bundle/bilikara.exe", b"native update")
+            command = rust_runtime.prepare_update_install(
+                {
+                    "platform": "windows",
+                    "archive_path": str(archive_path),
+                    "extract_dir": str(root / "extracted"),
+                    "script_path": str(root / "apply.cmd"),
+                    "install_root": str(root / "installed"),
+                    "executable_name": "bilikara.exe",
+                    "launch_executable_name": "bilikara-desktop.exe",
+                    "wait_pids": [42],
+                }
+            )
+            self.assertEqual(command[:2], ["cmd", "/c"])
+            self.assertTrue((root / "extracted" / "bundle" / "bilikara.exe").is_file())
+            self.assertIn(
+                "/XD runtime data updates __pycache__",
+                (root / "apply.cmd").read_text(encoding="utf-8"),
+            )
+
+    @unittest.skipUnless(
+        os.getenv("BILIKARA_REQUIRE_RUST_LIB", "").strip().lower()
+        in {"1", "true", "yes", "on"},
+        "native Rust runtime is optional outside the release gate",
+    )
+    def test_native_status_service_owns_gatcha_lease_and_task_state(self):
+        rust_runtime.reset_gatcha_status_service()
+        try:
+            self.assertTrue(
+                rust_runtime.try_begin_gatcha_refresh(
+                    busy_message="refresh busy",
+                    task={
+                        "status": "running",
+                        "message": "refreshing",
+                        "blocking": True,
+                    },
+                )
+            )
+            self.assertFalse(
+                rust_runtime.try_begin_gatcha_refresh(busy_message="duplicate")
+            )
+            self.assertTrue(rust_runtime.gatcha_task_snapshot()["busy"])
+
+            rust_runtime.release_gatcha_refresh()
+            snapshot = rust_runtime.set_gatcha_task_status(
+                "running", message="schema rebuild", blocking=False
+            )
+            self.assertFalse(snapshot["busy"])
+            self.assertTrue(snapshot["background_busy"])
+        finally:
+            rust_runtime.reset_gatcha_status_service()
+
+    @unittest.skipUnless(
+        os.getenv("BILIKARA_REQUIRE_RUST_LIB", "").strip().lower()
+        in {"1", "true", "yes", "on"},
+        "native Rust runtime is optional outside the release gate",
+    )
+    def test_native_status_service_rejects_stale_bilibili_login_updates(self):
+        rust_runtime.reset_bilibili_login_status()
+        first_generation = rust_runtime.begin_bilibili_login(message="first")
+        current_generation = rust_runtime.begin_bilibili_login(message="second")
+
+        self.assertFalse(
+            rust_runtime.set_bilibili_login_status(
+                "failed",
+                message="stale failure",
+                generation=first_generation,
+            )
+        )
+        self.assertTrue(
+            rust_runtime.set_bilibili_login_status(
+                "waiting",
+                message="scan current code",
+                qr_image="data:image/png;base64,current",
+                generation=current_generation,
+            )
+        )
+        snapshot = rust_runtime.bilibili_login_snapshot(
+            logged_in=False,
+            data_exists=False,
+            data_path=Path("BBDown.data"),
+        )
+        self.assertEqual(snapshot["state"], "waiting")
+        self.assertEqual(snapshot["message"], "scan current code")
+        self.assertEqual(snapshot["qr_image"], "data:image/png;base64,current")
+
+
+class RustRuntimeCacheRoutingTest(unittest.TestCase):
+    def make_manager(self):
+        manager = CacheManager.__new__(CacheManager)
+        manager._append_log_line = Mock()
+        return manager
+
+    def test_native_dash_resolution_selects_hires_flac(self):
+        manager = self.make_manager()
+        manager.lock = threading.RLock()
+        manager.hevc_supported = None
+        manager.avc_quality_cap = ""
+        manager.video_quality = DEFAULT_VIDEO_QUALITY
+        manager.audio_hires = True
+        item = Mock(bvid="BV1jDVUzSEom", aid=123, cid=456)
+        flac = {
+            "url": "https://media.invalid/hires.m4s",
+            "backup_urls": [],
+            "quality_id": 30251,
+            "bandwidth": 1_882_182,
+            "codec_name": "flac",
+            "mime_type": "audio/mp4",
+        }
+        dash = {
+            "video": [{
+                "url": "https://media.invalid/video.m4s",
+                "backup_urls": [],
+                "quality_id": 80,
+                "bandwidth": 1_000_000,
+                "codec_name": "avc",
+            }],
+            "audio": [{
+                "url": "https://media.invalid/audio.m4s",
+                "backup_urls": [],
+                "quality_id": 30280,
+                "bandwidth": 198_226,
+                "mime_type": "audio/mp4",
+            }],
+            "flac": flac,
+            "dolby": None,
+        }
+
+        with patch(
+            "bilikara.cache.effective_bilibili_cookie",
+            return_value="SESSDATA=test",
+        ), patch(
+            "bilikara.cache.rust_runtime.fetch_bilibili_dash_playurl",
+            return_value=dash,
+        ), patch.object(
+            manager,
+            "_select_dash_video_stream",
+            return_value=dash["video"][0],
+        ), patch.object(
+            manager,
+            "_select_dash_audio_stream",
+            return_value=dash["audio"][0],
+        ):
+            resolved = manager._resolve_dash_streams(item, native_media=True)
+
+        self.assertEqual(resolved["audio"][0]["quality_id"], 30251)
+        self.assertEqual(resolved["audio"][0]["codec_name"], "flac")
+
+    def test_native_download_publishes_selected_hires_as_flac(self):
+        manager = self.make_manager()
+        manager.stop_event = threading.Event()
+        manager._selected_pages_for_item = Mock(return_value=[1])
+        manager._cid_for_page = Mock(return_value=456)
+        manager._dash_stream_urls = Mock(return_value=["https://media.invalid/video.m4s"])
+        manager._preferred_audio_urls = Mock(return_value=["https://media.invalid/hires.m4s"])
+        manager._raise_if_retry_requested = Mock()
+        manager._raise_if_priority_shift = Mock()
+        manager._reset_download_track_progress = Mock()
+        manager._set_download_track_phase = Mock()
+        manager._update_download_track_progress = Mock()
+        manager._duration_for_page = Mock(return_value=120)
+        flac = {
+            "url": "https://media.invalid/hires.m4s",
+            "backup_urls": [],
+            "quality_id": 30251,
+            "bandwidth": 1_882_182,
+            "codec_name": "flac",
+            "mime_type": "audio/mp4",
+        }
+        manager._resolve_dash_streams = Mock(
+            return_value={"video": [], "audio": [flac], "flac": None, "dolby": None}
+        )
+
+        def download_track(_item_id, target_dir, _log_path, **kwargs):
+            target_dir.mkdir(parents=True, exist_ok=True)
+            output = target_dir / kwargs["out_name"]
+            output.write_bytes(b"raw")
+            return output
+
+        def normalize_track(*, source, destination, expected_kind):
+            destination.write_bytes(source.read_bytes())
+            return {
+                "source": {},
+                "output": {
+                    "path": str(destination),
+                    "kind": expected_kind,
+                    "codec": "flac" if destination.suffix == ".flac" else "h264",
+                    "duration_seconds": 120.0,
+                    "sample_count": 1,
+                    "sample_bytes": 3,
+                    "file_bytes": 3,
+                    "fragmented": False,
+                    "fast_start": True,
+                },
+            }
+
+        manager._download_stream_with_rust = Mock(side_effect=download_track)
+        item = Mock(id="song-hires", video_page=1)
+        video_track = {"key": "video-p1", "page": 1, "label": "video"}
+        audio_track = {"key": "audio-p1", "page": 1, "label": "audio"}
+        dash = {
+            "video": [{
+                "url": "https://media.invalid/video.m4s",
+                "backup_urls": [],
+                "codec_name": "avc",
+            }],
+            "audio": [],
+        }
+
+        with TemporaryDirectory() as temp_dir, patch(
+            "bilikara.cache.effective_bilibili_cookie",
+            return_value="SESSDATA=test",
+        ), patch(
+            "bilikara.cache.rust_runtime.normalize_media",
+            side_effect=normalize_track,
+        ):
+            paths = manager._download_dash_streams_native(
+                item,
+                Path(temp_dir),
+                Path(temp_dir) / "native.log",
+                dash_streams=dash,
+                video_track=video_track,
+                audio_tracks=[audio_track],
+                cache_attempt_token=1,
+            )
+
+        self.assertEqual(paths["audio-p1"].suffix, ".flac")
+        self.assertEqual(audio_track["stream_metadata"]["quality_id"], 30251)
+
+    def test_native_download_log_includes_transport_and_throughput(self):
+        manager = self.make_manager()
+        manager._update_download_track_progress = Mock()
+
+        def complete_download(**kwargs):
+            destination = kwargs["destination"]
+            destination.write_bytes(b"download")
+            return {
+                "bytes_written": 8,
+                "candidate_index": 0,
+                "segments_used": 10,
+                "workers_used": 10,
+                "host_rewritten": True,
+                "transport": "http",
+                "final_host": "upos-sz-mirrorcoso1.bilivideo.com",
+                "elapsed_ms": 2500,
+                "average_bytes_per_second": 19_902_445,
+            }
+
+        with TemporaryDirectory() as temp_dir, patch(
+            "bilikara.cache.rust_runtime.download_to_path",
+            side_effect=complete_download,
+        ):
+            manager._download_stream_with_rust(
+                "song-a",
+                Path(temp_dir) / "video-p1",
+                Path(temp_dir) / "download.log",
+                urls=["https://media.invalid"],
+                out_name="video-p1.mp4",
+                cookie="",
+                stage_label="download",
+                track_key="video-p1",
+                cache_attempt_token=1,
+                stream_kind="video",
+            )
+
+        log_line = manager._append_log_line.call_args_list[-1].args[1]
+        diagnostic = json.loads(log_line.split("media_diagnostic: ", 1)[1])
+        self.assertEqual(diagnostic["transport"], "http")
+        self.assertEqual(diagnostic["workers_used"], 10)
+        self.assertEqual(diagnostic["elapsed_ms"], 2500)
+        self.assertEqual(diagnostic["average_bytes_per_second"], 19_902_445)
+        self.assertEqual(
+            diagnostic["final_host"],
+            "upos-sz-mirrorcoso1.bilivideo.com",
+        )
+
+    def test_native_selected_stream_path_never_calls_legacy_downloader(self):
+        with TemporaryDirectory() as temp_dir, patch(
+            "bilikara.cache.CACHE_DIR", Path(temp_dir)
+        ):
+            cache_dir = Path(temp_dir)
+            item_dir = cache_dir / "song-a"
+            video_path = item_dir / "video-p1" / "video-p1.mp4"
+            audio_path = item_dir / "audio-p1" / "audio-p1.m4a"
+            video_path.parent.mkdir(parents=True)
+            audio_path.parent.mkdir(parents=True)
+            video_path.write_bytes(b"video")
+            audio_path.write_bytes(b"audio")
+
+            manager = self.make_manager()
+            manager.store = Mock()
+            manager._raise_if_priority_shift = Mock()
+            manager._raise_if_retry_requested = Mock()
+            manager._selected_pages_for_item = Mock(return_value=[1])
+            manager._begin_download_progress = Mock()
+            manager._record_item_activity = Mock()
+            manager._part_label_for_page = Mock(return_value="P1")
+            manager._cid_for_validation = Mock(return_value=123)
+            manager._duration_for_page = Mock(return_value=12)
+            manager._resolve_dash_streams = Mock(
+                return_value={"video": [{"codec_name": "avc"}], "audio": [{}]}
+            )
+            manager._download_page_stream = Mock()
+
+            def native_download(*_args, video_track, audio_tracks, **_kwargs):
+                video_track["validation_metadata"] = {"kind": "video"}
+                audio_tracks[0]["validation_metadata"] = {"kind": "audio"}
+                return {
+                    str(video_track["key"]): video_path,
+                    str(audio_tracks[0]["key"]): audio_path,
+                }
+
+            manager._download_dash_streams_native = Mock(
+                side_effect=native_download
+            )
+            item = Mock(
+                id="song-a",
+                video_page=1,
+                selected_audio_variant_id="",
+            )
+
+            result = manager._download_selected_streams(
+                item,
+                Path(),
+                Path(),
+                item_dir,
+                cache_dir / "native.log",
+                cache_attempt_token=1,
+                download_source="native",
+            )
+
+        manager._download_dash_streams_native.assert_called_once()
+        manager._download_page_stream.assert_not_called()
+        self.assertTrue(result["native_tracks_prevalidated"])
+        self.assertEqual(len(result["validation_metadata"]), 2)
+
+
+# Only live Python source-adapter failure guards remain here. The actual image,
+# QR, encoding and HTTP contracts execute in native_images / Node suites.
+class SourceImageAdapterGuardTest(unittest.TestCase):
+    def source_qr_status(self, payload):
+        from types import SimpleNamespace
+        from bilikara import server
+        handler = server.BilikaraHandler.__new__(server.BilikaraHandler)
+        handler.path = "/api/internet-remote/qr"
+        handler.headers = {}
+        handler.client_address = ("127.0.0.1", 12345)
+        handler.connection = SimpleNamespace(getsockname=lambda: ("127.0.0.1", 6764))
+        handler._read_json_body = lambda: {"url": payload}
+        writes = []
+        handler._write_json = lambda body, status=200: writes.append((status, body))
+        with patch.object(server, "CONTEXT", SimpleNamespace(touch_client=Mock())):
+            handler.do_POST()
+        self.assertEqual(len(writes), 1)
+        return writes[0][0]
+
+    def test_native_unavailable_and_failed_never_fall_back(self):
+        # Python qrcode cannot be imported even if installed in a developer env.
+        with patch.dict("sys.modules", {"qrcode": None}):
+            with patch.object(rust_runtime, "_runtime_lib", None):
+                with self.assertRaises(rust_runtime.RustRuntimeUnavailableError):
+                    rust_runtime.generate_qr_image("https://passport.bilibili.com/synthetic-login?token=SYNTHETIC-ONLY", border=4)
+                self.assertEqual(self.source_qr_status("https://rtc.kevinx96.icu/remote.html#synthetic"), 500)
+            with patch.object(rust_runtime, "_call_runtime_service", side_effect=rust_runtime.RustRuntimeServiceError(
+                "encoding_failed", "QR image encoding failed", response={}
+            )):
+                with self.assertRaises(rust_runtime.RustRuntimeServiceError):
+                    rust_runtime.generate_qr_image("https://passport.bilibili.com/synthetic-login?token=SYNTHETIC-ONLY", border=4)
+                self.assertEqual(self.source_qr_status("https://rtc.kevinx96.icu/remote.html#synthetic"), 500)
+
+    def test_malformed_native_images_are_rejected_before_consumption(self):
+        for encoded in [None, "", "not base64", base64.b64encode(b"\x89PNG\r\n\x1a\n").decode()]:
+            with patch.object(rust_runtime, "_call_runtime_service", return_value={"png_base64": encoded}):
+                with self.assertRaises(rust_runtime.RustRuntimeServiceError) as caught:
+                    rust_runtime.generate_qr_image("https://passport.bilibili.com/synthetic-login?token=SYNTHETIC-ONLY", border=4)
+                self.assertEqual(caught.exception.kind, "invalid_response")
+
+    def test_malformed_login_response_is_rejected_by_live_source_adapter(self):
+        for command, result in (
+            ("start", {}), ("start", {"generation": True}),
+            ("read_cookie", []), ("read_cookie", {"cookie": None}),
+            ("take_success", {"notify": "true"}),
+            ("run", {"diagnostics": [{"cookie": "synthetic-private"}]}),
+            ("download_access", {}), ("download_access", {"message": False}),
+            ("download_access", {"message": []}),
+        ):
+            with self.subTest(command=command), patch.object(rust_runtime, "_call_runtime_service", return_value=result):
+                with self.assertRaises(rust_runtime.RustStatusServiceError):
+                    rust_runtime.desktop_login(command, generation=1)
+
+    def test_invalid_export_artifact_is_rejected_by_live_source_adapter(self):
+        from bilikara import playlist_export
+        for artifact in [{}, {"data_base64": "@@", "mime_type": "image/png", "filename": "bad.png", "missing_glyphs": []},
+                         {"data_base64": base64.b64encode(b"\x89PNG\r\n\x1a\n").decode(), "mime_type": "image/png", "filename": "bilikara-playlist.png", "missing_glyphs": []}]:
+            with patch.object(rust_runtime, "_call_runtime_service", return_value=artifact):
+                with self.assertRaises(rust_runtime.RustRuntimeServiceError):
+                    playlist_export.playlist_image_export([])

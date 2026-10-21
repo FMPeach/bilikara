@@ -1,4 +1,16 @@
 const audioVariantSwitchDebounceMs = 350;
+let playbackRestartMenu = null;
+let playbackSheetGesture = null;
+// Modal autofocus can inherit :focus-visible from an input or keyboard action.
+// Track explicit pointer use without blurring controls or disrupting focus traps.
+document.addEventListener("pointerdown", () => {
+  document.documentElement.dataset.remoteInputModality = "pointer";
+}, true);
+document.addEventListener("keydown", (event) => {
+  if (!event.altKey && !event.ctrlKey && !event.metaKey) {
+    document.documentElement.dataset.remoteInputModality = "keyboard";
+  }
+}, true);
 const playerSettingsEchoSuppressMs = 1800;
 const remoteVolumeCommitDebounceMs = 160;
 const avDelayRequestTimeoutMs = 8000;
@@ -6,15 +18,17 @@ const viewportScaleResetDelaysMs = [0, 120, 360];
 const eventStreamInitialRetryMs = 1000;
 const eventStreamMaxRetryMs = 15000;
 const eventStreamRetryJitterRatio = 0.2;
-const larkSearchTableCount = 5;
+const stateFallbackRefreshMs = 1000;
+const nativeEventStreamDeadlineMs = 12000;
+const remoteConnectionOfflineGraceMs = 3000;
 const expandedSearchEagerCoverCount = 6;
-const d1BrowseItemLimit = 450;
+const d1BrowseItemLimit = 18; // Six visible cards plus at most two pages ahead.
 const d1BrowseTagLimit = 450;
 const d1BrowseLetters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ#".split("");
-const categoryBrowsePageSize = 100;
+const browsePageSize = 100;
 const searchResultItemByElement = new WeakMap();
+const remoteResultPagers = new WeakMap();
 let searchDetailController = null;
-let searchModalCloseTimer = 0;
 const categoryBrowseDefinitionsRaw = [
   { key: "hotBlood", tags: ["热血", "战斗"] },
   { key: "fantasy", tags: ["奇幻", "冒险", "魔法", "科幻"] },
@@ -121,35 +135,35 @@ const categoryBrowseFullFieldTags = new Set([
   "FAIRY TAIL",
 ].map(categoryBrowseTagKey));
 const categoryBrowseImageUrls = [
-  "/pic/cat_1.png",
-  "/pic/cat_2.png",
-  "/pic/cat_3.png",
-  "/pic/cat_4.png",
-  "/pic/cat_5.png",
-  "/pic/cat_6.png",
+  "/pic/cat_1.jpg",
+  "/pic/cat_2.jpg",
+  "/pic/cat_3.jpg",
+  "/pic/cat_4.jpg",
+  "/pic/cat_5.jpg",
+  "/pic/cat_6.jpg",
   "/pic/cat_7.jpg",
   "/pic/cat_8.jpg",
-  "/pic/cat_9.png",
+  "/pic/cat_9.jpg",
   "/pic/cat_10.jpg",
   "/pic/cat_11.jpg",
   "/pic/cat_12.jpg",
   "/pic/cat_13.jpg",
-  "/pic/cat_14.png",
-  "/pic/cat_15.png",
+  "/pic/cat_14.jpg",
+  "/pic/cat_15.jpg",
   "/pic/cat_16.jpg",
   "/pic/cat_17.jpg",
   "/pic/cat_18.jpg",
   "/pic/cat_19.jpg",
   "/pic/cat_20.jpg",
-  "/pic/cat_21.png",
+  "/pic/cat_21.jpg",
   "/pic/cat_22.jpg",
   "/pic/cat_23.jpg",
   "/pic/cat_24.jpg",
-  "/pic/cat_25.png",
-  "/pic/cat_26.png",
+  "/pic/cat_25.jpg",
+  "/pic/cat_26.jpg",
   "/pic/cat_27.jpg",
   "/pic/cat_28.jpg",
-  "/pic/cat_29.png",
+  "/pic/cat_29.jpg",
   "/pic/cat_30.jpg",
   "/pic/cat_31.jpg",
   "/pic/cat_32.jpg",
@@ -159,15 +173,13 @@ const categoryBrowseImageUrls = [
   "/pic/cat_36.jpg",
   "/pic/cat_37.jpg",
   "/pic/cat_38.jpg",
-  "/pic/cat_39.webp",
-  "/pic/cat_40.png",
+  "/pic/cat_39.jpg",
+  "/pic/cat_40.jpg",
 ];
-const playerControlStatusRefreshDelaysMs = [180, 520, 1100, 1800];
 const playerControlStatusSyncTimeoutMs = 3200;
 const remoteRatingPromptThreshold = 0.5;
 const storageKeys = {
   language: "bilikara.ui.language",
-  layoutMode: "bilikara.remote.layout.mode",
   theme: "bilikara.ui.theme",
 };
 
@@ -194,6 +206,22 @@ const state = {
   playerControlPendingAction: "",
   playerControlStatusSync: null,
   playerControlStatusRefreshTimers: [],
+  playbackSheetSeekScrubbing: false,
+  playbackMetadataIdentity: "",
+  playbackMetadataLayoutSignature: "",
+  playbackMetadataLayoutPendingSignature: "",
+  playbackMetadataLayoutFrame: null,
+  playbackMetadataLayoutViewportChange: false,
+  playbackMetadataLayoutInteractionEnded: false,
+  playbackMetadataLayoutDeferred: false,
+  playbackMetadataLayoutRunCount: 0,
+  playbackMetadataLayoutEvidence: null,
+  playbackMetadataPopoverField: "",
+  playbackMetadataPopoverAnchor: null,
+  playbackDockMarqueeFrame: null,
+  playbackDockMarqueeEvidence: null,
+  autoRefreshTimer: null,
+  stateFallbackFetchInFlight: false,
   audioVariantSwitchInFlight: false,
   audioVariantSwitchUnlockAt: 0,
   audioVariantSwitchTimer: null,
@@ -208,6 +236,7 @@ const state = {
   remoteKeyShiftSaveSeq: 0,
   audioVariantBarExpanded: false,
   audioVariantBarItemId: "",
+  audioVariantBarRenderSignature: "",
   bindingSheetOpen: false,
   bindingIntent: null,
   gatchaFavlistSheetOpen: false,
@@ -223,52 +252,53 @@ const state = {
     audio: false,
   },
   eventSource: null,
+  eventStreamHealthy: false,
   eventStreamReconnectTimer: null,
   eventStreamRetryMs: eventStreamInitialRetryMs,
   gatchaCandidate: null,
-  gatchaUidVisible: false,
+  gatchaDrawBusy: false,
   gatchaUidSaving: false,
   gatchaRefreshSaving: false,
   gatchaFavlistSaving: false,
-  gatchaTaskLastMessageSignature: "",
-  gatchaTaskWatchStartedAt: Date.now() / 1000,
-  followBrowseVisible: false,
-  larkSearchVisible: true,
-  larkSearchLoading: false,
-  larkSearchSeq: 0,
-  searchModalOpen: false,
-  searchModalView: "search",
-  searchModalLarkLoading: false,
-  searchModalLarkSeq: 0,
-  remoteSearchStageView: "",
-  remoteSearchStageAngle: 0,
-  remoteSearchFlipTimer: null,
-  remoteSearchFlipFrame: null,
-  remoteSearchPruneTimer: null,
-  gatchaStageView: "",
-  gatchaStageAngle: 0,
-  gatchaFlipTimer: null,
-  gatchaFlipFrame: null,
-  gatchaPruneTimer: null,
-  gatchaMidpointCallback: null,
+  remoteRequestView: "quick",
+  remoteRequestTabsExpanded: false,
+  remoteSearchMode: "shared",
+  remoteDiscoverMode: "categories",
+  remoteSourcesMode: "uids",
+  remoteMenuOpen: false,
+  remoteQrSectionOpen: false,
+  remoteSettingsSectionOpen: false,
+  remoteConnectionPhase: "connecting",
+  remoteConnectionOfflineTimer: null,
+  remoteConnectionFailureStartedAt: null,
+  remoteIssueSignatures: new Set(),
   followBrowseData: null,
   followBrowseSelectedUid: "",
   followBrowseLoading: false,
-  followBrowseRenderSignature: "",
-  modalFollowBrowseRenderSignature: "",
+  followBrowseSeq: 0,
+  followBrowseError: "",
+  sourcesFollowBrowseRenderSignature: "",
   favlistBrowseData: null,
   favlistBrowseSelectedFolderId: "",
   favlistBrowseLoading: false,
+  favlistBrowseSeq: 0,
+  favlistBrowseError: "",
   favlistBrowseRenderSignature: "",
   favlistBrowseReloadTimer: null,
-  d1BrowseKind: "",
-  d1BrowseLetter: "",
-  d1BrowseTag: "",
-  d1BrowseLocale: "",
-  d1BrowseQuery: "",
-  d1BrowseData: null,
-  d1BrowseLoading: false,
-  d1BrowseSeq: 0,
+  d1BrowseModes: {
+    name: { letter: "", tag: "", locale: "", query: "", data: null, loading: false, seq: 0, error: "" },
+    artist: { letter: "", tag: "", locale: "", query: "", data: null, loading: false, seq: 0, error: "" },
+  },
+  requestDetailSelections: {
+    shared: { selectedKey: "", focusElement: null },
+    local: { selectedKey: "", focusElement: null },
+    categories: { selectedKey: "", focusElement: null },
+    name: { selectedKey: "", focusElement: null },
+    artist: { selectedKey: "", focusElement: null },
+    uids: { selectedKey: "", focusElement: null },
+    favorites: { selectedKey: "", focusElement: null },
+  },
+  activeRequestDetailOwner: "",
   categoryBrowseSelectedId: "",
   categoryBrowseQuery: "",
   categoryBrowseItems: [],
@@ -284,6 +314,7 @@ const state = {
   },
   remoteIdentityChecking: true,
   remoteIdentitySaving: false,
+  remoteSessionReentering: false,
   remoteIdentityModalMode: "register",
   remoteIdentityError: "",
   dataRenderSignature: "",
@@ -294,6 +325,10 @@ const state = {
   currentPlaybackClockStartedAt: 0,
   currentPlaybackClockPaused: true,
   currentPlaybackClockTimer: null,
+  playbackSheetOpen: false,
+  playbackSheetCloseTimer: null,
+  playbackSheetTransitionSequence: 0,
+  playbackSheetScrollLock: null,
   ratingPromptElement: null,
   ratingPromptItem: null,
   ratingPromptItems: null,
@@ -302,8 +337,14 @@ const state = {
   ratingPromptBvid: "",
   ratingPromptScore: 5,
   ratingPromptSubmitted: false,
+  ratingPromptPreviousFocus: null,
+  ratingPromptReturnFocusToDock: false,
   ratingPromptSeenPlayIds: new Set(),
   ratingSubmittedKeys: new Set(),
+  ratingPendingKeys: new Set(),
+  ratingQueuedKeys: new Set(),
+  ratingSavedScores: new Map(),
+  ratingPromptScoreDirty: false,
   ratingOptOut: false,
   // Deferred auto-ratings: items that crossed the play threshold but whose
   // auto score=5 has not been submitted yet. The auto-rating fires TWO songs
@@ -322,8 +363,6 @@ const state = {
   listHeaderRenderSignature: "",
   queueRenderSignature: "",
   historyRenderSignature: "",
-  layoutMode: "full",
-  displaySettingsOpen: false,
   remoteAccessRenderSignature: "",
   viewportScaleResetTimers: [],
   renderDebounceTimer: null,
@@ -335,17 +374,17 @@ const elements = {
   remoteShell: document.getElementById("remote-shell"),
   languageSwitch: document.getElementById("language-switch"),
   themeSwitch: document.getElementById("theme-switch"),
-  displaySettingsToggle: document.getElementById("display-settings-toggle"),
-  displaySettingsPanel: document.getElementById("display-settings-popover"),
-  displayLayoutSummary: document.getElementById("remote-layout-summary"),
-  displayPopoverClose: document.getElementById("display-popover-close"),
-  layoutModeSwitch: document.getElementById("layout-mode-switch"),
-  remoteQrControl: document.getElementById("remote-qr-control"),
+  remoteMenuToggle: document.getElementById("remote-menu-toggle"),
+  remoteMenuPanel: document.getElementById("remote-menu-panel"),
+  remoteConnectionIndicator: document.getElementById("remote-connection-indicator"),
+  remoteConnectionStatusIndicator: document.getElementById("remote-connection-status-indicator"),
+  remoteConnectionStatusTrigger: document.getElementById("remote-connection-status-trigger"),
+  remoteConnectionStatusValue: document.getElementById("remote-connection-status-value"),
+  remoteConnectionStatusText: document.getElementById("remote-connection-status-text"),
   remoteQrToggle: document.getElementById("remote-qr-toggle"),
-  remoteMiniQrImage: document.getElementById("remote-mini-qr-image"),
-  remoteMiniQrPlaceholder: document.getElementById("remote-mini-qr-placeholder"),
-  remoteQrPopover: document.getElementById("remote-qr-popover"),
-  remoteQrPopoverClose: document.getElementById("remote-qr-popover-close"),
+  remoteQrContent: document.getElementById("remote-qr-content"),
+  remoteSettingsToggle: document.getElementById("remote-settings-toggle"),
+  remoteSettingsContent: document.getElementById("remote-settings-content"),
   remotePopoverQrImage: document.getElementById("remote-popover-qr-image"),
   remotePopoverQrPlaceholder: document.getElementById("remote-popover-qr-placeholder"),
   remotePopoverUrlLink: document.getElementById("remote-popover-url-link"),
@@ -353,13 +392,37 @@ const elements = {
   currentTitle: document.getElementById("current-title"),
   currentRequester: document.getElementById("current-requester"),
   currentOwner: document.getElementById("current-owner"),
+  playbackMetadataFields: [...document.querySelectorAll("[data-playback-metadata-field]")],
+  playbackSheetSummary: document.querySelector(".playback-sheet-summary"),
+  playbackSheetSummaryCopy: document.querySelector(".playback-sheet-summary-copy"),
+  playbackSheetPrimary: document.querySelector(".playback-sheet-primary"),
+  playbackSheetSecondary: document.querySelector(".playback-sheet-secondary"),
+  playbackSheetPlaybackGroup: document.querySelector(".playback-sheet-playback-group"),
+  playbackMetadataPopover: document.getElementById("playback-metadata-popover"),
+  playbackMetadataPopoverText: document.getElementById("playback-metadata-popover-text"),
   currentCacheState: document.getElementById("current-cache-state"),
   currentMeta: document.getElementById("current-meta"),
-  currentRatingButton: document.getElementById("current-rating-button"),
   audioVariantBar: document.getElementById("audio-variant-bar"),
+  audioVariantPopover: document.getElementById("audio-variant-popover"),
   playerControlPanel: document.getElementById("player-control-panel"),
-  floatingPlayerControlPanel: document.getElementById("floating-player-control-panel"),
-  playerControlHint: document.getElementById("player-control-hint"),
+  playbackDock: document.getElementById("playback-dock"),
+  playbackDockCoverImage: document.getElementById("playback-dock-cover-image"),
+  playbackDockTitle: document.getElementById("playback-dock-title"),
+  playbackDockTitleText: document.querySelector("#playback-dock-title .playback-dock-marquee-text"),
+  playbackDockRequester: document.getElementById("playback-dock-requester"),
+  playbackDockRequesterText: document.querySelector("#playback-dock-requester .playback-dock-marquee-text"),
+  playbackDockClock: document.getElementById("playback-dock-clock"),
+  playbackDockProgress: document.getElementById("playback-dock-progress"),
+  playbackSheet: document.getElementById("playback-sheet"),
+  playbackSheetBackdrop: document.getElementById("playback-sheet-backdrop"),
+  playbackSheetPanel: document.getElementById("playback-sheet-panel"),
+  playbackSheetCollapse: document.getElementById("playback-sheet-collapse"),
+  playbackSheetBody: document.getElementById("playback-sheet-body"),
+  playbackSheetCoverImage: document.getElementById("playback-sheet-cover-image"),
+  playbackSheetClock: document.getElementById("playback-sheet-clock"),
+  playbackSheetCurrentTime: document.getElementById("playback-sheet-current-time"),
+  playbackSheetDuration: document.getElementById("playback-sheet-duration"),
+  playbackSheetSeek: document.getElementById("playback-sheet-seek"),
   remoteAvSyncPanel: document.getElementById("remote-av-sync-panel"),
   remoteAvOffsetInput: document.getElementById("remote-av-offset-input"),
   remoteAvOffsetResetButton: document.getElementById("remote-av-offset-reset-button"),
@@ -373,14 +436,8 @@ const elements = {
   remoteKeyShiftDecButton: document.getElementById("remote-key-shift-dec-button"),
   remoteKeyShiftInput: document.getElementById("remote-key-shift-input"),
   remoteKeyShiftIncButton: document.getElementById("remote-key-shift-inc-button"),
-  floatingControlTrigger: document.getElementById("floating-control-trigger"),
-  floatingControlOverlay: document.getElementById("floating-control-overlay"),
-  floatingControlBackdrop: document.getElementById("floating-control-backdrop"),
-  floatingControlCard: document.getElementById("floating-control-card"),
-  floatingControlClose: document.getElementById("floating-control-close"),
   bindingSheet: document.getElementById("binding-sheet"),
   bindingSheetBackdrop: document.getElementById("binding-sheet-backdrop"),
-  bindingSheetText: document.getElementById("binding-sheet-text"),
   bindingVideoToggle: document.getElementById("binding-video-toggle"),
   bindingAudioToggle: document.getElementById("binding-audio-toggle"),
   bindingSheetVideoOptionsWrap: document.getElementById("binding-sheet-video-options-wrap"),
@@ -411,47 +468,50 @@ const elements = {
   poolConfigUidSelectNone: document.getElementById("gatcha-pool-uid-select-none"),
   poolConfigFavlistSelectAll: document.getElementById("gatcha-pool-favlist-select-all"),
   poolConfigFavlistSelectNone: document.getElementById("gatcha-pool-favlist-select-none"),
-  poolConfigMessage: document.getElementById("gatcha-pool-config-message"),
   reorderConfirmSheet: document.getElementById("reorder-confirm-sheet"),
   reorderConfirmSheetBackdrop: document.getElementById("reorder-confirm-sheet-backdrop"),
   reorderConfirmSheetText: document.getElementById("reorder-confirm-sheet-text"),
   reorderConfirmSheetClose: document.getElementById("reorder-confirm-sheet-close"),
   reorderConfirmSheetCancel: document.getElementById("reorder-confirm-sheet-cancel"),
   reorderConfirmSheetConfirm: document.getElementById("reorder-confirm-sheet-confirm"),
+  requestPanel: document.querySelector(".request-panel"),
   requestForm: document.getElementById("request-form"),
+  remoteRequestPrimaryTabs: document.getElementById("remote-request-primary-tabs"),
+  remoteRequestSecondaryNav: document.getElementById("remote-request-secondary-nav"),
+  remoteRequestSecondaryBack: document.getElementById("remote-request-secondary-back"),
+  remoteRequestSecondarySlot: document.getElementById("remote-request-secondary-slot"),
+  remoteSearchToolbar: document.getElementById("remote-search-toolbar"),
+  remoteDiscoverToolbar: document.getElementById("remote-discover-toolbar"),
+  remoteSourcesToolbar: document.getElementById("remote-sources-toolbar"),
+  remoteRequestViewButtons: document.querySelectorAll("[data-remote-request-view]"),
+  remoteRequestViewPanels: document.querySelectorAll("[data-remote-request-panel]"),
+  remoteSearchModeButtons: document.querySelectorAll("[data-remote-search-mode]"),
+  remoteSearchModePanels: document.querySelectorAll("[data-remote-search-panel]"),
+  remoteDiscoverModeButtons: document.querySelectorAll("[data-remote-discover-mode]"),
+  remoteDiscoverModePanels: document.querySelectorAll("[data-remote-discover-panel]"),
+  remoteRequestDiscoverPanel: document.getElementById("remote-request-discover-panel"),
+  remoteDiscoverCategoriesPanel: document.getElementById("remote-discover-categories-panel"),
+  remoteDiscoverNamePanel: document.getElementById("remote-discover-name-panel"),
+  remoteDiscoverArtistPanel: document.getElementById("remote-discover-artist-panel"),
+  remoteSourcesModeButtons: document.querySelectorAll("[data-remote-sources-mode]"),
+  remoteSourcesModePanels: document.querySelectorAll("[data-remote-sources-panel]"),
+  remoteRequestSourcesPanel: document.getElementById("remote-request-sources-panel"),
   remoteIdentityName: document.getElementById("remote-identity-name"),
   remoteIdentityRename: document.getElementById("remote-identity-rename"),
   remoteIdentityModal: document.getElementById("remote-identity-modal"),
+  remoteIdentityBackdrop: document.getElementById("remote-identity-backdrop"),
   remoteIdentityForm: document.getElementById("remote-identity-form"),
   remoteIdentityTitle: document.getElementById("remote-identity-title"),
   remoteIdentityDescription: document.getElementById("remote-identity-description"),
   remoteIdentityInput: document.getElementById("remote-identity-input"),
-  remoteIdentityMessage: document.getElementById("remote-identity-message"),
   remoteIdentityCancel: document.getElementById("remote-identity-cancel"),
   remoteIdentitySubmit: document.getElementById("remote-identity-submit"),
   urlInput: document.getElementById("url-input"),
-  formMessage: document.getElementById("form-message"),
   searchForm: document.getElementById("search-form"),
   searchQuery: document.getElementById("search-query"),
   searchButton: document.getElementById("search-button"),
   searchMessage: document.getElementById("search-message"),
   searchResults: document.getElementById("search-results"),
-  remoteSearchStage: document.getElementById("remote-search-stage"),
-  remoteSearchStageInner: document.getElementById("remote-search-stage-inner"),
-  searchTag: document.querySelector(".search-panel .panel-tag"),
-  searchTitle: document.querySelector(".search-panel .panel-title"),
-  searchLibraryOpen: document.getElementById("search-library-open"),
-  searchModal: document.getElementById("search-modal"),
-  searchModalBackdrop: document.getElementById("search-modal-backdrop"),
-  searchModalClose: document.getElementById("search-modal-close"),
-  searchModalTabs: document.querySelectorAll(".remote-search-modal-tab"),
-  searchModalSearchView: document.getElementById("search-modal-search-view"),
-  searchModalLarkForm: document.getElementById("search-modal-lark-form"),
-  searchModalLarkQuery: document.getElementById("search-modal-lark-query"),
-  searchModalLarkButton: document.getElementById("search-modal-lark-button"),
-  searchModalLarkMessage: document.getElementById("search-modal-lark-message"),
-  searchModalLarkResults: document.getElementById("search-modal-lark-results"),
-  favlistBrowserView: document.getElementById("favlist-browser-view"),
   favlistListView: document.getElementById("favlist-list-view"),
   favlistGrid: document.getElementById("favlist-grid"),
   favlistItemsView: document.getElementById("favlist-items-view"),
@@ -464,74 +524,52 @@ const elements = {
   favlistSearchButton: document.getElementById("favlist-search-button"),
   favlistSongResults: document.getElementById("favlist-song-results"),
   favlistBrowseMessage: document.getElementById("favlist-browse-message"),
-  modalFollowBrowserView: document.getElementById("modal-follow-browser-view"),
-  modalFollowUpListView: document.getElementById("modal-follow-up-list-view"),
-  modalFollowUidForm: document.getElementById("modal-follow-uid-form"),
-  modalFollowUidInput: document.getElementById("modal-follow-uid-input"),
-  modalAddFollowUidButton: document.getElementById("modal-add-follow-uid-button"),
-  modalFollowUpGrid: document.getElementById("modal-follow-up-grid"),
-  modalFollowUpItemsView: document.getElementById("modal-follow-up-items-view"),
-  modalFollowBrowseBack: document.getElementById("modal-follow-browse-back"),
-  modalFollowBrowseAvatar: document.getElementById("modal-follow-browse-avatar"),
-  modalFollowBrowseTitle: document.getElementById("modal-follow-browse-title"),
-  modalFollowBrowseCount: document.getElementById("modal-follow-browse-count"),
-  modalFollowSearchForm: document.getElementById("modal-follow-search-form"),
-  modalFollowSearchQuery: document.getElementById("modal-follow-search-query"),
-  modalFollowSearchButton: document.getElementById("modal-follow-search-button"),
-  modalFollowSongResults: document.getElementById("modal-follow-song-results"),
-  modalFollowBrowseMessage: document.getElementById("modal-follow-browse-message"),
-  modalFavlistPullForm: document.getElementById("modal-favlist-pull-form"),
-  modalFavlistUidInput: document.getElementById("modal-favlist-uid-input"),
-  modalPullFavlistButton: document.getElementById("modal-pull-favlist-button"),
-  searchModalOtherView: document.getElementById("search-modal-other-view"),
-  larkSearchToggle: document.getElementById("lark-search-toggle"),
-  larkSearchView: document.getElementById("lark-search-view"),
+  sourcesFollowListView: document.getElementById("sources-follow-list-view"),
+  sourcesFollowUidForm: document.getElementById("sources-follow-uid-form"),
+  sourcesFollowUidInput: document.getElementById("sources-follow-uid-input"),
+  sourcesAddFollowUidButton: document.getElementById("sources-add-follow-uid-button"),
+  sourcesFollowGrid: document.getElementById("sources-follow-grid"),
+  sourcesFollowItemsView: document.getElementById("sources-follow-items-view"),
+  sourcesFollowBack: document.getElementById("sources-follow-back"),
+  sourcesFollowAvatar: document.getElementById("sources-follow-avatar"),
+  sourcesFollowTitle: document.getElementById("sources-follow-title"),
+  sourcesFollowCount: document.getElementById("sources-follow-count"),
+  sourcesFollowSearchForm: document.getElementById("sources-follow-search-form"),
+  sourcesFollowSearchQuery: document.getElementById("sources-follow-search-query"),
+  sourcesFollowSearchButton: document.getElementById("sources-follow-search-button"),
+  sourcesFollowResults: document.getElementById("sources-follow-results"),
+  sourcesFollowMessage: document.getElementById("sources-follow-message"),
+  sourcesFavlistPullForm: document.getElementById("sources-favlist-pull-form"),
+  sourcesFavlistUidInput: document.getElementById("sources-favlist-uid-input"),
+  sourcesPullFavlistButton: document.getElementById("sources-pull-favlist-button"),
   larkSearchForm: document.getElementById("lark-search-form"),
   larkSearchQuery: document.getElementById("lark-search-query"),
   larkSearchButton: document.getElementById("lark-search-button"),
   larkSearchMessage: document.getElementById("lark-search-message"),
   larkSearchResults: document.getElementById("lark-search-results"),
-  followBrowseToggle: document.getElementById("follow-browse-toggle"),
-  followBrowseView: document.getElementById("follow-browse-view"),
-  followUpListView: document.getElementById("follow-up-list-view"),
-  followUpGrid: document.getElementById("follow-up-grid"),
-  followUpItemsView: document.getElementById("follow-up-items-view"),
-  followBrowseBack: document.getElementById("follow-browse-back"),
-  followBrowseAvatar: document.getElementById("follow-browse-avatar"),
-  followBrowseTitle: document.getElementById("follow-browse-title"),
-  followBrowseCount: document.getElementById("follow-browse-count"),
-  followSearchForm: document.getElementById("follow-search-form"),
-  followSearchQuery: document.getElementById("follow-search-query"),
-  followSearchButton: document.getElementById("follow-search-button"),
-  followSongResults: document.getElementById("follow-song-results"),
-  followBrowseMessage: document.getElementById("follow-browse-message"),
   addNextButton: document.getElementById("add-next-button"),
   resortPlaylistButton: document.getElementById("resort-playlist-button"),
   refreshButton: document.getElementById("refresh-button"),
   openRatingButton: document.getElementById("open-rating-button"),
   gatchaPoolConfigToggle: document.getElementById("gatcha-pool-config-toggle"),
-  gatchaUidToggle: document.getElementById("gatcha-uid-toggle"),
   gatchaButton: document.getElementById("gatcha-button"),
   gatchaConfirmButton: document.getElementById("gatcha-confirm-button"),
   gatchaRetryButton: document.getElementById("gatcha-retry-button"),
-  gatchaMessage: document.getElementById("gatcha-message"),
   gatchaInitView: document.getElementById("gatcha-init-view"),
   gatchaResultView: document.getElementById("gatcha-result-view"),
   gatchaCandidateTitle: document.getElementById("gatcha-candidate-title"),
-  gatchaStage: document.getElementById("gatcha-stage"),
-  gatchaStageInner: document.getElementById("gatcha-stage-inner"),
-  gatchaUidView: document.getElementById("gatcha-uid-view"),
-  gatchaUidForm: document.getElementById("gatcha-uid-form"),
-  gatchaUidInput: document.getElementById("gatcha-uid-input"),
-  addGatchaUidButton: document.getElementById("add-gatcha-uid-button"),
   refreshGatchaCacheButton: document.getElementById("refresh-gatcha-cache-button"),
-  pullGatchaFavlistButton: document.getElementById("pull-gatcha-favlist-button"),
   gatchaUidMessage: document.getElementById("gatcha-uid-message"),
   listTag: document.getElementById("list-tag"),
   listTitle: document.getElementById("list-title"),
+  listTitleText: document.getElementById("list-title-text"),
   listCount: document.getElementById("list-count"),
   queueViewButton: document.getElementById("queue-view-button"),
   historyViewButton: document.getElementById("history-view-button"),
+  historyExportButton: document.getElementById("history-export-button"),
+  historyExportDialog: document.getElementById("history-export-dialog"),
+  historyExportClose: document.getElementById("history-export-close"),
+  historyExportStatus: document.getElementById("history-export-status"),
   historyExportRow: document.getElementById("history-export-row"),
   historyExportSource: document.getElementById("history-export-source"),
   historyExportPageSize: document.getElementById("history-export-page-size"),
@@ -593,6 +631,10 @@ function localizedApiMessage(message) {
   if (!raw) {
     return "";
   }
+  if (raw === "队列已更新，请重新拖动") return t("remote.queueChanged");
+  if (raw === "歌曲已离开等待队列，请刷新后重试") return t("remote.queueItemMissing");
+  if (raw === "Invalid YouTube video link") return t("request.youtubeInvalid");
+  if (raw === "Multiple YouTube videos found; paste one video link") return t("request.youtubeMultiple");
   const bbdownMessage = localizedBBDownLoginMessage(raw);
   if (bbdownMessage && bbdownMessage !== raw) {
     return bbdownMessage;
@@ -727,8 +769,18 @@ function applyStaticI18n(root = document) {
   root.querySelectorAll("[data-i18n-alt]").forEach((element) => {
     setElementAttribute(element, "alt", element.dataset.i18nAlt);
   });
+  root.querySelectorAll("[data-duration-seconds]").forEach((node) => {
+    const seconds = Number(node.dataset.durationSeconds);
+    node.textContent = seconds > 0 ? t("player.durationSeconds", { seconds }) : t("player.durationUnknown");
+  });
+  root.querySelectorAll("[data-rating-score]").forEach((node) => {
+    node.setAttribute("aria-label", t("rating.scoreAria", { score: Number(node.dataset.ratingScore) }));
+  });
   document.documentElement.lang = state.language === "zh" ? "zh-CN" : state.language;
   document.title = t("document.remoteTitle");
+  if (state.translations.languages?.[state.language]) {
+    window.BilikaraRemoteTransport?.localize?.(t, applyStaticI18n);
+  }
 }
 
 function renderLanguageSwitch() {
@@ -739,10 +791,8 @@ function renderLanguageSwitch() {
 
 function invalidateLanguageSensitiveRenderCache() {
   state.remoteAccessRenderSignature = "";
-  state.followBrowseRenderSignature = "";
-  state.modalFollowBrowseRenderSignature = "";
+  state.sourcesFollowBrowseRenderSignature = "";
   state.favlistBrowseRenderSignature = "";
-  state.gatchaTaskLastMessageSignature = "";
   state.listHeaderRenderSignature = "";
   state.queueRenderSignature = "";
   state.historyRenderSignature = "";
@@ -754,6 +804,7 @@ function setLanguage(language) {
   const nextLanguage = normalizeLanguage(language);
   if (state.language === nextLanguage) {
     renderLanguageSwitch();
+    renderRemoteConnectionStatus();
     return;
   }
   state.language = nextLanguage;
@@ -761,12 +812,17 @@ function setLanguage(language) {
   invalidateLanguageSensitiveRenderCache();
   applyStaticI18n();
   renderLanguageSwitch();
+  renderRemoteConnectionStatus();
   if (state.data) {
     render();
   }
-  if (state.searchModalOpen) {
-    renderSearchModalView(state.searchModalView);
-  }
+  syncBilikaraSearchView();
+  remoteResultPagers.get(elements.searchResults)?.localize(state.language);
+  renderCategoryBrowseView();
+  renderD1BrowseView("name");
+  renderD1BrowseView("artist");
+  renderSourcesFollowBrowse();
+  renderFavlistBrowse();
 }
 
 function applyTheme(theme) {
@@ -889,135 +945,710 @@ function scheduleViewportScaleReset(force = false) {
   ));
 }
 
-function normalizeLayoutMode(value) {
-  if (value === "basic" || value === "normal") {
-    return "basic";
+function normalizeRemoteRequestView(value, fallback = "quick") {
+  const candidate = String(value || "").trim().toLowerCase();
+  return ["quick", "search", "discover", "sources"].includes(candidate)
+    ? candidate
+    : fallback;
+}
+
+function normalizeRemoteSearchMode(value, fallback = "shared") {
+  const candidate = String(value || "").trim().toLowerCase();
+  return candidate === "shared" || candidate === "local" ? candidate : fallback;
+}
+
+function normalizeRemoteDiscoverMode(value, fallback = "categories") {
+  const candidate = String(value || "").trim().toLowerCase();
+  return ["categories", "name", "artist"].includes(candidate) ? candidate : fallback;
+}
+
+function normalizeRemoteSourcesMode(value, fallback = "uids") {
+  const candidate = String(value || "").trim().toLowerCase();
+  return candidate === "uids" || candidate === "favorites" ? candidate : fallback;
+}
+
+function setRemoteTabPanelVisibility(panel, visible) {
+  if (!panel) {
+    return;
   }
-  return "full";
+  panel.hidden = !visible;
+  panel.inert = !visible;
+  panel.setAttribute("aria-hidden", String(!visible));
+}
+
+function syncRemoteRequestPanelSizeTier() {
+  if (!elements.requestPanel) {
+    return;
+  }
+  let tier = "compact";
+  if (state.remoteRequestView === "quick") {
+    tier = "compact";
+  } else if (["discover", "sources"].includes(state.remoteRequestView)) {
+    // Keep the browsing workspace steady through category/owner/folder navigation.
+    tier = "browse-deep";
+  } else {
+    const activePanel = Array.from(elements.remoteRequestViewPanels || [])
+      .find((panel) => !panel.hidden && !panel.inert);
+    const visibleResults = Array.from(activePanel?.querySelectorAll?.(".search-result-item") || [])
+      .filter((item) => !item.closest("[hidden], .hidden"));
+    if (visibleResults.length) {
+      tier = "browse-deep";
+    }
+  }
+  if (elements.requestPanel.dataset.requestSize !== tier) {
+    elements.requestPanel.dataset.requestSize = tier;
+  }
+}
+
+function syncRemoteSearchModeSelection() {
+  window.BilikaraBrowseSearch?.primary(elements.searchForm, {translate:t});
+  window.BilikaraBrowseSearch?.primary(elements.larkSearchForm, {translate:t});
+  const activeMode = normalizeRemoteSearchMode(state.remoteSearchMode);
+  state.remoteSearchMode = activeMode;
+  elements.remoteSearchModeButtons?.forEach((button) => {
+    const mode = normalizeRemoteSearchMode(button.dataset.remoteSearchMode, "");
+    const selected = mode === activeMode;
+    button.setAttribute("aria-selected", String(selected));
+    button.tabIndex = selected ? 0 : -1;
+  });
+  elements.remoteSearchModePanels?.forEach((panel) => {
+    setRemoteTabPanelVisibility(
+      panel,
+      panel.dataset.remoteSearchPanel === activeMode,
+    );
+  });
+}
+
+function syncRemoteDiscoverModeSelection() {
+  const activeMode = normalizeRemoteDiscoverMode(state.remoteDiscoverMode);
+  state.remoteDiscoverMode = activeMode;
+  elements.remoteDiscoverModeButtons?.forEach((button) => {
+    const mode = normalizeRemoteDiscoverMode(button.dataset.remoteDiscoverMode, "");
+    const selected = mode === activeMode;
+    button.setAttribute("aria-selected", String(selected));
+    button.tabIndex = selected ? 0 : -1;
+  });
+  elements.remoteDiscoverModePanels?.forEach((panel) => {
+    setRemoteTabPanelVisibility(
+      panel,
+      panel.dataset.remoteDiscoverPanel === activeMode,
+    );
+  });
+  if (activeMode === "categories") {
+    renderCategoryBrowseView();
+  } else {
+    renderD1BrowseView(activeMode);
+  }
+}
+
+function syncRemoteSourcesModeSelection() {
+  const activeMode = normalizeRemoteSourcesMode(state.remoteSourcesMode);
+  state.remoteSourcesMode = activeMode;
+  elements.remoteSourcesModeButtons?.forEach((button) => {
+    const mode = normalizeRemoteSourcesMode(button.dataset.remoteSourcesMode, "");
+    const selected = mode === activeMode;
+    button.setAttribute("aria-selected", String(selected));
+    button.tabIndex = selected ? 0 : -1;
+  });
+  elements.remoteSourcesModePanels?.forEach((panel) => {
+    setRemoteTabPanelVisibility(
+      panel,
+      panel.dataset.remoteSourcesPanel === activeMode,
+    );
+  });
+  if (activeMode === "uids") {
+    renderSourcesFollowBrowse();
+  } else {
+    renderFavlistBrowse();
+  }
+}
+
+function ensureActiveRemoteSourcesLoaded() {
+  const activeMode = normalizeRemoteSourcesMode(state.remoteSourcesMode);
+  if (activeMode === "uids" && !state.followBrowseData && !state.followBrowseLoading) {
+    void loadFollowBrowse({ uid: "", query: "" });
+  } else if (activeMode === "favorites" && !state.favlistBrowseData && !state.favlistBrowseLoading) {
+    void loadFavlistBrowse({ folderId: "", query: "" });
+  }
+}
+
+function revealRemoteTab(button, { instant = false } = {}) {
+  if (!button || typeof button.scrollIntoView !== "function") {
+    return;
+  }
+  const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches;
+  button.scrollIntoView({
+    behavior: instant || reducedMotion ? "auto" : "smooth",
+    block: "nearest",
+    inline: "nearest",
+  });
+}
+
+function closeRequestDetailForNavigation() {
+  if (!searchDetailController?.isOpen?.()) {
+    return;
+  }
+  searchDetailController.close({
+    immediate: true,
+    restoreFocus: false,
+    reason: "navigation",
+  });
+  state.activeRequestDetailOwner = "";
+}
+
+function remoteRequestSecondaryTablist(view) {
+  if (view === "search") {
+    return elements.remoteSearchModeButtons?.[0]?.closest(".remote-search-mode-tabs") || null;
+  }
+  if (view === "discover") {
+    return elements.remoteDiscoverModeButtons?.[0]?.closest(".remote-discover-mode-tabs") || null;
+  }
+  if (view === "sources") {
+    return elements.remoteSourcesModeButtons?.[0]?.closest(".remote-sources-mode-tabs") || null;
+  }
+  return null;
+}
+
+function remoteRequestSecondaryHome(view) {
+  if (view === "search") {
+    return elements.remoteSearchToolbar;
+  }
+  if (view === "discover") {
+    return elements.remoteDiscoverToolbar;
+  }
+  if (view === "sources") {
+    return elements.remoteSourcesToolbar;
+  }
+  return null;
+}
+
+function selectedRemoteRequestSecondaryTab(view) {
+  if (view === "search") {
+    return Array.from(elements.remoteSearchModeButtons || [])
+      .find((button) => button.dataset.remoteSearchMode === state.remoteSearchMode) || null;
+  }
+  if (view === "discover") {
+    return Array.from(elements.remoteDiscoverModeButtons || [])
+      .find((button) => button.dataset.remoteDiscoverMode === state.remoteDiscoverMode) || null;
+  }
+  if (view === "sources") {
+    return Array.from(elements.remoteSourcesModeButtons || [])
+      .find((button) => button.dataset.remoteSourcesMode === state.remoteSourcesMode) || null;
+  }
+  return null;
+}
+
+function restoreRemoteRequestSecondaryTablists(exceptView = "") {
+  ["search", "discover", "sources"].forEach((view) => {
+    if (view === exceptView) {
+      return;
+    }
+    const tablist = remoteRequestSecondaryTablist(view);
+    const home = remoteRequestSecondaryHome(view);
+    if (tablist && home && tablist.parentElement !== home) {
+      home.append(tablist);
+    }
+  });
+}
+
+function syncRemoteRequestTabPresentation() {
+  if (
+    !elements.remoteRequestPrimaryTabs
+    || !elements.remoteRequestSecondaryNav
+    || !elements.remoteRequestSecondarySlot
+  ) {
+    return;
+  }
+  const activeView = normalizeRemoteRequestView(state.remoteRequestView);
+  const expanded = activeView !== "quick";
+  const activeTablist = expanded ? remoteRequestSecondaryTablist(activeView) : null;
+  const activeHome = expanded ? remoteRequestSecondaryHome(activeView) : null;
+  const canExpand = Boolean(activeTablist && activeHome && elements.remoteRequestSecondarySlot);
+
+  const navigation = elements.remoteRequestPrimaryTabs.parentElement;
+  navigation.dataset.activeView = activeView;
+
+  state.remoteRequestTabsExpanded = expanded && canExpand;
+  if (!state.remoteRequestTabsExpanded) {
+    restoreRemoteRequestSecondaryTablists();
+    elements.remoteRequestPrimaryTabs.classList.remove("hidden");
+    elements.remoteRequestPrimaryTabs.hidden = false;
+    elements.remoteRequestPrimaryTabs.inert = false;
+    elements.remoteRequestPrimaryTabs.setAttribute("aria-hidden", "false");
+    elements.remoteRequestSecondaryNav.classList.add("hidden");
+    elements.remoteRequestSecondaryNav.hidden = true;
+    elements.remoteRequestSecondaryNav.inert = true;
+    elements.remoteRequestSecondaryNav.setAttribute("aria-hidden", "true");
+    elements.remoteRequestSecondaryNav.removeAttribute("data-view");
+    return;
+  }
+
+  restoreRemoteRequestSecondaryTablists(activeView);
+  if (activeTablist.parentElement !== elements.remoteRequestSecondarySlot) {
+    elements.remoteRequestSecondarySlot.append(activeTablist);
+  }
+  elements.remoteRequestPrimaryTabs.classList.add("hidden");
+  elements.remoteRequestPrimaryTabs.hidden = true;
+  elements.remoteRequestPrimaryTabs.inert = true;
+  elements.remoteRequestPrimaryTabs.setAttribute("aria-hidden", "true");
+  elements.remoteRequestSecondaryNav.classList.remove("hidden");
+  elements.remoteRequestSecondaryNav.hidden = false;
+  elements.remoteRequestSecondaryNav.inert = false;
+  elements.remoteRequestSecondaryNav.setAttribute("aria-hidden", "false");
+  elements.remoteRequestSecondaryNav.dataset.view = activeView;
+}
+
+function collapseRemoteRequestSecondaryNavigation({ focus = true } = {}) {
+  activateRemoteRequestView("quick", { focusTab: focus });
+}
+
+function syncRemoteRequestViewSelection() {
+  const activeView = normalizeRemoteRequestView(state.remoteRequestView);
+  state.remoteRequestView = activeView;
+  if (elements.remoteShell) {
+    elements.remoteShell.dataset.remoteRequestView = activeView;
+  }
+  elements.remoteRequestViewButtons?.forEach((button) => {
+    const view = normalizeRemoteRequestView(button.dataset.remoteRequestView, "");
+    const selected = view === activeView;
+    button.hidden = false;
+    button.inert = false;
+    button.setAttribute("aria-hidden", "false");
+    button.setAttribute("aria-selected", String(selected));
+    button.tabIndex = selected ? 0 : -1;
+  });
+  elements.remoteRequestViewPanels?.forEach((panel) => {
+    setRemoteTabPanelVisibility(
+      panel,
+      panel.dataset.remoteRequestPanel === activeView,
+    );
+  });
+  syncRemoteSearchModeSelection();
+  syncRemoteDiscoverModeSelection();
+  syncRemoteSourcesModeSelection();
+  syncRemoteRequestTabPresentation();
+  syncRemoteRequestPanelSizeTier();
+}
+
+function animateRemoteRequestEntry(panel) {
+  if (!panel || window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
+  panel.getAnimations?.().forEach((animation) => animation.cancel());
+  panel.animate?.([{ opacity: 0.6 }, { opacity: 1 }], { duration: 180, easing: "ease-out" });
+}
+
+function activateRemoteRequestView(
+  view,
+  { focusTab = false, focusSecondary = false } = {},
+) {
+  const nextView = normalizeRemoteRequestView(view, "");
+  if (!nextView) {
+    return false;
+  }
+  const changed = state.remoteRequestView !== nextView;
+  if (changed) {
+    closeRequestDetailForNavigation();
+  }
+  state.remoteRequestView = nextView;
+  try { window.sessionStorage?.setItem("bilikara.remote.requestView", nextView); } catch { /* Optional view memory. */ }
+  syncRemoteRequestViewSelection();
+  if (changed) {
+    animateRemoteRequestEntry(Array.from(elements.remoteRequestViewPanels || []).find((panel) => !panel.hidden));
+    animateRemoteRequestEntry(state.remoteRequestTabsExpanded ? elements.remoteRequestSecondaryNav : elements.remoteRequestPrimaryTabs);
+  }
+  if (nextView === "sources") {
+    ensureActiveRemoteSourcesLoaded();
+  }
+  const selectedTab = Array.from(elements.remoteRequestViewButtons || [])
+    .find((button) => button.dataset.remoteRequestView === nextView);
+  const secondaryTab = state.remoteRequestTabsExpanded
+    ? selectedRemoteRequestSecondaryTab(nextView)
+    : null;
+  revealRemoteTab(secondaryTab || selectedTab);
+  if (focusSecondary && secondaryTab) {
+    secondaryTab.focus({ preventScroll: true });
+  } else if (focusTab && !selectedTab?.hidden) {
+    selectedTab?.focus({ preventScroll: true });
+  }
+  return changed;
+}
+
+function activateRemoteSearchMode(mode, { focusTab = false } = {}) {
+  const nextMode = normalizeRemoteSearchMode(mode, "");
+  if (!nextMode) {
+    return false;
+  }
+  const changed = state.remoteSearchMode !== nextMode;
+  if (changed) {
+    closeRequestDetailForNavigation();
+  }
+  state.remoteSearchMode = nextMode;
+  syncRemoteSearchModeSelection();
+  if (changed) animateRemoteRequestEntry(Array.from(elements.remoteSearchModePanels || []).find((panel) => !panel.hidden));
+  const selectedTab = Array.from(elements.remoteSearchModeButtons || [])
+    .find((button) => button.dataset.remoteSearchMode === nextMode);
+  revealRemoteTab(selectedTab);
+  if (focusTab) {
+    selectedTab?.focus({ preventScroll: true });
+  }
+  return changed;
+}
+
+function activateRemoteDiscoverMode(mode, { focusTab = false } = {}) {
+  const nextMode = normalizeRemoteDiscoverMode(mode, "");
+  if (!nextMode) {
+    return false;
+  }
+  const changed = state.remoteDiscoverMode !== nextMode;
+  if (changed) {
+    closeRequestDetailForNavigation();
+  }
+  state.remoteDiscoverMode = nextMode;
+  syncRemoteDiscoverModeSelection();
+  if (changed) animateRemoteRequestEntry(Array.from(elements.remoteDiscoverModePanels || []).find((panel) => !panel.hidden));
+  const selectedTab = Array.from(elements.remoteDiscoverModeButtons || [])
+    .find((button) => button.dataset.remoteDiscoverMode === nextMode);
+  revealRemoteTab(selectedTab);
+  if (focusTab) {
+    selectedTab?.focus({ preventScroll: true });
+  }
+  return changed;
+}
+
+function activateRemoteSourcesMode(mode, { focusTab = false } = {}) {
+  const nextMode = normalizeRemoteSourcesMode(mode, "");
+  if (!nextMode) {
+    return false;
+  }
+  const changed = state.remoteSourcesMode !== nextMode;
+  if (changed) {
+    closeRequestDetailForNavigation();
+  }
+  state.remoteSourcesMode = nextMode;
+  syncRemoteSourcesModeSelection();
+  if (changed) animateRemoteRequestEntry(Array.from(elements.remoteSourcesModePanels || []).find((panel) => !panel.hidden));
+  ensureActiveRemoteSourcesLoaded();
+  const selectedTab = Array.from(elements.remoteSourcesModeButtons || [])
+    .find((button) => button.dataset.remoteSourcesMode === nextMode);
+  revealRemoteTab(selectedTab);
+  if (focusTab) {
+    selectedTab?.focus({ preventScroll: true });
+  }
+  return changed;
+}
+
+function handleRemoteHorizontalTabKeydown(event, values, currentValue, activate) {
+  const currentIndex = Math.max(0, values.indexOf(currentValue));
+  let targetIndex = null;
+  if (event.key === "ArrowRight") {
+    targetIndex = (currentIndex + 1) % values.length;
+  } else if (event.key === "ArrowLeft") {
+    targetIndex = (currentIndex - 1 + values.length) % values.length;
+  } else if (event.key === "Home") {
+    targetIndex = 0;
+  } else if (event.key === "End") {
+    targetIndex = values.length - 1;
+  } else {
+    return false;
+  }
+  event.preventDefault();
+  activate(values[targetIndex], { focusTab: true });
+  return true;
+}
+
+function handleRemoteRequestTabKeydown(event) {
+  return handleRemoteHorizontalTabKeydown(
+    event,
+    ["quick", "search", "discover", "sources"],
+    String(event.currentTarget?.dataset?.remoteRequestView || ""),
+    activateRemoteRequestView,
+  );
+}
+
+function handleRemoteSearchModeTabKeydown(event) {
+  return handleRemoteHorizontalTabKeydown(
+    event,
+    ["shared", "local"],
+    String(event.currentTarget?.dataset?.remoteSearchMode || ""),
+    activateRemoteSearchMode,
+  );
+}
+
+function handleRemoteDiscoverModeTabKeydown(event) {
+  return handleRemoteHorizontalTabKeydown(
+    event,
+    ["categories", "name", "artist"],
+    String(event.currentTarget?.dataset?.remoteDiscoverMode || ""),
+    activateRemoteDiscoverMode,
+  );
+}
+
+function handleRemoteSourcesModeTabKeydown(event) {
+  return handleRemoteHorizontalTabKeydown(
+    event,
+    ["uids", "favorites"],
+    String(event.currentTarget?.dataset?.remoteSourcesMode || ""),
+    activateRemoteSourcesMode,
+  );
 }
 
 function hydrateLocalPreferences() {
-  state.layoutMode = normalizeLayoutMode(readLocalString(storageKeys.layoutMode, state.layoutMode));
-
+  try {
+    state.remoteRequestView = normalizeRemoteRequestView(window.sessionStorage?.getItem("bilikara.remote.requestView"));
+  } catch { /* New page sessions default to Quick. */ }
   // Hydrate and apply theme
   state.theme = normalizeTheme(readLocalString(storageKeys.theme, state.theme));
   applyTheme(state.theme);
 }
 
-function renderLayoutMode() {
-  const layoutMode = normalizeLayoutMode(state.layoutMode);
-  elements.remoteShell?.classList.toggle("layout-mode-basic", layoutMode === "basic");
-  elements.remoteShell?.classList.toggle("layout-mode-full", layoutMode === "full");
-  elements.layoutModeSwitch?.querySelectorAll("button[data-layout-mode]").forEach((button) => {
-    button.classList.toggle("active", button.dataset.layoutMode === layoutMode);
-  });
-  const layoutKey = layoutMode === "basic" ? "layout.basicLayout" : "layout.fullLayout";
-  setTextContent(elements.displayLayoutSummary, layoutKey);
+function remoteConnectionStatusKey(phase = state.remoteConnectionPhase) {
+  if (phase === "connected") {
+    return "remote.connectionConnected";
+  }
+  if (phase === "reconnecting") {
+    return "remote.connectionReconnecting";
+  }
+  if (phase === "offline") {
+    return "remote.connectionOffline";
+  }
+  return "remote.connectionConnecting";
 }
 
-function setLayoutMode(mode) {
-  const nextMode = normalizeLayoutMode(mode);
-  if (state.layoutMode === nextMode) {
-    renderLayoutMode();
+function normalizeRemoteConnectionPhase(phase) {
+  return phase === "connected"
+    || phase === "reconnecting"
+    || phase === "offline"
+    ? phase
+    : "connecting";
+}
+
+function syncRemoteConnectionIndicatorNode(indicator, phase) {
+  if (!indicator) {
     return;
   }
-  state.layoutMode = nextMode;
-  writeLocalPreference(storageKeys.layoutMode, nextMode);
-  renderLayoutMode();
+  const normalizedPhase = normalizeRemoteConnectionPhase(phase);
+  if (indicator.dataset.connectionPhase === normalizedPhase) {
+    return;
+  }
+  indicator.dataset.connectionPhase = normalizedPhase;
+  indicator.classList.remove("is-ready", "is-failed", "is-loading", "is-pending");
+  if (normalizedPhase === "connected") {
+    indicator.classList.add("is-ready");
+    indicator.textContent = "";
+  } else if (normalizedPhase === "offline") {
+    indicator.classList.add("is-failed");
+    indicator.textContent = "";
+  } else {
+    indicator.classList.add("is-loading");
+    indicator.textContent = "";
+  }
 }
 
-function setRemoteQrPopoverOpen(open) {
-  state.remoteQrPopoverOpen = Boolean(open);
-  if (state.remoteQrPopoverOpen) {
-    setDisplaySettingsOpen(false);
-  }
-  elements.remoteQrPopover?.classList.toggle("hidden", !state.remoteQrPopoverOpen);
-  elements.remoteQrToggle?.setAttribute("aria-expanded", String(state.remoteQrPopoverOpen));
+function syncRemoteConnectionIndicator(phase) {
+  const normalizedPhase = normalizeRemoteConnectionPhase(phase);
+  syncRemoteConnectionIndicatorNode(elements.remoteConnectionIndicator, normalizedPhase);
+  syncRemoteConnectionIndicatorNode(elements.remoteConnectionStatusIndicator, normalizedPhase);
 }
 
-function setDisplaySettingsOpen(open) {
-  state.displaySettingsOpen = Boolean(open);
-  if (state.displaySettingsOpen) {
-    setRemoteQrPopoverOpen(false);
+function renderRemoteConnectionStatus() {
+  const phase = normalizeRemoteConnectionPhase(state.remoteConnectionPhase);
+  const statusText = t(remoteConnectionStatusKey(phase));
+  syncRemoteConnectionIndicator(phase);
+  setTextContent(elements.remoteConnectionStatusValue, remoteConnectionStatusKey(phase));
+  setTextContent(elements.remoteConnectionStatusText, remoteConnectionStatusKey(phase));
+  if (elements.remoteConnectionStatusTrigger) {
+    elements.remoteConnectionStatusTrigger.setAttribute(
+      "aria-label",
+      t("remote.connectionIndicatorLabel", { status: statusText }),
+    );
   }
-  elements.displaySettingsPanel?.classList.toggle("hidden", !state.displaySettingsOpen);
-  elements.displaySettingsToggle?.setAttribute("aria-expanded", String(state.displaySettingsOpen));
+  if (elements.remoteMenuToggle) {
+    elements.remoteMenuToggle.setAttribute("aria-label", t("remote.menuLabel", { status: statusText }));
+  }
 }
+
+function setRemoteConnectionPhase(phase) {
+  const nextPhase = normalizeRemoteConnectionPhase(phase);
+  if (state.remoteConnectionPhase === nextPhase) {
+    return false;
+  }
+  if (nextPhase !== "connected" && typeof freezeCurrentPlaybackClock === "function") {
+    freezeCurrentPlaybackClock();
+  } else {
+    state.currentPlaybackClockSignature = "";
+  }
+  state.remoteConnectionPhase = nextPhase;
+  renderRemoteConnectionStatus();
+  return true;
+}
+
+function setRemoteMenuOpen(open, { restoreFocus = false } = {}) {
+  const nextOpen = Boolean(open);
+  state.remoteMenuOpen = nextOpen;
+  elements.remoteMenuPanel?.classList.toggle("hidden", !nextOpen);
+  elements.remoteMenuToggle?.setAttribute("aria-expanded", String(nextOpen));
+  if (nextOpen) {
+    renderRemoteAccess(state.data?.remote_access);
+    syncRemoteMenuBounds();
+  }
+  if (!nextOpen) {
+    setRemoteQrSectionOpen(false);
+    setRemoteSettingsSectionOpen(false);
+    if (typeof closeRemoteContextualInfo === "function") {
+      closeRemoteContextualInfo();
+    }
+    if (restoreFocus && typeof elements.remoteMenuToggle?.focus === "function") {
+      elements.remoteMenuToggle.focus({ preventScroll: true });
+    }
+  }
+}
+
+function setRemoteQrSectionOpen(open) {
+  state.remoteQrSectionOpen = Boolean(open);
+  elements.remoteQrContent?.classList.toggle("hidden", !state.remoteQrSectionOpen);
+  elements.remoteQrToggle?.setAttribute("aria-expanded", String(state.remoteQrSectionOpen));
+  elements.remoteQrToggle?.classList.toggle("is-expanded", state.remoteQrSectionOpen);
+  if (open && document.documentElement.dataset.nativeHost === "true") loadNativeRemoteAccess();
+  syncRemoteMenuBounds();
+}
+
+let nativeRemoteAccess = null;
+let nativeRemoteAccessLoading = false;
+async function loadNativeRemoteAccess() {
+  if (nativeRemoteAccessLoading) return;
+  if (nativeRemoteAccess) { renderRemoteAccess(nativeRemoteAccess); return; }
+  nativeRemoteAccessLoading = true;
+  try {
+    const response = await fetch("/api/remote-access", {headers:clientHeaders(), cache:"no-store"});
+    const payload = await response.json();
+    if (!response.ok || !payload.ok) throw new Error(t("remote.qrFailed"));
+    nativeRemoteAccess = payload.data;
+    renderRemoteAccess(nativeRemoteAccess);
+  } catch {
+    elements.remotePopoverQrPlaceholder.textContent = t("remote.qrFailed");
+  } finally { nativeRemoteAccessLoading = false; }
+}
+
+function setRemoteSettingsSectionOpen(open) {
+  state.remoteSettingsSectionOpen = Boolean(open);
+  elements.remoteSettingsContent?.classList.toggle("hidden", !state.remoteSettingsSectionOpen);
+  elements.remoteSettingsToggle?.setAttribute("aria-expanded", String(state.remoteSettingsSectionOpen));
+  elements.remoteSettingsToggle?.classList.toggle("is-expanded", state.remoteSettingsSectionOpen);
+  syncRemoteMenuBounds();
+}
+
+function syncRemoteMenuBounds() {
+  const panel = elements.remoteMenuPanel;
+  if (!state.remoteMenuOpen || !panel) return;
+  const viewport = window.visualViewport;
+  const bottom = (viewport?.offsetTop || 0) + (viewport?.height || window.innerHeight);
+  const top = panel.getBoundingClientRect().top;
+  panel.style.setProperty("--remote-menu-available-height", `max(0px, calc(${Math.max(0, bottom - top - 12)}px - env(safe-area-inset-bottom)))`);
+}
+
+window.addEventListener("resize", syncRemoteMenuBounds);
+window.addEventListener("scroll", syncRemoteMenuBounds, { passive: true });
+window.visualViewport?.addEventListener("resize", syncRemoteMenuBounds);
+window.visualViewport?.addEventListener("scroll", syncRemoteMenuBounds);
+window.addEventListener("remote-invitation-changed", () => renderRemoteAccess(state.data?.remote_access));
 
 function renderRemoteAccess(remoteAccess) {
-  const preferredUrl = String(remoteAccess?.preferred_url || "");
-  const lanUrls = Array.isArray(remoteAccess?.lan_urls) ? remoteAccess.lan_urls : [];
-  const localUrl = String(remoteAccess?.local_url || "");
-  const displayUrl = preferredUrl || localUrl || `${window.location.origin}/remote`;
-  const displayHint = lanUrls.length > 1
-    ? t("remote.multipleLanHint", { urls: lanUrls.join(" · ") })
-    : lanUrls.length === 1
-      ? t("remote.defaultHint")
-      : t("remote.noLanHint");
-  const signature = JSON.stringify({ language: state.language, displayUrl, displayHint });
-  if (signature === state.remoteAccessRenderSignature) {
-    return;
-  }
+  if (!remoteAccess) remoteAccess = nativeRemoteAccess;
+  const internet = window.BilikaraRemoteTransport?.mode === "internet";
+  if (!internet && document.documentElement.dataset.nativeHost === "true" && !remoteAccess) return;
+  const invitation = internet ? window.BilikaraRemoteTransport.invitation?.() : null;
+  // A public Remote snapshot has no LAN address. Never invent one from its origin.
+  const candidates = [remoteAccess?.preferred_url, ...(remoteAccess?.lan_urls || []), remoteAccess?.local_url];
+  const localUrl = candidates.find((value) => {
+    try {
+      const url = new URL(value);
+      return /^https?:$/.test(url.protocol) && !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+    } catch { return false; }
+  }) || (!internet ? `${window.location.origin}/remote` : "");
+  const signature = JSON.stringify({ language: state.language, localUrl, invitation });
+  if (signature === state.remoteAccessRenderSignature) return;
   state.remoteAccessRenderSignature = signature;
-
+  const card = elements.remoteQrContent;
+  const local = document.getElementById("remote-share-local");
+  const publicEntry = document.getElementById("remote-share-public");
+  local.hidden = !localUrl;
+  publicEntry.hidden = !internet;
+  card.classList.toggle("is-dual", Boolean(localUrl && internet));
   if (elements.remotePopoverUrlLink) {
-    elements.remotePopoverUrlLink.href = displayUrl;
-    elements.remotePopoverUrlLink.textContent = displayUrl;
+    elements.remotePopoverUrlLink.href = localUrl;
+    elements.remotePopoverUrlLink.textContent = localUrl ? (new URL(localUrl).origin + new URL(localUrl).pathname) : "";
   }
-  if (elements.remotePopoverUrlHint) {
-    elements.remotePopoverUrlHint.textContent = displayHint;
-  }
-  renderRemoteQr(displayUrl, [
-    { image: elements.remoteMiniQrImage, placeholder: elements.remoteMiniQrPlaceholder, size: 132 },
-    { image: elements.remotePopoverQrImage, placeholder: elements.remotePopoverQrPlaceholder, size: 220 },
-  ]);
+  elements.remotePopoverUrlHint.textContent = t("internetRemote.localSameNetwork");
+  renderRemoteQr(localUrl, [{ image: elements.remotePopoverQrImage, placeholder: elements.remotePopoverQrPlaceholder }]);
+  const password = document.getElementById("remote-share-password");
+  password.textContent = invitation?.password || "";
+  password.parentElement.hidden = !invitation;
+  renderRemoteQr(invitation?.url || "", [{
+    image: document.getElementById("remote-public-qr-image"),
+    placeholder: document.getElementById("remote-public-qr-placeholder"),
+    emptyMessage: t("remote.shareUnavailable"),
+  }]);
+  syncRemoteMenuBounds();
 }
 
 function renderRemoteQr(url, targets = []) {
   const normalizedUrl = String(url || "").trim();
-  if (!normalizedUrl) {
-    targets.forEach(({ image, placeholder }) => {
-      image?.classList.add("hidden");
-      if (placeholder) {
-        placeholder.textContent = t("remote.noAddress");
-        placeholder.classList.remove("hidden");
-      }
-    });
-    return;
-  }
-
-  targets.forEach(({ image, placeholder, size = 220 }) => {
-    if (!image || !placeholder) {
-      return;
-    }
-    const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=${size}x${size}&margin=0&data=${encodeURIComponent(normalizedUrl)}`;
-    if (image.dataset.qrUrl === qrUrl) {
-      return;
-    }
-
-    image.dataset.qrUrl = qrUrl;
+  for (const { image, placeholder, emptyMessage } of targets) {
+    if (!image || !placeholder) continue;
+    image.onload = null;
+    image.onerror = null;
     image.classList.add("hidden");
-    placeholder.textContent = t("remote.qrLoading");
     placeholder.classList.remove("hidden");
-    image.onload = () => {
-      placeholder.classList.add("hidden");
-      image.classList.remove("hidden");
-    };
-    image.onerror = () => {
-      image.classList.add("hidden");
+    if (!normalizedUrl) {
+      image.removeAttribute("src");
+      placeholder.textContent = emptyMessage || t("remote.noAddress");
+      continue;
+    }
+    try {
+      const code = window.qrcode(0, "M");
+      // Invitations and normalized URLs are ASCII; Unicode URLs are percent encoded.
+      code.addData(new URL(normalizedUrl).href, "Byte");
+      code.make();
+      const count = code.getModuleCount();
+      let path = "";
+      for (let row = 0; row < count; row += 1) {
+        for (let col = 0; col < count; col += 1) {
+          if (code.isDark(row, col)) path += `M${col},${row}h1v1h-1z`;
+        }
+      }
+      // Access cards share the Host's outer white frame. Do not add a second
+      // frame inside the SVG; preserve every encoded module at any URL length.
+      const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${count} ${count}"><rect width="${count}" height="${count}" fill="white"/><path d="${path}" fill="black" /></svg>`;
+      // Inline SVG works with the public Worker's strict img-src CSP (no
+      // data: images). Only numeric modules from the local encoder enter SVG.
+      const documentSvg = new DOMParser().parseFromString(svg, "image/svg+xml");
+      const qr = document.importNode(documentSvg.documentElement, true);
+      qr.setAttribute("width", "100%");
+      qr.setAttribute("height", "100%");
+      qr.setAttribute("aria-hidden", "true");
+      image.removeAttribute("src");
+      placeholder.replaceChildren(qr);
+      syncRemoteMenuBounds();
+    } catch {
+      image.removeAttribute("src");
       placeholder.textContent = t("remote.qrFailed");
-      placeholder.classList.remove("hidden");
-    };
-    image.src = qrUrl;
-  });
+    }
+  }
 }
 
+window.addEventListener("remote-connection-message", (event) => {
+  setAppMessage(event.detail?.message, event.detail?.isError);
+});
+
+window.addEventListener("remote-operation-message", (event) => {
+  setAppMessage(event.detail?.message, event.detail?.isError);
+});
+
 function setFormMessage(message, isError = false) {
-  elements.formMessage.textContent = message;
-  elements.formMessage.classList.toggle("error", isError);
+  setAppMessage(message, isError);
 }
 
 function setAppMessage(message, isError = false) {
+  if (String(message).includes("下载需要登录 Bilibili")) message = localizedCacheMessage(message);
   if (!elements.appToast) {
     return;
   }
@@ -1025,6 +1656,8 @@ function setAppMessage(message, isError = false) {
     window.clearTimeout(state.appToastTimer);
     state.appToastTimer = null;
   }
+  const toastParent = document.querySelector("dialog[open]") || document.body;
+  if (elements.appToast.parentElement !== toastParent) toastParent.append(elements.appToast);
   elements.appToast.textContent = message || "";
   elements.appToast.classList.toggle("is-error", Boolean(isError));
   elements.appToast.classList.toggle("hidden", !message);
@@ -1037,53 +1670,44 @@ function setAppMessage(message, isError = false) {
 }
 
 function setSearchMessage(message, isError = false) {
-  if (!elements.searchMessage) {
-    return;
-  }
-  elements.searchMessage.textContent = message || "";
-  elements.searchMessage.classList.toggle("error", Boolean(isError));
+  if (elements.searchMessage) elements.searchMessage.textContent = "";
+  if (isError && message) setAppMessage(message, true);
 }
 
 function setLarkSearchMessage(message, isError = false) {
-  if (!elements.larkSearchMessage) {
-    return;
-  }
-  elements.larkSearchMessage.textContent = message || "";
-  elements.larkSearchMessage.classList.toggle("error", Boolean(isError));
+  if (elements.larkSearchMessage) elements.larkSearchMessage.textContent = "";
+  if (isError && message) setAppMessage(message, true);
 }
 
 function setMessageForSource(source, message, isError = false) {
-  if (source === "search") {
+  if (source === "search" || source === "local") {
     setSearchMessage(message, isError);
     return;
   }
-  if (source === "lark") {
+  if (source === "lark" || source === "shared") {
     setLarkSearchMessage(message, isError);
     return;
   }
-  if (source === "modalSearch") {
-    setSearchModalLarkMessage(message, isError);
-    return;
-  }
-  if (source === "modalFavlist") {
+  if (source === "favorites") {
     setFavlistBrowseMessage(message, isError);
     return;
   }
-  if (source === "modalFollow") {
-    setModalFollowBrowseMessage(message, isError);
+  if (source === "uids") {
+    setSourcesFollowBrowseMessage(message, isError);
     return;
   }
-  if (source === "modalBrowse") {
-    const messageElement = elements.searchModalOtherView?.querySelector(".tag-browser-message");
+  if (["categories", "name", "artist"].includes(source)) {
+    const panel = source === "categories"
+      ? elements.remoteDiscoverCategoriesPanel
+      : source === "artist"
+        ? elements.remoteDiscoverArtistPanel
+        : elements.remoteDiscoverNamePanel;
+    const messageElement = panel?.querySelector(".tag-browser-message");
     if (messageElement) {
       messageElement.textContent = message || "";
       messageElement.classList.toggle("is-error", Boolean(isError));
       return;
     }
-  }
-  if (source === "follow") {
-    setFollowBrowseMessage(message, isError);
-    return;
   }
   if (source === "gatcha") {
     setGatchaMessage(message, isError);
@@ -1097,6 +1721,8 @@ function localizedCacheMessage(message, cacheStatus = "") {
   if (raw.includes("\n")) {
     raw = raw.split("\n")[0].trim();
   }
+  const loginRequired = raw.match(/(BBDown|DownKyi\/aria2c) 下载需要登录 Bilibili/);
+  if (loginRequired) return t("cache.downloadLoginRequired", { source: loginRequired[1] });
   const status = String(cacheStatus || "").trim();
   if (!raw) {
     return "";
@@ -1142,229 +1768,6 @@ function localizedCacheMessage(message, cacheStatus = "") {
   return raw;
 }
 
-function setRemoteSearchStageView(view) {
-  if (!elements.remoteSearchStage) {
-    return;
-  }
-  const nextView = ["search", "browse", "lark"].includes(view) ? view : "search";
-  const previousView = state.remoteSearchStageView || "search";
-  const isInitialRender = !state.remoteSearchStageView;
-  if (state.remoteSearchStageView === nextView) {
-    return;
-  }
-  state.remoteSearchStageView = nextView;
-
-  if (state.remoteSearchFlipTimer) {
-    window.clearTimeout(state.remoteSearchFlipTimer);
-    state.remoteSearchFlipTimer = null;
-  }
-  if (state.remoteSearchPruneTimer) {
-    window.clearTimeout(state.remoteSearchPruneTimer);
-    state.remoteSearchPruneTimer = null;
-  }
-  elements.remoteSearchStage.classList.remove("is-flip-pruned");
-  if (state.remoteSearchFlipFrame) {
-    window.cancelAnimationFrame(state.remoteSearchFlipFrame);
-    state.remoteSearchFlipFrame = null;
-    elements.remoteSearchStage.classList.remove("is-preparing-flip", "is-flip-pruned");
-  }
-
-  const applySearchStageClass = (activeView) => {
-    elements.remoteSearchStage.classList.toggle("is-browse-view", activeView === "browse");
-    elements.remoteSearchStage.classList.toggle("is-lark-view", activeView === "lark");
-  };
-  const clearFlip = () => {
-    elements.remoteSearchStage?.classList.remove("is-flipping", "is-preparing-flip", "is-flip-pruned");
-    elements.remoteSearchStage?.removeAttribute("data-previous-view");
-    elements.remoteSearchStage?.removeAttribute("data-next-view");
-    elements.remoteSearchStage?.removeAttribute("data-skipped-view");
-    state.remoteSearchFlipTimer = null;
-  };
-
-  if (isInitialRender) {
-    const initialAngles = { search: 0, browse: -120, lark: 120 };
-    state.remoteSearchStageAngle = initialAngles[nextView] ?? 0;
-    if (elements.remoteSearchStageInner) {
-      elements.remoteSearchStageInner.style.transform = `rotateY(${state.remoteSearchStageAngle}deg)`;
-    }
-    applySearchStageClass(nextView);
-    elements.remoteSearchStage.classList.remove("is-flipping", "is-preparing-flip", "is-flip-pruned");
-    elements.remoteSearchStage.removeAttribute("data-previous-view");
-    elements.remoteSearchStage.removeAttribute("data-next-view");
-    elements.remoteSearchStage.removeAttribute("data-skipped-view");
-    return;
-  }
-
-  const searchViewOrder = ["search", "browse", "lark"];
-  const previousIndex = searchViewOrder.indexOf(previousView);
-  const nextIndex = searchViewOrder.indexOf(nextView);
-  const forwardSteps = (nextIndex - previousIndex + searchViewOrder.length) % searchViewOrder.length;
-  const skippedView = searchViewOrder.find((candidate) => candidate !== previousView && candidate !== nextView) || "";
-  const startAngle = state.remoteSearchStageAngle;
-  if (forwardSteps === 1) {
-    state.remoteSearchStageAngle -= 120;
-  } else if (forwardSteps === 2) {
-    state.remoteSearchStageAngle += 120;
-  }
-
-  elements.remoteSearchStage.dataset.previousView = previousView;
-  elements.remoteSearchStage.dataset.nextView = nextView;
-  if (skippedView) {
-    elements.remoteSearchStage.dataset.skippedView = skippedView;
-  } else {
-    elements.remoteSearchStage.removeAttribute("data-skipped-view");
-  }
-  elements.remoteSearchStage.classList.add("is-preparing-flip", "is-flipping");
-  if (elements.remoteSearchStageInner) {
-    elements.remoteSearchStageInner.style.transform = `rotateY(${startAngle}deg)`;
-    elements.remoteSearchStageInner.getBoundingClientRect();
-  }
-  state.remoteSearchFlipFrame = window.requestAnimationFrame(() => {
-    state.remoteSearchFlipFrame = null;
-    elements.remoteSearchStage?.classList.remove("is-preparing-flip");
-    if (elements.remoteSearchStageInner) {
-      elements.remoteSearchStageInner.style.transform = `rotateY(${state.remoteSearchStageAngle}deg)`;
-    }
-  });
-  state.remoteSearchPruneTimer = window.setTimeout(() => {
-    state.remoteSearchPruneTimer = null;
-    elements.remoteSearchStage?.classList.add("is-flip-pruned");
-    applySearchStageClass(nextView);
-  }, 150);
-  state.remoteSearchFlipTimer = window.setTimeout(clearFlip, 420);
-}
-
-function setGatchaStageView(showUid, onMidpoint) {
-  if (!elements.gatchaStage) {
-    if (typeof onMidpoint === "function") {
-      onMidpoint();
-    }
-    return;
-  }
-  const nextView = showUid ? "uid" : "draw";
-  const previousView = state.gatchaStageView || "draw";
-  const isInitialRender = !state.gatchaStageView;
-  if (state.gatchaStageView === nextView) {
-    if (elements.gatchaStage.classList.contains("is-flipping") && !elements.gatchaStage.classList.contains("is-flip-pruned")) {
-      state.gatchaMidpointCallback = onMidpoint;
-      return;
-    }
-    if (typeof onMidpoint === "function") {
-      onMidpoint();
-    }
-    return;
-  }
-  state.gatchaStageView = nextView;
-
-  if (state.gatchaFlipTimer) {
-    window.clearTimeout(state.gatchaFlipTimer);
-    state.gatchaFlipTimer = null;
-  }
-  if (state.gatchaPruneTimer) {
-    window.clearTimeout(state.gatchaPruneTimer);
-    state.gatchaPruneTimer = null;
-  }
-  elements.gatchaStage.classList.remove("is-flip-pruned");
-  if (state.gatchaFlipFrame) {
-    window.cancelAnimationFrame(state.gatchaFlipFrame);
-    state.gatchaFlipFrame = null;
-    elements.gatchaStage.classList.remove("is-preparing-flip", "is-flip-pruned");
-  }
-
-  const applyGatchaStageClass = (activeView) => {
-    elements.gatchaStage.classList.toggle("is-uid-view", activeView === "uid");
-  };
-  const clearFlip = () => {
-    elements.gatchaStage?.classList.remove("is-flipping", "is-preparing-flip", "is-flip-pruned");
-    elements.gatchaStage?.removeAttribute("data-previous-view");
-    state.gatchaFlipTimer = null;
-  };
-
-  if (isInitialRender) {
-    state.gatchaStageAngle = nextView === "uid" ? 180 : 0;
-    if (elements.gatchaStageInner) {
-      elements.gatchaStageInner.style.transform = `rotateY(${state.gatchaStageAngle}deg)`;
-    }
-    applyGatchaStageClass(nextView);
-    elements.gatchaStage.classList.remove("is-flipping", "is-preparing-flip", "is-flip-pruned");
-    elements.gatchaStage.removeAttribute("data-previous-view");
-    if (typeof onMidpoint === "function") {
-      onMidpoint();
-    }
-    return;
-  }
-
-  const startAngle = state.gatchaStageAngle;
-  state.gatchaStageAngle += nextView === "uid" ? 180 : -180;
-  state.gatchaMidpointCallback = onMidpoint;
-  elements.gatchaStage.dataset.previousView = previousView;
-  elements.gatchaStage.classList.add("is-preparing-flip", "is-flipping");
-  if (elements.gatchaStageInner) {
-    elements.gatchaStageInner.style.transform = `rotateY(${startAngle}deg)`;
-    elements.gatchaStageInner.getBoundingClientRect();
-  }
-  state.gatchaFlipFrame = window.requestAnimationFrame(() => {
-    state.gatchaFlipFrame = null;
-    elements.gatchaStage?.classList.remove("is-preparing-flip");
-    if (elements.gatchaStageInner) {
-      elements.gatchaStageInner.style.transform = `rotateY(${state.gatchaStageAngle}deg)`;
-    }
-  });
-  state.gatchaPruneTimer = window.setTimeout(() => {
-    state.gatchaPruneTimer = null;
-    elements.gatchaStage?.classList.add("is-flip-pruned");
-    applyGatchaStageClass(nextView);
-    const midpointCallback = state.gatchaMidpointCallback;
-    state.gatchaMidpointCallback = null;
-    if (typeof midpointCallback === "function") {
-      midpointCallback();
-    }
-  }, 150);
-  state.gatchaFlipTimer = window.setTimeout(clearFlip, 420);
-}
-
-function setupRemoteFlipStages() {
-  const searchInner = elements.remoteSearchStage?.querySelector(".remote-search-stage-inner");
-  if (searchInner) {
-    elements.remoteSearchStageInner = searchInner;
-    elements.followBrowseView?.classList.remove("hidden");
-    elements.followBrowseView?.classList.add("remote-search-face", "remote-search-face-back", "follow-browser");
-    elements.larkSearchView?.classList.add("remote-search-face", "remote-search-face-lark");
-    if (elements.followBrowseView && elements.followBrowseView.parentElement !== searchInner) {
-      searchInner.insertBefore(elements.followBrowseView, elements.larkSearchView || null);
-    }
-  }
-
-  if (elements.gatchaStage || !elements.gatchaInitView || !elements.gatchaResultView || !elements.gatchaUidView) {
-    return;
-  }
-  const gatchaPanel = elements.gatchaInitView.closest(".gatcha-panel");
-  if (!gatchaPanel) {
-    return;
-  }
-
-  const stage = document.createElement("div");
-  stage.id = "gatcha-stage";
-  stage.className = "gatcha-stage";
-  const inner = document.createElement("div");
-  inner.id = "gatcha-stage-inner";
-  inner.className = "gatcha-stage-inner";
-  const mainFace = document.createElement("div");
-  mainFace.id = "gatcha-main-view";
-  mainFace.className = "gatcha-face gatcha-face-front";
-
-  gatchaPanel.insertBefore(stage, elements.gatchaInitView);
-  stage.appendChild(inner);
-  inner.appendChild(mainFace);
-  mainFace.append(elements.gatchaInitView, elements.gatchaResultView);
-  elements.gatchaUidView.classList.remove("hidden");
-  elements.gatchaUidView.classList.add("gatcha-face", "gatcha-face-back");
-  inner.appendChild(elements.gatchaUidView);
-
-  elements.gatchaStage = stage;
-  elements.gatchaStageInner = inner;
-}
-
 function duplicateConfirmMessage(duplicateItem, sessionEntry, activeItem) {
   const title = duplicateItem?.display_title || activeItem?.display_title || sessionEntry?.display_title || t("request.thisSong");
   const count = Number(sessionEntry?.request_count || 0);
@@ -1379,6 +1782,7 @@ function duplicateConfirmMessage(duplicateItem, sessionEntry, activeItem) {
 
 async function apiPost(url, payload = {}, options = {}) {
   const timeoutMs = Math.max(0, Number(options.timeoutMs || 0));
+  const returnEnvelope = options.returnEnvelope === true;
   const controller = timeoutMs > 0 && typeof AbortController === "function"
     ? new AbortController()
     : null;
@@ -1401,7 +1805,7 @@ async function apiPost(url, payload = {}, options = {}) {
       error.payload = data;
       throw error;
     }
-    return data.data;
+    return returnEnvelope ? data : data.data;
   } catch (error) {
     if (error?.name === "AbortError") {
       throw new Error(t("error.requestTimeout"));
@@ -1414,10 +1818,22 @@ async function apiPost(url, payload = {}, options = {}) {
   }
 }
 
+async function apiPostExactStateCommand(url, payload = {}, options = {}) {
+  const envelope = await apiPost(url, payload, {
+    ...options,
+    returnEnvelope: true,
+  });
+  return {
+    snapshotAccepted: applyStateSnapshot(envelope.data),
+    commandApplied: envelope.stale !== true,
+  };
+}
+
 function normalizedRemoteIdentity(payload) {
   return {
     registered: Boolean(payload?.registered),
     name: String(payload?.name || "").trim(),
+    userId: String(payload?.user_id || ""),
     sessionId: String(payload?.session_id || "").trim(),
   };
 }
@@ -1426,19 +1842,39 @@ function renderRemoteIdentity() {
   const identity = state.remoteIdentity;
   const registered = Boolean(identity.registered && identity.name);
   const renameMode = registered && state.remoteIdentityModalMode === "rename";
-  const modalOpen = !registered || renameMode;
+  const modalOpen = (!registered && (window.BilikaraRemoteTransport?.mode !== "internet" || state.data?.session_user_edit_version >= 1)) || renameMode;
 
   if (elements.remoteIdentityName) {
     elements.remoteIdentityName.textContent = registered ? identity.name : "—";
   }
   if (elements.remoteIdentityRename) {
-    elements.remoteIdentityRename.disabled = !registered || state.remoteIdentitySaving;
+    const unavailable = window.BilikaraRemoteTransport?.mode === "internet" && !(state.data?.session_user_edit_version >= 1);
+    elements.remoteIdentityRename.disabled = !registered || state.remoteIdentitySaving || unavailable;
+    elements.remoteIdentityRename.title = unavailable ? t("remoteIdentity.upgradeRequired") : t("remoteIdentity.rename");
   }
-  elements.remoteIdentityModal?.classList.toggle("hidden", !modalOpen);
+  const identityModal = elements.remoteIdentityModal;
+  if (identityModal && modalOpen) {
+    identityModal.classList.remove("hidden", "closing");
+    identityModal.inert = false;
+  } else if (identityModal && !identityModal.classList.contains("hidden") && !identityModal.classList.contains("closing")) {
+    const finish = () => {
+      if (!identityModal.classList.contains("closing")) return;
+      identityModal.classList.add("hidden");
+      identityModal.classList.remove("closing");
+      syncRemoteShellInert();
+    };
+    identityModal.inert = true;
+    identityModal.classList.add("closing");
+    const animation = prefersReducedMotion() ? null : identityModal.querySelector(".remote-identity-card")?.getAnimations()
+      .find((entry) => entry.animationName === "scale-to-center-card");
+    if (animation) animation.finished.then(finish, finish);
+    else finish();
+  }
   document.body.classList.toggle("remote-identity-modal-open", modalOpen);
-  if (elements.remoteShell) {
-    elements.remoteShell.inert = modalOpen;
+  if (modalOpen) {
+    retireTransientPlaybackModalForModal();
   }
+  syncRemoteShellInert();
   if (elements.remoteIdentityTitle) {
     elements.remoteIdentityTitle.textContent = t(renameMode ? "remoteIdentity.renameTitle" : "remoteIdentity.registerTitle");
   }
@@ -1459,16 +1895,17 @@ function renderRemoteIdentity() {
           : "remoteIdentity.registerSubmit",
     );
     elements.remoteIdentitySubmit.disabled = state.remoteIdentityChecking || state.remoteIdentitySaving;
+    if (state.remoteIdentitySaving) elements.remoteIdentitySubmit.setAttribute("aria-busy", "true");
+    else elements.remoteIdentitySubmit.removeAttribute("aria-busy");
   }
   if (elements.remoteIdentityInput) {
     elements.remoteIdentityInput.disabled = state.remoteIdentityChecking || state.remoteIdentitySaving;
   }
-  if (elements.remoteIdentityMessage) {
-    elements.remoteIdentityMessage.textContent = state.remoteIdentityChecking
-      ? t("remoteIdentity.checking")
-      : state.remoteIdentityError;
-    elements.remoteIdentityMessage.classList.toggle("is-error", Boolean(state.remoteIdentityError));
+  if (state.remoteIdentityError && state.remoteIdentityError !== state.remoteIdentityLastToast) {
+    setAppMessage(state.remoteIdentityError, true);
   }
+  state.remoteIdentityLastToast = state.remoteIdentityError;
+
 }
 
 function applyRemoteIdentity(payload) {
@@ -1491,6 +1928,7 @@ async function fetchRemoteIdentity({ showExpired = false } = {}) {
       headers: clientHeaders(),
     });
     const payload = await response.json();
+    if (reenterExpiredLocalRemote(response, payload)) return;
     if (!response.ok || !payload.ok) {
       throw new Error(localizedApiMessage(payload.error) || t("error.requestFailed"));
     }
@@ -1532,23 +1970,33 @@ function openRemoteIdentityRename() {
   if (!state.remoteIdentity.registered || state.remoteIdentitySaving) {
     return;
   }
+  state.remoteIdentityRenameTarget = { ...state.remoteIdentity };
   state.remoteIdentityModalMode = "rename";
   state.remoteIdentityError = "";
   if (elements.remoteIdentityInput) {
     elements.remoteIdentityInput.value = state.remoteIdentity.name;
   }
   renderRemoteIdentity();
-  elements.remoteIdentityInput?.focus();
+  elements.remoteIdentityInput?.focus({ preventScroll: true });
   elements.remoteIdentityInput?.select();
 }
 
 function closeRemoteIdentityRename() {
-  if (!state.remoteIdentity.registered || state.remoteIdentitySaving) {
+  if (!state.remoteIdentity.registered || state.remoteIdentitySaving || state.remoteIdentityModalMode !== "rename") {
     return;
   }
   state.remoteIdentityModalMode = "register";
   state.remoteIdentityError = "";
   renderRemoteIdentity();
+  const modal = elements.remoteIdentityModal;
+  const animations = modal?.querySelector(".remote-identity-card")?.getAnimations() || [];
+  Promise.allSettled(animations.map((animation) => animation.finished)).then(() => {
+    if (modal?.classList.contains("hidden") && state.remoteIdentity.registered
+      && state.remoteIdentityModalMode !== "rename" && !anotherRemoteModalIsOpen()
+      && (document.activeElement === document.body || modal.contains(document.activeElement))) {
+      elements.remoteIdentityRename?.focus({ preventScroll: true });
+    }
+  });
 }
 
 async function submitRemoteIdentity(event) {
@@ -1557,8 +2005,8 @@ async function submitRemoteIdentity(event) {
     return;
   }
   const name = String(elements.remoteIdentityInput?.value || "").trim();
-  if (!name) {
-    state.remoteIdentityError = t("remoteIdentity.required");
+  if (!name || Array.from(name).length > 24) {
+    state.remoteIdentityError = t(name ? "session.nameLength" : "remoteIdentity.required");
     renderRemoteIdentity();
     return;
   }
@@ -1569,7 +2017,8 @@ async function submitRemoteIdentity(event) {
   try {
     const identity = await apiPost(
       renameMode ? "/api/remote-identity/rename" : "/api/remote-identity/register",
-      { name },
+      renameMode ? { name, user_id: state.remoteIdentityRenameTarget?.userId || state.remoteIdentity.userId,
+        expected_name: state.remoteIdentityRenameTarget?.name || state.remoteIdentity.name } : { name },
     );
     applyRemoteIdentity(identity);
     if (elements.remoteIdentityInput) {
@@ -1601,6 +2050,8 @@ async function submitRemoteIdentity(event) {
     state.remoteIdentitySaving = false;
     state.remoteIdentityError = error?.message || t("error.requestFailed");
     renderRemoteIdentity();
+  } finally {
+    if (!state.remoteIdentitySaving) syncRemoteIdentityWithSnapshot(state.data);
   }
 }
 
@@ -1616,20 +2067,21 @@ function ratingLog(message) {
   } catch (e) { /* ignore */ }
 }
 
-function submitSongRating(item, score) {
+function submitSongRating(item, score, trigger = null) {
   const bvid = String(item?.bvid || "").trim();
   const playId = ratingSubmissionPlayId(item);
   const sessionUserName = ratingSubmissionUserName(item);
+  const sessionUserId = ratingSubmissionUserId(item);
   if (!bvid) {
     return null;
   }
   const submissionKey = ratingSubmissionKey({ ...item, play_id: playId, requester_name: sessionUserName });
-  if (submissionKey && state.ratingSubmittedKeys.has(submissionKey)) {
+  if (submissionKey && (hasSubmittedSongRating(item) || serverRatingStatus(item) === "sending" || state.ratingPendingKeys.has(submissionKey))) {
     ratingLog("submit BLOCKED by dedup: playId=" + playId + " score=" + score);
     return false;
   }
   if (submissionKey) {
-    state.ratingSubmittedKeys.add(submissionKey);
+    state.ratingPendingKeys.add(submissionKey);
     // The user submitted a manual rating — cancel any pending auto-rating
     // for this item so the auto score=5 doesn't override the user's choice.
     state.pendingAutoRatings.delete(playId);
@@ -1645,17 +2097,48 @@ function submitSongRating(item, score) {
     bvid,
     score: Math.max(1, Math.min(5, Math.trunc(Number(score) || 5))),
   };
+  const button = trigger && "disabled" in trigger ? trigger : null;
+  const wasDisabled = button?.disabled;
+  if (button) {
+    button.disabled = true;
+    button.setAttribute("aria-busy", "true");
+  }
+  renderCurrentRatingButton(state.data?.current_item);
   fetch("/api/rating/submit", {
     method: "POST",
     headers: clientHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify(payload),
     keepalive: true,
+  }).then(async (response) => {
+    const result = await response.json();
+    if (!response.ok || result?.ok !== true || result?.success === false || result?.data?.success !== true) {
+      throw new Error(result?.error || t("error.requestFailed"));
+    }
+    if (submissionKey) {
+      if (result?.data?.queued) state.ratingQueuedKeys.add(submissionKey);
+      else state.ratingSubmittedKeys.add(submissionKey);
+      if (!result?.data?.duplicate) {
+        state.ratingSavedScores.set(submissionKey, payload.score);
+        const entry = (state.data?.song_ratings || []).find(entry => (
+          entry.play_id === playId
+          && (entry.session_user_id ? entry.session_user_id === sessionUserId : entry.session_user_name === sessionUserName)
+        ));
+        if (entry) entry.score = payload.score;
+      }
+    }
   }).catch((error) => {
     if (submissionKey) {
       state.ratingSubmittedKeys.delete(submissionKey);
-      renderCurrentRatingButton(state.data?.current_item);
     }
     console.warn("Rating submit failed:", error);
+    setAppMessage(error.message || t("error.requestFailed"), true);
+  }).finally(() => {
+    state.ratingPendingKeys.delete(submissionKey);
+    renderCurrentRatingButton(state.data?.current_item);
+    if (button) {
+      button.disabled = wasDisabled;
+      button.removeAttribute("aria-busy");
+    }
   });
   return true;
 }
@@ -1677,6 +2160,138 @@ function safeHttpUrl(value) {
   }
 }
 
+function normalizedPlaybackCoverUrl(item) {
+  const rawCoverUrl = String(item?.cover_url || "").trim();
+  const normalizedCoverUrl = window.BilikaraSongDetail?.normalizeBilibiliImageUrl?.(rawCoverUrl)
+    || rawCoverUrl;
+  return safeHttpUrl(normalizedCoverUrl);
+}
+
+function syncPlaybackCoverImage(image, coverUrl, identity) {
+  if (!image) {
+    return;
+  }
+  const normalizedUrl = String(coverUrl || "");
+  const normalizedIdentity = String(identity || "");
+  const previousIdentity = String(image.dataset.coverIdentity || "");
+  image.dataset.coverIdentity = normalizedIdentity;
+
+  if (!normalizedUrl) {
+    const nextSequence = Number(image.dataset.coverSequence || 0) + 1;
+    image.dataset.coverSequence = String(nextSequence);
+    delete image.dataset.coverUrl;
+    image.onload = null;
+    image.onerror = null;
+    image.removeAttribute("src");
+    image.classList.add("hidden");
+    return;
+  }
+
+  const sameUrl = image.dataset.coverUrl === normalizedUrl;
+  if (sameUrl && previousIdentity === normalizedIdentity) {
+    return;
+  }
+
+  const sequence = Number(image.dataset.coverSequence || 0) + 1;
+  image.dataset.coverSequence = String(sequence);
+  image.dataset.coverUrl = normalizedUrl;
+  image.onload = () => {
+    if (
+      image.dataset.coverSequence !== String(sequence)
+      || image.dataset.coverUrl !== normalizedUrl
+      || image.dataset.coverIdentity !== normalizedIdentity
+    ) {
+      return;
+    }
+    image.classList.remove("hidden");
+  };
+  image.onerror = () => {
+    if (
+      image.dataset.coverSequence !== String(sequence)
+      || image.dataset.coverUrl !== normalizedUrl
+      || image.dataset.coverIdentity !== normalizedIdentity
+    ) {
+      return;
+    }
+    image.classList.add("hidden");
+  };
+  if (sameUrl) {
+    image.classList.toggle("hidden", !(image.complete && image.naturalWidth > 0));
+    return;
+  }
+  image.classList.add("hidden");
+  image.src = normalizedUrl;
+}
+
+function setPlaybackDockMarqueeText(container, textNode, value) {
+  if (!container || !textNode) {
+    return;
+  }
+  const text = String(value || "");
+  if (textNode.textContent === text) return;
+  globalThis.BilikaraTextMarquee?.reset(container, textNode);
+  if (textNode.textContent !== text) {
+    textNode.textContent = text;
+  }
+  container.classList.remove("is-scrolling");
+  container.dataset.textOverflow = "false";
+  container.style.removeProperty("--playback-dock-marquee-offset");
+  container.style.removeProperty("--playback-dock-marquee-duration");
+}
+
+function syncPlaybackDockMarquees() {
+  const evidence = {};
+  for (const [key, container, textNode] of [
+    ["title", elements.playbackDockTitle, elements.playbackDockTitleText],
+    ["requester", elements.playbackDockRequester, elements.playbackDockRequesterText],
+  ]) {
+    if (!container || !textNode) {
+      continue;
+    }
+    container.classList.remove("is-scrolling");
+    const availableWidth = container.clientWidth;
+    const naturalWidth = textNode.scrollWidth;
+    const distance = Math.max(0, naturalWidth - availableWidth);
+    const overflowing = distance > 1;
+    container.dataset.textOverflow = String(overflowing);
+    if (overflowing) {
+      const durationSeconds = Math.max(6, Math.min(16, 3 + (distance / 28)));
+      container.style.setProperty("--playback-dock-marquee-offset", `${-distance}px`);
+      container.style.setProperty("--playback-dock-marquee-duration", `${durationSeconds}s`);
+      container.classList.add("is-scrolling");
+      globalThis.BilikaraTextMarquee?.configure(container, textNode, availableWidth, naturalWidth);
+    } else {
+      globalThis.BilikaraTextMarquee?.reset(container, textNode);
+      container.style.removeProperty("--playback-dock-marquee-offset");
+      container.style.removeProperty("--playback-dock-marquee-duration");
+    }
+    evidence[key] = { availableWidth, naturalWidth, distance, overflowing };
+  }
+  state.playbackDockMarqueeEvidence = evidence;
+}
+
+function schedulePlaybackDockMarquee() {
+  if (state.playbackDockMarqueeFrame !== null) {
+    return;
+  }
+  state.playbackDockMarqueeFrame = window.requestAnimationFrame(() => {
+    state.playbackDockMarqueeFrame = null;
+    if (!elements.playbackDock?.classList.contains("hidden")) {
+      syncPlaybackDockMarquees();
+    }
+  });
+}
+
+function resetPlaybackDockMarquees() {
+  if (state.playbackDockMarqueeFrame !== null) {
+    window.cancelAnimationFrame(state.playbackDockMarqueeFrame);
+    state.playbackDockMarqueeFrame = null;
+  }
+  setPlaybackDockMarqueeText(elements.playbackDockTitle, elements.playbackDockTitleText, "");
+  setPlaybackDockMarqueeText(elements.playbackDockRequester, elements.playbackDockRequesterText, "");
+  state.playbackDockMarqueeEvidence = null;
+}
+
 function ratingOwnerUid(item) {
   const rawMid = item?.owner_mid ?? item?.mid;
   const uid = String(rawMid || "").trim();
@@ -1693,7 +2308,17 @@ function ratingSubmissionUserName(item) {
 
 function ratingSubmissionPlayId(item) {
   const bvid = String(item?.bvid || "").trim();
-  return String(item?.play_id || item?.id || state.ratingPromptItemId || bvid).trim();
+  return String(item?.play_id || item?.id || item?.item_id || state.ratingPromptItemId || bvid).trim();
+}
+
+function ratingSubmissionUserId(item) {
+  return state.data?.session_user_entries?.find(user => user.name === ratingSubmissionUserName(item))?.id || "";
+}
+
+function ratingBelongsToUser(entry, item) {
+  const id = ratingSubmissionUserId(item);
+  return id && entry.session_user_id ? entry.session_user_id === id
+    : String(entry.session_user_name || "").toLowerCase() === ratingSubmissionUserName(item).toLowerCase();
 }
 
 function ratingSubmissionKey(item) {
@@ -1701,12 +2326,37 @@ function ratingSubmissionKey(item) {
   if (!playId) {
     return "";
   }
-  return `${ratingSubmissionUserName(item).toLowerCase()}::${playId}`;
+  return `${state.data?.session_generation ?? state.remoteIdentity?.session_id ?? ""}::${ratingSubmissionUserId(item) || ratingSubmissionUserName(item).toLowerCase()}::${playId}`;
+}
+
+function serverRatingStatus(item) {
+  const playId = ratingSubmissionPlayId(item);
+  const entry = (state.data?.song_ratings || []).find(entry => entry.play_id === playId
+    && ratingBelongsToUser(entry, item));
+  const key = ratingSubmissionKey(item);
+  if (entry && !["waiting", "sending"].includes(entry.status)) state.ratingQueuedKeys.delete(key);
+  if (entry) return entry.status;
+  if (playId !== ratingSubmissionPlayId(state.data?.current_item)) state.ratingQueuedKeys.delete(key);
+  return state.ratingQueuedKeys.has(key) ? "waiting" : "";
+}
+
+function isSongRatingQueued(item) {
+  return ["waiting", "sending"].includes(serverRatingStatus(item));
 }
 
 function hasSubmittedSongRating(item) {
   const key = ratingSubmissionKey(item);
-  return Boolean(key && state.ratingSubmittedKeys.has(key));
+  return serverRatingStatus(item) === "accepted" || Boolean(key && state.ratingSubmittedKeys.has(key));
+}
+
+function savedSongRatingScore(item) {
+  if (!item) return 5;
+  const entry = (state.data?.song_ratings || []).find(entry => (
+    entry.play_id === ratingSubmissionPlayId(item)
+    && ratingBelongsToUser(entry, item)
+  ));
+  const score = Number(entry?.score ?? state.ratingSavedScores.get(ratingSubmissionKey(item)) ?? 5);
+  return Math.max(1, Math.min(5, Math.trunc(score) || 5));
 }
 
 function normalizeRatingPromptItem(item) {
@@ -1745,13 +2395,37 @@ function ratingPromptItemsForItem(item) {
 }
 
 function isItemRateable(item, isCurrent = false) {
-  const bvid = String(item?.bvid || "").trim();
-  if (!item || !bvid) {
-    return false;
+  if (!item?.bvid || !selectedRequesterName() || state.data?.capabilities?.song_rating === false) return false;
+  const playId = ratingSubmissionPlayId(item);
+  const played = (state.data?.session_played || []).find(entry => String(entry.item_id || entry.id || "") === playId);
+  // Current-song confirmation may be held by the Host until its accepted
+  // playback observation reaches 50%; a skipped, ineligible song cannot be rated.
+  return (Boolean(state.data?.current_item && playId === ratingSubmissionPlayId(state.data.current_item)) || Boolean(played?.threshold_reached))
+    && !hasSubmittedSongRating(item)
+    && serverRatingStatus(item) !== "sending"
+    && !state.ratingPendingKeys.has(ratingSubmissionKey(item));
+}
+
+function refreshOpenRatingPrompt(current) {
+  if (!state.ratingPromptElement) return;
+  const items = ratingPromptItemsForItem(current);
+  const selectedItem = activeRatingPromptItem();
+  const selectedId = selectedItem ? ratingSubmissionPlayId(selectedItem) : "";
+  const tab = ["current", "previous"].find(key => items[key]
+    && ratingSubmissionPlayId(items[key]) === selectedId)
+    || (items.current ? "current" : "previous");
+  const changed = (items[tab] ? ratingSubmissionPlayId(items[tab]) : "") !== selectedId;
+  state.ratingPromptItems = items;
+  state.ratingPromptActiveTab = tab;
+  state.ratingPromptItem = items[tab];
+  state.ratingPromptItemId = String(items[tab]?.id || "");
+  if (changed) state.ratingPromptScoreDirty = false;
+  if (!state.ratingPromptScoreDirty || !isItemRateable(items[tab])) {
+    state.ratingPromptScore = savedSongRatingScore(items[tab]);
+    state.ratingPromptScoreDirty = false;
   }
-  // Manual rating is no longer gated by the play threshold. The user can
-  // rate at any time — the auto-rating defers to the user's choice.
-  return true;
+  if (changed) renderRatingPromptContent();
+  else syncRatingPromptControls();
 }
 
 function activeRatingPromptItem() {
@@ -1774,22 +2448,32 @@ function renderRatingStars() {
   });
 }
 
+function syncRatingPromptControls() {
+  const root = state.ratingPromptElement;
+  if (!root) return;
+  const item = activeRatingPromptItem();
+  const rateable = isItemRateable(item);
+  root.querySelectorAll("[data-rating-tab]").forEach(button => {
+    button.disabled = !state.ratingPromptItems?.[button.dataset.ratingTab]?.bvid;
+    button.classList.toggle("active", button.dataset.ratingTab === state.ratingPromptActiveTab);
+    button.setAttribute("aria-selected", button.dataset.ratingTab === state.ratingPromptActiveTab ? "true" : "false");
+  });
+  const submit = root.querySelector("[data-rating-submit]");
+  submit.disabled = !rateable;
+  if (state.ratingPendingKeys.has(ratingSubmissionKey(item))) submit.setAttribute("aria-busy", "true");
+  else submit.removeAttribute("aria-busy");
+  root.querySelectorAll("[data-rating-score]").forEach(button => { button.disabled = !rateable; });
+  renderRatingStars();
+}
+
 function renderRatingPromptContent() {
   const root = state.ratingPromptElement;
   if (!root) {
     return;
   }
-  const activeItem = activeRatingPromptItem();
+  const activeItem = activeRatingPromptItem() || {};
   state.ratingPromptItem = activeItem;
   state.ratingPromptBvid = String(activeItem?.bvid || "").trim();
-
-  root.querySelectorAll("[data-rating-tab]").forEach((button) => {
-    const tab = button.dataset.ratingTab;
-    const isRateable = tab === "current" ? state.ratingPromptCurrentRateable : state.ratingPromptPreviousRateable;
-    button.disabled = !isRateable;
-    button.classList.toggle("active", tab === state.ratingPromptActiveTab);
-    button.setAttribute("aria-selected", tab === state.ratingPromptActiveTab ? "true" : "false");
-  });
 
   const content = root.querySelector("[data-rating-content]");
   if (!content || !activeItem) {
@@ -1799,62 +2483,68 @@ function renderRatingPromptContent() {
   const ownerName = String(activeItem.owner_name || "").trim() || t("rating.unknownOwner");
   const coverUrl = safeHttpUrl(activeItem.cover_url);
   const url = safeHttpUrl(ratingItemUrl(activeItem) || (bvid ? `https://www.bilibili.com/video/${bvid}` : ""));
-  const titleKey = state.ratingPromptActiveTab === "previous" ? "rating.previousTitle" : "rating.title";
   const media = document.createElement("div");
-  media.className = "rating-media";
+  media.className = "song-detail-hero";
+  const cover = document.createElement("div");
+  cover.className = "song-detail-cover";
+  media.appendChild(cover);
   if (coverUrl) {
     const image = document.createElement("img");
     image.className = "rating-cover";
-    image.src = coverUrl;
     image.alt = "";
     image.loading = "lazy";
     image.referrerPolicy = "no-referrer";
-    media.appendChild(image);
+    image.src = coverUrl;
+    cover.appendChild(image);
   } else {
     const placeholder = document.createElement("div");
     placeholder.className = "rating-cover rating-cover-empty";
-    media.appendChild(placeholder);
+    cover.appendChild(placeholder);
   }
   const copy = document.createElement("div");
-  copy.className = "rating-copy";
-  const kicker = document.createElement("p");
-  kicker.className = "rating-kicker";
-  kicker.textContent = t("rating.kicker");
+  copy.className = "song-detail-facts";
   const title = document.createElement("h2");
-  title.textContent = t(titleKey);
-  const hint = document.createElement("p");
-  hint.className = "rating-hint";
-  hint.textContent = t("rating.hint");
+  title.className = "song-detail-title rating-title";
+  title.dataset.i18n = "rating.title";
+  title.textContent = t("rating.title");
   const owner = document.createElement("p");
-  owner.className = "rating-owner owner-badge-label";
-  renderOwnerBadgeLabel(owner, ownerName);
-  copy.append(kicker, title, hint, owner);
+  owner.className = "rating-owner";
+  window.BilikaraSongDetail.renderOwnerLabel(owner, activeItem, ownerName, state.followBrowseData?.owners);
+  copy.append(owner);
   if (url) {
     const link = document.createElement("a");
-    link.className = "rating-link";
+    link.className = "rating-link song-detail-bilibili-link";
+    link.dataset.i18n = "search.openOnBilibili";
     link.href = url;
     link.target = "_blank";
     link.rel = "noreferrer";
-    link.textContent = url;
+    link.textContent = t("search.openOnBilibili");
     copy.appendChild(link);
   }
+  const score = document.createElement("div");
+  score.className = "song-detail-metric rating-score";
+  score.append(root.querySelector(".rating-stars"));
+  copy.appendChild(score);
   media.appendChild(copy);
-  content.replaceChildren(media);
+  content.replaceChildren(title, media);
   const addUpButton = root.querySelector("[data-rating-add-up]");
   if (addUpButton) {
     const ownerUid = ratingOwnerUid(activeItem);
-    addUpButton.disabled = !ownerUid;
-    addUpButton.textContent = ownerUid ? t("rating.addUp") : t("rating.missingUid");
+    addUpButton.disabled = addUpButton.hasAttribute("aria-busy") || !ownerUid;
+    addUpButton.dataset.i18n = ownerUid ? "rating.addUp" : "rating.missingUid";
+    addUpButton.textContent = t(addUpButton.dataset.i18n);
   }
-  renderRatingStars();
+  syncRatingPromptControls();
 }
 
 function setRatingPromptActiveTab(tab) {
-  if (!state.ratingPromptElement || !state.ratingPromptItems?.[tab]) {
+  if (!state.ratingPromptElement || !state.ratingPromptItems?.[tab]?.bvid) {
     return;
   }
   state.ratingPromptActiveTab = tab;
   const activeItem = state.ratingPromptItems[tab];
+  state.ratingPromptScore = savedSongRatingScore(activeItem);
+  state.ratingPromptScoreDirty = false;
   state.ratingPromptItemId = String(activeItem?.id || activeItem?.bvid || "").trim();
   renderRatingPromptContent();
 }
@@ -1863,17 +2553,21 @@ function setRatingOptOut(enabled) {
   state.ratingOptOut = Boolean(enabled);
 }
 
-function closeRatingPrompt({ submit = true } = {}) {
+function closeRatingPrompt({ submit = false, restoreFocus = true, trigger = null } = {}) {
   const root = state.ratingPromptElement;
   if (!root) {
     return;
   }
   const promptItem = activeRatingPromptItem();
   const bvid = state.ratingPromptBvid;
-  const shouldSubmit = submit && !state.ratingPromptSubmitted && !state.ratingOptOut && bvid;
+  const shouldSubmit = submit && !state.ratingPromptSubmitted && bvid && isItemRateable(activeRatingPromptItem());
+  const previousFocus = state.ratingPromptPreviousFocus;
+  const returnFocusToDock = state.ratingPromptReturnFocusToDock;
   state.ratingPromptSubmitted = true;
 
   root.classList.add("closing");
+  root.setAttribute("inert", "");
+  root.querySelector('[role="dialog"]')?.setAttribute("aria-modal", "false");
 
   state.ratingPromptElement = null;
   state.ratingPromptItem = null;
@@ -1881,20 +2575,44 @@ function closeRatingPrompt({ submit = true } = {}) {
   state.ratingPromptActiveTab = "current";
   state.ratingPromptItemId = "";
   state.ratingPromptBvid = "";
+  state.ratingPromptPreviousFocus = null;
+  state.ratingPromptReturnFocusToDock = false;
+  if (!playbackSheetIsOpen()) unlockPlaybackSheetDocumentScroll();
+  syncRemoteShellInert();
 
-  setTimeout(() => {
-    root.remove();
-  }, 250);
+  const animation = root.querySelector(".rating-card")?.getAnimations()
+    .find((entry) => entry.animationName === "scale-to-center-card");
+  if (animation) animation.finished.catch(() => {}).then(() => root.remove());
+  else root.remove();
+
+  if (
+    restoreFocus
+    &&
+    returnFocusToDock
+    && state.data?.current_item
+    && elements.playbackDock
+    && !elements.playbackDock.classList.contains("hidden")
+  ) {
+    elements.playbackDock.focus({ preventScroll: true });
+  } else if (
+    restoreFocus
+    &&
+    previousFocus
+    && previousFocus.isConnected
+    && !root.contains(previousFocus)
+    && typeof previousFocus.focus === "function"
+  ) {
+    previousFocus.focus({ preventScroll: true });
+  }
 
   if (shouldSubmit) {
-    submitSongRating({ ...(promptItem || {}), bvid }, state.ratingPromptScore);
+    submitSongRating({ ...(promptItem || {}), bvid }, state.ratingPromptScore, trigger);
   }
 }
 
 function openRatingPrompt(item, { manual = false } = {}) {
-  const bvid = String(item?.bvid || "").trim();
-  const playId = String(item?.id || bvid).trim();
-  if (!item || !bvid || !playId || (!manual && (state.ratingOptOut || state.ratingPromptSeenPlayIds.has(playId)))) {
+  const playId = String(item?.id || "").trim();
+  if (!manual && (state.ratingOptOut || state.ratingPromptSeenPlayIds.has(playId))) {
     return;
   }
 
@@ -1902,29 +2620,37 @@ function openRatingPrompt(item, { manual = false } = {}) {
   const currentRateable = isItemRateable(promptItems.current, true);
   const previousRateable = isItemRateable(promptItems.previous, false);
 
-  if (!currentRateable && !previousRateable) {
+  if (!manual && (!currentRateable && !previousRateable)) {
+    return;
+  }
+  if (
+    remoteIdentityModalIsOpen()
+    || elements.historyExportDialog?.open
+    || state.bindingSheetOpen
+    || state.gatchaFavlistSheetOpen
+    || state.poolConfigSheetOpen
+    || state.reorderConfirmSheetOpen
+  ) {
     return;
   }
 
-  closeRatingPrompt({ submit: true });
+  closeRatingPrompt({ submit: false, restoreFocus: false });
+  const previousFocus = document.activeElement;
+  const returnFocusToDock = false; // Rating overlays the existing playback sheet.
 
-  const defaultTab = currentRateable ? "current" : "previous";
+  const defaultTab = promptItems.current ? "current" : "previous";
   const activeItem = promptItems[defaultTab];
   const activePlayId = String(activeItem?.id || activeItem?.bvid || "").trim();
 
-  if (activePlayId) {
-    state.ratingPromptSeenPlayIds.add(activePlayId);
-  }
 
   state.ratingPromptItems = promptItems;
   state.ratingPromptActiveTab = defaultTab;
   state.ratingPromptItem = activeItem;
   state.ratingPromptItemId = activePlayId;
   state.ratingPromptBvid = String(activeItem?.bvid || "").trim();
-  state.ratingPromptScore = 5;
+  state.ratingPromptScore = savedSongRatingScore(activeItem);
+  state.ratingPromptScoreDirty = false;
   state.ratingPromptSubmitted = false;
-  state.ratingPromptCurrentRateable = currentRateable;
-  state.ratingPromptPreviousRateable = previousRateable;
 
   const root = document.createElement("div");
   root.className = "rating-modal";
@@ -1937,14 +2663,16 @@ function openRatingPrompt(item, { manual = false } = {}) {
   card.className = "rating-card";
   card.setAttribute("role", "dialog");
   card.setAttribute("aria-modal", "true");
+  card.dataset.i18nAriaLabel = "rating.dialogLabel";
   card.setAttribute("aria-label", t("rating.dialogLabel"));
 
   const closeButton = document.createElement("button");
   closeButton.type = "button";
   closeButton.className = "rating-close";
   closeButton.dataset.ratingClose = "";
+  closeButton.dataset.i18nAriaLabel = "rating.closeLabel";
   closeButton.setAttribute("aria-label", t("rating.closeLabel"));
-  closeButton.textContent = "\u00d7";
+  closeButton.innerHTML = '<svg class="close-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m6 6 12 12M18 6 6 18" /></svg>';
 
   const content = document.createElement("div");
   content.dataset.ratingContent = "";
@@ -1952,6 +2680,7 @@ function openRatingPrompt(item, { manual = false } = {}) {
   const stars = document.createElement("div");
   stars.className = "rating-stars";
   stars.setAttribute("role", "radiogroup");
+  stars.dataset.i18nAriaLabel = "rating.scoreLabel";
   stars.setAttribute("aria-label", t("rating.scoreLabel"));
   [1, 2, 3, 4, 5].forEach((score) => {
     const button = document.createElement("button");
@@ -1972,41 +2701,48 @@ function openRatingPrompt(item, { manual = false } = {}) {
   const doneButton = document.createElement("button");
   doneButton.type = "button";
   doneButton.className = "primary-button";
-  doneButton.dataset.ratingClose = "";
+  doneButton.dataset.ratingSubmit = "";
+  doneButton.dataset.i18n = "rating.done";
   doneButton.textContent = t("rating.done");
-  const optOutButton = document.createElement("button");
-  optOutButton.type = "button";
-  optOutButton.className = "secondary-button";
-  optOutButton.dataset.ratingOptOutBtn = "";
-  optOutButton.textContent = t("rating.optOutBtn");
-  actions.append(addUpButton, doneButton, optOutButton);
+  actions.append(addUpButton, doneButton);
 
   const tabs = document.createElement("div");
   tabs.className = "rating-tabs";
   tabs.setAttribute("role", "tablist");
+  tabs.dataset.i18nAriaLabel = "rating.dialogLabel";
   tabs.setAttribute("aria-label", t("rating.dialogLabel"));
   const previousTab = document.createElement("button");
   previousTab.type = "button";
   previousTab.dataset.ratingTab = "previous";
   previousTab.setAttribute("role", "tab");
   previousTab.disabled = !previousRateable;
+  previousTab.dataset.i18n = "rating.previousTab";
   previousTab.textContent = t("rating.previousTab");
   const currentTab = document.createElement("button");
   currentTab.type = "button";
   currentTab.dataset.ratingTab = "current";
   currentTab.setAttribute("role", "tab");
   currentTab.disabled = !currentRateable;
+  currentTab.dataset.i18n = "rating.currentTab";
   currentTab.textContent = t("rating.currentTab");
   tabs.append(previousTab, currentTab);
 
   const message = document.createElement("p");
   message.className = "rating-message";
   message.dataset.ratingMessage = "";
-  card.append(closeButton, content, stars, actions, tabs, message);
+  const body = document.createElement("div");
+  body.className = "rating-body";
+  body.append(content, stars, actions, tabs, message);
+  card.append(closeButton, body);
   root.append(backdrop, card);
   document.body.appendChild(root);
   state.ratingPromptElement = root;
+  state.ratingPromptPreviousFocus = previousFocus;
+  state.ratingPromptReturnFocusToDock = returnFocusToDock;
+  lockPlaybackSheetDocumentScroll();
+  syncRemoteShellInert();
   renderRatingPromptContent();
+  closeButton.focus({ preventScroll: true });
 }
 
 function currentPlaybackClockSeconds() {
@@ -2042,7 +2778,7 @@ function flushPendingAutoRating(playId, itemData) {
   }
   // If the user already submitted a manual rating, skip the auto-rating.
   const submissionKey = ratingSubmissionKey({ ...pending.item, play_id: playId });
-  if (submissionKey && state.ratingSubmittedKeys.has(submissionKey)) {
+  if (submissionKey && (state.ratingSubmittedKeys.has(submissionKey) || isSongRatingQueued(pending.item))) {
     ratingLog("flush: skipping " + playId + " (user already rated)");
     return;
   }
@@ -2063,48 +2799,7 @@ function flushAllPendingAutoRatings() {
 }
 
 function maybeUpdateRemoteRatingPrompt(currentItem) {
-  const promptItems = ratingPromptItemsForItem(currentItem);
-  const currentRateable = isItemRateable(promptItems.current, true);
-  const previousRateable = isItemRateable(promptItems.previous, false);
-
-  if (elements.openRatingButton) {
-    elements.openRatingButton.disabled = !currentRateable && !previousRateable;
-  }
-
-  // Handle live-update, tab switching, and auto-closing of an already-open rating modal.
-  if (state.ratingPromptElement && state.ratingPromptItemId) {
-    const currentPromptId = String(promptItems.current?.id || promptItems.current?.bvid || "").trim();
-    const previousPromptId = String(promptItems.previous?.id || promptItems.previous?.bvid || "").trim();
-
-    if (state.ratingPromptItemId === currentPromptId && currentRateable) {
-      // The item being rated is still the current item, and is rateable.
-      const tabsChanged =
-        state.ratingPromptCurrentRateable !== currentRateable
-        || state.ratingPromptPreviousRateable !== previousRateable;
-      state.ratingPromptItems = promptItems;
-      state.ratingPromptCurrentRateable = currentRateable;
-      state.ratingPromptPreviousRateable = previousRateable;
-      if (tabsChanged) {
-        renderRatingPromptContent();
-      }
-    } else if (state.ratingPromptItemId === previousPromptId && previousRateable) {
-      // The item being rated is the previous item, and is rateable.
-      const needsTabTransition = state.ratingPromptActiveTab !== "previous";
-      const tabsChanged =
-        state.ratingPromptCurrentRateable !== currentRateable
-        || state.ratingPromptPreviousRateable !== previousRateable;
-      state.ratingPromptItems = promptItems;
-      state.ratingPromptActiveTab = "previous";
-      state.ratingPromptCurrentRateable = currentRateable;
-      state.ratingPromptPreviousRateable = previousRateable;
-      if (needsTabTransition || tabsChanged) {
-        renderRatingPromptContent();
-      }
-    } else {
-      // The item being rated is no longer rateable (neither current nor previous, or not rateable).
-      closeRatingPrompt({ submit: false });
-    }
-  }
+  renderCurrentRatingButton(currentItem);
 
   const { currentSeconds, durationSeconds } = currentPlaybackClockSeconds();
   const bvid = String(currentItem?.bvid || "").trim();
@@ -2126,10 +2821,9 @@ function maybeUpdateRemoteRatingPrompt(currentItem) {
       state.autoRatingFlushQueue.push(entry);
       ratingLog("moved " + prevPlayId + " to flush queue (len=" + state.autoRatingFlushQueue.length + ")");
     }
-    // Flush the head of the queue — it's the oldest song that hasn't been
-    // manually rated. If the user rated it, submitSongRating already removed
-    // it from the queue, so the head is always a genuinely pending auto-rating.
-    if (state.autoRatingFlushQueue.length > 0) {
+    // Keep the immediate previous song available for manual rating. Flush
+    // older songs only after that one-song opportunity has passed.
+    while (state.autoRatingFlushQueue.length > 0 && state.autoRatingFlushQueue[0].playId !== prevPlayId) {
       const headEntry = state.autoRatingFlushQueue.shift();
       flushPendingAutoRating(headEntry.playId, headEntry);
     }
@@ -2148,7 +2842,8 @@ function maybeUpdateRemoteRatingPrompt(currentItem) {
     ratingLog("threshold reached: playId=" + playId + " ratio=" + ratio.toFixed(2)
       + " seen=" + state.ratingPromptSeenPlayIds.has(playId));
   }
-  if (ratio >= remoteRatingPromptThreshold) {
+  if (ratio >= remoteRatingPromptThreshold && isItemRateable(currentItem, true) && !isSongRatingQueued(currentItem)
+      && serverRatingStatus(currentItem) !== "failed") {
     // Mark as seen so the auto-prompt can fire, but do NOT auto-submit
     // score=5 immediately. Instead, queue it as a pending auto-rating
     // that will be flushed when the next song starts or on session close.
@@ -2177,6 +2872,9 @@ function selectedHistoryExportPageSize() {
 }
 
 async function downloadHistoryExport(format, source = selectedHistoryExportSource(), pageSize = selectedHistoryExportPageSize()) {
+  if (window.BilikaraRemoteTransport?.mode === "internet") {
+    throw new Error(t("history.exportLanOnly"));
+  }
   const normalizedFormat = String(format || "").trim().toLowerCase();
   const normalizedSource = source;
   const requestedPageSize = Number.parseInt(String(pageSize || "200"), 10);
@@ -2206,30 +2904,102 @@ async function downloadHistoryExport(format, source = selectedHistoryExportSourc
 }
 
 elements.openRatingButton?.addEventListener("click", () => {
-  if (state.data?.current_item) {
-    openRatingPrompt(state.data.current_item, { manual: true });
-  }
+  openRatingPrompt(state.data?.current_item, { manual: true });
 });
+
+function setHistoryExportMessage(message, isError = false) {
+  // Feedback belongs to the toast; the status node is reserved for availability help.
+  setAppMessage(message, isError);
+}
+
+function openHistoryExportDialog() {
+  const dialog = elements.historyExportDialog;
+  if (!dialog || dialog.open) return;
+  if (window.BilikaraRemoteTransport?.mode === "internet") {
+    setHistoryExportMessage(t("history.exportLanOnly"), true);
+    return;
+  }
+  retireTransientPlaybackModalForModal();
+  setRemoteMenuOpen(false);
+  elements.historyExportRow.hidden = false;
+  elements.historyExportStatus.textContent = "";
+  historyExportRestoreFocus = true;
+  dialog.showModal();
+  lockPlaybackSheetDocumentScroll();
+  elements.historyExportClose.focus({ preventScroll: true });
+  void loadHistoryExportSessions();
+}
+
+let historyExportSessionsRequest = 0;
+let historyExportRestoreFocus = true;
+async function loadHistoryExportSessions() {
+  const request = ++historyExportSessionsRequest;
+  const select = elements.historyExportSource;
+  try {
+    const response = await fetch("/api/played-sessions", { headers: clientHeaders() });
+    const result = await response.json();
+    if (!response.ok || !result.ok || !Array.isArray(result.data)) throw new Error(t("error.requestFailed"));
+    if (request !== historyExportSessionsRequest || !elements.historyExportDialog.open) return;
+    // Same recent-session choices as desktop Host; values come from Host.
+    const selected = select.value;
+    select.querySelectorAll("optgroup").forEach((group) => group.remove());
+    const group = document.createElement("optgroup");
+    group.label = t("history.otherSessions");
+    for (const session of result.data.slice(0, 10)) {
+      if (!/^played-[^/\\]+\.json$/.test(String(session.id || ""))) continue;
+      const option = document.createElement("option");
+      option.value = session.id;
+      option.textContent = Number.isFinite(session.started_at) && session.started_at > 0
+        ? new Date(session.started_at * 1000).toLocaleString(state.language === "zh" ? "zh-CN" : state.language)
+        : session.id;
+      group.appendChild(option);
+    }
+    if (group.children.length) select.appendChild(group);
+    if ([...select.options].some((option) => option.value === selected)) select.value = selected;
+  } catch {
+    if (request === historyExportSessionsRequest && elements.historyExportDialog.open) {
+      elements.historyExportStatus.textContent = t("history.sessionsLoadFailed");
+    }
+  }
+}
+
+function closeHistoryExportDialog({ restoreFocus = true } = {}) {
+  closeRemoteContextualInfo();
+  historyExportRestoreFocus = restoreFocus;
+  historyExportSessionsRequest += 1;
+  const dialog = elements.historyExportDialog;
+  if (!dialog?.open || dialog.classList.contains("closing")) return;
+  const finish = () => {
+    dialog.classList.remove("closing");
+    dialog.close();
+  };
+  if (prefersReducedMotion()) { finish(); return; }
+  dialog.classList.add("closing");
+  const animation = dialog.getAnimations().find((entry) => entry.animationName === "scale-to-center-card");
+  if (animation) animation.finished.then(finish, finish);
+  else finish();
+}
 
 async function exportHistory(format) {
   return historyExportGuard.run(async () => {
     const source = selectedHistoryExportSource();
     const pageSize = selectedHistoryExportPageSize();
-    const sourceLabel = source === "played" ? t("history.playedSource") : t("history.allSource");
-    setAppMessage(format === "csv"
+    const sourceLabel = elements.historyExportSource?.selectedOptions?.[0]?.textContent
+      || (source === "played" ? t("history.playedSource") : t("history.allSource"));
+    setHistoryExportMessage(format === "csv"
       ? t("remote.exportingCsv", { source: sourceLabel })
       : t("remote.exportingImagePaged", { source: sourceLabel, count: pageSize }));
     try {
       const saved = await downloadHistoryExport(format, source, pageSize);
       if (!saved) {
-        setAppMessage("");
+        setHistoryExportMessage("");
         return;
       }
-      setAppMessage(format === "csv"
+      setHistoryExportMessage(format === "csv"
         ? t("history.csvDownloadStarted", { source: sourceLabel })
         : t("history.imageDownloadStarted", { source: sourceLabel }));
     } catch (error) {
-      setAppMessage(
+      setHistoryExportMessage(
         window.BilikaraExportDownload.normalizedErrorMessage(error, t("history.exportFailed")),
         true,
       );
@@ -2284,36 +3054,193 @@ async function fetchState(options = {}) {
   const { force = true } = options;
   const response = await fetch("/api/state", { headers: clientHeaders() });
   const payload = await response.json();
+  if (reenterExpiredLocalRemote(response, payload)) return;
   if (!response.ok || !payload.ok) {
     throw new Error(localizedApiMessage(payload.error) || t("error.stateFailed"));
   }
   applyStateSnapshot(payload.data, { forceRender: force || !state.data });
+  noteRemoteFallbackSuccess();
+}
+
+function reenterExpiredLocalRemote(response, payload) {
+  if (response.status !== 403 || payload?.code !== "forbidden"
+    || window.BilikaraRemoteTransport?.mode === "internet") return false;
+  // A native data reset invalidates the device cookie as well as its name.
+  // Re-enter through the existing navigation-only LAN handshake before asking
+  // for a new name; repeatedly submitting with the retired cookie cannot work.
+  if (!state.remoteSessionReentering) {
+    state.remoteSessionReentering = true;
+    window.location.replace("/remote");
+  }
+  return true;
+}
+
+function clearRemoteConnectionOfflineTimer() {
+  if (state.remoteConnectionOfflineTimer === null || state.remoteConnectionOfflineTimer === undefined) {
+    return;
+  }
+  window.clearTimeout(state.remoteConnectionOfflineTimer);
+  state.remoteConnectionOfflineTimer = null;
+}
+
+function remoteIssueSignatureSet() {
+  if (!(state.remoteIssueSignatures instanceof Set)) {
+    state.remoteIssueSignatures = new Set();
+  }
+  return state.remoteIssueSignatures;
+}
+
+function reportRemoteIssue(signature, message, isError = true) {
+  const normalizedSignature = String(signature || "").trim();
+  if (!normalizedSignature || remoteIssueSignatureSet().has(normalizedSignature)) {
+    return false;
+  }
+  remoteIssueSignatureSet().add(normalizedSignature);
+  if (typeof setAppMessage === "function") {
+    setAppMessage(message, isError);
+  }
+  return true;
+}
+
+function clearRemoteIssue(signature) {
+  const normalizedSignature = String(signature || "").trim();
+  if (!normalizedSignature) {
+    return false;
+  }
+  return remoteIssueSignatureSet().delete(normalizedSignature);
+}
+
+function clearRemoteIssueByPrefix(prefix, keepSignature = "") {
+  const normalizedPrefix = String(prefix || "").trim();
+  const normalizedKeepSignature = String(keepSignature || "").trim();
+  if (!normalizedPrefix) {
+    return 0;
+  }
+  let cleared = 0;
+  for (const signature of remoteIssueSignatureSet()) {
+    if (
+      signature !== normalizedKeepSignature
+      && (signature === normalizedPrefix || signature.startsWith(`${normalizedPrefix}:`))
+    ) {
+      remoteIssueSignatureSet().delete(signature);
+      cleared += 1;
+    }
+  }
+  return cleared;
+}
+
+function noteRemoteFallbackSuccess() {
+  clearRemoteConnectionOfflineTimer();
+  state.remoteConnectionFailureStartedAt = null;
+  clearRemoteIssue("remote-connection-offline");
+  if (!state.eventStreamHealthy && typeof setRemoteConnectionPhase === "function") {
+    setRemoteConnectionPhase(remoteConnectionRecoveryPhase());
+  }
+}
+
+function clearStateFallbackTimer() {
+  if (!state.autoRefreshTimer) {
+    return;
+  }
+  window.clearTimeout(state.autoRefreshTimer);
+  state.autoRefreshTimer = null;
+}
+
+function scheduleStateFallbackRefresh(delayMs = stateFallbackRefreshMs) {
+  if (
+    state.eventStreamHealthy
+    || state.autoRefreshTimer
+    || state.stateFallbackFetchInFlight
+  ) {
+    return;
+  }
+  const boundedDelayMs = Math.max(
+    stateFallbackRefreshMs,
+    Number(delayMs) || stateFallbackRefreshMs,
+  );
+  state.autoRefreshTimer = window.setTimeout(() => {
+    state.autoRefreshTimer = null;
+    return refreshCacheStatusOnly();
+  }, boundedDelayMs);
 }
 
 async function refreshCacheStatusOnly() {
-  try {
-    const response = await fetch("/api/state", { headers: clientHeaders() });
-    const payload = await response.json();
-    if (response.ok && payload.ok && payload.data) {
-      const previousSnapshot = state.data;
-      state.data = payload.data;
-      const current = state.data.current_item;
-      renderCacheStatusOnly(previousSnapshot);
-      if (current) {
-        if (current.cache_status === "downloading" || current.cache_status === "queued" || current.cache_status === "waiting") {
-          state.autoRefreshTimer = setTimeout(refreshCacheStatusOnly, 1000);
-          return;
-        }
-      }
-    }
-  } catch (e) {
-    // 静默失败
+  if (state.eventStreamHealthy || state.stateFallbackFetchInFlight) {
+    return;
   }
-  state.autoRefreshTimer = null;
+  state.stateFallbackFetchInFlight = true;
+  try {
+    await fetchState({ force: false });
+  } catch (e) {
+    noteRemoteFallbackFailure();
+  } finally {
+    state.stateFallbackFetchInFlight = false;
+    if (!state.eventStreamHealthy) {
+      scheduleStateFallbackRefresh();
+    }
+  }
 }
+
+function armRemoteConnectionOfflineGrace() {
+  if (
+    state.remoteConnectionOfflineTimer !== null
+    && state.remoteConnectionOfflineTimer !== undefined
+  ) {
+    return;
+  }
+  if (state.remoteConnectionFailureStartedAt === null || state.remoteConnectionFailureStartedAt === undefined) {
+    return;
+  }
+  const graceMs = typeof remoteConnectionOfflineGraceMs === "number"
+    ? remoteConnectionOfflineGraceMs
+    : 3000;
+  const startedAt = state.remoteConnectionFailureStartedAt;
+  state.remoteConnectionOfflineTimer = window.setTimeout(() => {
+    state.remoteConnectionOfflineTimer = null;
+    if (
+      state.eventStreamHealthy
+      || state.remoteConnectionFailureStartedAt !== startedAt
+    ) {
+      return;
+    }
+    if (typeof setRemoteConnectionPhase === "function") {
+      setRemoteConnectionPhase("offline");
+    }
+    reportRemoteIssue("remote-connection-offline", t("remote.connectionOfflineToast"));
+  }, graceMs);
+}
+
+function noteRemoteFallbackFailure() {
+  if (state.eventStreamHealthy) {
+    return;
+  }
+  if (remoteIssueSignatureSet().has("remote-connection-offline")) {
+    if (typeof setRemoteConnectionPhase === "function") {
+      setRemoteConnectionPhase("offline");
+    }
+    return;
+  }
+  if (state.remoteConnectionFailureStartedAt === null || state.remoteConnectionFailureStartedAt === undefined) {
+    state.remoteConnectionFailureStartedAt = Date.now();
+  }
+  if (typeof setRemoteConnectionPhase === "function") {
+    setRemoteConnectionPhase(remoteConnectionRecoveryPhase());
+  }
+  armRemoteConnectionOfflineGrace();
+}
+
 function currentStateRevision(snapshot = state.data) {
   const revision = Number(snapshot?.state_revision || 0);
   return Number.isFinite(revision) && revision >= 0 ? revision : 0;
+}
+
+// Revisions are ordered only within a Host lifetime. Remember retired epochs
+// so an old HTTP response cannot roll the page back after SSE reconnects.
+function stateEpochTransition(snapshot) {
+  const next = typeof snapshot?.state_epoch === "string" ? snapshot.state_epoch : "";
+  const current = typeof state.data?.state_epoch === "string" ? state.data.state_epoch : "";
+  if (state.retiredStateEpochs?.has(next) || (current && !next)) return "stale";
+  return next && next !== current ? "restart" : "same";
 }
 
 const CACHE_VOLATILE_ITEM_KEYS = new Set([
@@ -2348,6 +3275,7 @@ function stableSnapshotForRenderSignature(snapshot) {
     ffmpeg: _ffmpeg,
     player_status: _playerStatus,
     state_revision: _stateRevision,
+    revision: _revision,
     updated_at: _updatedAt,
     ...renderedData
   } = snapshot;
@@ -2375,26 +3303,43 @@ function scheduleRender() {
   }
   state.renderDebounceTimer = setTimeout(() => {
     state.renderDebounceTimer = null;
-    render();
+    try {
+      render();
+      state.remoteLastRenderedGeneration = state.data?.playback_generation;
+    } catch (error) {
+      reportNativeRemoteConnection("render_error");
+      throw error;
+    }
   }, 50);
-}
-
-function renderPlaybackStatusOnly() {
-  const currentItem = state.data?.current_item;
-  if (!currentItem) {
-    return;
-  }
-  renderCurrentPlaybackState(currentItem);
-  renderPlayerControls(currentItem, frontendPlaybackMode(state.data?.playback_mode));
 }
 
 function renderCacheStatusOnly(previousSnapshot = null) {
   const currentItem = state.data?.current_item;
-  if (currentItem) {
-    renderCurrentPlaybackState(currentItem);
+  const items = [currentItem, ...(state.data?.playlist || [])];
+  const identity = JSON.stringify([state.data?.state_epoch, ...items.filter(Boolean).map(item =>
+    [item.item_incarnation_id, item.cache_status])]);
+  const now = Date.now();
+  const elapsed = now - (state.cacheProgressPaintAt || 0);
+  let playbackPainted = false;
+  if (identity !== state.cacheProgressPaintIdentity || elapsed >= 1000) {
+    window.clearTimeout(state.cacheProgressPaintTimer);
+    state.cacheProgressPaintTimer = null;
+    state.cacheProgressPaintIdentity = identity;
+    state.cacheProgressPaintAt = now;
+    if (currentItem) {
+      renderCurrentPlaybackState(currentItem);
+      playbackPainted = true;
+    }
+    renderQueueCacheStatus(Array.isArray(state.data?.playlist) ? state.data.playlist : []);
+  } else if (!state.cacheProgressPaintTimer) {
+    state.cacheProgressPaintTimer = window.setTimeout(() => {
+      state.cacheProgressPaintTimer = null;
+      renderCacheStatusOnly(state.data);
+    }, Math.max(1, 1000 - elapsed));
   }
-  renderQueueCacheStatus(Array.isArray(state.data?.playlist) ? state.data.playlist : []);
   if (playerStatusSignature(previousSnapshot) !== playerStatusSignature(state.data)) {
+    // Seek/pause/duration acknowledgements must not wait for the cache display.
+    if (currentItem?.cache_status === "ready" && !playbackPainted) renderCurrentPlaybackState(currentItem);
     renderPlayerControls(currentItem, frontendPlaybackMode(state.data?.playback_mode));
   }
 }
@@ -2403,13 +3348,19 @@ function applyStateSnapshot(snapshot, { forceRender = false } = {}) {
   if (!snapshot || typeof snapshot !== "object") {
     return false;
   }
+  const epochTransition = stateEpochTransition(snapshot);
+  if (epochTransition === "stale") return false;
+  if (epochTransition === "restart") {
+    if (!state.retiredStateEpochs) state.retiredStateEpochs = new Set();
+    if (state.data?.state_epoch) state.retiredStateEpochs.add(state.data.state_epoch);
+    forceRender = true;
+  }
   const nextRevision = currentStateRevision(snapshot);
   const currentRevision = currentStateRevision(state.data);
-  if (!forceRender && state.data) {
-    if (nextRevision > 0 && nextRevision <= currentRevision) {
-      return false;
-    }
-    if (nextRevision === 0 && currentRevision > 0) {
+  if (state.data && epochTransition !== "restart") {
+    // forceRender requests a redraw, never permission to roll state back.
+    if (nextRevision < currentRevision
+      || (!forceRender && nextRevision > 0 && nextRevision === currentRevision)) {
       return false;
     }
   }
@@ -2418,9 +3369,35 @@ function applyStateSnapshot(snapshot, { forceRender = false } = {}) {
   const shouldRender = forceRender
     || !state.data
     || nextRenderSignature !== state.dataRenderSignature;
+  const loginFailure = [snapshot.current_item, ...(snapshot.playlist || [])].find((item) => {
+    if (!item || item.cache_status !== "failed" || !String(item.cache_message).includes("下载需要登录 Bilibili")) return false;
+    const previous = [state.data?.current_item, ...(state.data?.playlist || [])]
+      .find((entry) => entry?.item_incarnation_id === item.item_incarnation_id);
+    return !previous || previous.cache_status !== "failed" || previous.cache_message !== item.cache_message;
+  });
+  if (loginFailure) setAppMessage(localizedCacheMessage(loginFailure.cache_message, "failed"), true);
   state.data = snapshot;
+  globalThis.BilikaraVolumeControl?.refreshAutomatic(elements.remoteVolumeSlider);
+  if (epochTransition === "restart" || previousSnapshot?.current_item?.item_incarnation_id !== snapshot.current_item?.item_incarnation_id) {
+    clearRemoteVolumeCommitTimer();
+    state.remoteVolumeSaveSeq += 1;
+    state.remoteSettingsEchoSuppressUntil = 0;
+    state.remoteLocalVolumePercent = null;
+    state.remoteLocalMuted = null;
+    globalThis.BilikaraVolumeControl?.resetForSong(elements.remoteVolumeSlider, snapshot.player_settings.volume_percent);
+  }
+  const programChanged = Boolean(
+    previousSnapshot
+    && previousSnapshot.playback_generation !== snapshot.playback_generation
+  );
+  if (programChanged || !currentPlayerStatus(snapshot.current_item, snapshot)) {
+    clearCurrentPlaybackClock();
+  }
   syncRemoteIdentityWithSnapshot(snapshot);
   scheduleFavlistBrowseReloadFromState(previousSnapshot, snapshot);
+  if (JSON.stringify(previousSnapshot?.gatcha) !== JSON.stringify(snapshot.gatcha)) {
+    renderSourceManagementControls();
+  }
 
   // 简单的渲染防抖，合并 50ms 内的多次状态变更（如切歌时的密集事件）
   if (shouldRender) {
@@ -2442,12 +3419,44 @@ function clearEventStreamReconnectTimer() {
 }
 
 function closeEventStream() {
+  window.clearTimeout(state.eventStreamWatchdog);
+  state.eventStreamWatchdog = null;
   clearEventStreamReconnectTimer();
+  state.eventStreamHealthy = false;
   if (!state.eventSource) {
     return;
   }
   state.eventSource.close();
   state.eventSource = null;
+}
+
+function reportNativeRemoteConnection(event, receivedRevision = null) {
+  if (!state.data?.capabilities?.event_heartbeat) return;
+  // Fixed measurements only, no title/user, cookie, invite or arbitrary error.
+  fetch("/api/remote/connection-diagnostic", {
+    method: "POST", headers: {...clientHeaders(), "Content-Type":"application/json"},
+    body: JSON.stringify({event, revision:currentStateRevision(), received_revision:receivedRevision,
+      playback_generation:state.data?.playback_generation,
+      rendered_generation:state.remoteLastRenderedGeneration,
+      stream_state:state.eventSource?.readyState ?? 2,
+      age_ms:Math.max(0, Date.now() - (state.eventStreamLastFrameAt || Date.now())),
+      visible:document.visibilityState === "visible"}),
+  }).catch(() => {});
+}
+
+function armNativeEventStreamWatchdog(source) {
+  if (!state.data?.capabilities?.event_heartbeat) return;
+  state.eventStreamLastFrameAt = Date.now();
+  window.clearTimeout(state.eventStreamWatchdog);
+  state.eventStreamWatchdog = window.setTimeout(() => {
+    if (state.eventSource !== source) return;
+    reportNativeRemoteConnection("stale");
+    closeEventStream();
+    setRemoteConnectionPhase("reconnecting");
+    // Read-only local Host snapshot; never trigger a media/library refresh.
+    refreshCacheStatusOnly();
+    scheduleEventStreamReconnect();
+  }, nativeEventStreamDeadlineMs);
 }
 
 function eventStreamReconnectDelayMs(baseDelayMs, randomValue = Math.random()) {
@@ -2475,62 +3484,122 @@ function scheduleEventStreamReconnect() {
     connectStateStream();
   }, delayMs);
   state.eventStreamRetryMs = Math.min(eventStreamMaxRetryMs, baseDelayMs * 2);
+  return delayMs;
+}
+
+function eventStreamStateIsCurrent(snapshot) {
+  if (
+    !snapshot
+    || typeof snapshot !== "object"
+    || Array.isArray(snapshot)
+    || !Object.prototype.hasOwnProperty.call(snapshot, "state_revision")
+  ) {
+    return false;
+  }
+  const nextRevision = Number(snapshot.state_revision);
+  if (!Number.isFinite(nextRevision) || nextRevision < 0) {
+    return false;
+  }
+  const epochTransition = stateEpochTransition(snapshot);
+  return epochTransition !== "stale"
+    && (epochTransition === "restart" || !state.data || nextRevision >= currentStateRevision());
+}
+
+function remoteConnectionRecoveryPhase() {
+  return state.remoteConnectionPhase === "connecting" && !state.eventStreamHealthy
+    ? "connecting"
+    : "reconnecting";
 }
 
 function connectStateStream() {
+  const recoveryPhase = remoteConnectionRecoveryPhase();
   if (typeof window.EventSource !== "function") {
+    state.eventStreamHealthy = false;
+    if (typeof setRemoteConnectionPhase === "function") {
+      setRemoteConnectionPhase(recoveryPhase);
+    }
+    scheduleStateFallbackRefresh();
     return;
   }
   closeEventStream();
+  if (typeof setRemoteConnectionPhase === "function") {
+    setRemoteConnectionPhase(recoveryPhase);
+  }
   const source = new window.EventSource(`/api/events?client_id=${encodeURIComponent(state.clientId)}`);
   state.eventSource = source;
-
-  source.addEventListener("open", () => {
-    state.eventStreamRetryMs = eventStreamInitialRetryMs;
-  });
+  scheduleStateFallbackRefresh();
 
   source.addEventListener("state", (event) => {
+    if (state.eventSource !== source) {
+      return;
+    }
     try {
       const snapshot = JSON.parse(event.data);
+      const confirmsCurrentState = eventStreamStateIsCurrent(snapshot);
       applyStateSnapshot(snapshot);
+      if (!confirmsCurrentState) {
+        reportNativeRemoteConnection("out_of_order", Number(snapshot.state_revision));
+        return;
+      }
+      if (!state.eventStreamHealthy) reportNativeRemoteConnection("connected");
+      state.eventStreamHealthy = true;
+      armNativeEventStreamWatchdog(source);
       state.eventStreamRetryMs = eventStreamInitialRetryMs;
+      clearStateFallbackTimer();
+      clearRemoteConnectionOfflineTimer();
+      state.remoteConnectionFailureStartedAt = null;
+      clearRemoteIssue("remote-connection-offline");
+      if (typeof setRemoteConnectionPhase === "function") {
+        setRemoteConnectionPhase("connected");
+      }
     } catch {
+      reportNativeRemoteConnection("invalid_state");
       // Ignore malformed events and wait for the next valid snapshot.
     }
   });
 
-  source.addEventListener("error", async () => {
+  source.addEventListener("heartbeat", (event) => {
+    if (state.eventSource !== source || !state.eventStreamHealthy) return;
+    try {
+      const revision = JSON.parse(event.data).state_revision;
+      if (revision === currentStateRevision()) armNativeEventStreamWatchdog(source);
+      // A missing state frame must not be hidden by a newer heartbeat.
+    } catch { /* Invalid heartbeats cannot extend the liveness deadline. */ }
+  });
+
+  source.addEventListener("error", () => {
     if (state.eventSource !== source) {
       return;
     }
+    const nextPhase = remoteConnectionRecoveryPhase();
     closeEventStream();
-    try {
-      await fetchState();
-    } catch {
-      // Keep the last successful state on screen while reconnecting.
+    if (typeof setRemoteConnectionPhase === "function") {
+      setRemoteConnectionPhase(nextPhase);
     }
-    scheduleEventStreamReconnect();
+    const reconnectDelayMs = scheduleEventStreamReconnect();
+    scheduleStateFallbackRefresh(reconnectDelayMs + stateFallbackRefreshMs);
   });
 }
 
-async function searchGatchaCache(query) {
+async function searchGatchaCache(query, {offset = 0, limit = 18} = {}) {
   const normalizedQuery = String(query || "").trim();
-  const response = await fetch(`/api/gatcha/search?q=${encodeURIComponent(normalizedQuery)}`, {
+  const response = await fetch(`/api/gatcha/search?q=${encodeURIComponent(normalizedQuery)}&offset=${offset}&limit=${limit}`, {
     headers: clientHeaders(),
   });
   const payload = await response.json();
   if (!response.ok || !payload.ok) {
     throw new Error(localizedApiMessage(payload.error) || t("error.searchFailed"));
   }
-  return Array.isArray(payload.data?.items) ? payload.data.items : [];
+  return {...payload.data, items: Array.isArray(payload.data?.items) ? payload.data.items : []};
 }
 
-async function searchLarkPool(query) {
+async function searchCatalog(query, {offset = 0, limit = 80} = {}) {
   const normalizedQuery = String(query || "").trim();
   const params = new URLSearchParams();
   params.set("q", normalizedQuery);
-  params.set("limit", "80");
-  const response = await fetch(`/api/lark/search?${params.toString()}`, {
+  params.set("limit", String(limit));
+  params.set("offset", String(offset));
+  const response = await fetch(`/api/catalog/search?${params.toString()}`, {
     cache: "no-store",
     headers: clientHeaders(),
   });
@@ -2538,29 +3607,14 @@ async function searchLarkPool(query) {
   if (!response.ok || !payload.ok) {
     throw new Error(localizedApiMessage(payload.error) || t("error.larkSearchFailed"));
   }
-  return Array.isArray(payload.data?.items) ? payload.data.items : [];
+  return {...payload.data, items: Array.isArray(payload.data?.items) ? payload.data.items : []};
 }
 
-async function searchLarkPoolTable(query, tableIndex) {
-  const normalizedQuery = String(query || "").trim();
-  const params = new URLSearchParams();
-  params.set("q", normalizedQuery);
-  params.set("table", String(tableIndex));
-  params.set("limit", "80");
-  const response = await fetch(`/api/lark/search?${params.toString()}`, {
-    cache: "no-store",
-    headers: clientHeaders(),
-  });
-  const payload = await response.json();
-  if (!response.ok || !payload.ok) {
-    throw new Error(localizedApiMessage(payload.error) || t("error.larkSearchFailed"));
-  }
-  return Array.isArray(payload.data?.items) ? payload.data.items : [];
-}
 
-async function fetchD1Browse({ kind = "name", letter = "", query = "", tag = "", locale = "", limit = 100 } = {}) {
+async function fetchD1Browse({ kind = "name", letter = "", query = "", tag = "", locale = "", limit = 100, offset = 0 } = {}) {
   const params = new URLSearchParams();
   params.set("kind", kind === "artist" ? "artist" : "name");
+  params.set("offset", String(offset));
   params.set("limit", String(limit));
   const normalizedLetter = String(letter || "").trim().toUpperCase();
   const normalizedQuery = String(query || "").trim();
@@ -2632,7 +3686,7 @@ async function fetchD1CategoryBrowse({ tags = [], query = "", offset = 0, limit 
   };
 }
 
-async function fetchGatchaBrowse(uid = "", query = "") {
+async function fetchGatchaBrowse(uid = "", query = "", { offset = 0, limit = 100 } = {}) {
   const params = new URLSearchParams();
   const normalizedUid = String(uid || "").trim();
   const normalizedQuery = String(query || "").trim();
@@ -2642,6 +3696,8 @@ async function fetchGatchaBrowse(uid = "", query = "") {
   if (normalizedQuery) {
     params.set("q", normalizedQuery);
   }
+  params.set("offset", String(offset));
+  params.set("limit", String(limit));
   const queryString = params.toString();
   const response = await fetch(`/api/gatcha/browse${queryString ? `?${queryString}` : ""}`, {
     cache: "no-store",
@@ -2654,7 +3710,11 @@ async function fetchGatchaBrowse(uid = "", query = "") {
   return payload.data || { owners: [], items: [] };
 }
 
-async function fetchGatchaFavlistBrowse(folderId = "", query = "") {
+async function fetchGatchaFavlistBrowse(
+  folderId = "",
+  query = "",
+  { offset = 0, limit = 100 } = {},
+) {
   const params = new URLSearchParams();
   const normalizedFolderId = String(folderId || "").trim();
   const normalizedQuery = String(query || "").trim();
@@ -2664,6 +3724,8 @@ async function fetchGatchaFavlistBrowse(folderId = "", query = "") {
   if (normalizedQuery) {
     params.set("q", normalizedQuery);
   }
+  params.set("offset", String(offset));
+  params.set("limit", String(limit));
   const queryString = params.toString();
   const response = await fetch(`/api/gatcha/favlist/browse${queryString ? `?${queryString}` : ""}`, {
     cache: "no-store",
@@ -2697,7 +3759,10 @@ async function previewGatchaUid(uid) {
 }
 
 async function addGatchaUid(uid) {
-  return apiPost("/api/gatcha/uids/add", { uid: String(uid || "").trim() });
+  return apiPost("/api/gatcha/uids/add", {
+    uid: String(uid || "").trim(),
+    queue: Boolean(state.data?.capabilities?.source_queue),
+  });
 }
 
 async function refreshGatchaCache() {
@@ -2708,15 +3773,24 @@ async function previewGatchaFavlist(uid) {
   return apiPost("/api/gatcha/favlist/preview", { uid: String(uid || "").trim() });
 }
 
-async function pullGatchaFavlist(uid, folderIds = []) {
+async function pullGatchaFavlist(uid, folderIds = [], folders = []) {
   return apiPost("/api/gatcha/favlist", {
+    queue: Boolean(state.data?.capabilities?.source_queue),
     uid: String(uid || "").trim(),
     folder_ids: Array.isArray(folderIds) ? folderIds : [],
+    ...(state.data?.capabilities?.source_queue_titles ? {
+      folder_titles: Object.fromEntries(folders.filter(folder => folderIds.includes(String(folder.id || folder.folder_id)))
+        .map(folder => [String(folder.id || folder.folder_id).split(":").pop(), String(folder.title || "").trim().slice(0, 200)])),
+    } : {}),
   });
 }
 
 function gatchaTaskBusy() {
-  return Boolean(state.data?.gatcha?.busy);
+  return Boolean(state.data?.gatcha?.busy || state.data?.gatcha?.background_busy);
+}
+
+function gatchaSourceBusy() {
+  return gatchaTaskBusy() && !state.data?.capabilities?.source_queue;
 }
 
 function localizedGatchaTaskMessage(message, status = "") {
@@ -2756,40 +3830,44 @@ function gatchaTaskBusyMessage() {
 }
 
 function syncGatchaTaskTerminalMessage() {
-  const task = state.data?.gatcha || {};
-  if (task.busy || state.gatchaUidSaving || state.gatchaRefreshSaving || state.gatchaFavlistSaving) {
-    return;
+  const task = state.data?.gatcha;
+  if (!task) return;
+  const changedSources = window.BilikaraSourceStatus?.takeSourceChanges?.(task) || [];
+  const completed = window.BilikaraSourceStatus?.takeCompletion(task,
+    state.gatchaUidSaving || state.gatchaRefreshSaving || state.gatchaFavlistSaving);
+  if (!completed && !changedSources.length) return;
+  if (completed) {
+    const status = String(task.last_status || "");
+    const fallback =
+      status === "success"
+        ? t("gatcha.refreshDone")
+        : status === "partial"
+          ? t("gatcha.refreshPartial")
+          : t("gatcha.refreshFailed");
+    const operation = task.last_result?.operation;
+    const message = operation === "source_order" ? t("sources.orderSaved")
+      : operation === "source_cleanup" ? t(status === "partial" ? "sources.removedCleanupPending" : "sources.cleanupDone")
+      : ["remove_source", "remove_sources"].includes(operation)
+        ? t(status === "partial" ? "sources.removedCleanupPending" : "sources.removedLocal")
+        : localizedGatchaTaskMessage(task.last_message, status) || fallback;
+    const detail = task.last_error ? `${message} ${task.last_error}` : message;
+    setGatchaUidMessage(detail, status !== "success");
   }
-  const status = String(task.last_status || "");
-  if (!["success", "partial", "failed"].includes(status)) {
-    return;
-  }
-  const updatedAt = Number(task.last_updated_at || 0);
-  if (updatedAt && updatedAt < state.gatchaTaskWatchStartedAt - 1) {
-    return;
-  }
-  const signature = JSON.stringify({
-    status,
-    message: task.last_message || "",
-    error: task.last_error || "",
-    updatedAt,
+  // Each committed source becomes visible while the rest of the batch runs.
+  if ((completed || changedSources.includes("uids")) && (state.followBrowseData || state.followBrowseLoading)) window.BilikaraSourceStatus?.queueReload("uids", () => !state.followBrowseLoading, () => {
+    state.sourcesFollowBrowseRenderSignature = "";
+    void loadFollowBrowse({uid:state.followBrowseSelectedUid,
+      query:String(state.followBrowseData?.query || ""), keepQuery:true});
   });
-  if (signature === state.gatchaTaskLastMessageSignature) {
-    return;
-  }
-  state.gatchaTaskLastMessageSignature = signature;
-  const fallback =
-    status === "success"
-      ? t("gatcha.refreshDone")
-      : status === "partial"
-        ? t("gatcha.refreshPartial")
-        : t("gatcha.refreshFailed");
-  const message = localizedGatchaTaskMessage(task.last_message, status) || fallback;
-  const detail = task.last_error ? `${message} ${task.last_error}` : message;
-  setGatchaUidMessage(detail, status !== "success");
+  if ((completed || changedSources.includes("favorites")) && (state.favlistBrowseData || state.favlistBrowseLoading)) window.BilikaraSourceStatus?.queueReload("favorites", () => !state.favlistBrowseLoading, () => {
+    state.favlistBrowseRenderSignature = "";
+    void loadFavlistBrowse({folderId:state.favlistBrowseSelectedFolderId,
+      query:String(state.favlistBrowseData?.query || ""), keepQuery:true});
+  });
 }
 
 function gatchaUidResultMessage(result, fallbackUid = "") {
+  if (result?.queued) return t(result.duplicate ? "gatcha.sourceAlreadyQueued" : "gatcha.sourceQueued");
   const cache = result?.cache || {};
   const addedCount = Number(cache.added_count || 0);
   const totalCount = Number(cache.total_count || 0);
@@ -2808,6 +3886,7 @@ function gatchaUidResultMessage(result, fallbackUid = "") {
 function hideSearchResults() {
   elements.searchResults.innerHTML = "";
   elements.searchResults.classList.add("hidden");
+  hideRemoteResultPager(elements.searchResults);
 }
 
 function hideLarkSearchResults() {
@@ -2816,6 +3895,7 @@ function hideLarkSearchResults() {
   }
   elements.larkSearchResults.innerHTML = "";
   elements.larkSearchResults.classList.add("hidden");
+  hideRemoteResultPager(elements.larkSearchResults);
 }
 
 function searchResultOwnerName(item) {
@@ -2898,17 +3978,20 @@ function searchResultRatingText(item) {
   return rating == null ? t("search.ratingNone") : t("search.ratingValue", { rating: formatSearchRating(rating) });
 }
 
-function createSearchResultRatingStars(item) {
+function createSearchResultRatingBadge(item) {
   const rating = searchResultRatingValue(item);
   if (rating == null) {
     return null;
   }
-  const stars = document.createElement("span");
-  stars.className = "search-result-rating-stars";
-  stars.setAttribute("aria-label", searchResultRatingText(item));
-  stars.style.setProperty("--rating-width", `${(rating / 5) * 100}%`);
-  stars.innerHTML = `<span class="search-result-rating-stars-base">★★★★★</span><span class="search-result-rating-stars-fill">★★★★★</span>`;
-  return stars;
+  const badge = document.createElement("span");
+  badge.className = "search-result-rating-badge";
+  badge.setAttribute("role", "img");
+  badge.setAttribute("aria-label", searchResultRatingText(item));
+  badge.title = searchResultRatingText(item);
+  const value = document.createElement("span");
+  value.textContent = `★ ${rating.toFixed(1)}`;
+  badge.appendChild(value);
+  return badge;
 }
 
 function searchResultStatusLabel(item) {
@@ -2920,7 +4003,7 @@ function searchResultStatusLabel(item) {
     return t("search.followed");
   }
   const source = String(item?.source || "").trim();
-  if (source === "bilikara" || source === "cloudflare") {
+  if (source === "bilikara" || source === "cloudflare" || source === "sheets") {
     return "";
   }
   if (source === "favlist") {
@@ -2952,168 +4035,44 @@ function createSearchResultUrlLine(item) {
 }
 
 function renderSearchResults(items) {
-  elements.searchResults.innerHTML = "";
-  elements.searchResults.classList.remove("hidden");
-
-  if (!items.length) {
-    const empty = document.createElement("div");
-    empty.className = "search-empty";
-    empty.textContent = t("search.empty");
-    elements.searchResults.appendChild(empty);
-    return;
-  }
-
-  items.forEach((item) => {
-    const row = document.createElement("div");
-    row.className = "search-result-item";
-    searchResultItemByElement.set(row, item);
-
-    const meta = document.createElement("div");
-    meta.className = "search-result-meta";
-
-    const title = document.createElement("div");
-    title.className = "search-result-title";
-    title.textContent = String(item.title || "");
-
-    const url = createSearchResultUrlLine(item);
-
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "primary-button";
-    button.dataset.url = String(item.url || "");
-    button.textContent = t("search.add");
-
-    meta.append(title, url);
-    row.append(meta, button);
-    elements.searchResults.appendChild(row);
-  });
+  renderSearchResultItems(elements.searchResults, items, t("search.empty"));
 }
 
 function renderLarkSearchResults(items) {
-  if (!elements.larkSearchResults) {
-    return;
-  }
-  elements.larkSearchResults.innerHTML = "";
-  elements.larkSearchResults.classList.remove("hidden");
-
-  if (!items.length) {
-    const empty = document.createElement("div");
-    empty.className = "search-empty";
-    empty.textContent = t("search.larkNoResults");
-    elements.larkSearchResults.appendChild(empty);
-    return;
-  }
-
-  items.forEach((item) => {
-    const row = document.createElement("div");
-    row.className = "search-result-item";
-    searchResultItemByElement.set(row, item);
-
-    const meta = document.createElement("div");
-    meta.className = "search-result-meta";
-    const title = document.createElement("div");
-    title.className = "search-result-title";
-    title.textContent = String(item.title || "");
-
-    const url = createSearchResultUrlLine(item);
-
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "primary-button";
-    button.dataset.url = String(item.url || "");
-    button.textContent = t("search.add");
-
-    meta.append(title, url);
-    row.append(meta, button);
-    elements.larkSearchResults.appendChild(row);
-  });
+  renderSearchResultItems(elements.larkSearchResults, items, t("search.larkNoResults"));
 }
 
-function appendLarkSearchResults(items) {
-  if (!elements.larkSearchResults || !items.length) {
-    return;
-  }
-  const existingEmpty = elements.larkSearchResults.querySelector(".search-empty");
-  if (existingEmpty) {
-    existingEmpty.remove();
-  }
-  elements.larkSearchResults.classList.remove("hidden");
-  items.forEach((item) => {
-    const row = document.createElement("div");
-    row.className = "search-result-item";
-    searchResultItemByElement.set(row, item);
-
-    const meta = document.createElement("div");
-    meta.className = "search-result-meta";
-    const title = document.createElement("div");
-    title.className = "search-result-title";
-    title.textContent = String(item.title || "");
-
-    const url = createSearchResultUrlLine(item);
-
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "primary-button";
-    button.dataset.url = String(item.url || "");
-    button.textContent = t("search.add");
-
-    meta.append(title, url);
-    row.append(meta, button);
-    elements.larkSearchResults.appendChild(row);
-  });
-}
-
-function setFollowBrowseMessage(message, isError = false) {
-  if (!elements.followBrowseMessage) {
-    return;
-  }
-  elements.followBrowseMessage.textContent = message || "";
-  elements.followBrowseMessage.classList.toggle("is-error", Boolean(isError));
-  elements.followBrowseMessage.classList.toggle("hidden", !message);
-}
-
-function setModalFollowBrowseMessage(message, isError = false) {
-  if (!elements.modalFollowBrowseMessage) {
-    return;
-  }
-  elements.modalFollowBrowseMessage.textContent = message || "";
-  elements.modalFollowBrowseMessage.classList.toggle("is-error", Boolean(isError));
-  elements.modalFollowBrowseMessage.classList.toggle("hidden", !message);
-}
-
-function setSearchModalLarkMessage(message, isError = false) {
-  if (!elements.searchModalLarkMessage) {
-    return;
-  }
-  elements.searchModalLarkMessage.textContent = message || "";
-  elements.searchModalLarkMessage.classList.toggle("is-error", Boolean(isError));
+function setSourcesFollowBrowseMessage(message, isError = false) {
+  if (elements.sourcesFollowMessage) elements.sourcesFollowMessage.textContent = "";
+  if (isError && message) setAppMessage(message, true);
 }
 
 function setFavlistBrowseMessage(message, isError = false) {
-  if (!elements.favlistBrowseMessage) {
-    return;
-  }
-  elements.favlistBrowseMessage.textContent = message || "";
-  elements.favlistBrowseMessage.classList.toggle("is-error", Boolean(isError));
-  elements.favlistBrowseMessage.classList.toggle("hidden", !message);
+  if (elements.favlistBrowseMessage) elements.favlistBrowseMessage.textContent = "";
+  if (isError && message) setAppMessage(message, true);
 }
 
-function setGatchaUidFlowMessage(target, message, isError = false) {
-  if (target === "follow-modal") {
-    setModalFollowBrowseMessage(message, isError);
-    return;
-  }
-  if (target === "favlist-modal") {
+function setSourceManagementInlineMessage(target, message, isError = false) {
+  if (target === "sources-favorites") {
     setFavlistBrowseMessage(message, isError);
     return;
   }
-  setGatchaUidMessage(message, isError);
+  setSourcesFollowBrowseMessage(message, isError);
 }
 
-function appendSearchResultCoverFallback(cover, item, stateName) {
+function setSourceManagementMessage(target, message, isError = false) {
+  setSourceManagementInlineMessage(target, "");
+  setAppMessage(message, isError);
+}
+
+function setSourceManagementLoadingMessage(target, message) {
+  setSourceManagementInlineMessage(target, message);
+}
+
+function appendSearchResultCoverFallback(cover, stateName) {
   const fallback = document.createElement("span");
   fallback.className = "search-result-cover-fallback";
-  fallback.textContent = String(item?.bvid || "Bili");
+  fallback.textContent = "Bili";
   cover.appendChild(fallback);
   cover.classList.add("is-empty");
   cover.classList.toggle("is-error", stateName === "error");
@@ -3139,24 +4098,46 @@ function createSearchResultCover(item, { eagerCover = false } = {}) {
         return;
       }
       image.remove();
-      appendSearchResultCoverFallback(cover, item, "error");
+      appendSearchResultCoverFallback(cover, "error");
     };
     cover.appendChild(image);
     image.src = coverUrl;
   } else {
-    appendSearchResultCoverFallback(cover, item, "missing");
+    appendSearchResultCoverFallback(cover, "missing");
   }
 
+  const stats = document.createElement("div");
+  stats.className = "search-result-cover-stats";
+  const playCount = formatCompactCount(firstSearchResultValue(item, ["played_count", "play_count", "play", "view", "views"]));
+  if (playCount) {
+    const plays = document.createElement("span");
+    plays.className = "search-result-plays";
+    plays.setAttribute("role", "img");
+    plays.setAttribute("aria-label", `${t("search.playCountLabel")} ${playCount}`);
+    plays.title = plays.getAttribute("aria-label");
+    plays.innerHTML = '<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="1.25" y="2.5" width="13.5" height="11" rx="2.5"/><path d="m6.5 5 4 3-4 3Z"/></svg>';
+    const value = document.createElement("span");
+    value.textContent = playCount;
+    plays.appendChild(value);
+    stats.appendChild(plays);
+  }
+  const ratingBadge = createSearchResultRatingBadge(item);
+  if (ratingBadge) stats.appendChild(ratingBadge);
   const duration = formatSearchDuration(firstSearchResultValue(item, ["preserved_1", "duration", "length"]));
   if (duration) {
     const durationNode = document.createElement("span");
     durationNode.className = "search-result-duration";
     durationNode.textContent = duration;
-    cover.appendChild(durationNode);
+    stats.appendChild(durationNode);
   }
-  const ratingStars = createSearchResultRatingStars(item);
-  if (ratingStars) {
-    cover.appendChild(ratingStars);
+  if (stats.children.length) cover.appendChild(stats);
+  const statusLabel = searchResultStatusLabel(item);
+  if (statusLabel) {
+    const status = document.createElement("span");
+    status.className = "search-result-follow";
+    status.textContent = statusLabel;
+    status.title = statusLabel;
+    cover.appendChild(status);
   }
   return cover;
 }
@@ -3178,28 +4159,6 @@ function createSearchResultRow(item, { eagerCover = false } = {}) {
   title.className = "search-result-title";
   title.textContent = String(item?.title || "");
 
-  const statusLine = document.createElement("div");
-  statusLine.className = "search-result-status";
-  const statusLabel = searchResultStatusLabel(item);
-  if (statusLabel) {
-    const status = document.createElement("span");
-    status.className = "search-result-follow";
-    status.textContent = statusLabel;
-    statusLine.appendChild(status);
-  }
-  const playCount = formatCompactCount(firstSearchResultValue(item, ["played_count", "play_count", "play", "view", "views"]));
-  if (playCount) {
-    const plays = document.createElement("span");
-    plays.className = "search-result-plays";
-    const playLabel = document.createElement("span");
-    playLabel.className = "search-result-play-label";
-    playLabel.textContent = t("search.playCountLabel");
-    const playValue = document.createElement("span");
-    playValue.textContent = playCount;
-    plays.append(playLabel, playValue);
-    statusLine.appendChild(plays);
-  }
-
   const url = createSearchResultUrlLine(item);
 
   const button = document.createElement("button");
@@ -3208,16 +4167,144 @@ function createSearchResultRow(item, { eagerCover = false } = {}) {
   button.dataset.url = itemUrl;
   button.textContent = t("search.detail");
 
-  meta.append(title);
-  if (statusLine.children.length) {
-    meta.appendChild(statusLine);
-  }
-  meta.appendChild(url);
+  meta.append(title, url);
   row.append(cover, meta, button);
   return row;
 }
 
+function remoteResultPaginationOptions(container, items, emptyText) {
+  const owner = requestDetailOwnerForContainer(container);
+  let data = {}, load = null, loading = false, key = owner;
+  if (owner === "uids" || owner === "favorites") {
+    const favorites = owner === "favorites";
+    data = (favorites ? state.favlistBrowseData : state.followBrowseData) || {};
+    const selected = favorites ? state.favlistBrowseSelectedFolderId : state.followBrowseSelectedUid;
+    const query = String(data.query || "");
+    loading = favorites ? state.favlistBrowseLoading : state.followBrowseLoading;
+    key = JSON.stringify([owner, selected, query, favorites ? state.favlistBrowseSeq : state.followBrowseSeq]);
+    load = page => favorites
+      ? fetchGatchaFavlistBrowse(selected, query, page)
+      : fetchGatchaBrowse(selected, query, page);
+  } else if (owner === "name" || owner === "artist") {
+    const mode = d1BrowseModeState(owner);
+    data = mode.data || {};
+    loading = mode.loading;
+    const query = { kind: owner, letter: mode.letter, tag: mode.tag, locale: mode.locale, query: mode.query };
+    key = JSON.stringify([query, mode.seq]);
+    if (typeof data.has_more === "boolean") load = page => fetchD1Browse({ ...query, ...page });
+  } else if (owner === "categories") {
+    const category = selectedCategoryBrowseDefinition();
+    data = { matched_count: state.categoryBrowseMatchedCount, has_more: state.categoryBrowseHasMore };
+    loading = state.categoryBrowseLoading;
+    const query = { tags: category?.tags || [], query: state.categoryBrowseQuery };
+    key = JSON.stringify([query, state.categoryBrowseSeq]);
+    load = page => fetchD1CategoryBrowse({ ...query, ...page });
+  } else if (owner === "shared" || owner === "local") {
+    const search = owner === "shared" ? canonicalBilikaraSearch : localLibrarySearch;
+    key = JSON.stringify([owner, search.seq]);
+    data = search.data || {};
+    loading = search.loading;
+    const query = search.query;
+    if (typeof data.has_more === "boolean") {
+      load = page => owner === "shared" ? searchCatalog(query, page) : searchGatchaCache(query, page);
+    }
+  }
+  const limited = !load;
+  const total = !limited && Number.isSafeInteger(data.matched_count) && data.matched_count >= 0
+    ? data.matched_count : (limited || data.has_more === false ? items.length : null);
+  const readAhead = ["name", "artist", "categories", "shared"].includes(owner) ? 2 : 0;
+  const readSize = ["shared", "local"].includes(owner) ? 72 : undefined;
+  return { key, items, total, hasMore: Boolean(data.has_more), limited, load, loading, readAhead, readSize,
+    emptyText, language: state.language, prefetch: readAhead > 0 };
+}
+
 function renderSearchResultItems(container, items, emptyText = "") {
+  if (!container) return;
+  if (!window.BilikaraResultPager) {
+    renderSearchResultPage(container, items, emptyText);
+    return;
+  }
+  let pager = remoteResultPagers.get(container);
+  if (!pager) {
+    pager = window.BilikaraResultPager.create(container, {
+      translate: t,
+      renderItems: (page, message, target = container) => renderSearchResultPage(target, page, message, requestDetailOwnerForContainer(container)),
+      reportError: message => setAppMessage(message, true),
+    });
+    remoteResultPagers.set(container, pager);
+  }
+  pager.update(remoteResultPaginationOptions(container, Array.isArray(items) ? items : [], emptyText));
+}
+
+const remoteGridSources = new WeakMap();
+function renderRemoteGridPages(container, items, key, renderPage, {loading = false, emptyText = ""} = {}) {
+  let source = remoteGridSources.get(container);
+  const signature = JSON.stringify([key, items]);
+  if (!source || source.signature !== signature) {
+    source = {signature, items};
+    remoteGridSources.set(container, source);
+  }
+  let pager = remoteResultPagers.get(container);
+  if (!pager) {
+    pager = window.BilikaraResultPager.create(container, {
+      translate: t,
+      renderItems: (page, message, target = container) => renderPage(target, page, message),
+      reportError: message => setAppMessage(message, true),
+    });
+    remoteResultPagers.set(container, pager);
+  }
+  pager.update({key, items:source.items, total:items.length, pageSize:12, limited:true, hasMore:false,
+    loading, emptyText, language:state.language});
+}
+
+function renderSourceCardPage(container, entries, emptyText, favorites = false) {
+  container.replaceChildren();
+  if (!entries.length) {
+    const empty = document.createElement("div");
+    empty.className = "search-empty";
+    empty.textContent = emptyText;
+    container.append(empty);
+  }
+  for (const entry of entries) {
+    const id = String(favorites ? entry.id : entry.uid);
+    const title = favorites
+      ? String(entry.title || (entry.placeholder ? `${t("favlist.folder")} ${entry.folder_id}` : id || t("favlist.folder")))
+      : followOwnerDisplayName(entry);
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = favorites ? "follow-up-button favlist-browse-button" : "follow-up-button";
+    button.classList.toggle("source-card-placeholder", Boolean(entry.placeholder));
+    button.dataset[favorites ? "folderId" : "uid"] = id;
+    button.title = title;
+    const name = document.createElement("span");
+    name.className = "follow-up-name";
+    name.textContent = title;
+    const count = document.createElement("span");
+    count.className = "follow-up-count";
+    // A queued source has no count yet; its status label fills this line.
+    count.textContent = entry.placeholder ? "" : t(favorites ? "favlist.mediaCount" : "follow.countSongs", {
+      count:Number((favorites ? entry.media_count : entry.count) || entry.count || 0),
+    });
+    button.append(name, count);
+    if (entry.avatar_url) {
+      const avatar = document.createElement("img");
+      avatar.className = "follow-up-avatar";
+      avatar.alt = "";
+      avatar.loading = "lazy";
+      avatar.referrerPolicy = "no-referrer";
+      avatar.src = entry.avatar_url;
+      button.append(avatar);
+    }
+    window.BilikaraSourceStatus?.syncCard(button, state.data?.gatcha, t);
+    container.append(button);
+  }
+}
+
+function hideRemoteResultPager(container) {
+  if (container) remoteResultPagers.get(container)?.hide();
+}
+
+function renderSearchResultPage(container, items, emptyText = "", owner = requestDetailOwnerForContainer(container)) {
   if (!container) {
     return;
   }
@@ -3229,13 +4316,17 @@ function renderSearchResultItems(container, items, emptyText = "") {
     empty.className = "search-empty";
     empty.textContent = emptyText || t("search.empty");
     container.appendChild(empty);
+    syncRemoteRequestPanelSizeTier();
     return;
   }
   normalizedItems.forEach((item, index) => {
-    container.appendChild(createSearchResultRow(item, {
+    const row = createSearchResultRow(item, {
       eagerCover: index < expandedSearchEagerCoverCount,
-    }));
+    });
+    applyRequestResultSelection(row, item, owner);
+    container.appendChild(row);
   });
+  syncRemoteRequestPanelSizeTier();
 }
 
 function appendSearchResultItems(container, items) {
@@ -3248,11 +4339,16 @@ function appendSearchResultItems(container, items) {
   }
   container.classList.remove("hidden");
   items.forEach((item) => {
-    container.appendChild(createSearchResultRow(item));
+    const row = createSearchResultRow(item);
+    applyRequestResultSelection(row, item, requestDetailOwnerForContainer(container));
+    container.appendChild(row);
   });
+  syncRemoteRequestPanelSizeTier();
 }
 
+const localLibrarySearch = {query:"", data:null, seq:0, loading:false};
 const canonicalBilikaraSearch = {
+  data: null,
   query: "",
   items: [],
   message: "",
@@ -3262,7 +4358,7 @@ const canonicalBilikaraSearch = {
   loading: false,
 };
 
-function syncBilikaraSearchViews() {
+function syncBilikaraSearchView() {
   const query = canonicalBilikaraSearch.query;
   const items = canonicalBilikaraSearch.items;
   const message = canonicalBilikaraSearch.message;
@@ -3273,63 +4369,55 @@ function syncBilikaraSearchViews() {
   if (elements.larkSearchQuery && elements.larkSearchQuery.value !== query) {
     elements.larkSearchQuery.value = query;
   }
-  if (elements.searchModalLarkQuery && elements.searchModalLarkQuery.value !== query) {
-    elements.searchModalLarkQuery.value = query;
-  }
+  window.BilikaraBrowseSearch?.primary(elements.searchForm, {translate:t});
+  window.BilikaraBrowseSearch?.primary(elements.larkSearchForm, {translate:t});
 
   setLarkSearchMessage(message, isError);
-  setSearchModalLarkMessage(message, isError);
-
-  const emptyText = hasSearched && !loading && !items.length ? (isError ? "" : t("search.larkNoResults")) : "";
 
   if (elements.larkSearchResults) {
     if ((loading && !items.length) || (!hasSearched && !items.length && !message)) {
       elements.larkSearchResults.innerHTML = "";
       elements.larkSearchResults.classList.add("hidden");
+      hideRemoteResultPager(elements.larkSearchResults);
     } else {
       renderLarkSearchResults(items);
     }
   }
-
-  if (elements.searchModalLarkResults) {
-    if ((loading && !items.length) || (!hasSearched && !items.length && !message)) {
-      elements.searchModalLarkResults.innerHTML = "";
-      elements.searchModalLarkResults.classList.toggle(
-        "hidden",
-        !loading && !hasSearched && !message,
-      );
-    } else {
-      renderSearchResultItems(elements.searchModalLarkResults, items, emptyText);
-    }
-  }
+  syncRemoteRequestPanelSizeTier();
 }
 
 async function executeCanonicalBilikaraSearch(queryStr) {
   const query = String(queryStr || "").trim();
+  if (canonicalBilikaraSearch.loading && canonicalBilikaraSearch.submitted === query) return;
   if (!query) {
     canonicalBilikaraSearch.query = "";
     canonicalBilikaraSearch.items = [];
-    canonicalBilikaraSearch.message = t("search.keywordRequired");
-    canonicalBilikaraSearch.isError = true;
+    canonicalBilikaraSearch.message = "";
+    canonicalBilikaraSearch.isError = false;
     canonicalBilikaraSearch.hasSearched = false;
-    syncBilikaraSearchViews();
+    syncBilikaraSearchView();
+    setAppMessage(t("search.keywordRequired"), true);
     return;
   }
 
   const searchSeq = canonicalBilikaraSearch.seq + 1;
   canonicalBilikaraSearch.seq = searchSeq;
   canonicalBilikaraSearch.query = query;
+  canonicalBilikaraSearch.submitted = query;
   canonicalBilikaraSearch.loading = true;
   canonicalBilikaraSearch.message = t("search.larkSearching");
   canonicalBilikaraSearch.isError = false;
   canonicalBilikaraSearch.hasSearched = true;
-  syncBilikaraSearchViews();
+  syncBilikaraSearchView();
 
-  if (elements.larkSearchButton) elements.larkSearchButton.disabled = true;
-  if (elements.searchModalLarkButton) elements.searchModalLarkButton.disabled = true;
+  if (elements.larkSearchButton) {
+    elements.larkSearchButton.disabled = true;
+    elements.larkSearchButton.setAttribute("aria-busy", "true");
+  }
 
   try {
-    const poolItems = await searchLarkPool(query);
+    const data = await searchCatalog(query);
+    const poolItems = data.items;
     if (canonicalBilikaraSearch.seq !== searchSeq) {
       return;
     }
@@ -3343,38 +4431,58 @@ async function executeCanonicalBilikaraSearch(queryStr) {
       return true;
     });
 
+    canonicalBilikaraSearch.data = data;
     canonicalBilikaraSearch.items = freshItems;
-    canonicalBilikaraSearch.message = freshItems.length
-      ? t("search.larkFound", { count: freshItems.length })
-      : t("search.larkNoResults");
+    canonicalBilikaraSearch.message = freshItems.length ? "" : t("search.larkNoResults");
     canonicalBilikaraSearch.isError = false;
   } catch (error) {
     if (canonicalBilikaraSearch.seq !== searchSeq) {
       return;
     }
     canonicalBilikaraSearch.items = [];
-    canonicalBilikaraSearch.message = error.message || t("error.larkSearchFailed");
-    canonicalBilikaraSearch.isError = true;
+    canonicalBilikaraSearch.message = "";
+    canonicalBilikaraSearch.isError = false;
+    setAppMessage(error.message || t("error.larkSearchFailed"), true);
   } finally {
     if (canonicalBilikaraSearch.seq === searchSeq) {
       canonicalBilikaraSearch.loading = false;
-      if (elements.larkSearchButton) elements.larkSearchButton.disabled = false;
-      if (elements.searchModalLarkButton) elements.searchModalLarkButton.disabled = false;
-      syncBilikaraSearchViews();
+      if (elements.larkSearchButton) {
+        elements.larkSearchButton.disabled = false;
+        elements.larkSearchButton.removeAttribute("aria-busy");
+      }
+      syncBilikaraSearchView();
     }
   }
 }
 
-function d1BrowseTitle(kind = state.d1BrowseKind) {
+function d1BrowseModeState(kind = state.remoteDiscoverMode) {
+  const normalizedKind = kind === "artist" ? "artist" : "name";
+  if (!state.d1BrowseModes[normalizedKind]) state.d1BrowseModes[normalizedKind] = {
+    letter: "",
+    tag: "",
+    locale: "",
+    query: "",
+    data: null,
+    loading: false,
+    seq: 0,
+    error: "",
+  };
+  return state.d1BrowseModes[normalizedKind];
+}
+
+function d1BrowseTitle(kind = state.remoteDiscoverMode) {
   return kind === "artist" ? t("search.artistBrowse") : t("search.nameBrowse");
 }
 
-function d1BrowsePickLetterText(kind = state.d1BrowseKind) {
+function d1BrowsePickLetterText(kind = state.remoteDiscoverMode) {
   return kind === "artist" ? t("search.browsePickArtistLetter") : t("search.browsePickLetter");
 }
 
-function d1BrowseSearchPlaceholder(kind = state.d1BrowseKind) {
-  return state.d1BrowseTag ? t("search.browseItemPlaceholder") : t("search.tagBrowsePlaceholder", { title: d1BrowseTitle(kind) });
+function d1BrowseSearchPlaceholder(kind = state.remoteDiscoverMode) {
+  const mode = d1BrowseModeState(kind);
+  return mode.tag
+    ? t("search.browseItemPlaceholder")
+    : t("search.tagBrowsePlaceholder", { title: d1BrowseTitle(kind) });
 }
 
 function d1BrowseItemKey(item) {
@@ -3421,7 +4529,7 @@ function selectedCategoryBrowseDefinition() {
   return categoryBrowseDefinitions().find((entry) => entry.id === selectedId) || null;
 }
 
-function mergeCategoryBrowseItems(existingItems, nextItems) {
+function mergeBrowseItems(existingItems, nextItems) {
   const seen = new Set();
   const items = [];
   [...(Array.isArray(existingItems) ? existingItems : []), ...(Array.isArray(nextItems) ? nextItems : [])].forEach((item) => {
@@ -3435,19 +4543,24 @@ function mergeCategoryBrowseItems(existingItems, nextItems) {
   return items;
 }
 
-function ensureD1BrowseView() {
-  if (!elements.searchModalOtherView) {
+function d1BrowsePanel(kind) {
+  return kind === "artist"
+    ? elements.remoteDiscoverArtistPanel
+    : elements.remoteDiscoverNamePanel;
+}
+
+function ensureD1BrowseView(kind = state.remoteDiscoverMode) {
+  const panel = d1BrowsePanel(kind);
+  if (!panel) {
     return null;
   }
-  elements.searchModalOtherView.classList.add("remote-search-browser-view");
-  let view = elements.searchModalOtherView.querySelector("[data-d1-browse-view]");
+  let view = panel.querySelector("[data-d1-browse-view]");
   if (view) {
     return view;
   }
-  elements.searchModalOtherView.textContent = "";
   view = document.createElement("div");
   view.className = "tag-browser";
-  view.dataset.d1BrowseView = "1";
+  view.dataset.d1BrowseView = kind === "artist" ? "artist" : "name";
   view.innerHTML = `
     <form class="tag-browser-search" data-d1-browse-search>
       <input type="text" autocomplete="off" data-d1-browse-query>
@@ -3462,17 +4575,44 @@ function ensureD1BrowseView() {
     <div class="search-results hidden" data-d1-browse-results></div>
     <p class="gatcha-message tag-browser-message" data-d1-browse-message role="status"></p>
   `;
-  elements.searchModalOtherView.appendChild(view);
+  panel.appendChild(view);
   return view;
 }
 
-function renderD1BrowseView() {
-  const view = ensureD1BrowseView();
+const emptyD1Tags = [];
+function renderD1TagPage(container, entries, emptyText = t("search.browseNoTags")) {
+  container.replaceChildren();
+  if (!entries.length) {
+    const empty = document.createElement("div");
+    empty.className = "search-empty";
+    empty.textContent = emptyText;
+    container.append(empty);
+  }
+  for (const entry of entries) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "tag-browser-tag";
+    button.dataset.tag = String(entry.tag || "");
+    button.dataset.locale = String(entry.locale || "");
+    const name = document.createElement("span");
+    name.className = "tag-browser-tag-name";
+    name.textContent = String(entry.tag || "");
+    const count = document.createElement("span");
+    count.className = "tag-browser-tag-count";
+    count.textContent = t("search.browseTagCount", {count:Number(entry.count || 0)});
+    button.append(name, count);
+    container.append(button);
+  }
+}
+
+function renderD1BrowseView(kind = state.remoteDiscoverMode) {
+  const normalizedKind = kind === "artist" ? "artist" : "name";
+  const mode = d1BrowseModeState(normalizedKind);
+  const view = ensureD1BrowseView(normalizedKind);
   if (!view) {
     return;
   }
-  const kind = state.d1BrowseKind || "name";
-  const title = d1BrowseTitle(kind);
+  const title = d1BrowseTitle(normalizedKind);
   const queryInput = view.querySelector("[data-d1-browse-query]");
   const submitButton = view.querySelector("[data-d1-browse-submit]");
   const alphabet = view.querySelector("[data-d1-browse-alphabet]");
@@ -3483,155 +4623,155 @@ function renderD1BrowseView() {
   const message = view.querySelector("[data-d1-browse-message]");
 
   if (queryInput && document.activeElement !== queryInput) {
-    queryInput.value = state.d1BrowseQuery || "";
+    queryInput.value = mode.query || "";
   }
   if (queryInput) {
-    queryInput.placeholder = d1BrowseSearchPlaceholder(kind);
+    queryInput.placeholder = d1BrowseSearchPlaceholder(normalizedKind);
   }
   if (submitButton) {
     submitButton.textContent = t("search.submit");
-    submitButton.disabled = state.d1BrowseLoading;
+    submitButton.disabled = mode.loading;
+    submitButton.toggleAttribute("aria-busy", mode.loading);
   }
   if (alphabet) {
     alphabet.innerHTML = "";
-    alphabet.classList.toggle("hidden", Boolean(state.d1BrowseLetter));
+    alphabet.classList.toggle("hidden", Boolean(mode.letter));
     d1BrowseLetters.forEach((letter) => {
       const button = document.createElement("button");
       button.type = "button";
       button.className = "tag-letter-button";
       button.dataset.letter = letter;
       button.textContent = letter;
-      button.classList.toggle("active", state.d1BrowseLetter === letter);
-      button.disabled = state.d1BrowseLoading;
+      button.classList.toggle("active", mode.letter === letter);
+      button.disabled = mode.loading;
       alphabet.appendChild(button);
     });
   }
-  view.classList.toggle("has-letter", Boolean(state.d1BrowseLetter));
-  view.classList.toggle("has-tag", Boolean(state.d1BrowseTag));
+  view.classList.toggle("has-letter", Boolean(mode.letter));
+  view.classList.toggle("has-tag", Boolean(mode.tag));
   if (backButton) {
     backButton.textContent = t("common.back");
-    backButton.classList.toggle("hidden", !state.d1BrowseLetter);
-    backButton.disabled = state.d1BrowseLoading;
+    backButton.classList.toggle("hidden", !mode.letter);
+    backButton.disabled = mode.loading;
   }
 
-  const tags = Array.isArray(state.d1BrowseData?.tags) ? state.d1BrowseData.tags : [];
-  const items = Array.isArray(state.d1BrowseData?.items) ? state.d1BrowseData.items : [];
+  const tags = Array.isArray(mode.data?.tags) ? mode.data.tags : emptyD1Tags;
+  const items = Array.isArray(mode.data?.items) ? mode.data.items : [];
   if (current) {
-    const parts = [title];
-    if (state.d1BrowseLetter) {
-      parts.push(state.d1BrowseLetter);
+    const parts = [mode.letter ? title : d1BrowsePickLetterText(normalizedKind)];
+    if (mode.letter) {
+      parts.push(mode.letter);
     }
-    if (state.d1BrowseTag) {
-      parts.push(state.d1BrowseTag);
+    if (mode.tag) {
+      parts.push(mode.tag);
     }
-    current.textContent = parts.join(" / ");
+    current.textContent = mode.letter ? parts.join(" / ") : "";
+    current.closest(".tag-browser-nav")?.classList.toggle("hidden", !mode.letter);
   }
   if (tagGrid) {
-    tagGrid.innerHTML = "";
-    tagGrid.classList.toggle("hidden", Boolean(state.d1BrowseTag));
-    if (!state.d1BrowseTag) {
-      if (state.d1BrowseLoading) {
-        const loading = document.createElement("div");
-        loading.className = "search-empty";
-        loading.textContent = t("search.browseLoading");
-        tagGrid.appendChild(loading);
-      } else if (!state.d1BrowseLetter) {
-        const empty = document.createElement("div");
-        empty.className = "search-empty";
-        empty.textContent = d1BrowsePickLetterText(kind);
-        tagGrid.appendChild(empty);
-      } else if (!tags.length) {
-        const empty = document.createElement("div");
-        empty.className = "search-empty";
-        empty.textContent = t("search.browseNoTags");
-        tagGrid.appendChild(empty);
-      } else {
-        tags.forEach((entry) => {
-          const button = document.createElement("button");
-          button.type = "button";
-          button.className = "tag-browser-tag";
-          button.dataset.tag = String(entry.tag || "");
-          button.dataset.locale = String(entry.locale || "");
-          const name = document.createElement("span");
-          name.className = "tag-browser-tag-name";
-          name.textContent = String(entry.tag || "");
-          const count = document.createElement("span");
-          count.className = "tag-browser-tag-count";
-          count.textContent = t("search.browseTagCount", { count: Number(entry.count || 0) });
-          button.append(name, count);
-          tagGrid.appendChild(button);
-        });
+    tagGrid.classList.toggle("hidden", Boolean(mode.tag));
+    if (mode.tag || !mode.letter) {
+      tagGrid.replaceChildren();
+      hideRemoteResultPager(tagGrid);
+      if (!mode.letter) {
+        const hint = document.createElement("div");
+        hint.className = "search-empty";
+        hint.textContent = d1BrowsePickLetterText(normalizedKind);
+        tagGrid.append(hint);
       }
+    } else {
+      let pager = remoteResultPagers.get(tagGrid);
+      if (!pager) {
+        pager = window.BilikaraResultPager.create(tagGrid, {
+          translate: t,
+          renderItems: (entries, message, target = tagGrid) => renderD1TagPage(target, entries, message),
+          rows: 6,
+          reportError: text => setAppMessage(text, true),
+        });
+        remoteResultPagers.set(tagGrid, pager);
+      }
+      pager.update({key: JSON.stringify([normalizedKind, mode.letter, mode.query, mode.seq]),
+        items: tags, total: tags.length, limited: true, hasMore: false, loading: mode.loading,
+        emptyText: t(mode.loading ? "search.browseLoading" : "search.browseNoTags"), language: state.language});
     }
   }
   if (results) {
-    if (state.d1BrowseTag) {
-      renderSearchResultItems(results, items, t("search.larkNoResults"));
+    if (mode.tag) {
+      const scrollTop = results.scrollTop;
+      renderSearchResultItems(results, items, t(mode.loading ? "search.browseLoading" : "search.larkNoResults"));
+      results.scrollTop = scrollTop;
     } else {
       results.innerHTML = "";
       results.classList.add("hidden");
+      hideRemoteResultPager(results);
     }
   }
-  if (message) {
-    let text = "";
-    if (state.d1BrowseTag && !state.d1BrowseLoading) {
-      text = items.length ? t("search.larkFound", { count: items.length }) : t("search.larkNoResults");
-    } else if (!state.d1BrowseTag && tags.length) {
-      text = t("search.browseTagsFound", { count: tags.length });
-    }
-    message.textContent = state.d1BrowseLoading ? t("search.browseLoading") : text;
-    message.classList.toggle("is-error", false);
-  }
+  if (message) message.textContent = "";
+  window.BilikaraBrowseSearch?.sync(view.querySelector("[data-d1-browse-search]"),
+    view.querySelector(".tag-browser-nav"), {
+      key: JSON.stringify([normalizedKind, mode.letter, mode.tag, mode.locale]),
+      title: mode.tag || [title, mode.letter].filter(Boolean).join(" / "),
+      query: mode.query, loading: mode.loading, translate: t, available: Boolean(mode.letter),
+    });
+  syncRemoteRequestPanelSizeTier();
 }
 
-async function loadD1Browse({ kind = state.d1BrowseKind || "name", letter = state.d1BrowseLetter, query = state.d1BrowseQuery, tag = "", locale = "" } = {}) {
-  const searchSeq = state.d1BrowseSeq + 1;
-  state.d1BrowseSeq = searchSeq;
-  state.d1BrowseKind = kind === "artist" ? "artist" : "name";
-  state.d1BrowseLetter = String(letter || "").trim().toUpperCase();
-  state.d1BrowseQuery = String(query || "").trim();
-  state.d1BrowseTag = String(tag || "").trim();
-  state.d1BrowseLocale = String(locale || "").trim();
-  state.d1BrowseLoading = true;
-  renderD1BrowseView();
+async function loadD1Browse({ kind = state.remoteDiscoverMode, letter = "", query = "", tag = "", locale = "", append = false } = {}) {
+  const normalizedKind = kind === "artist" ? "artist" : "name";
+  const mode = d1BrowseModeState(normalizedKind);
+  if (append && (mode.loading || !mode.tag || !mode.data?.has_more)) return;
+  const offset = append ? Number(mode.data.next_offset) : 0;
+  const searchSeq = mode.seq + 1;
+  mode.seq = searchSeq;
+  if (!append) {
+    mode.letter = String(letter || "").trim().toUpperCase();
+    mode.query = String(query || "").trim();
+    mode.tag = String(tag || "").trim();
+    mode.locale = String(locale || "").trim();
+    mode.data = null;
+  }
+  mode.loading = true;
+  mode.error = "";
+  renderD1BrowseView(normalizedKind);
   try {
     const data = await fetchD1Browse({
-      kind: state.d1BrowseKind,
-      letter: state.d1BrowseLetter,
-      query: state.d1BrowseQuery,
-      tag: state.d1BrowseTag,
-      locale: state.d1BrowseLocale,
-      limit: state.d1BrowseTag ? d1BrowseItemLimit : d1BrowseTagLimit,
+      kind: normalizedKind,
+      letter: mode.letter,
+      query: mode.query,
+      tag: mode.tag,
+      locale: mode.locale,
+      limit: mode.tag ? d1BrowseItemLimit : d1BrowseTagLimit,
+      offset,
     });
-    if (state.d1BrowseSeq !== searchSeq) {
+    if (mode.seq !== searchSeq) {
       return;
     }
-    state.d1BrowseData = data || {};
+    const items = mergeBrowseItems(append ? mode.data?.items : [], data?.items);
+    mode.data = {...data, items};
+    if (typeof data?.has_more === "boolean") {
+      mode.data.has_more = data.has_more && Number.isSafeInteger(data.next_offset) && data.next_offset > offset && Boolean(data.items?.length);
+    }
   } catch (error) {
-    const view = ensureD1BrowseView();
-    const message = view?.querySelector("[data-d1-browse-message]");
-    if (message) {
-      message.textContent = error.message;
-      message.classList.add("is-error");
+    if (mode.seq === searchSeq) {
+      mode.error = error.message;
+      setAppMessage(error.message, true);
     }
   } finally {
-    if (state.d1BrowseSeq === searchSeq) {
-      state.d1BrowseLoading = false;
-      renderD1BrowseView();
+    if (mode.seq === searchSeq) {
+      mode.loading = false;
+      renderD1BrowseView(normalizedKind);
     }
   }
 }
 
 function ensureCategoryBrowseView() {
-  if (!elements.searchModalOtherView) {
+  if (!elements.remoteDiscoverCategoriesPanel) {
     return null;
   }
-  elements.searchModalOtherView.classList.add("remote-search-browser-view");
-  let view = elements.searchModalOtherView.querySelector("[data-category-browse-view]");
+  let view = elements.remoteDiscoverCategoriesPanel.querySelector("[data-category-browse-view]");
   if (view) {
     return view;
   }
-  elements.searchModalOtherView.textContent = "";
   view = document.createElement("div");
   view.className = "category-browser";
   view.dataset.categoryBrowseView = "1";
@@ -3645,15 +4785,11 @@ function ensureCategoryBrowseView() {
         <button type="submit" class="primary-button" data-category-browse-submit></button>
       </form>
       <div class="category-browser-tabs" data-category-browser-tabs></div>
-      <div class="tag-browser-nav">
-        <button type="button" class="secondary-button tag-browser-back" data-category-browse-back></button>
-        <div class="tag-browser-current hidden" data-category-browse-current></div>
-      </div>
       <div class="search-results category-browser-results" data-category-browse-results></div>
       <p class="gatcha-message tag-browser-message" data-category-browse-message role="status"></p>
     </div>
   `;
-  elements.searchModalOtherView.appendChild(view);
+  elements.remoteDiscoverCategoriesPanel.appendChild(view);
   return view;
 }
 
@@ -3679,6 +4815,16 @@ function createCategoryBrowseCard(category, { compact = false } = {}) {
   return button;
 }
 
+function createCategoryBrowseBackCard() {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "secondary-button tag-browser-back";
+  button.dataset.categoryBrowseBack = "";
+  button.setAttribute("aria-label", t("common.back"));
+  button.textContent = t("common.back");
+  return button;
+}
+
 function renderCategoryBrowseView() {
   const view = ensureCategoryBrowseView();
   if (!view) {
@@ -3692,19 +4838,20 @@ function renderCategoryBrowseView() {
   const tabs = view.querySelector("[data-category-browser-tabs]");
   const queryInput = view.querySelector("[data-category-browse-query]");
   const submitButton = view.querySelector("[data-category-browse-submit]");
-  const backButton = view.querySelector("[data-category-browse-back]");
   const results = view.querySelector("[data-category-browse-results]");
   const message = view.querySelector("[data-category-browse-message]");
 
   home?.classList.toggle("hidden", Boolean(selected));
   detail?.classList.toggle("hidden", !selected);
   if (grid && !selected) {
-    grid.innerHTML = "";
-    categories.forEach((category) => {
-      grid.appendChild(createCategoryBrowseCard(category));
+    renderRemoteGridPages(grid, categories, `categories:${state.language}`, (target, entries) => {
+      target.replaceChildren(...entries.map(category => createCategoryBrowseCard(category)));
     });
   }
   if (!selected) {
+    hideRemoteResultPager(results);
+    window.BilikaraBrowseSearch?.reset(view.querySelector("[data-category-browse-search]"));
+    syncRemoteRequestPanelSizeTier();
     return;
   }
   if (queryInput && document.activeElement !== queryInput) {
@@ -3716,13 +4863,13 @@ function renderCategoryBrowseView() {
   if (submitButton) {
     submitButton.textContent = t("search.submit");
     submitButton.disabled = state.categoryBrowseLoading;
-  }
-  if (backButton) {
-    backButton.textContent = t("common.back");
-    backButton.disabled = state.categoryBrowseLoading;
+    submitButton.toggleAttribute("aria-busy", state.categoryBrowseLoading);
   }
   if (tabs) {
     tabs.innerHTML = "";
+    const backButton = createCategoryBrowseBackCard();
+    backButton.disabled = state.categoryBrowseLoading;
+    tabs.appendChild(backButton);
     categories.forEach((category) => {
       const tab = createCategoryBrowseCard(category, { compact: true });
       tab.classList.toggle("active", category.id === selected.id);
@@ -3733,22 +4880,12 @@ function renderCategoryBrowseView() {
   if (results) {
     renderSearchResultItems(results, state.categoryBrowseItems, t("search.larkNoResults"));
   }
-  if (message) {
-    let text = "";
-    if (state.categoryBrowseError) {
-      text = state.categoryBrowseError;
-    } else if (state.categoryBrowseLoading && !state.categoryBrowseItems.length) {
-      text = t("search.browseLoading");
-    } else if (state.categoryBrowseItems.length) {
-      text = state.categoryBrowseHasMore
-        ? t("search.categoryLoadedMore", { count: state.categoryBrowseItems.length })
-        : t("search.categoryLoadedAll", { count: state.categoryBrowseItems.length });
-    } else if (!state.categoryBrowseLoading) {
-      text = t("search.larkNoResults");
-    }
-    message.textContent = text;
-    message.classList.toggle("is-error", Boolean(state.categoryBrowseError));
-  }
+  if (message) message.textContent = "";
+  window.BilikaraBrowseSearch?.sync(view.querySelector("[data-category-browse-search]"), tabs, {
+    key: selected.id, title: selected.name, query: state.categoryBrowseQuery,
+    loading: state.categoryBrowseLoading, translate: t,
+  });
+  syncRemoteRequestPanelSizeTier();
 }
 
 async function loadCategoryBrowse({ categoryId = state.categoryBrowseSelectedId, query = state.categoryBrowseQuery, append = false } = {}) {
@@ -3770,6 +4907,7 @@ async function loadCategoryBrowse({ categoryId = state.categoryBrowseSelectedId,
     state.categoryBrowseItems = [];
     state.categoryBrowseOffset = 0;
     state.categoryBrowseHasMore = true;
+    state.categoryBrowseMatchedCount = null;
   }
   state.categoryBrowseLoading = true;
   renderCategoryBrowseView();
@@ -3778,18 +4916,20 @@ async function loadCategoryBrowse({ categoryId = state.categoryBrowseSelectedId,
       tags: category.tags,
       query: state.categoryBrowseQuery,
       offset: append ? state.categoryBrowseOffset : 0,
-      limit: categoryBrowsePageSize,
+      limit: d1BrowseItemLimit,
     });
     if (state.categoryBrowseSeq !== searchSeq) {
       return;
     }
     const nextItems = Array.isArray(data.items) ? data.items : [];
-    state.categoryBrowseItems = append ? mergeCategoryBrowseItems(state.categoryBrowseItems, nextItems) : mergeCategoryBrowseItems([], nextItems);
+    state.categoryBrowseItems = append ? mergeBrowseItems(state.categoryBrowseItems, nextItems) : mergeBrowseItems([], nextItems);
     state.categoryBrowseHasMore = Boolean(data.has_more);
+    state.categoryBrowseMatchedCount = Number.isSafeInteger(data.matched_count) ? data.matched_count : null;
     state.categoryBrowseOffset = Number(data.next_offset ?? (append ? state.categoryBrowseOffset + nextItems.length : nextItems.length)) || state.categoryBrowseItems.length;
   } catch (error) {
     if (state.categoryBrowseSeq === searchSeq) {
       state.categoryBrowseError = error.message;
+      setAppMessage(error.message, true);
     }
   } finally {
     if (state.categoryBrowseSeq === searchSeq) {
@@ -3799,24 +4939,16 @@ async function loadCategoryBrowse({ categoryId = state.categoryBrowseSelectedId,
   }
 }
 
-function maybeLoadMoreCategoryBrowse(scrollContainer) {
-  if (
-    !state.categoryBrowseSelectedId
-    || state.categoryBrowseLoading
-    || !state.categoryBrowseHasMore
-    || !scrollContainer
-  ) {
-    return;
+function paginatedBrowseStatus(items, { loading, loadingText, emptyText = "" }) {
+  if (loading) {
+    return items.length ? t("follow.loadingMore") : loadingText;
   }
-  const remaining = scrollContainer.scrollHeight - scrollContainer.scrollTop - scrollContainer.clientHeight;
-  if (remaining <= 160) {
-    loadCategoryBrowse({ append: true });
-  }
+  return items.length ? "" : emptyText;
 }
 
 function selectedFavlistFolder() {
   const folders = Array.isArray(state.favlistBrowseData?.folders) ? state.favlistBrowseData.folders : [];
-  return folders.find((folder) => String(folder.id || "") === state.favlistBrowseSelectedFolderId) || null;
+  return window.BilikaraSourceStatus.selectedFolder(state.data?.gatcha, folders, state.favlistBrowseSelectedFolderId);
 }
 
 function renderFavlistBrowse() {
@@ -3825,11 +4957,18 @@ function renderFavlistBrowse() {
   }
   const folders = Array.isArray(state.favlistBrowseData?.folders) ? state.favlistBrowseData.folders : [];
   const items = Array.isArray(state.favlistBrowseData?.items) ? state.favlistBrowseData.items : [];
+  const hasMore = Boolean(state.favlistBrowseData?.has_more);
+  const placeholders = window.BilikaraSourceStatus?.queuedSources?.(state.data?.gatcha, "favorites",
+    folders.map(folder => folder?.folder_id || folder?.id)) || [];
   const signature = JSON.stringify({
     loading: state.favlistBrowseLoading,
+    error: state.favlistBrowseError,
     selected: state.favlistBrowseSelectedFolderId,
+    sourceState: window.BilikaraSourceStatus.sourceState(state.data?.gatcha, {folderId: state.favlistBrowseSelectedFolderId}),
     folders,
+    placeholders,
     items,
+    hasMore,
     language: state.language,
   });
   if (signature === state.favlistBrowseRenderSignature) {
@@ -3840,48 +4979,28 @@ function renderFavlistBrowse() {
   const hasSelectedFolder = Boolean(state.favlistBrowseSelectedFolderId);
   elements.favlistListView?.classList.toggle("hidden", hasSelectedFolder);
   elements.favlistItemsView?.classList.toggle("hidden", !hasSelectedFolder);
+  if (elements.favlistSearchQuery) {
+    elements.favlistSearchQuery.disabled = state.favlistBrowseLoading;
+  }
+  if (elements.favlistSearchButton) {
+    elements.favlistSearchButton.disabled = state.favlistBrowseLoading;
+    elements.favlistSearchButton.toggleAttribute("aria-busy", state.favlistBrowseLoading);
+  }
 
   if (!hasSelectedFolder) {
-    elements.favlistGrid.innerHTML = "";
-    if (!folders.length) {
-      const empty = document.createElement("div");
-      empty.className = "search-empty";
-      empty.textContent = state.favlistBrowseLoading ? t("favlist.loadingFolders") : t("favlist.noBrowseFolders");
-      elements.favlistGrid.appendChild(empty);
-    } else {
-      folders.forEach((folder) => {
-        const folderId = String(folder.id || "").trim();
-        const title = String(folder.title || folderId || t("favlist.folder")).trim();
-        const button = document.createElement("button");
-        button.type = "button";
-        button.className = "follow-up-button favlist-browse-button";
-        button.dataset.folderId = folderId;
-        button.title = title;
-
-        const name = document.createElement("span");
-        name.className = "follow-up-name favlist-browse-name";
-        name.textContent = title;
-
-        const count = document.createElement("span");
-        count.className = "follow-up-count favlist-browse-count";
-        count.textContent = t("favlist.mediaCount", { count: Number(folder.media_count || folder.count || 0) });
-
-        button.append(name, count);
-
-        if (folder.avatar_url) {
-          const avatar = document.createElement("img");
-          avatar.className = "follow-up-avatar favlist-browse-avatar";
-          avatar.src = folder.avatar_url;
-          avatar.alt = "";
-          avatar.loading = "lazy";
-          avatar.referrerPolicy = "no-referrer";
-          button.append(avatar);
-        }
-
-        elements.favlistGrid.appendChild(button);
-      });
+    hideRemoteResultPager(elements.favlistSongResults);
+    window.BilikaraBrowseSearch?.reset(elements.favlistSearchForm);
+    if (elements.favlistSearchButton) {
+      elements.favlistSearchButton.disabled = state.favlistBrowseLoading;
+      elements.favlistSearchButton.toggleAttribute("aria-busy", state.favlistBrowseLoading);
     }
+    renderRemoteGridPages(elements.favlistGrid, [...placeholders, ...folders], "favorites", (target, entries, message) =>
+      renderSourceCardPage(target, entries, message, true), {
+        loading:state.favlistBrowseLoading,
+        emptyText:t(state.favlistBrowseLoading ? "favlist.loadingFolders" : "favlist.noBrowseFolders"),
+      });
     setFavlistBrowseMessage(state.favlistBrowseLoading ? t("favlist.loadingFolders") : "");
+    syncRemoteRequestPanelSizeTier();
     return;
   }
 
@@ -3899,82 +5018,202 @@ function renderFavlistBrowse() {
     elements.favlistBrowseTitle.textContent = String(folder?.title || state.favlistBrowseSelectedFolderId || t("favlist.folder"));
   }
   if (elements.favlistBrowseCount) {
-    const totalCount = Number(folder?.media_count || folder?.count || items.length || 0);
+    const matchedCount = Number(state.favlistBrowseData?.matched_count);
+    const totalCount = Number.isFinite(matchedCount)
+      ? matchedCount
+      : Number(folder?.media_count || folder?.count || items.length || 0);
     elements.favlistBrowseCount.textContent = t("follow.itemCount", { shown: items.length, total: totalCount });
+  }
+  if (elements.favlistSearchButton) {
+    elements.favlistSearchButton.disabled = state.favlistBrowseLoading;
+    elements.favlistSearchButton.toggleAttribute("aria-busy", state.favlistBrowseLoading);
   }
   renderSearchResultItems(
     elements.favlistSongResults,
     items,
-    state.favlistBrowseLoading ? t("favlist.loadingItems") : t("favlist.noItems"),
+    state.favlistBrowseLoading ? t("favlist.loadingItems") : window.BilikaraSourceStatus.emptyText(state.data?.gatcha, {folderId: state.favlistBrowseSelectedFolderId}, t, t("favlist.noItems")),
   );
-  setFavlistBrowseMessage(state.favlistBrowseLoading ? t("favlist.loadingItems") : "");
+  setFavlistBrowseMessage(paginatedBrowseStatus(items, {
+    loading: state.favlistBrowseLoading,
+    hasMore,
+    loadingText: t("favlist.loadingItems"),
+  }));
+  window.BilikaraBrowseSearch?.sync(elements.favlistSearchForm,
+    elements.favlistItemsView.querySelector(".follow-browser-head"), {
+      key: state.favlistBrowseSelectedFolderId, title: elements.favlistBrowseTitle.textContent,
+      query: String(state.favlistBrowseData?.selected_folder_id || "") === state.favlistBrowseSelectedFolderId
+        ? state.favlistBrowseData.query : "",
+      loading: state.favlistBrowseLoading, translate: t,
+    });
+  syncRemoteRequestPanelSizeTier();
 }
 
 async function loadFavlistBrowse({
   folderId = state.favlistBrowseSelectedFolderId,
   query = "",
   keepQuery = false,
+  append = false,
 } = {}) {
+  if (state.favlistBrowseLoading) {
+    return;
+  }
+  const seq = state.favlistBrowseSeq + 1;
+  state.favlistBrowseSeq = seq;
   state.favlistBrowseLoading = true;
+  state.favlistBrowseError = "";
   state.favlistBrowseSelectedFolderId = String(folderId || "").trim();
   renderFavlistBrowse();
-  let caughtError = null;
   try {
-    const nextData = await fetchGatchaFavlistBrowse(state.favlistBrowseSelectedFolderId, query);
-    state.favlistBrowseData = nextData;
-    state.favlistBrowseSelectedFolderId = String(
-      nextData.selected_folder_id || state.favlistBrowseSelectedFolderId || "",
+    const offset = append ? Number(state.favlistBrowseData?.next_offset || 0) : 0;
+    const nextData = await fetchGatchaFavlistBrowse(
+      state.favlistBrowseSelectedFolderId,
+      query,
+      { offset, limit: browsePageSize },
     );
+    if (state.favlistBrowseSeq !== seq) {
+      return;
+    }
+    const previousItems = append && Array.isArray(state.favlistBrowseData?.items)
+      ? state.favlistBrowseData.items
+      : [];
+    state.favlistBrowseData = {
+      ...nextData,
+      items: mergeBrowseItems(previousItems, nextData.items),
+    };
+    state.favlistBrowseSelectedFolderId = window.BilikaraSourceStatus.selectedFolderId(
+      state.data?.gatcha, nextData.selected_folder_id, state.favlistBrowseSelectedFolderId);
     if (!keepQuery && elements.favlistSearchQuery) {
       elements.favlistSearchQuery.value = String(nextData.query || "");
     }
   } catch (error) {
-    caughtError = error;
+    if (state.favlistBrowseSeq === seq) {
+      state.favlistBrowseError = error.message;
+      setAppMessage(error.message, true);
+    }
   } finally {
-    state.favlistBrowseLoading = false;
-    renderFavlistBrowse();
-    if (caughtError) {
-      setFavlistBrowseMessage(caughtError.message, true);
+    if (state.favlistBrowseSeq === seq) {
+      state.favlistBrowseLoading = false;
+      renderFavlistBrowse();
+      window.BilikaraSourceStatus?.flush("favorites");
     }
   }
 }
 
-function setSearchModalOpen(open) {
-  const shouldOpen = Boolean(open);
-  state.searchModalOpen = shouldOpen;
-  if (shouldOpen) {
-    window.clearTimeout(searchModalCloseTimer);
-    searchModalCloseTimer = 0;
-    elements.searchModal?.classList.remove("hidden", "closing");
-    document.body.classList.add("remote-search-modal-open");
-    renderSearchModalView(state.searchModalView || "search");
-    window.setTimeout(() => {
-      if (state.searchModalView === "search") {
-        elements.searchModalLarkQuery?.focus();
-      }
-    }, 0);
-    return;
-  }
-  searchDetailController?.close({ immediate: true });
-  if (!elements.searchModal || elements.searchModal.classList.contains("hidden")) {
-    document.body.classList.remove("remote-search-modal-open");
-    return;
-  }
-  if (elements.searchModal.classList.contains("closing")) {
-    return;
-  }
-  elements.searchModal.classList.add("closing");
-  window.clearTimeout(searchModalCloseTimer);
-  searchModalCloseTimer = window.setTimeout(() => {
-    elements.searchModal?.classList.add("hidden");
-    elements.searchModal?.classList.remove("closing");
-    document.body.classList.remove("remote-search-modal-open");
-    searchModalCloseTimer = 0;
-  }, 220);
+function requestResultItemKey(item) {
+  return String(
+    item?.bvid
+      || item?.url
+      || item?.id
+      || `${item?.title || ""}\n${searchResultOwnerName(item)}`,
+  ).trim();
 }
 
-function openSearchResultDetail(event, container, source) {
-  if (!searchDetailController || !container?.closest("#search-modal")) {
+function requestDetailOwnerForContainer(container) {
+  if (!container) {
+    return "";
+  }
+  if (container === elements.larkSearchResults || container.closest?.("#remote-search-shared-panel")) {
+    return "shared";
+  }
+  if (container === elements.searchResults || container.closest?.("#remote-search-local-panel")) {
+    return "local";
+  }
+  if (container === elements.sourcesFollowResults || container.closest?.("#remote-sources-uids-panel")) {
+    return "uids";
+  }
+  if (container === elements.favlistSongResults || container.closest?.("#remote-sources-favorites-panel")) {
+    return "favorites";
+  }
+  if (container.closest?.("#remote-discover-categories-panel")) {
+    return "categories";
+  }
+  if (container.closest?.("#remote-discover-name-panel")) {
+    return "name";
+  }
+  if (container.closest?.("#remote-discover-artist-panel")) {
+    return "artist";
+  }
+  return "";
+}
+
+function requestDetailContainerForOwner(owner) {
+  const containers = {
+    shared: elements.larkSearchResults,
+    local: elements.searchResults,
+    categories: elements.remoteDiscoverCategoriesPanel?.querySelector?.("[data-category-browse-results]"),
+    name: elements.remoteDiscoverNamePanel?.querySelector?.("[data-d1-browse-results]"),
+    artist: elements.remoteDiscoverArtistPanel?.querySelector?.("[data-d1-browse-results]"),
+    uids: elements.sourcesFollowResults,
+    favorites: elements.favlistSongResults,
+  };
+  return containers[owner] || null;
+}
+
+function requestDetailSafeControl(owner) {
+  let buttons = [];
+  let datasetKey = "";
+  let value = owner;
+  if (["shared", "local"].includes(owner)) {
+    buttons = Array.from(elements.remoteSearchModeButtons || []);
+    datasetKey = "remoteSearchMode";
+  } else if (["categories", "name", "artist"].includes(owner)) {
+    buttons = Array.from(elements.remoteDiscoverModeButtons || []);
+    datasetKey = "remoteDiscoverMode";
+  } else if (["uids", "favorites"].includes(owner)) {
+    buttons = Array.from(elements.remoteSourcesModeButtons || []);
+    datasetKey = "remoteSourcesMode";
+  }
+  const secondary = buttons.find((button) => button.dataset?.[datasetKey] === value);
+  if (secondary?.isConnected && !secondary.closest?.("[inert]")) {
+    return secondary;
+  }
+  const topView = ["shared", "local"].includes(owner)
+    ? "search"
+    : ["categories", "name", "artist"].includes(owner)
+      ? "discover"
+      : "sources";
+  return Array.from(elements.remoteRequestViewButtons || [])
+    .find((button) => button.dataset.remoteRequestView === topView) || null;
+}
+
+function applyRequestResultSelection(row, item, owner) {
+  if (!row || !owner) {
+    return;
+  }
+  const itemKey = requestResultItemKey(item);
+  row.dataset.requestResultOwner = owner;
+  row.dataset.requestResultKey = itemKey;
+  const selected = state.requestDetailSelections[owner];
+  const isSelected = Boolean(itemKey && selected?.selectedKey === itemKey);
+  row.classList.toggle("is-selected", isSelected);
+  row.setAttribute("aria-current", isSelected ? "true" : "false");
+}
+
+function resolveRequestDetailReturnFocus(previouslyFocused, item) {
+  const owner = String(item?.detailOwner || "");
+  const selectedKey = String(item?.detailSelectedKey || "");
+  if (
+    previouslyFocused?.isConnected
+    && !previouslyFocused.closest?.("[inert]")
+  ) {
+    return previouslyFocused;
+  }
+  const container = requestDetailContainerForOwner(owner);
+  const recoveredRow = Array.from(container?.querySelectorAll?.(".search-result-item") || [])
+    .find((row) => row.dataset.requestResultKey === selectedKey);
+  if (recoveredRow?.isConnected && !recoveredRow.closest?.("[inert]")) {
+    recoveredRow.tabIndex = -1;
+    return recoveredRow;
+  }
+  if (container?.isConnected && !container.closest?.("[inert]")) {
+    container.tabIndex = -1;
+    return container;
+  }
+  return requestDetailSafeControl(owner);
+}
+
+function openSearchResultDetail(event, container, source = "") {
+  if (!searchDetailController || !container || event.target.closest("button[data-url]")) {
     return false;
   }
   const card = event.target.closest(".search-result-item[data-url]");
@@ -3982,18 +5221,31 @@ function openSearchResultDetail(event, container, source) {
     return false;
   }
   const item = searchResultItemByElement.get(card);
-  if (!item) {
+  const owner = requestDetailOwnerForContainer(container) || source;
+  if (!item || !owner || !state.requestDetailSelections[owner]) {
     return false;
   }
+  const selectedKey = requestResultItemKey(item);
+  state.requestDetailSelections[owner] = { selectedKey, focusElement: card };
+  state.activeRequestDetailOwner = owner;
+  Array.from(container.querySelectorAll?.(".search-result-item") || []).forEach((row) => {
+    const selected = row === card;
+    row.classList.toggle("is-selected", selected);
+    row.setAttribute("aria-current", selected ? "true" : "false");
+  });
   const avatarUrl = window.BilikaraSongDetail.ownerAvatarFromCachedOwners(
     item,
     state.followBrowseData?.owners,
   );
   event.preventDefault();
+  card.tabIndex = -1;
+  card.focus({ preventScroll: true });
   searchDetailController.open({
     ...item,
     avatar_url: avatarUrl,
-    detailSource: source,
+    detailSource: source || owner,
+    detailOwner: owner,
+    detailSelectedKey: selectedKey,
   });
   return true;
 }
@@ -4002,74 +5254,21 @@ function initSearchDetailController() {
   if (searchDetailController || !window.BilikaraSongDetail) {
     return;
   }
-  const container = elements.searchModal?.querySelector(".remote-search-modal-card");
   searchDetailController = window.BilikaraSongDetail.createSongDetailController({
-    container,
+    container: elements.remoteShell,
     t,
     requestButtonClass: "primary-button",
     nextButtonClass: "secondary-button",
+    resolveReturnFocus: resolveRequestDetailReturnFocus,
+    onClose: () => {
+      state.activeRequestDetailOwner = "";
+    },
     onRequest: (url, position, item) => addByUrl(
       url,
       position,
-      String(item?.detailSource || "modalSearch"),
+      String(item?.detailSource || item?.detailOwner || "search"),
     ),
   });
-}
-
-function renderSearchModalView(target = state.searchModalView || "search") {
-  const nextTarget = ["search", "follow", "favlist", "category", "name", "artist"].includes(target) ? target : "search";
-  state.searchModalView = nextTarget;
-  elements.searchModalTabs?.forEach((button) => {
-    button.classList.toggle("active", button.dataset.target === nextTarget);
-  });
-  elements.searchModalSearchView?.classList.toggle("hidden", nextTarget !== "search");
-  elements.modalFollowBrowserView?.classList.toggle("hidden", nextTarget !== "follow");
-  elements.favlistBrowserView?.classList.toggle("hidden", nextTarget !== "favlist");
-  elements.searchModalOtherView?.classList.toggle("hidden", !["category", "name", "artist"].includes(nextTarget));
-
-  if (nextTarget === "search") {
-    syncBilikaraSearchViews();
-  }
-
-  if (nextTarget === "follow") {
-    if (!state.followBrowseData && !state.followBrowseLoading) {
-      state.followBrowseSelectedUid = "";
-      if (elements.modalFollowSearchQuery) {
-        elements.modalFollowSearchQuery.value = "";
-      }
-      loadFollowBrowse({ uid: "", query: "" });
-    } else {
-      renderModalFollowBrowse();
-    }
-    return;
-  }
-  if (nextTarget === "favlist") {
-    if (!state.favlistBrowseData && !state.favlistBrowseLoading) {
-      state.favlistBrowseSelectedFolderId = "";
-      if (elements.favlistSearchQuery) {
-        elements.favlistSearchQuery.value = "";
-      }
-      loadFavlistBrowse({ folderId: "", query: "" });
-    } else {
-      renderFavlistBrowse();
-    }
-    return;
-  }
-  if (nextTarget === "category") {
-    renderCategoryBrowseView();
-    return;
-  }
-  if (nextTarget === "name" || nextTarget === "artist") {
-    if (state.d1BrowseKind !== nextTarget) {
-      state.d1BrowseData = null;
-      state.d1BrowseLetter = "";
-      state.d1BrowseTag = "";
-      state.d1BrowseLocale = "";
-      state.d1BrowseQuery = "";
-    }
-    state.d1BrowseKind = nextTarget;
-    renderD1BrowseView();
-  }
 }
 
 function selectedFollowOwner() {
@@ -4109,49 +5308,6 @@ function followOwnerDisplayName(owner) {
   return stateOwnerName || ownerName || `UID ${uid}`;
 }
 
-function renderFollowSongResultsInto(container, items, emptyText) {
-  if (!container) {
-    return;
-  }
-  container.innerHTML = "";
-  container.classList.remove("hidden");
-
-  if (!items.length) {
-    const empty = document.createElement("div");
-    empty.className = "search-empty";
-    empty.textContent = emptyText;
-    container.appendChild(empty);
-    return;
-  }
-
-  items.forEach((item) => {
-    const row = document.createElement("div");
-    row.className = "search-result-item";
-
-    const meta = document.createElement("div");
-    meta.className = "search-result-meta";
-    const title = document.createElement("div");
-    title.className = "search-result-title";
-    title.textContent = String(item.title || "");
-
-    const url = createSearchResultUrlLine(item);
-
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "primary-button";
-    button.dataset.url = String(item.url || "");
-    button.textContent = t("search.add");
-
-    meta.append(title, url);
-    row.append(meta, button);
-    container.appendChild(row);
-  });
-}
-
-function renderFollowSongResults(items, emptyText) {
-  renderFollowSongResultsInto(elements.followSongResults, items, emptyText);
-}
-
 function scheduleFavlistBrowseReloadFromState(previousSnapshot, nextSnapshot) {
   const previousUpdatedAt = Number(previousSnapshot?.gatcha_favlist_updated_at || 0);
   const nextUpdatedAt = Number(nextSnapshot?.gatcha_favlist_updated_at || 0);
@@ -4175,335 +5331,251 @@ function scheduleFavlistBrowseReloadFromState(previousSnapshot, nextSnapshot) {
   }, 0);
 }
 
-function renderFollowBrowse() {
-  if (!elements.followBrowseView || !elements.followUpGrid || !elements.followSongResults) {
-    return;
-  }
-
-  const showFollow = Boolean(state.followBrowseVisible);
-  const showLark = Boolean(state.larkSearchVisible);
-  setRemoteSearchStageView(showFollow ? "browse" : showLark ? "lark" : "search");
-  if (elements.followBrowseToggle) {
-    elements.followBrowseToggle.textContent = showFollow ? t("search.followBrowseBack") : t("search.followBrowse");
-    elements.followBrowseToggle.setAttribute("aria-pressed", String(showFollow));
-  }
-  if (elements.larkSearchToggle) {
-    elements.larkSearchToggle.textContent = showLark ? t("search.larkBack") : t("search.larkSearch");
-    elements.larkSearchToggle.setAttribute("aria-pressed", String(showLark));
-  }
-  if (elements.searchTag) {
-    elements.searchTag.textContent = showLark ? t("search.larkTag") : showFollow ? t("search.followTag") : t("search.localTag");
-  }
-  if (elements.searchTitle) {
-    elements.searchTitle.textContent = showLark ? t("search.larkSearch") : showFollow ? t("follow.title") : t("search.title");
-  }
-  if (!state.followBrowseVisible) {
+function renderSourcesFollowBrowse() {
+  if (!elements.sourcesFollowGrid || !elements.sourcesFollowResults) {
     return;
   }
 
   const owners = Array.isArray(state.followBrowseData?.owners) ? state.followBrowseData.owners : [];
   const items = Array.isArray(state.followBrowseData?.items) ? state.followBrowseData.items : [];
-  const signature = JSON.stringify({
-    language: state.language,
-    loading: state.followBrowseLoading,
-    selected: state.followBrowseSelectedUid,
-    owners,
-    items,
-  });
-  if (signature === state.followBrowseRenderSignature) {
-    return;
-  }
-  state.followBrowseRenderSignature = signature;
-
-  const hasSelectedUid = Boolean(state.followBrowseSelectedUid);
-  elements.followUpListView?.classList.toggle("hidden", hasSelectedUid);
-  elements.followUpItemsView?.classList.toggle("hidden", !hasSelectedUid);
-
-  if (!hasSelectedUid) {
-    elements.followUpGrid.innerHTML = "";
-    if (!owners.length) {
-      const empty = document.createElement("div");
-      empty.className = "search-empty";
-      empty.textContent = state.followBrowseLoading ? t("follow.loadingOwners") : t("follow.noOwners");
-      elements.followUpGrid.appendChild(empty);
-    } else {
-      owners.forEach((owner) => {
-        const displayName = followOwnerDisplayName(owner);
-        const button = document.createElement("button");
-        button.type = "button";
-        button.className = "follow-up-button";
-        button.dataset.uid = String(owner.uid || "");
-        button.title = displayName;
-
-        const name = document.createElement("span");
-        name.className = "follow-up-name";
-        name.textContent = displayName;
-
-        const count = document.createElement("span");
-        count.className = "follow-up-count";
-        count.textContent = t("follow.countSongs", { count: Number(owner.count || 0) });
-
-        button.append(name, count);
-
-        if (owner.avatar_url) {
-          const avatar = document.createElement("img");
-          avatar.className = "follow-up-avatar";
-          avatar.src = owner.avatar_url;
-          avatar.alt = "";
-          avatar.loading = "lazy";
-          avatar.referrerPolicy = "no-referrer";
-          button.append(avatar);
-        }
-
-        elements.followUpGrid.appendChild(button);
-      });
-    }
-    setFollowBrowseMessage(state.followBrowseLoading ? t("follow.loadingOwners") : "");
-    return;
-  }
-
-  const owner = selectedFollowOwner();
-  if (elements.followBrowseAvatar) {
-    const avatarUrl = String(owner?.avatar_url || "").trim();
-    elements.followBrowseAvatar.classList.toggle("hidden", !avatarUrl);
-    if (avatarUrl) {
-      elements.followBrowseAvatar.src = avatarUrl;
-    } else {
-      elements.followBrowseAvatar.removeAttribute("src");
-    }
-  }
-  if (elements.followBrowseTitle) {
-    elements.followBrowseTitle.textContent = followOwnerDisplayName(owner) || `UID ${state.followBrowseSelectedUid}`;
-  }
-  if (elements.followBrowseCount) {
-    const totalCount = Number(owner?.count || items.length || 0);
-    elements.followBrowseCount.textContent = t("follow.itemCount", { shown: items.length, total: totalCount });
-  }
-  renderFollowSongResults(
-    items,
-    state.followBrowseLoading ? t("follow.loadingItems") : t("follow.noItems"),
-  );
-  setFollowBrowseMessage(state.followBrowseLoading ? t("follow.loadingItems") : "");
-}
-
-function renderModalFollowBrowse() {
-  if (!elements.modalFollowBrowserView || !elements.modalFollowUpGrid || !elements.modalFollowSongResults) {
-    return;
-  }
-
-  const owners = Array.isArray(state.followBrowseData?.owners) ? state.followBrowseData.owners : [];
-  const items = Array.isArray(state.followBrowseData?.items) ? state.followBrowseData.items : [];
+  const hasMore = Boolean(state.followBrowseData?.has_more);
+  const placeholders = window.BilikaraSourceStatus?.queuedSources?.(state.data?.gatcha, "uids",
+    owners.map(owner => owner?.uid)) || [];
   const taskBusy = gatchaTaskBusy();
+  const sourceBusy = gatchaSourceBusy();
   const signature = JSON.stringify({
     loading: state.followBrowseLoading,
+    error: state.followBrowseError,
     selected: state.followBrowseSelectedUid,
+    sourceState: window.BilikaraSourceStatus.sourceState(state.data?.gatcha, {uid: state.followBrowseSelectedUid}),
     owners,
+    placeholders,
     items,
+    hasMore,
     uidSaving: state.gatchaUidSaving,
     taskBusy,
+    sourceBusy,
     language: state.language,
   });
-  if (signature === state.modalFollowBrowseRenderSignature) {
+  if (signature === state.sourcesFollowBrowseRenderSignature) {
     return;
   }
-  state.modalFollowBrowseRenderSignature = signature;
+  state.sourcesFollowBrowseRenderSignature = signature;
 
   const hasSelectedUid = Boolean(state.followBrowseSelectedUid);
-  elements.modalFollowUpListView?.classList.toggle("hidden", hasSelectedUid);
-  elements.modalFollowUpItemsView?.classList.toggle("hidden", !hasSelectedUid);
-  if (elements.modalFollowUidInput) {
-    elements.modalFollowUidInput.disabled = state.gatchaUidSaving || taskBusy;
+  elements.sourcesFollowListView?.classList.toggle("hidden", hasSelectedUid);
+  elements.sourcesFollowItemsView?.classList.toggle("hidden", !hasSelectedUid);
+  if (elements.sourcesFollowUidInput) {
+    elements.sourcesFollowUidInput.disabled = state.gatchaUidSaving || sourceBusy;
   }
-  if (elements.modalAddFollowUidButton) {
-    elements.modalAddFollowUidButton.disabled = state.gatchaUidSaving || taskBusy;
-    elements.modalAddFollowUidButton.textContent = taskBusy
-      ? t("gatcha.globalCooldown")
+  if (elements.sourcesAddFollowUidButton) {
+    elements.sourcesAddFollowUidButton.disabled = state.gatchaUidSaving || sourceBusy;
+    window.BilikaraSourceStatus.setBusy(elements.sourcesAddFollowUidButton, state.gatchaUidSaving || sourceBusy);
+    elements.sourcesAddFollowUidButton.textContent = sourceBusy
+      ? t("gatcha.pulling")
       : state.gatchaUidSaving
         ? t("gatcha.adding")
         : t("gatcha.add");
   }
+  if (elements.sourcesFollowSearchQuery) {
+    elements.sourcesFollowSearchQuery.disabled = state.followBrowseLoading;
+  }
+  if (elements.sourcesFollowSearchButton) {
+    elements.sourcesFollowSearchButton.disabled = state.followBrowseLoading;
+    elements.sourcesFollowSearchButton.toggleAttribute("aria-busy", state.followBrowseLoading);
+  }
 
   if (!hasSelectedUid) {
-    elements.modalFollowUpGrid.innerHTML = "";
-    if (!owners.length) {
-      const empty = document.createElement("div");
-      empty.className = "search-empty";
-      empty.textContent = state.followBrowseLoading ? t("follow.loadingOwners") : t("follow.noOwners");
-      elements.modalFollowUpGrid.appendChild(empty);
-    } else {
-      owners.forEach((owner) => {
-        const displayName = followOwnerDisplayName(owner);
-        const button = document.createElement("button");
-        button.type = "button";
-        button.className = "follow-up-button";
-        button.dataset.uid = String(owner.uid || "");
-        button.title = displayName;
-
-        const name = document.createElement("span");
-        name.className = "follow-up-name";
-        name.textContent = displayName;
-
-        const count = document.createElement("span");
-        count.className = "follow-up-count";
-        count.textContent = t("follow.countSongs", { count: Number(owner.count || 0) });
-
-        button.append(name, count);
-
-        if (owner.avatar_url) {
-          const avatar = document.createElement("img");
-          avatar.className = "follow-up-avatar";
-          avatar.src = owner.avatar_url;
-          avatar.alt = "";
-          avatar.loading = "lazy";
-          avatar.referrerPolicy = "no-referrer";
-          button.append(avatar);
-        }
-
-        elements.modalFollowUpGrid.appendChild(button);
-      });
-    }
-    setModalFollowBrowseMessage(state.followBrowseLoading ? t("follow.loadingOwners") : "");
+    hideRemoteResultPager(elements.sourcesFollowResults);
+    window.BilikaraBrowseSearch?.reset(elements.sourcesFollowSearchForm);
+    renderRemoteGridPages(elements.sourcesFollowGrid, [...placeholders, ...owners], "uids", renderSourceCardPage, {
+      loading:state.followBrowseLoading,
+      emptyText:t(state.followBrowseLoading ? "follow.loadingOwners" : "follow.noOwners"),
+    });
+    setSourcesFollowBrowseMessage(state.followBrowseLoading ? t("follow.loadingOwners") : "");
+    syncRemoteRequestPanelSizeTier();
     return;
   }
 
   const owner = selectedFollowOwner();
-  if (elements.modalFollowBrowseAvatar) {
+  if (elements.sourcesFollowAvatar) {
     const avatarUrl = String(owner?.avatar_url || "").trim();
-    elements.modalFollowBrowseAvatar.classList.toggle("hidden", !avatarUrl);
+    elements.sourcesFollowAvatar.classList.toggle("hidden", !avatarUrl);
     if (avatarUrl) {
-      elements.modalFollowBrowseAvatar.src = avatarUrl;
+      elements.sourcesFollowAvatar.src = avatarUrl;
     } else {
-      elements.modalFollowBrowseAvatar.removeAttribute("src");
+      elements.sourcesFollowAvatar.removeAttribute("src");
     }
   }
-  if (elements.modalFollowBrowseTitle) {
-    elements.modalFollowBrowseTitle.textContent = followOwnerDisplayName(owner) || `UID ${state.followBrowseSelectedUid}`;
+  if (elements.sourcesFollowTitle) {
+    elements.sourcesFollowTitle.textContent = followOwnerDisplayName(owner) || `UID ${state.followBrowseSelectedUid}`;
   }
-  if (elements.modalFollowBrowseCount) {
-    const totalCount = Number(owner?.count || items.length || 0);
-    elements.modalFollowBrowseCount.textContent = t("follow.itemCount", { shown: items.length, total: totalCount });
+  if (elements.sourcesFollowCount) {
+    const matchedCount = Number(state.followBrowseData?.matched_count);
+    const totalCount = Number.isFinite(matchedCount)
+      ? matchedCount
+      : Number(owner?.count || items.length || 0);
+    elements.sourcesFollowCount.textContent = t("follow.itemCount", { shown: items.length, total: totalCount });
   }
   renderSearchResultItems(
-    elements.modalFollowSongResults,
+    elements.sourcesFollowResults,
     items,
-    state.followBrowseLoading ? t("follow.loadingItems") : t("follow.noItems"),
+    state.followBrowseLoading ? t("follow.loadingItems") : window.BilikaraSourceStatus.emptyText(state.data?.gatcha, {uid: state.followBrowseSelectedUid}, t, t("follow.noItems")),
   );
-  setModalFollowBrowseMessage(state.followBrowseLoading ? t("follow.loadingItems") : "");
+  setSourcesFollowBrowseMessage(paginatedBrowseStatus(items, {
+    loading: state.followBrowseLoading,
+    hasMore,
+    loadingText: t("follow.loadingItems"),
+  }));
+  window.BilikaraBrowseSearch?.sync(elements.sourcesFollowSearchForm,
+    elements.sourcesFollowItemsView.querySelector(".follow-browser-head"), {
+      key: state.followBrowseSelectedUid, title: elements.sourcesFollowTitle.textContent,
+      query: String(state.followBrowseData?.selected_uid || "") === state.followBrowseSelectedUid
+        ? state.followBrowseData.query : "",
+      loading: state.followBrowseLoading, translate: t,
+    });
+  syncRemoteRequestPanelSizeTier();
 }
 
-async function loadFollowBrowse({ uid = state.followBrowseSelectedUid, query = "", keepQuery = false } = {}) {
+async function loadFollowBrowse({
+  uid = state.followBrowseSelectedUid,
+  query = "",
+  keepQuery = false,
+  append = false,
+} = {}) {
+  if (state.followBrowseLoading) {
+    return;
+  }
+  const seq = state.followBrowseSeq + 1;
+  state.followBrowseSeq = seq;
   state.followBrowseLoading = true;
+  state.followBrowseError = "";
   state.followBrowseSelectedUid = String(uid || "").trim();
-  renderFollowBrowse();
-  renderModalFollowBrowse();
+  renderSourcesFollowBrowse();
   try {
-    const nextData = await fetchGatchaBrowse(state.followBrowseSelectedUid, query);
-    state.followBrowseData = nextData;
-    state.followBrowseSelectedUid = String(nextData.selected_uid || state.followBrowseSelectedUid || "");
-    if (!keepQuery && elements.followSearchQuery) {
-      elements.followSearchQuery.value = String(nextData.query || "");
+    const offset = append ? Number(state.followBrowseData?.next_offset || 0) : 0;
+    const nextData = await fetchGatchaBrowse(
+      state.followBrowseSelectedUid,
+      query,
+      { offset, limit: browsePageSize },
+    );
+    if (state.followBrowseSeq !== seq) {
+      return;
     }
-    if (!keepQuery && elements.modalFollowSearchQuery) {
-      elements.modalFollowSearchQuery.value = String(nextData.query || "");
+    const previousItems = append && Array.isArray(state.followBrowseData?.items)
+      ? state.followBrowseData.items
+      : [];
+    state.followBrowseData = {
+      ...nextData,
+      items: mergeBrowseItems(previousItems, nextData.items),
+    };
+    state.followBrowseSelectedUid = String(nextData.selected_uid ?? state.followBrowseSelectedUid ?? "");
+    if (!keepQuery && elements.sourcesFollowSearchQuery) {
+      elements.sourcesFollowSearchQuery.value = String(nextData.query || "");
     }
   } catch (error) {
-    setFollowBrowseMessage(error.message, true);
-    setModalFollowBrowseMessage(error.message, true);
+    if (state.followBrowseSeq === seq) {
+      state.followBrowseError = error.message;
+      setAppMessage(error.message, true);
+    }
   } finally {
-    state.followBrowseLoading = false;
-    renderFollowBrowse();
-    renderModalFollowBrowse();
+    if (state.followBrowseSeq === seq) {
+      state.followBrowseLoading = false;
+      renderSourcesFollowBrowse();
+      window.BilikaraSourceStatus?.flush("uids");
+    }
   }
 }
 
 async function refreshFollowBrowseAfterGatchaUidAdd(uid = "") {
-  state.followBrowseRenderSignature = "";
-  state.modalFollowBrowseRenderSignature = "";
+  state.sourcesFollowBrowseRenderSignature = "";
   const currentUid = String(state.followBrowseSelectedUid || "").trim();
   const nextUid = currentUid || String(uid || "").trim();
   await loadFollowBrowse({ uid: nextUid, query: "", keepQuery: false });
 }
 
-async function addGatchaUidFromInput(input, { messageTarget = "gatcha" } = {}) {
+async function addGatchaUidFromInput(input, { messageTarget = "sources-follow" } = {}) {
   const uid = String(input?.value || "").trim();
   if (!uid) {
-    setGatchaUidFlowMessage(messageTarget, t("gatcha.uidRequired"), true);
+    setSourceManagementMessage(messageTarget, t("gatcha.uidRequired"), true);
     return;
   }
   if (state.gatchaUidSaving) {
     return;
   }
-  if (gatchaTaskBusy()) {
-    setGatchaUidFlowMessage(messageTarget, gatchaTaskBusyMessage(), true);
-    renderGatchaUidView();
+  if (gatchaSourceBusy()) {
+    setSourceManagementMessage(messageTarget, gatchaTaskBusyMessage(), true);
+    renderSourceManagementControls();
     return;
   }
 
   state.gatchaUidSaving = true;
-  renderGatchaUidView();
-  setGatchaUidFlowMessage(messageTarget, t("gatcha.checkingUid"));
+  renderSourceManagementControls();
+  setSourceManagementLoadingMessage(messageTarget, t("gatcha.checkingUid"));
   try {
     const preview = await previewGatchaUid(uid);
     const ownerName = preview?.name || `UID ${preview?.uid || uid}`;
     const modeLabel = preview?.cache_mode === "incremental" ? t("gatcha.latestMode") : t("gatcha.allMode");
     const followedPrefix = preview?.already_followed ? t("gatcha.alreadyFollowedPrefix") : "";
-    setGatchaUidFlowMessage(messageTarget, t("gatcha.detectedOwner", { prefix: followedPrefix, owner: ownerName }));
+    setSourceManagementMessage(messageTarget, t("gatcha.detectedOwner", { prefix: followedPrefix, owner: ownerName }));
 
     if (!window.confirm(t("gatcha.confirmPullOwner", { owner: ownerName, mode: modeLabel }))) {
-      setGatchaUidFlowMessage(messageTarget, t("remote.uidAddCancelled"));
+      setSourceManagementMessage(messageTarget, t("remote.uidAddCancelled"));
       return;
     }
 
     const normalizedUid = preview?.uid || uid;
-    if (gatchaTaskBusy()) {
-      setGatchaUidFlowMessage(messageTarget, gatchaTaskBusyMessage(), true);
-      renderGatchaUidView();
+    if (gatchaSourceBusy()) {
+      setSourceManagementMessage(messageTarget, gatchaTaskBusyMessage(), true);
+      renderSourceManagementControls();
       return;
     }
-    setGatchaUidFlowMessage(messageTarget, t("gatcha.pullingOwnerItems", { name: ownerName }));
+    setSourceManagementLoadingMessage(messageTarget, t("gatcha.pullingOwnerItems", { name: ownerName }));
+    window.BilikaraSourceStatus?.rememberSource({ uid: normalizedUid, title: preview?.name });
     const result = await addGatchaUid(normalizedUid);
-    setGatchaUidFlowMessage(messageTarget, gatchaUidResultMessage(result, normalizedUid));
+    setSourceManagementMessage(messageTarget, gatchaUidResultMessage(result, normalizedUid));
     if (input) {
       input.value = "";
     }
     await refreshFollowBrowseAfterGatchaUidAdd(result?.uid || normalizedUid);
   } catch (error) {
-    setGatchaUidFlowMessage(messageTarget, error.message, true);
+    setSourceManagementMessage(messageTarget, error.message, true);
   } finally {
     state.gatchaUidSaving = false;
-    renderGatchaUidView();
+    renderSourceManagementControls();
   }
 }
 
-async function previewGatchaFavlistFromInput(input, { messageTarget = "gatcha" } = {}) {
+async function previewGatchaFavlistFromInput(input, { messageTarget = "sources-favorites" } = {}) {
   const uid = String(input?.value || "").trim();
   if (!uid) {
-    setGatchaUidFlowMessage(messageTarget, t("gatcha.uidRequired"), true);
+    setSourceManagementMessage(messageTarget, t("gatcha.uidRequired"), true);
     return;
   }
-  if (gatchaTaskBusy()) {
-    setGatchaUidFlowMessage(messageTarget, gatchaTaskBusyMessage(), true);
-    renderGatchaUidView();
+  if (gatchaSourceBusy()) {
+    setSourceManagementMessage(messageTarget, gatchaTaskBusyMessage(), true);
+    renderSourceManagementControls();
     return;
   }
   state.gatchaFavlistSaving = true;
-  renderGatchaUidView();
-  setGatchaUidFlowMessage(messageTarget, t("gatcha.readingFavlists"));
+  renderSourceManagementControls();
+  setSourceManagementLoadingMessage(messageTarget, t("gatcha.readingFavlists"));
   try {
     const result = await previewGatchaFavlist(uid);
     openGatchaFavlistSheet(result?.uid || uid, result, { messageTarget });
-    setGatchaUidFlowMessage(messageTarget, t("gatcha.chooseFavlists"));
+    setSourceManagementMessage(messageTarget, t("gatcha.chooseFavlists"));
   } catch (error) {
-    setGatchaUidFlowMessage(messageTarget, error.message, true);
+    setSourceManagementMessage(messageTarget, error.message, true);
   } finally {
     state.gatchaFavlistSaving = false;
-    renderGatchaUidView();
+    renderSourceManagementControls();
   }
 }
 
 async function handleGatchaDraw() {
-  state.gatchaUidVisible = false;
-  renderGatchaUidView();
+  if (state.gatchaDrawBusy || !gatchaLoggedIn()) return;
+  state.gatchaDrawBusy = true;
+  renderGatchaView();
   setGatchaMessage(t("gatcha.drawing"));
   try {
     const response = await fetch("/api/gatcha/candidate", { headers: clientHeaders() });
@@ -4514,107 +5586,100 @@ async function handleGatchaDraw() {
 
     state.gatchaCandidate = payload.data;
     elements.gatchaCandidateTitle.textContent = state.gatchaCandidate.title;
-    renderGatchaUidView();
+    renderGatchaView();
     setGatchaMessage("");
   } catch (error) {
     setGatchaMessage(error.message, true);
+  } finally {
+    state.gatchaDrawBusy = false;
+    renderGatchaView();
   }
 }
 
 function setGatchaMessage(message, isError = false) {
-  if (!elements.gatchaMessage) {
-    return;
-  }
-  elements.gatchaMessage.textContent = message || "";
-  elements.gatchaMessage.classList.toggle("is-error", Boolean(isError));
-  elements.gatchaMessage.classList.toggle("hidden", !message);
+  setAppMessage(message, isError);
 }
 
 function setGatchaUidMessage(message, isError = false) {
+  if (elements.gatchaUidMessage) {
+    elements.gatchaUidMessage.textContent = "";
+    elements.gatchaUidMessage.classList.remove("is-error");
+    elements.gatchaUidMessage.classList.add("hidden");
+  }
+  setAppMessage(message, isError);
+}
+
+function setGatchaUidLoadingMessage(message) {
   if (!elements.gatchaUidMessage) {
     return;
   }
   elements.gatchaUidMessage.textContent = message || "";
-  elements.gatchaUidMessage.classList.toggle("is-error", Boolean(isError));
+  elements.gatchaUidMessage.classList.remove("is-error");
   elements.gatchaUidMessage.classList.toggle("hidden", !message);
 }
 
-function syncGatchaMainContent(showUid, hasCandidate) {
-  elements.gatchaInitView?.classList.toggle("hidden", showUid || hasCandidate);
-  elements.gatchaResultView?.classList.toggle("hidden", showUid || !hasCandidate);
+function syncGatchaMainContent(hasCandidate) {
+  elements.gatchaInitView?.classList.toggle("hidden", hasCandidate);
+  elements.gatchaResultView?.classList.toggle("hidden", !hasCandidate);
 }
 
-function renderGatchaUidView() {
-  syncGatchaTaskTerminalMessage();
-  const showUid = Boolean(state.gatchaUidVisible);
+function gatchaLoggedIn() {
+  return Boolean(state.data?.bbdown?.login?.logged_in || state.data?.bbdown?.logged_in);
+}
+
+function renderGatchaView() {
+  const loggedIn = gatchaLoggedIn();
+  const notice = document.getElementById("gatcha-login-notice");
+  if (notice) notice.hidden = loggedIn;
   const hasCandidate = Boolean(state.gatchaCandidate);
-  const taskBusy = gatchaTaskBusy();
   if (elements.gatchaCandidateTitle && state.gatchaCandidate?.title) {
     elements.gatchaCandidateTitle.textContent = state.gatchaCandidate.title;
   }
-  setGatchaStageView(showUid, () => {
-    syncGatchaMainContent(showUid, hasCandidate);
-  });
-  if (elements.gatchaUidToggle) {
-    elements.gatchaUidToggle.textContent = showUid ? t("gatcha.backToDraw") : t("gatcha.addUid");
-    elements.gatchaUidToggle.setAttribute("aria-pressed", String(showUid));
-  }
-  if (elements.gatchaTag) {
-    elements.gatchaTag.textContent = showUid ? t("gatcha.uidTag") : t("gatcha.tag");
-  }
-  if (elements.gatchaTitle) {
-    elements.gatchaTitle.textContent = showUid ? t("gatcha.uidTitle") : t("gatcha.title");
-  }
+  syncGatchaMainContent(hasCandidate);
   if (elements.gatchaConfirmButton && !elements.gatchaConfirmButton.disabled) {
     elements.gatchaConfirmButton.textContent = t("gatcha.confirm");
   }
   if (elements.gatchaButton) {
-    elements.gatchaButton.disabled = false;
-    elements.gatchaButton.textContent = t("gatcha.title");
+    elements.gatchaButton.disabled = !loggedIn || state.gatchaDrawBusy;
+    elements.gatchaButton.toggleAttribute("aria-busy", state.gatchaDrawBusy);
+    elements.gatchaButton.textContent = t(state.gatchaDrawBusy ? "gatcha.drawing" : "gatcha.title");
   }
   if (elements.gatchaRetryButton) {
-    elements.gatchaRetryButton.disabled = false;
+    elements.gatchaRetryButton.disabled = !loggedIn || state.gatchaDrawBusy;
+    elements.gatchaRetryButton.toggleAttribute("aria-busy", state.gatchaDrawBusy);
     elements.gatchaRetryButton.textContent = t("gatcha.retry");
   }
-  if (elements.gatchaUidInput) {
-    elements.gatchaUidInput.disabled = state.gatchaUidSaving;
-  }
-  if (elements.addGatchaUidButton) {
-    elements.addGatchaUidButton.disabled = state.gatchaUidSaving || taskBusy;
-    elements.addGatchaUidButton.textContent = state.gatchaUidSaving ? t("gatcha.adding") : t("gatcha.add");
-  }
+}
+
+function renderSourceManagementControls() {
+  syncGatchaTaskTerminalMessage();
+  window.BilikaraSourceStatus?.sync([document.getElementById("remote-sources-uids-panel"), document.getElementById("remote-sources-favorites-panel")], {
+    task:state.data?.gatcha, loading:state.gatchaUidSaving || state.gatchaFavlistSaving || state.gatchaRefreshSaving, translate:t,
+  });
+  const taskBusy = gatchaTaskBusy();
+  const sourceBusy = gatchaSourceBusy();
   if (elements.refreshGatchaCacheButton) {
     elements.refreshGatchaCacheButton.disabled = state.gatchaRefreshSaving || taskBusy;
+    window.BilikaraSourceStatus.setBusy(elements.refreshGatchaCacheButton, state.gatchaRefreshSaving || taskBusy);
     elements.refreshGatchaCacheButton.textContent = state.gatchaRefreshSaving ? t("gatcha.refreshing") : t("gatcha.refresh");
   }
-  if (elements.pullGatchaFavlistButton) {
-    elements.pullGatchaFavlistButton.disabled = state.gatchaFavlistSaving || taskBusy;
-    elements.pullGatchaFavlistButton.textContent = state.gatchaFavlistSaving ? t("gatcha.pulling") : t("gatcha.pullFavlist");
+  if (elements.sourcesFavlistUidInput) {
+    elements.sourcesFavlistUidInput.disabled = state.gatchaFavlistSaving || sourceBusy;
   }
-  if (elements.modalFavlistUidInput) {
-    elements.modalFavlistUidInput.disabled = state.gatchaFavlistSaving || taskBusy;
-  }
-  if (elements.modalPullFavlistButton) {
-    elements.modalPullFavlistButton.disabled = state.gatchaFavlistSaving || taskBusy;
-    elements.modalPullFavlistButton.textContent = state.gatchaFavlistSaving ? t("gatcha.pulling") : t("gatcha.pullFavlist");
+  if (elements.sourcesPullFavlistButton) {
+    elements.sourcesPullFavlistButton.disabled = state.gatchaFavlistSaving || sourceBusy;
+    window.BilikaraSourceStatus.setBusy(elements.sourcesPullFavlistButton, state.gatchaFavlistSaving || sourceBusy);
+    elements.sourcesPullFavlistButton.textContent = state.gatchaFavlistSaving ? t("gatcha.pulling") : t("gatcha.pullFavlist");
   }
   if (taskBusy) {
     if (elements.refreshGatchaCacheButton) {
-      elements.refreshGatchaCacheButton.textContent = t("gatcha.globalCooldown");
+      elements.refreshGatchaCacheButton.textContent = t("gatcha.pulling");
     }
-    if (elements.pullGatchaFavlistButton) {
-      elements.pullGatchaFavlistButton.textContent = t("gatcha.globalCooldown");
-    }
-    if (elements.modalPullFavlistButton) {
-      elements.modalPullFavlistButton.textContent = t("gatcha.globalCooldown");
+    if (sourceBusy && elements.sourcesPullFavlistButton) {
+      elements.sourcesPullFavlistButton.textContent = t("gatcha.pulling");
     }
   }
-  renderModalFollowBrowse();
-}
-
-async function handleGatchaUidSubmit(event) {
-  event.preventDefault();
-  await addGatchaUidFromInput(elements.gatchaUidInput, { messageTarget: "gatcha" });
+  renderSourcesFollowBrowse();
 }
 
 function render() {
@@ -4633,43 +5698,785 @@ function render() {
   renderRemoteVolumeControls(playbackMode, data.player_settings);
   renderRemoteKeyShiftControls(playbackMode, data.player_settings);
   renderRemoteAccess(data.remote_access);
-  renderFollowBrowse();
-  renderModalFollowBrowse();
+  renderSourcesFollowBrowse();
   renderListHeader(data.playlist || [], data.history || []);
   renderQueue(Array.isArray(data.playlist) ? data.playlist : []);
   renderHistory(Array.isArray(data.history) ? data.history : []);
   syncListView();
-  renderLayoutMode();
-  renderGatchaUidView();
-  renderFloatingControlTrigger(data.current_item, playbackMode);
+  syncRemoteRequestViewSelection();
+  renderGatchaView();
+  renderSourceManagementControls();
+  syncPlaybackMetadataFieldVisibility();
+  schedulePlaybackSheetAdaptiveLayout();
 }
 
 function frontendPlaybackMode(_mode) {
   return "local";
 }
 
+function playbackMetadataEntries() {
+  const nodes = {
+    title: elements.currentTitle,
+    requester: elements.currentRequester,
+    owner: elements.currentOwner,
+  };
+  const labelKeys = {
+    title: "remote.showFullTitle",
+    requester: "remote.showFullRequester",
+    owner: "remote.showFullOwner",
+  };
+  return elements.playbackMetadataFields
+    .map((wrapper) => {
+      const key = wrapper.dataset.playbackMetadataField || "";
+      return {
+        key,
+        wrapper,
+        element: nodes[key] || null,
+        labelKey: labelKeys[key] || "remote.showFullMetadata",
+      };
+    })
+    .filter(({ element, wrapper }) => (
+      element
+      && wrapper
+      && !wrapper.classList.contains("hidden")
+      && !element.classList.contains("hidden")
+      && Boolean(element.textContent?.trim())
+    ));
+}
+
+function syncPlaybackMetadataFieldVisibility() {
+  const nodes = {
+    title: elements.currentTitle,
+    requester: elements.currentRequester,
+    owner: elements.currentOwner,
+  };
+  elements.playbackMetadataFields.forEach((wrapper) => {
+    const element = nodes[wrapper.dataset.playbackMetadataField || ""];
+    const visible = Boolean(
+      element
+      && !element.classList.contains("hidden")
+      && !(wrapper.dataset.playbackMetadataField === "owner" && state.data?.current_item?.cache_status !== "ready")
+      && element.textContent?.trim(),
+    );
+    wrapper.classList.toggle("hidden", !visible);
+    if (!visible) {
+      wrapper.classList.remove("is-clamped", "is-disclosable", "is-marquee");
+      wrapper.style.removeProperty("--playback-metadata-lines");
+      wrapper.removeAttribute("role");
+      wrapper.removeAttribute("tabindex");
+      wrapper.removeAttribute("aria-controls");
+      wrapper.removeAttribute("aria-expanded");
+      wrapper.removeAttribute("aria-label");
+      delete wrapper.dataset.naturalLines;
+      delete wrapper.dataset.visibleLines;
+      delete wrapper.dataset.truncated;
+    }
+  });
+}
+
+function clearPlaybackMetadataPopoverPosition() {
+  const popover = elements.playbackMetadataPopover;
+  if (!popover) {
+    return;
+  }
+  for (const property of [
+    "width",
+    "max-width",
+    "max-height",
+    "left",
+    "right",
+    "top",
+    "bottom",
+    "--remote-tooltip-arrow-left",
+    "--remote-tooltip-transform-origin",
+  ]) {
+    popover.style.removeProperty(property);
+  }
+  delete popover.dataset.tooltipDirection;
+  elements.playbackMetadataPopoverText?.style.removeProperty("max-height");
+}
+
+function closePlaybackMetadataPopover({ restoreFocus = false } = {}) {
+  const popover = elements.playbackMetadataPopover;
+  const anchor = state.playbackMetadataPopoverAnchor;
+  const wasOpen = Boolean(state.playbackMetadataPopoverField);
+  state.playbackMetadataPopoverField = "";
+  elements.playbackMetadataFields.forEach((wrapper) => {
+    if (wrapper.classList.contains("is-disclosable")) {
+      wrapper.setAttribute("aria-expanded", "false");
+    }
+  });
+  if (popover) {
+    popover.classList.add("is-closing");
+    popover.classList.remove("is-visible");
+    popover.setAttribute("aria-hidden", "true");
+    const closing = popover.__bilikaraCloseSequence = (popover.__bilikaraCloseSequence || 0) + 1;
+    Promise.allSettled((popover.getAnimations?.() || []).map(animation => animation.finished)).then(() => {
+      if (popover.__bilikaraCloseSequence !== closing || state.playbackMetadataPopoverField) return;
+      if (typeof popover.hidePopover === "function" && popover.matches(":popover-open")) popover.hidePopover();
+      popover.hidden = true;
+      popover.classList.remove("is-closing");
+      state.playbackMetadataPopoverAnchor = null;
+      clearPlaybackMetadataPopoverPosition();
+    });
+  }
+  if (
+    restoreFocus
+    && anchor?.isConnected
+    && anchor.classList.contains("is-disclosable")
+  ) {
+    anchor.focus({ preventScroll: true });
+  }
+  return wasOpen;
+}
+
+function positionPlaybackMetadataPopover() {
+  const popover = elements.playbackMetadataPopover;
+  const anchor = state.playbackMetadataPopoverAnchor;
+  const panel = elements.playbackSheetPanel;
+  if (!popover || popover.hidden || !state.playbackMetadataPopoverField || !anchor || !panel) {
+    return false;
+  }
+
+  const viewport = window.visualViewport;
+  const viewportLeft = Number(viewport?.offsetLeft || 0);
+  const viewportTop = Number(viewport?.offsetTop || 0);
+  const viewportRight = viewportLeft + Number(viewport?.width || window.innerWidth);
+  const viewportBottom = viewportTop + Number(viewport?.height || window.innerHeight);
+  const panelRect = panel.getBoundingClientRect();
+  const anchorRect = anchor.getBoundingClientRect();
+  const inset = 8;
+  const gap = 7;
+  const boundaryLeft = Math.max(viewportLeft + inset, panelRect.left + inset);
+  const boundaryRight = Math.min(viewportRight - inset, panelRect.right - inset);
+  const boundaryTop = Math.max(viewportTop + inset, panelRect.top + inset);
+  const boundaryBottom = Math.min(viewportBottom - inset, panelRect.bottom - inset);
+  const widthLimit = Math.max(0, Math.min(320, boundaryRight - boundaryLeft));
+  const heightLimit = Math.max(44, Math.min(224, boundaryBottom - boundaryTop));
+
+  popover.style.width = "max-content";
+  popover.style.maxWidth = String(Math.round(widthLimit)) + "px";
+  popover.style.maxHeight = String(Math.round(heightLimit)) + "px";
+  popover.style.left = "0px";
+  popover.style.right = "auto";
+  popover.style.top = "0px";
+  popover.style.bottom = "auto";
+  const style = getComputedStyle(popover);
+  const verticalInset = playbackCssPixels(style.paddingTop) + playbackCssPixels(style.paddingBottom)
+    + playbackCssPixels(style.borderTopWidth) + playbackCssPixels(style.borderBottomWidth);
+  elements.playbackMetadataPopoverText.style.maxHeight = `${Math.max(0, heightLimit - verticalInset)}px`;
+
+  const width = Math.min(popover.offsetWidth, widthLimit);
+  const height = Math.min(popover.offsetHeight, heightLimit);
+  const anchorCenter = anchorRect.left + (anchorRect.width / 2);
+  const left = Math.max(
+    boundaryLeft,
+    Math.min(anchorCenter - (width / 2), boundaryRight - width),
+  );
+  const spaceAbove = anchorRect.top - boundaryTop - gap;
+  const spaceBelow = boundaryBottom - anchorRect.bottom - gap;
+  let direction = "down";
+  if (spaceBelow < height && spaceAbove >= height) {
+    direction = "up";
+  } else if (spaceBelow < height && spaceAbove < height && spaceAbove > spaceBelow) {
+    direction = "up";
+  }
+  const preferredTop = direction === "up"
+    ? anchorRect.top - gap - height
+    : anchorRect.bottom + gap;
+  const top = Math.max(boundaryTop, Math.min(preferredTop, boundaryBottom - height));
+  const arrowCenter = Math.max(10, Math.min(width - 10, anchorCenter - left));
+  const offsetLeft = popover.hasAttribute("popover") ? 0 : panelRect.left + panel.clientLeft;
+  const offsetTop = popover.hasAttribute("popover") ? 0 : panelRect.top + panel.clientTop;
+
+  popover.dataset.tooltipDirection = direction;
+  popover.style.left = String(Math.round(left - offsetLeft)) + "px";
+  popover.style.top = String(Math.round(top - offsetTop)) + "px";
+  popover.style.setProperty("--remote-tooltip-arrow-left", String(Math.round(arrowCenter - 6)) + "px");
+  popover.style.setProperty(
+    "--remote-tooltip-transform-origin",
+    direction === "up" ? "bottom center" : "top center",
+  );
+  return true;
+}
+
+function openPlaybackMetadataPopover(wrapper) {
+  if (!wrapper?.classList.contains("is-disclosable")) {
+    return false;
+  }
+  const field = wrapper.dataset.playbackMetadataField || "";
+  const textElement = wrapper.querySelector(".playback-metadata-text");
+  const fullText = field === "owner"
+    ? textElement?.querySelector(".owner-badge-name")?.textContent || ""
+    : textElement?.textContent || "";
+  if (!field || !fullText.trim() || !elements.playbackMetadataPopoverText) {
+    return false;
+  }
+
+  setAudioVariantPopoverOpen(false);
+  closeRemoteContextualInfo();
+  closePlaybackMetadataPopover();
+  state.playbackMetadataPopoverField = field;
+  state.playbackMetadataPopoverAnchor = wrapper;
+  elements.playbackMetadataPopoverText.textContent = fullText;
+  const popover = elements.playbackMetadataPopover;
+  popover.__bilikaraCloseSequence = (popover.__bilikaraCloseSequence || 0) + 1;
+  // Keep a hidden painted frame for both top-layer and older WebView paths.
+  popover.classList.add("is-closing");
+  elements.playbackMetadataPopover.hidden = false;
+  elements.playbackMetadataPopover.setAttribute("aria-hidden", "false");
+  if (typeof popover.showPopover === "function") {
+    popover.setAttribute("popover", "manual");
+    if (!popover.matches(":popover-open")) popover.showPopover();
+  }
+  getComputedStyle(popover).opacity;
+  wrapper.setAttribute("aria-expanded", "true");
+  positionPlaybackMetadataPopover();
+  popover.classList.remove("is-closing");
+  popover.classList.add("is-visible");
+  return true;
+}
+
+function playbackCssPixels(value) {
+  const parsed = Number.parseFloat(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function playbackVisibleChildrenStackHeight(container) {
+  if (!container) {
+    return 0;
+  }
+  const children = [...container.children].filter((child) => (
+    !child.hidden
+    && !child.classList.contains("hidden")
+    && getComputedStyle(child).display !== "none"
+  ));
+  if (!children.length) {
+    return 0;
+  }
+  const gap = playbackCssPixels(getComputedStyle(container).rowGap);
+  return children.reduce(
+    (height, child) => height + child.getBoundingClientRect().height,
+    0,
+  ) + (gap * Math.max(0, children.length - 1));
+}
+
+function playbackMetadataLineHeight(element) {
+  const style = getComputedStyle(element);
+  const lineHeight = playbackCssPixels(style.lineHeight);
+  if (lineHeight > 0) {
+    return lineHeight;
+  }
+  return playbackCssPixels(style.fontSize) * 1.2;
+}
+
+function resetPlaybackMetadataFieldForMeasurement({ wrapper }) {
+  wrapper.classList.remove("is-clamped", "is-disclosable", "is-marquee");
+  wrapper.style.removeProperty("--playback-metadata-lines");
+  wrapper.removeAttribute("role");
+  wrapper.removeAttribute("tabindex");
+  wrapper.removeAttribute("aria-controls");
+  wrapper.removeAttribute("aria-expanded");
+  wrapper.removeAttribute("aria-label");
+}
+
+function applyPlaybackMetadataAllocation(entry, naturalLines, visibleLines) {
+  const { wrapper, element, labelKey } = entry;
+  const lines = entry.key === "title" ? (naturalLines <= 2 ? naturalLines : 1)
+    : entry.key === "owner" ? 1 : Math.max(1, Math.min(naturalLines, visibleLines));
+  const expectedClipping = lines < naturalLines;
+  wrapper.style.setProperty("--playback-metadata-lines", String(lines));
+  wrapper.classList.toggle("is-clamped", expectedClipping);
+
+  const clipsSingleLine = element.scrollWidth > element.clientWidth + 0.5;
+  const clipsMultiline = element.scrollHeight > element.clientHeight + 0.5;
+  const truncated = Boolean(expectedClipping && (
+    naturalLines > lines
+    || clipsSingleLine
+    || clipsMultiline
+  ));
+  wrapper.classList.toggle("is-disclosable", truncated);
+  if (entry.key === "title" && truncated) {
+    wrapper.classList.remove("is-clamped");
+    wrapper.classList.add("is-marquee");
+    const distance = Math.max(0, element.scrollWidth - wrapper.clientWidth);
+    wrapper.style.setProperty("--playback-marquee-distance", `${distance}px`);
+    wrapper.style.setProperty("--playback-marquee-duration", `${Math.max(10, distance / 24 + 4)}s`);
+    globalThis.BilikaraTextMarquee?.configure(wrapper, element, wrapper.clientWidth, element.scrollWidth);
+  } else {
+    globalThis.BilikaraTextMarquee?.reset(wrapper, element);
+  }
+  wrapper.dataset.naturalLines = String(naturalLines);
+  wrapper.dataset.visibleLines = String(truncated ? lines : naturalLines);
+  wrapper.dataset.truncated = String(truncated);
+  if (truncated) {
+    wrapper.setAttribute("role", "button");
+    wrapper.setAttribute("tabindex", "0");
+    wrapper.setAttribute("aria-controls", "playback-metadata-popover");
+    wrapper.setAttribute(
+      "aria-expanded",
+      String(state.playbackMetadataPopoverField === entry.key),
+    );
+    wrapper.setAttribute("aria-label", t(labelKey));
+  } else {
+    wrapper.removeAttribute("role");
+    wrapper.removeAttribute("tabindex");
+    wrapper.removeAttribute("aria-controls");
+    wrapper.removeAttribute("aria-expanded");
+    wrapper.removeAttribute("aria-label");
+    if (state.playbackMetadataPopoverField === entry.key) {
+      closePlaybackMetadataPopover();
+    }
+  }
+  return truncated;
+}
+
+function playbackSheetMaximumPanelHeight() {
+  const panel = elements.playbackSheetPanel;
+  const sheet = elements.playbackSheet;
+  if (!panel || !sheet) {
+    return 0;
+  }
+  const viewportHeight = Number(window.visualViewport?.height || window.innerHeight || 0);
+  const sheetStyle = getComputedStyle(sheet);
+  const viewportBound = Math.max(
+    0,
+    viewportHeight
+      - playbackCssPixels(sheetStyle.paddingTop)
+      - playbackCssPixels(sheetStyle.paddingBottom),
+  );
+  const cssMaximum = playbackCssPixels(getComputedStyle(panel).maxHeight);
+  if (!(cssMaximum > 0)) {
+    return viewportBound;
+  }
+  return Math.min(viewportBound, cssMaximum);
+}
+
+function playbackSheetUsesTwoColumns() {
+  const primaryRect = elements.playbackSheetPrimary?.getBoundingClientRect();
+  const secondaryRect = elements.playbackSheetSecondary?.getBoundingClientRect();
+  return Boolean(
+    primaryRect
+    && secondaryRect
+    && secondaryRect.left >= primaryRect.right - 1
+    && Math.abs(primaryRect.top - secondaryRect.top) <= 1,
+  );
+}
+
+function playbackSheetInputManipulationActive() {
+  const active = document.activeElement;
+  return Boolean(
+    playbackSheetGesture?.active
+    || state.playbackSheetSeekScrubbing
+    || (
+      active
+      && elements.playbackSheetBody?.contains(active)
+      && active.matches?.('input[type="range"], input[type="number"]')
+    )
+  );
+}
+
+function playbackSheetAdaptiveLayoutSignature() {
+  if (!playbackSheetIsOpen()) {
+    return "";
+  }
+  const viewport = window.visualViewport;
+  const structuralVisibility = [
+    elements.audioVariantBar,
+    elements.playerControlPanel,
+    elements.remoteAvSyncPanel,
+    elements.remoteVolumePanel,
+    elements.remoteKeyShiftPanel,
+    elements.currentCacheState,
+    elements.openRatingButton,
+  ].map((element) => Boolean(
+    element
+    && !element.hidden
+    && !element.classList.contains("hidden")
+    && getComputedStyle(element).display !== "none"
+  ));
+  return JSON.stringify({
+    viewportWidth: Math.round(Number(viewport?.width || window.innerWidth || 0) * 10) / 10,
+    viewportHeight: Math.round(Number(viewport?.height || window.innerHeight || 0) * 10) / 10,
+    viewportScale: Math.round(Number(viewport?.scale || 1) * 100) / 100,
+    rootFontSize: getComputedStyle(document.documentElement).fontSize,
+    bodyFontSize: getComputedStyle(document.body).fontSize,
+    fonts: document.fonts?.status || "",
+    language: state.language,
+    item: state.currentNowPlayingSignature,
+    structuralVisibility,
+  });
+}
+
+function syncPlaybackSheetHeaderActionLayout() {
+  const header = elements.playbackSheetPanel?.querySelector(".playback-sheet-status-header");
+  const actions = header?.querySelector(".playback-sheet-status-actions");
+  if (!header || !actions) {
+    return false;
+  }
+  header.classList.remove("is-stacked-actions");
+  const visibleButtons = [...actions.children].filter((button) => (
+    !button.hidden
+    && !button.classList.contains("hidden")
+    && getComputedStyle(button).display !== "none"
+  ));
+  const gap = playbackCssPixels(getComputedStyle(actions).columnGap);
+  const requiredWidth = visibleButtons.reduce(
+    (width, button) => width + button.getBoundingClientRect().width,
+    0,
+  ) + gap * Math.max(0, visibleButtons.length - 1);
+  const stacked = requiredWidth > actions.getBoundingClientRect().width + 0.5;
+  header.classList.toggle("is-stacked-actions", stacked);
+  return stacked;
+}
+
+function applyPlaybackSheetAdaptiveLayout({ preserveTransportMode = false } = {}) {
+  if (!playbackSheetIsOpen()) {
+    return false;
+  }
+  const panel = elements.playbackSheetPanel;
+  const body = elements.playbackSheetBody;
+  const primary = elements.playbackSheetPrimary;
+  const secondary = elements.playbackSheetSecondary;
+  const summary = elements.playbackSheetSummary;
+  const summaryCopy = elements.playbackSheetSummaryCopy;
+  const playbackGroup = elements.playbackSheetPlaybackGroup;
+  const transportRow = elements.playerControlPanel?.querySelector(".player-control-row");
+  const progressUnit = transportRow?.querySelector(".player-progress-unit");
+  if (
+    !panel
+    || !body
+    || !primary
+    || !secondary
+    || !summary
+    || !summaryCopy
+    || !playbackGroup
+    || !transportRow
+    || !progressUnit
+  ) {
+    return false;
+  }
+
+  const headerActionsStacked = syncPlaybackSheetHeaderActionLayout();
+  const originalSpacious = panel.classList.contains("is-spacious-transport");
+  if (!preserveTransportMode) {
+    panel.classList.remove("is-spacious-transport");
+  }
+  syncPlaybackMetadataFieldVisibility();
+  const metadata = playbackMetadataEntries();
+  metadata.forEach(resetPlaybackMetadataFieldForMeasurement);
+
+  const panelStyle = getComputedStyle(panel);
+  const bodyStyle = getComputedStyle(body);
+  const maximumPanelHeight = playbackSheetMaximumPanelHeight();
+  const headerHeight = panel.querySelector(".playback-sheet-status-header")
+    ?.getBoundingClientRect().height || 0;
+  const bodyVerticalPadding = playbackCssPixels(bodyStyle.paddingTop)
+    + playbackCssPixels(bodyStyle.paddingBottom);
+  const panelVerticalBorder = playbackCssPixels(panelStyle.borderTopWidth)
+    + playbackCssPixels(panelStyle.borderBottomWidth);
+  const maximumBodyContentHeight = Math.max(
+    0,
+    maximumPanelHeight - headerHeight - bodyVerticalPadding - panelVerticalBorder,
+  );
+  const twoColumns = playbackSheetUsesTwoColumns();
+  const secondaryNaturalHeight = playbackVisibleChildrenStackHeight(secondary);
+  const bodyGap = playbackCssPixels(bodyStyle.rowGap);
+  const playbackGroupCompactHeight = playbackVisibleChildrenStackHeight(playbackGroup);
+  const primaryGap = playbackCssPixels(getComputedStyle(primary).rowGap);
+  const availablePrimaryHeight = Math.max(
+    0,
+    twoColumns
+      ? maximumBodyContentHeight
+      : maximumBodyContentHeight - secondaryNaturalHeight - bodyGap,
+  );
+  const availableSummaryHeight = Math.max(
+    0,
+    availablePrimaryHeight
+      - playbackGroupCompactHeight
+      - (playbackGroupCompactHeight > 0 ? primaryGap : 0),
+  );
+
+  const naturalMetrics = metadata.map((entry) => {
+    const lineHeight = playbackMetadataLineHeight(entry.element);
+    const naturalHeight = Math.max(
+      entry.element.scrollHeight,
+      entry.element.getBoundingClientRect().height,
+    );
+    return {
+      ...entry,
+      lineHeight,
+      naturalHeight,
+      naturalLines: Math.max(1, Math.ceil((naturalHeight - 0.5) / lineHeight)),
+    };
+  });
+  const naturalMetadataHeight = naturalMetrics.reduce(
+    (height, entry) => height + entry.wrapper.getBoundingClientRect().height,
+    0,
+  );
+  const fixedCopyHeight = Math.max(
+    0,
+    summaryCopy.scrollHeight - naturalMetadataHeight,
+  );
+  const coverHeight = summary.querySelector(".playback-sheet-cover")
+    ?.getBoundingClientRect().height || 0;
+  const metadataHeightBudget = Math.max(
+    0,
+    Math.max(coverHeight, availableSummaryHeight) - fixedCopyHeight,
+  );
+  const allocatedLines = Object.fromEntries(
+    naturalMetrics.map((entry) => [entry.key, 1]),
+  );
+  const naturalFits = naturalMetadataHeight <= metadataHeightBudget + 0.5;
+  if (naturalFits) {
+    naturalMetrics.forEach((entry) => {
+      allocatedLines[entry.key] = entry.naturalLines;
+    });
+  } else {
+    let remainingHeight = Math.max(
+      0,
+      metadataHeightBudget - naturalMetrics.reduce(
+        (height, entry) => height + entry.lineHeight,
+        0,
+      ),
+    );
+    for (const key of ["title", "requester", "owner"]) {
+      const entry = naturalMetrics.find((candidate) => candidate.key === key);
+      if (!entry) {
+        continue;
+      }
+      const availableExtraLines = Math.max(0, entry.naturalLines - 1);
+      const fittingExtraLines = Math.min(
+        availableExtraLines,
+        Math.max(0, Math.floor((remainingHeight + 0.5) / entry.lineHeight)),
+      );
+      allocatedLines[key] += fittingExtraLines;
+      remainingHeight -= fittingExtraLines * entry.lineHeight;
+      if (fittingExtraLines < availableExtraLines) {
+        break;
+      }
+    }
+  }
+
+  const truncatedFields = [];
+  naturalMetrics.forEach((entry) => {
+    if (applyPlaybackMetadataAllocation(
+      entry,
+      entry.naturalLines,
+      allocatedLines[entry.key],
+    )) {
+      truncatedFields.push(entry.key);
+    }
+  });
+
+  const compactProgressWidth = progressUnit.getBoundingClientRect().width;
+  const summaryHeight = summary.getBoundingClientRect().height;
+  const compactPrimaryNaturalHeight = summaryHeight
+    + (playbackGroupCompactHeight > 0 ? primaryGap : 0)
+    + playbackGroupCompactHeight;
+  let spaciousGroupHeight = playbackGroupCompactHeight;
+  let spaciousProgressWidth = compactProgressWidth;
+  let spaciousExtraHeight = 0;
+  const spareHeight = availablePrimaryHeight - compactPrimaryNaturalHeight;
+  let spacious = originalSpacious;
+
+  if (!preserveTransportMode) {
+    panel.classList.add("is-spacious-transport");
+    spaciousGroupHeight = playbackVisibleChildrenStackHeight(playbackGroup);
+    spaciousProgressWidth = progressUnit.getBoundingClientRect().width;
+    panel.classList.remove("is-spacious-transport");
+    spaciousExtraHeight = Math.max(0, spaciousGroupHeight - playbackGroupCompactHeight);
+    const clearance = 10;
+    const rangeGain = spaciousProgressWidth - compactProgressWidth;
+    spacious = Boolean(
+      twoColumns
+      && compactPrimaryNaturalHeight + spaciousExtraHeight + clearance
+        <= availablePrimaryHeight + 0.5
+      && rangeGain >= 96
+    );
+    panel.classList.toggle("is-spacious-transport", spacious);
+  }
+
+  panel.dataset.transportLayout = spacious ? "spacious" : "compact";
+  for (const column of [primary, secondary]) {
+    const scrollable = twoColumns && column.scrollHeight > column.clientHeight + 1;
+    column.classList.toggle("is-scrollable", scrollable);
+    if (!scrollable) column.scrollTop = 0;
+  }
+  if (twoColumns) body.scrollTop = 0;
+  panel.classList.toggle("has-scrollable-body", (twoColumns ? [primary, secondary] : [body])
+    .some(node => node.scrollHeight > node.clientHeight + 1));
+  panel.dataset.metadataTruncated = truncatedFields.join(",");
+  state.playbackMetadataLayoutRunCount += 1;
+  const primaryRect = primary.getBoundingClientRect();
+  const secondaryRect = secondary.getBoundingClientRect();
+  const groupRect = playbackGroup.getBoundingClientRect();
+  const settingsRect = secondary.querySelector(".playback-sheet-settings-card")
+    ?.getBoundingClientRect();
+  state.playbackMetadataLayoutEvidence = {
+    runCount: state.playbackMetadataLayoutRunCount,
+    maximumPanelHeight,
+    maximumBodyContentHeight,
+    availablePrimaryHeight,
+    compactPrimaryNaturalHeight,
+    secondaryNaturalHeight,
+    availableSummaryHeight,
+    metadataHeightBudget,
+    naturalLines: Object.fromEntries(
+      naturalMetrics.map((entry) => [entry.key, entry.naturalLines]),
+    ),
+    visibleLines: Object.fromEntries(
+      naturalMetrics.map((entry) => [
+        entry.key,
+        Number(entry.wrapper.dataset.visibleLines || entry.naturalLines),
+      ]),
+    ),
+    truncatedFields,
+    twoColumns,
+    primaryScrollable: primary.classList.contains("is-scrollable"),
+    secondaryScrollable: secondary.classList.contains("is-scrollable"),
+    headerActionsStacked,
+    transportLayout: panel.dataset.transportLayout,
+    compactProgressWidth,
+    spaciousProgressWidth,
+    spaciousExtraHeight,
+    spareHeight,
+    primaryBottom: primaryRect.bottom,
+    playbackGroupBottom: groupRect.bottom,
+    secondaryBottom: secondaryRect.bottom,
+    settingsBottom: settingsRect?.bottom || secondaryRect.bottom,
+  };
+  return true;
+}
+
+function schedulePlaybackSheetAdaptiveLayout({
+  force = false,
+  viewportChange = false,
+  interactionEnded = false,
+} = {}) {
+  if (!playbackSheetIsOpen()) {
+    return false;
+  }
+  const signature = playbackSheetAdaptiveLayoutSignature();
+  if (
+    !force
+    && signature === state.playbackMetadataLayoutSignature
+    && !state.playbackMetadataLayoutPendingSignature
+  ) {
+    return false;
+  }
+  if (
+    playbackSheetInputManipulationActive()
+    && !viewportChange
+    && !interactionEnded
+  ) {
+    state.playbackMetadataLayoutDeferred = true;
+    return false;
+  }
+  if (
+    state.playbackMetadataPopoverField
+    && signature !== state.playbackMetadataLayoutSignature
+  ) {
+    closePlaybackMetadataPopover();
+  }
+  state.playbackMetadataLayoutPendingSignature = signature;
+  if (!state.playbackMetadataLayoutViewportChange) state.playbackMetadataLayoutViewportChange = viewportChange;
+  if (!state.playbackMetadataLayoutInteractionEnded) state.playbackMetadataLayoutInteractionEnded = interactionEnded;
+  if (state.playbackMetadataLayoutFrame !== null) {
+    return true;
+  }
+  state.playbackMetadataLayoutFrame = window.requestAnimationFrame(() => {
+    state.playbackMetadataLayoutFrame = null;
+    const nextSignature = state.playbackMetadataLayoutPendingSignature;
+    const hasViewportChange = state.playbackMetadataLayoutViewportChange;
+    const hasEndedInteraction = state.playbackMetadataLayoutInteractionEnded;
+    state.playbackMetadataLayoutPendingSignature = "";
+    state.playbackMetadataLayoutViewportChange = false;
+    state.playbackMetadataLayoutInteractionEnded = false;
+    if (!playbackSheetIsOpen()) {
+      return;
+    }
+    if (
+      playbackSheetInputManipulationActive()
+      && !hasViewportChange
+      && !hasEndedInteraction
+    ) {
+      state.playbackMetadataLayoutDeferred = true;
+      return;
+    }
+    applyPlaybackSheetAdaptiveLayout({
+      preserveTransportMode: playbackSheetInputManipulationActive()
+        && !hasEndedInteraction,
+    });
+    state.playbackMetadataLayoutSignature = nextSignature;
+    state.playbackMetadataLayoutDeferred = false;
+    playbackRestartMenu?.refresh();
+  });
+  return true;
+}
+
+function handlePlaybackSheetViewportChange() {
+  if (!playbackSheetIsOpen()) {
+    return;
+  }
+  closePlaybackMetadataPopover();
+  schedulePlaybackSheetAdaptiveLayout({ force: true, viewportChange: true });
+}
+
 function renderCurrentItem(current, playbackMode) {
   if (current) {
     const requesterText = requesterBadgeText(current.requester_name);
     const ownerText = ownerLineText(current.owner_name);
-    const nowPlayingSignature = JSON.stringify([
+    const title = String(current.display_title || "").trim();
+    const playbackIdentity = [
+      state.data?.playback_generation || 0,
+      current.item_incarnation_id || "",
       current.id || "",
-      current.display_title || "",
+    ].join("|");
+    if (
+      state.playbackMetadataIdentity
+      && state.playbackMetadataIdentity !== playbackIdentity
+    ) {
+      closePlaybackMetadataPopover();
+    }
+    state.playbackMetadataIdentity = playbackIdentity;
+    const coverUrl = normalizedPlaybackCoverUrl(current);
+    const nowPlayingSignature = JSON.stringify({
+      language: state.language,
+      playbackIdentity,
+      title,
       requesterText,
       ownerText,
-    ]);
+      coverUrl,
+    });
     if (nowPlayingSignature !== state.currentNowPlayingSignature) {
       state.currentNowPlayingSignature = nowPlayingSignature;
-      elements.currentTitle.textContent = current.display_title;
+      elements.currentTitle.textContent = title;
       elements.currentRequester.textContent = requesterText;
       elements.currentRequester.classList.toggle("hidden", !requesterText);
       renderOwnerBadgeLabel(elements.currentOwner, ownerText);
       elements.currentOwner.classList.toggle("hidden", !ownerText);
-      if (elements.openRatingButton) {
-        elements.openRatingButton.classList.toggle("hidden", !current.bvid);
-      }
+      syncPlaybackMetadataFieldVisibility();
+      setPlaybackDockMarqueeText(elements.playbackDockTitle, elements.playbackDockTitleText, title);
+      setPlaybackDockMarqueeText(
+        elements.playbackDockRequester,
+        elements.playbackDockRequesterText,
+        requesterText,
+      );
+      elements.playbackDockRequester.classList.remove("hidden");
+      elements.playbackDock.setAttribute(
+        "aria-label",
+        t("remote.openPlaybackControls", { title }),
+      );
+      syncPlaybackCoverImage(elements.playbackDockCoverImage, coverUrl, playbackIdentity);
+      syncPlaybackCoverImage(elements.playbackSheetCoverImage, coverUrl, playbackIdentity);
       elements.currentMeta.textContent = ""; // 不显示 log 避免高度抖动
+      schedulePlaybackDockMarquee();
     }
+
+    elements.playbackDock.classList.remove("hidden");
+    elements.playbackDock.setAttribute("aria-hidden", "false");
+    elements.remoteShell?.classList.add("has-playback-dock");
 
     renderCurrentPlaybackState(current);
     try {
@@ -4679,47 +6486,49 @@ function renderCurrentItem(current, playbackMode) {
     }
     syncCurrentCacheState(current);
 
-    if (current.cache_status === "downloading" || current.cache_status === "queued" || current.cache_status === "waiting") {
-      if (!state.autoRefreshTimer) {
-        state.autoRefreshTimer = setTimeout(refreshCacheStatusOnly, 1000);
-      }
-    } else if (state.autoRefreshTimer) {
-      clearTimeout(state.autoRefreshTimer);
-      state.autoRefreshTimer = null;
-    }
-
     elements.currentMeta.textContent = ""; // 不显示 log 避免高度抖动
     return;
   }
 
   if (state.currentNowPlayingSignature !== "__empty__") {
     state.currentNowPlayingSignature = "__empty__";
+    state.playbackMetadataIdentity = "";
+    closePlaybackMetadataPopover();
     clearCurrentPlaybackClock();
+    closePlaybackSheet({ immediate: true, restoreFocus: false });
     elements.currentTitle.textContent = t("remote.noCurrentSong");
     elements.currentRequester.textContent = "";
     elements.currentRequester.classList.add("hidden");
-    if (elements.openRatingButton) {
-      elements.openRatingButton.classList.add("hidden");
-    }
+    resetPlaybackDockMarquees();
+    elements.playbackDockRequester.classList.add("hidden");
+    elements.playbackDock.removeAttribute("aria-label");
+    elements.playbackDock.classList.add("hidden");
+    elements.playbackDock.setAttribute("aria-hidden", "true");
+    elements.playbackDock.setAttribute("aria-expanded", "false");
+    elements.remoteShell?.classList.remove("has-playback-dock");
+    syncPlaybackCoverImage(elements.playbackDockCoverImage, "", "__empty__");
+    syncPlaybackCoverImage(elements.playbackSheetCoverImage, "", "__empty__");
     if (elements.currentOwner) {
       elements.currentOwner.textContent = "";
       elements.currentOwner.classList.add("hidden");
     }
+    syncPlaybackMetadataFieldVisibility();
     syncCurrentCacheState(null);
     elements.currentMeta.textContent = t("remote.noCurrentHint");
   }
 }
 
 function renderCurrentRatingButton(current) {
-  const button = elements.currentRatingButton;
-  if (!button) {
-    return;
-  }
-  const enabled = Boolean(current?.bvid);
-  const submitted = enabled && hasSubmittedSongRating(current);
-  button.disabled = !enabled || submitted;
-  button.textContent = submitted ? t("rating.rated") : t("rating.rate");
-  button.title = submitted ? t("rating.ratedTitle") : t("rating.rateTitle");
+  const button = elements.openRatingButton;
+  if (!button) return;
+  if (button.classList.contains("hidden")) button.classList.remove("hidden");
+  if (button.disabled) button.disabled = false;
+  const label = t("rating.rate");
+  const title = t("rating.rateTitle");
+  if (button.textContent !== label) button.textContent = label;
+  if (button.title !== title) button.title = title;
+  if (button.hasAttribute("aria-busy")) button.removeAttribute("aria-busy");
+  refreshOpenRatingPrompt(current);
 }
 
 function audioVariantsForItem(item) {
@@ -4851,39 +6660,199 @@ function scheduleAudioVariantSwitchUnlock() {
   }, remainingMs);
 }
 
+function audioVariantPopover() {
+  return elements.audioVariantPopover;
+}
+
+function clearAudioVariantPopoverPosition() {
+  const popover = audioVariantPopover();
+  if (!popover) {
+    return;
+  }
+  popover.style.left = "";
+  popover.style.top = "";
+  popover.style.width = "";
+  popover.style.maxHeight = "";
+  popover.classList.remove("is-scrollable");
+  popover.scrollTop = 0;
+  delete popover.dataset.popoverDirection;
+}
+
+function positionAudioVariantPopover() {
+  if (!state.audioVariantBarExpanded) {
+    return;
+  }
+  const popover = audioVariantPopover();
+  const panel = elements.playbackSheetPanel?.getBoundingClientRect?.();
+  if (!popover || popover.hidden || !panel) {
+    return;
+  }
+  const anchor = elements.audioVariantBar.getBoundingClientRect();
+  const scrollOwner = elements.playbackSheetBody?.getBoundingClientRect?.();
+  const topBoundary = scrollOwner?.top ?? 0;
+  const bottomBoundary = scrollOwner?.bottom ?? window.innerHeight;
+  const gap = 8;
+  const inset = 8;
+  const spaceBelow = Math.max(0, bottomBoundary - anchor.bottom - gap - inset);
+  const spaceAbove = Math.max(0, anchor.top - topBoundary - gap - inset);
+  const width = Math.min(anchor.width, Math.max(0, panel.width - inset * 2));
+  const left = Math.max(inset, Math.min(anchor.left - panel.left, panel.width - width - inset));
+  popover.style.left = String(left) + "px";
+  popover.style.width = String(width) + "px";
+  popover.style.maxHeight = "none";
+  const popoverStyle = window.getComputedStyle(popover);
+  const borderHeight = (Number.parseFloat(popoverStyle.borderTopWidth) || 0)
+    + (Number.parseFloat(popoverStyle.borderBottomWidth) || 0);
+  const naturalHeight = Math.ceil((popover.scrollHeight || 0) + borderHeight);
+  const preferredVisibleHeight = Math.min(naturalHeight, 224);
+  const minimumUsefulHeight = Math.min(preferredVisibleHeight, 132);
+  const direction = spaceAbove >= minimumUsefulHeight ? "up" : "down";
+  const availableHeight = direction === "down" ? spaceBelow : spaceAbove;
+  popover.dataset.popoverDirection = direction;
+  const visibleHeight = Math.max(44, Math.min(naturalHeight, availableHeight, 240));
+  popover.style.maxHeight = String(visibleHeight) + "px";
+  const scrollable = (popover.scrollHeight || 0) > visibleHeight - borderHeight + 1;
+  popover.classList.toggle("is-scrollable", scrollable);
+  if (!scrollable) popover.scrollTop = 0;
+  popover.style.top = String(
+    direction === "up"
+      ? anchor.top - panel.top - gap - visibleHeight
+      : anchor.bottom - panel.top + gap,
+  ) + "px";
+  window.BilikaraPartSelector?.syncLabels(popover);
+}
+
+function setAudioVariantPopoverOpen(open, { restoreFocus = false } = {}) {
+  const popover = audioVariantPopover();
+  const toggleButton = elements.audioVariantBar.querySelector(".audio-variant-toggle");
+  const nextOpen = Boolean(open && popover && toggleButton)
+    && !elements.audioVariantBar.classList.contains("is-inline");
+  state.audioVariantBarExpanded = nextOpen;
+  elements.audioVariantBar.classList.toggle("is-expanded", nextOpen);
+  toggleButton?.classList.toggle("is-expanded", nextOpen);
+  toggleButton?.setAttribute("aria-expanded", String(nextOpen));
+  toggleButton?.setAttribute("aria-label", nextOpen ? t("player.collapseParts") : t("player.expandParts"));
+  if (popover) {
+    popover.hidden = !nextOpen;
+    popover.setAttribute("aria-hidden", String(!nextOpen));
+  }
+  if (!nextOpen) {
+    if (popover) {
+      const sequence = popover.__closeSequence = (popover.__closeSequence || 0) + 1;
+      Promise.allSettled((popover.getAnimations?.() || []).map(animation => animation.finished)).then(() => {
+        if (!state.audioVariantBarExpanded && popover.__closeSequence === sequence) clearAudioVariantPopoverPosition();
+      });
+    }
+    if (restoreFocus) {
+      toggleButton?.focus?.({ preventScroll: true });
+    }
+    return;
+  }
+  window.requestAnimationFrame(positionAudioVariantPopover);
+}
+
+function syncAudioVariantLayout() {
+  const bar = elements.audioVariantBar;
+  const list = bar?.querySelector(".audio-variant-list");
+  if (!list || !bar.clientWidth) return;
+  bar.classList.add("is-inline");
+  const buttons = [...list.children];
+  buttons.forEach(button => button.classList.remove("hidden"));
+  const fits = list.scrollWidth <= list.clientWidth + 1;
+  if (fits) {
+    setAudioVariantPopoverOpen(false);
+  } else {
+    bar.classList.remove("is-inline");
+    const available = list.clientWidth;
+    const gap = playbackCssPixels(getComputedStyle(list).columnGap);
+    const selected = buttons.find(button => button.classList.contains("active")) || buttons[0];
+    let used = selected?.getBoundingClientRect().width || 0;
+    for (const button of buttons) {
+      if (button === selected) continue;
+      const width = button.getBoundingClientRect().width;
+      const show = used + gap + width <= available + 1;
+      button.classList.toggle("hidden", !show);
+      if (show) used += gap + width;
+    }
+  }
+}
+
+if (typeof ResizeObserver === "function" && elements.audioVariantBar) {
+  new ResizeObserver(syncAudioVariantLayout).observe(elements.audioVariantBar);
+}
+document.fonts?.ready?.then(syncAudioVariantLayout);
+
 function renderAudioVariantBar(currentItem, playbackMode) {
   if (playbackMode !== "local" || !currentItem) {
+    state.audioVariantBarRenderSignature = "";
+    setAudioVariantPopoverOpen(false);
     elements.audioVariantBar.replaceChildren();
+    elements.audioVariantPopover?.replaceChildren();
     elements.audioVariantBar.classList.add("hidden");
-    state.audioVariantBarExpanded = false;
     state.audioVariantBarItemId = "";
     return;
   }
 
   const variants = partOptionsForItem(currentItem);
   if (variants.length <= 1) {
+    state.audioVariantBarRenderSignature = "";
+    setAudioVariantPopoverOpen(false);
     elements.audioVariantBar.replaceChildren();
+    elements.audioVariantPopover?.replaceChildren();
     elements.audioVariantBar.classList.add("hidden");
-    state.audioVariantBarExpanded = false;
     state.audioVariantBarItemId = currentItem.id;
     return;
   }
 
   if (state.audioVariantBarItemId !== currentItem.id) {
-    state.audioVariantBarExpanded = false;
+    setAudioVariantPopoverOpen(false);
     state.audioVariantBarItemId = currentItem.id;
   }
 
   const selectedVariant = selectedAudioVariantForItem(currentItem);
   const buttonsDisabled = audioVariantSwitchLocked();
+  const signature = JSON.stringify({ itemId: currentItem.id, language: state.language,
+    selected: selectedVariant?.id || "", buttonsDisabled,
+    variants: variants.map(({ id, label, page, bound }) => ({ id, label, page, bound })),
+  });
+  if (signature === state.audioVariantBarRenderSignature) return;
+  state.audioVariantBarRenderSignature = signature;
+  const scrollTop = elements.audioVariantPopover?.scrollTop || 0;
   elements.audioVariantBar.replaceChildren();
+
+  const toggleButton = document.createElement("button");
+  toggleButton.type = "button";
+  toggleButton.className = "audio-variant-toggle";
+  toggleButton.dataset.action = "toggle-audio-variants";
+  toggleButton.setAttribute("aria-controls", "audio-variant-popover");
+  toggleButton.setAttribute("aria-haspopup", "true");
+  const toggleIcon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  toggleIcon.setAttribute("viewBox", "0 0 24 24");
+  toggleIcon.setAttribute("aria-hidden", "true");
+  const togglePath = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  togglePath.setAttribute("d", "m6 9 6 6 6-6");
+  togglePath.setAttribute("fill", "none");
+  togglePath.setAttribute("stroke", "currentColor");
+  togglePath.setAttribute("stroke-linecap", "round");
+  togglePath.setAttribute("stroke-linejoin", "round");
+  togglePath.setAttribute("stroke-width", "2");
+  toggleIcon.appendChild(togglePath);
+  toggleButton.appendChild(toggleIcon);
+
   const list = document.createElement("div");
   list.className = "audio-variant-list";
   variants.forEach((variant) => {
     const button = document.createElement("button");
     button.type = "button";
     button.className = "audio-variant-button";
-    button.textContent = variant.label || variant.id;
+    const label = document.createElement("span");
+    label.className = "audio-variant-button-label";
+    const text = document.createElement("span");
+    text.className = "audio-variant-button-text";
+    text.textContent = variant.label || variant.id;
+    label.append(text);
+    button.title = text.textContent;
+    button.appendChild(label);
     button.dataset.itemId = currentItem.id;
     button.dataset.variantId = variant.id;
     button.dataset.page = String(variant.page || "");
@@ -4894,35 +6863,13 @@ function renderAudioVariantBar(currentItem, playbackMode) {
     list.appendChild(button);
   });
 
-  const toggleButton = document.createElement("button");
-  toggleButton.type = "button";
-  toggleButton.className = "audio-variant-toggle";
-  toggleButton.dataset.action = "toggle-audio-variants";
-  toggleButton.setAttribute("aria-expanded", String(state.audioVariantBarExpanded));
-  toggleButton.setAttribute("aria-label", state.audioVariantBarExpanded ? t("player.collapseParts") : t("player.expandParts"));
-  const toggleIcon = document.createElement("span");
-  toggleIcon.setAttribute("aria-hidden", "true");
-  toggleIcon.textContent = "▾";
-  toggleButton.appendChild(toggleIcon);
-
+  elements.audioVariantPopover?.replaceChildren(list.cloneNode(true));
   elements.audioVariantBar.append(list, toggleButton);
   elements.audioVariantBar.classList.remove("hidden");
-
-  requestAnimationFrame(() => {
-    const firstButton = list.querySelector(".audio-variant-button");
-    const firstRowHeight = firstButton
-      ? Math.ceil(firstButton.getBoundingClientRect().height) + 6
-      : 44;
-    const isWrapped = list.scrollHeight > firstRowHeight + 2;
-    elements.audioVariantBar.classList.toggle("is-collapsed", isWrapped && !state.audioVariantBarExpanded);
-    toggleButton.classList.toggle("hidden", !isWrapped);
-    if (isWrapped) {
-      list.style.setProperty("--audio-variant-collapsed-height", `${firstRowHeight}px`);
-      toggleButton.classList.toggle("is-expanded", state.audioVariantBarExpanded);
-    } else {
-      state.audioVariantBarExpanded = false;
-    }
-  });
+  syncAudioVariantLayout();
+  setAudioVariantPopoverOpen(state.audioVariantBarExpanded);
+  if (elements.audioVariantPopover) elements.audioVariantPopover.scrollTop = scrollTop;
+  window.BilikaraPartSelector?.syncLabels(elements.audioVariantBar);
 }
 
 function boundedRemoteVolumePercent(volumePercent) {
@@ -4930,7 +6877,7 @@ function boundedRemoteVolumePercent(volumePercent) {
   if (!Number.isFinite(numeric)) {
     return null;
   }
-  return Math.max(0, Math.min(100, Math.round(numeric)));
+  return Math.max(0, Math.min(500, Math.round(numeric)));
 }
 
 function serverRemoteAvOffsetMs(playerSettings = state.data?.player_settings) {
@@ -4988,7 +6935,7 @@ async function setRemoteKeyShift(keyShift) {
 }
 
 function serverRemoteVolumePercent(playerSettings = state.data?.player_settings) {
-  return Math.max(0, Math.min(100, Number(playerSettings?.volume_percent ?? 100)));
+  return Math.max(0, Math.min(500, Number(playerSettings?.volume_percent ?? 100)));
 }
 
 function currentRemoteVolumePercent(playerSettings = state.data?.player_settings) {
@@ -5031,8 +6978,10 @@ function setRangeFillPercent(input, percent) {
   input.style.setProperty("--range-fill-percent", `${normalizedPercent}%`);
 }
 
-function muteIcon(isMuted) {
-  return isMuted ? "🔇" : "🔊";
+function setRemoteIconVisibility(button, attribute, visibleValue) {
+  button?.querySelectorAll(`[${attribute}]`).forEach((icon) => {
+    icon.classList.toggle("hidden", icon.getAttribute(attribute) !== visibleValue);
+  });
 }
 
 function renderRemoteAvSyncControls(playbackMode, playerSettings) {
@@ -5053,7 +7002,11 @@ function renderRemoteAvSyncControls(playbackMode, playerSettings) {
   if (elements.remoteAvDelayLockButton) {
     const locked = Boolean(delayState.locked);
     const hasLocal = Boolean(delayState.has_local_adjustment);
-    elements.remoteAvDelayLockButton.textContent = locked ? "🔒" : "🔓";
+    setRemoteIconVisibility(
+      elements.remoteAvDelayLockButton,
+      "data-av-lock-icon",
+      locked ? "locked" : "unlocked",
+    );
     elements.remoteAvDelayLockButton.disabled = state.remoteAvDelaySaving || !Boolean(delayState.lock_button_enabled);
     elements.remoteAvDelayLockButton.dataset.locked = String(locked);
     elements.remoteAvDelayLockButton.dataset.hasLocal = String(hasLocal);
@@ -5077,11 +7030,13 @@ function renderRemoteVolumeControls(playbackMode, playerSettings) {
   elements.remoteVolumePanel.classList.toggle("hidden", !isLocalMode);
   const volumePercent = currentRemoteVolumePercent(playerSettings);
   const isMuted = currentRemoteMuted(playerSettings);
-  elements.remoteVolumeSlider.value = String(volumePercent);
-  setRangeFillPercent(elements.remoteVolumeSlider, volumePercent);
-  elements.remoteVolumeValue.textContent = `${Math.round(volumePercent)}%`;
+  globalThis.BilikaraVolumeControl?.render(elements.remoteVolumeSlider, elements.remoteVolumeValue, volumePercent);
   const muteLabel = isMuted ? t("player.unmute") : t("player.mute");
-  elements.remoteVolumeMuteButton.textContent = muteIcon(isMuted);
+  setRemoteIconVisibility(
+    elements.remoteVolumeMuteButton,
+    "data-volume-icon",
+    isMuted ? "muted" : "unmuted",
+  );
   elements.remoteVolumeMuteButton.setAttribute("aria-label", muteLabel);
   elements.remoteVolumeMuteButton.setAttribute("title", muteLabel);
   elements.remoteVolumeMuteButton.classList.toggle("is-muted", isMuted);
@@ -5108,11 +7063,12 @@ function openBindingSheet(intent, payload) {
     setFormMessage(t("binding.readFailed"), true);
     return;
   }
+  retireTransientPlaybackModalForModal();
   state.bindingIntent = {
     ...intent,
     binding: payload,
+    focusElement: intent?.focusElement || document.activeElement,
   };
-  elements.bindingSheetText.textContent = t("binding.videoHasParts", { title: payload.title || t("binding.thisVideo") });
   elements.bindingSheetVideoOptions.innerHTML = "";
   elements.bindingSheetAudioOptions.innerHTML = "";
   state.bindingAccordion.video = false;
@@ -5129,17 +7085,21 @@ function openBindingSheet(intent, payload) {
   elements.bindingSheet.classList.remove("hidden");
   elements.bindingSheet.setAttribute("aria-hidden", "false");
   requestAnimationFrame(() => {
+    if (!state.bindingSheetOpen) return;
     elements.bindingSheet.classList.add("is-open");
+    elements.bindingSheetClose?.focus({ preventScroll: true });
   });
 }
 
 function closeBindingSheet() {
+  const opener = state.bindingIntent?.focusElement;
   state.bindingSheetOpen = false;
   state.bindingIntent = null;
   state.bindingAccordion.video = false;
   state.bindingAccordion.audio = false;
   elements.bindingSheet.classList.remove("is-open");
   elements.bindingSheet.setAttribute("aria-hidden", "true");
+  if (opener?.isConnected) opener.focus({ preventScroll: true });
   window.setTimeout(() => {
     if (state.bindingSheetOpen) {
       return;
@@ -5181,12 +7141,13 @@ function renderGatchaFavlistOption(folder) {
   return label;
 }
 
-function openGatchaFavlistSheet(uid, payload, { messageTarget = "gatcha" } = {}) {
+function openGatchaFavlistSheet(uid, payload, { messageTarget = "sources-favorites" } = {}) {
   const folders = Array.isArray(payload?.folders) ? payload.folders : [];
   if (!folders.length) {
-    setGatchaUidFlowMessage(messageTarget, t("favlist.none"), true);
+    setSourceManagementMessage(messageTarget, t("favlist.none"), true);
     return;
   }
+  retireTransientPlaybackModalForModal();
   state.gatchaFavlistIntent = { uid, folders, messageTarget };
   elements.gatchaFavlistSheetText.textContent = t("favlist.chooseForUid", {
     uid: payload?.uid || uid,
@@ -5223,17 +7184,13 @@ function poolConfigFolderId(folder) {
 }
 
 function poolConfigSetMessage(message, isError = false) {
-  if (!elements.poolConfigMessage) {
-    return;
-  }
-  elements.poolConfigMessage.textContent = message || "";
-  elements.poolConfigMessage.classList.toggle("is-error", Boolean(isError));
-  elements.poolConfigMessage.classList.toggle("hidden", !message);
+  setAppMessage(message, isError);
 }
 
 function updatePoolConfigWeightLabel() {
   const uidWeight = Math.max(0, Math.min(100, Number(elements.poolConfigWeightSlider?.value || 50)));
   const favlistWeight = 100 - uidWeight;
+  setRangeFillPercent(elements.poolConfigWeightSlider, uidWeight);
   if (elements.poolConfigWeightLabel) {
     elements.poolConfigWeightLabel.textContent = t("gatcha.poolWeightValue", {
       uid: uidWeight,
@@ -5339,6 +7296,11 @@ function renderPoolConfigSheet() {
   if (elements.poolConfigSheetSave) {
     const detailLoaded = Array.isArray(data.uid_options) || Array.isArray(data.favlist_folder_options);
     elements.poolConfigSheetSave.disabled = state.poolConfigSaving || !detailLoaded;
+    if (state.poolConfigSaving) {
+      elements.poolConfigSheetSave.setAttribute("aria-busy", "true");
+    } else {
+      elements.poolConfigSheetSave.removeAttribute("aria-busy");
+    }
     elements.poolConfigSheetSave.textContent = state.poolConfigSaving ? t("gatcha.poolSaving") : t("gatcha.poolSave");
   }
 }
@@ -5347,6 +7309,7 @@ async function openPoolConfigSheet() {
   if (!elements.poolConfigSheet || state.poolConfigSheetOpen) {
     return;
   }
+  retireTransientPlaybackModalForModal();
   state.poolConfigSheetOpen = true;
   state.poolConfigSaving = false;
   state.poolConfigData = state.data?.gatcha_pool_config || {};
@@ -5388,6 +7351,10 @@ function setPoolConfigChecked(name, checked) {
 }
 
 function resetPoolConfigControls() {
+  if (state.poolConfigData) {
+    state.poolConfigData.excluded_uids = [];
+    state.poolConfigData.excluded_favlist_folders = [];
+  }
   if (elements.poolConfigWeightSlider) {
     elements.poolConfigWeightSlider.value = "50";
   }
@@ -5398,10 +7365,12 @@ function resetPoolConfigControls() {
 }
 
 function poolConfigExcludedValues(name) {
-  return [...document.querySelectorAll(`input[name="${name}"]`)]
-    .filter((input) => !input.checked)
-    .map((input) => String(input.value || "").trim())
-    .filter(Boolean);
+  const inputs = [...document.querySelectorAll(`input[name="${name}"]`)];
+  const shown = new Set(inputs.map((input) => String(input.value || "").trim()));
+  const field = name === "gatcha-pool-uid" ? "excluded_uids" : "excluded_favlist_folders";
+  const retained = (state.poolConfigData?.[field] || []).filter((value) => !shown.has(String(value)));
+  return [...new Set([...retained, ...inputs.filter((input) => !input.checked)
+    .map((input) => String(input.value || "").trim()).filter(Boolean)])];
 }
 
 async function submitPoolConfigSheet() {
@@ -5438,6 +7407,7 @@ async function submitPoolConfigSheet() {
     poolConfigSetMessage(error.message, true);
   } finally {
     state.poolConfigSaving = false;
+    elements.poolConfigSheetSave?.removeAttribute("aria-busy");
     if (state.poolConfigSheetOpen) {
       renderPoolConfigSheet();
     }
@@ -5445,14 +7415,17 @@ async function submitPoolConfigSheet() {
 }
 
 function openReorderConfirmSheet(intent) {
-  if (!intent?.itemId || !Number.isInteger(intent.targetIndex) || !elements.reorderConfirmSheet) {
+  if (state.reorderConfirmSaving || !intent?.itemId || !Number.isInteger(intent.targetIndex) || !elements.reorderConfirmSheet) {
     return;
   }
+
+  retireTransientPlaybackModalForModal();
 
   const title = String(intent.title || "").trim() || t("request.thisSong");
   state.reorderConfirmIntent = {
     itemId: intent.itemId,
     targetIndex: intent.targetIndex,
+    queueVersion: intent.queueVersion,
     title,
   };
   state.reorderConfirmSaving = false;
@@ -5477,7 +7450,6 @@ function openReorderConfirmSheet(intent) {
 function closeReorderConfirmSheet() {
   state.reorderConfirmSheetOpen = false;
   state.reorderConfirmIntent = null;
-  state.reorderConfirmSaving = false;
   elements.reorderConfirmSheet?.classList.remove("is-open");
   elements.reorderConfirmSheet?.setAttribute("aria-hidden", "true");
   window.setTimeout(() => {
@@ -5488,7 +7460,7 @@ function closeReorderConfirmSheet() {
     if (elements.reorderConfirmSheetText) {
       elements.reorderConfirmSheetText.textContent = "";
     }
-    if (elements.reorderConfirmSheetConfirm) {
+    if (elements.reorderConfirmSheetConfirm && !state.reorderConfirmSaving) {
       elements.reorderConfirmSheetConfirm.disabled = false;
       elements.reorderConfirmSheetConfirm.textContent = t("remote.queueOrderConfirm");
     }
@@ -5504,24 +7476,28 @@ async function confirmReorderConfirmSheet() {
   state.reorderConfirmSaving = true;
   if (elements.reorderConfirmSheetConfirm) {
     elements.reorderConfirmSheetConfirm.disabled = true;
+    elements.reorderConfirmSheetConfirm.setAttribute("aria-busy", "true");
     elements.reorderConfirmSheetConfirm.textContent = t("remote.queueOrderMoving");
   }
 
   try {
-    state.data = await apiPost("/api/playlist/reorder", {
+    applyStateSnapshot(await apiPost("/api/playlist/reorder", {
       item_id: intent.itemId,
       index: intent.targetIndex,
-    });
+      expected_queue_version: intent.queueVersion,
+    }));
     closeReorderConfirmSheet();
     setFormMessage(t("remote.queueOrderUpdated"));
     render();
   } catch (error) {
+    setFormMessage(error.message, true);
+  } finally {
     state.reorderConfirmSaving = false;
     if (elements.reorderConfirmSheetConfirm) {
+      elements.reorderConfirmSheetConfirm.removeAttribute("aria-busy");
       elements.reorderConfirmSheetConfirm.disabled = false;
       elements.reorderConfirmSheetConfirm.textContent = t("remote.queueOrderConfirm");
     }
-    setFormMessage(error.message, true);
   }
 }
 async function confirmGatchaFavlistSheet() {
@@ -5529,25 +7505,29 @@ async function confirmGatchaFavlistSheet() {
   if (!intent?.uid) {
     return;
   }
-  const messageTarget = intent.messageTarget || "gatcha";
+  const messageTarget = intent.messageTarget || "sources-favorites";
   const folderIds = selectedGatchaFavlistFolderIds();
   if (!folderIds.length) {
-    setGatchaUidFlowMessage(messageTarget, t("favlist.selectAtLeastOne"), true);
+    setSourceManagementMessage(messageTarget, t("favlist.selectAtLeastOne"), true);
     return;
   }
-  if (gatchaTaskBusy()) {
-    setGatchaUidFlowMessage(messageTarget, gatchaTaskBusyMessage(), true);
-    renderGatchaUidView();
+  if (gatchaSourceBusy()) {
+    setSourceManagementMessage(messageTarget, gatchaTaskBusyMessage(), true);
+    renderSourceManagementControls();
     return;
   }
 
   state.gatchaFavlistSaving = true;
-  renderGatchaUidView();
-  setGatchaUidFlowMessage(messageTarget, t("favlist.pullingSelected"));
+  renderSourceManagementControls();
+  setSourceManagementLoadingMessage(messageTarget, t("favlist.pullingSelected"));
+  (Array.isArray(intent.folders) ? intent.folders : []).forEach(folder => {
+    const folderId = String(folder?.id || folder?.folder_id || "").trim();
+    if (folderIds.includes(folderId)) window.BilikaraSourceStatus?.rememberSource({ folderId, title: folder?.title });
+  });
   closeGatchaFavlistSheet();
   try {
-    const result = await pullGatchaFavlist(intent.uid, folderIds);
-    setGatchaUidFlowMessage(messageTarget, t("favlist.pullResult", {
+    const result = await pullGatchaFavlist(intent.uid, folderIds, intent.folders || []);
+    setSourceManagementMessage(messageTarget, result?.queued ? t(result.duplicate ? "gatcha.sourceAlreadyQueued" : "gatcha.sourceQueued") : t("favlist.pullResult", {
       folders: result?.matched_folder_count || 0,
       items: result?.item_count || 0,
     }));
@@ -5560,10 +7540,10 @@ async function confirmGatchaFavlistSheet() {
       });
     }
   } catch (error) {
-    setGatchaUidFlowMessage(messageTarget, error.message, true);
+    setSourceManagementMessage(messageTarget, error.message, true);
   } finally {
     state.gatchaFavlistSaving = false;
-    renderGatchaUidView();
+    renderSourceManagementControls();
   }
 }
 
@@ -5606,6 +7586,7 @@ function renderBindingOption(inputType, name, entry, checked) {
   title.textContent = `P${entry.page} · ${entry.part}`;
   const meta = document.createElement("div");
   meta.className = "binding-option-meta";
+  meta.dataset.durationSeconds = String(entry.duration || 0);
   meta.textContent = entry.duration > 0 ? t("player.durationSeconds", { seconds: entry.duration }) : t("player.durationUnknown");
   copy.append(title, meta);
 
@@ -5632,18 +7613,16 @@ async function confirmBindingSheet() {
   const source = intent.source || "request-form";
   const { selectedVideoPage, selectedAudioPages } = currentBindingSelection();
   if (!selectedVideoPage) {
-    setMessageForSource(source, t("binding.selectVideoPart"), true);
     setAppMessage(t("binding.selectVideoPart"), true);
     return;
   }
   if (!selectedAudioPages.length) {
-    setMessageForSource(source, t("binding.selectAudioPart"), true);
     setAppMessage(t("binding.selectAudioPart"), true);
     return;
   }
 
   state.submitting = true;
-  setMessageForSource(source, intent.position === "next" ? t("remote.bindingAddingNext") : t("remote.bindingAddingTail"));
+  setAppMessage(intent.position === "next" ? t("remote.bindingAddingNext") : t("remote.bindingAddingTail"));
 
   const button = elements.bindingSheetConfirm;
   let originalText = "";
@@ -5664,31 +7643,27 @@ async function confirmBindingSheet() {
       },
     );
     if (result.cancelled) {
-      setMessageForSource(source, t("remote.cancelledDuplicate"));
+      setAppMessage(t("remote.cancelledDuplicate"));
       return;
     }
     applyStateSnapshot(result.data, { forceRender: true });
     closeBindingSheet();
-    if (["modalSearch", "modalFollow", "modalFavlist", "modalBrowse"].includes(source)) {
+    if (["search", "lark", "shared", "local", "categories", "name", "artist", "uids", "favorites"].includes(source)) {
       searchDetailController?.close({ immediate: true });
     }
     if (intent.clearInput) {
       elements.urlInput.value = "";
     }
-    if (intent.source === "follow") {
-      setFollowBrowseMessage("");
-    }
     if (intent.source === "gatcha") {
       state.gatchaCandidate = null;
-      renderGatchaUidView();
+      renderGatchaView();
     }
-    setMessageForSource(source, intent.position === "next" ? t("binding.addedNext") : t("binding.addedTail"));
+    setAppMessage(intent.position === "next" ? t("binding.addedNext") : t("binding.addedTail"));
   } catch (error) {
     if (error.code === "manual_binding_required") {
       openBindingSheet(intent, error.payload?.binding);
       return;
     }
-    setMessageForSource(source, error.message, true);
     setAppMessage(error.message, true);
   } finally {
     state.submitting = false;
@@ -5711,6 +7686,10 @@ async function dispatchRemoteAvDelayAction(action) {
   if (state.remoteAvDelaySaving) {
     return;
   }
+  // Incoming playback snapshots replace state.data. A bare AV decision has
+  // no authoritative revision: apply it only while the captured snapshot is
+  // still current (including across restart and song changes).
+  const requestedSnapshot = state.data;
   const activeElement = document.activeElement;
   activeElement?.setAttribute?.("aria-busy", "true");
   state.remoteAvDelaySaving = true;
@@ -5721,6 +7700,7 @@ async function dispatchRemoteAvDelayAction(action) {
       action,
       { timeoutMs: avDelayRequestTimeoutMs },
     );
+    if (state.data !== requestedSnapshot) return;
     state.data = {
       ...state.data,
       player_settings: {
@@ -5753,6 +7733,7 @@ async function commitRemoteVolumeSettings(payload, requestSeq) {
       return;
     }
     applyStateSnapshot(nextData);
+    return true;
   } catch (error) {
     if (requestSeq !== state.remoteVolumeSaveSeq) {
       return;
@@ -5762,6 +7743,7 @@ async function commitRemoteVolumeSettings(payload, requestSeq) {
     state.remoteSettingsEchoSuppressUntil = 0;
     setFormMessage(error.message, true);
     renderRemoteVolumeControls(frontendPlaybackMode(state.data?.playback_mode), state.data?.player_settings);
+    return false;
   }
 }
 
@@ -5773,6 +7755,7 @@ async function setRemoteVolumeSettings({ volumePercent, isMuted } = {}, options 
       return;
     }
     payload.volume_percent = boundedVolumePercent;
+    payload.expected_item_incarnation_id = state.data?.current_item?.item_incarnation_id || "";
   }
   if (isMuted !== undefined) {
     payload.is_muted = Boolean(isMuted);
@@ -5793,7 +7776,7 @@ async function setRemoteVolumeSettings({ volumePercent, isMuted } = {}, options 
   }
 
   clearRemoteVolumeCommitTimer();
-  await commitRemoteVolumeSettings(payload, requestSeq);
+  return commitRemoteVolumeSettings(payload, requestSeq);
 }
 
 function hasLocalSplitMedia(item) {
@@ -5811,9 +7794,19 @@ function canRemoteControlPlayer(currentItem, playbackMode) {
   return Boolean(currentItem && playbackMode === "local" && hasLocalSplitMedia(currentItem));
 }
 
-function currentPlayerStatus(currentItem) {
-  const playerStatus = state.data?.player_status;
+function currentPlayerStatus(currentItem, snapshot = state.data) {
+  const playerStatus = snapshot?.player_status;
   if (!currentItem || !playerStatus) {
+    return null;
+  }
+  const snapshotGeneration = Number(snapshot?.playback_generation);
+  const statusGeneration = Number(playerStatus.playback_generation);
+  if (
+    !Number.isSafeInteger(snapshotGeneration)
+    || snapshotGeneration < 1
+    || !Number.isSafeInteger(statusGeneration)
+    || statusGeneration !== snapshotGeneration
+  ) {
     return null;
   }
   if (String(playerStatus.item_id || "") !== String(currentItem.id || "")) {
@@ -5854,9 +7847,13 @@ function clearPlayerControlStatusRefreshTimers() {
   state.playerControlStatusRefreshTimers = [];
 }
 
-function clearPlayerControlStatusSync() {
+function clearPlayerControlStatusSync(expectedSync = null) {
+  if (expectedSync && state.playerControlStatusSync !== expectedSync) {
+    return false;
+  }
   state.playerControlStatusSync = null;
   clearPlayerControlStatusRefreshTimers();
+  return true;
 }
 
 function renderAfterPlayerControlStatusSync() {
@@ -5870,7 +7867,11 @@ function playerControlStatusSyncPending(currentItem, playerStatus = currentPlaye
   if (!sync) {
     return false;
   }
-  if (!currentItem || String(currentItem.id || "") !== sync.itemId) {
+  if (
+    !currentItem
+    || String(currentItem.id || "") !== sync.itemId
+    || state.data?.playback_generation !== sync.playbackGeneration
+  ) {
     clearPlayerControlStatusSync();
     return false;
   }
@@ -5887,25 +7888,18 @@ function playerControlStatusSyncPending(currentItem, playerStatus = currentPlaye
 
 function schedulePlayerControlStatusRefresh() {
   clearPlayerControlStatusRefreshTimers();
-  const timers = playerControlStatusRefreshDelaysMs.map((delayMs) => (
-    window.setTimeout(async () => {
-      if (!state.playerControlStatusSync) {
-        return;
-      }
-      await fetchState({ force: true }).catch(() => {});
-      const currentItem = state.data?.current_item;
-      playerControlStatusSyncPending(currentItem);
-      renderAfterPlayerControlStatusSync();
-    }, delayMs)
-  ));
-  timers.push(window.setTimeout(() => {
-    if (!state.playerControlStatusSync) {
+  const sync = state.playerControlStatusSync;
+  if (!sync) {
+    return;
+  }
+  const timeoutId = window.setTimeout(() => {
+    if (state.playerControlStatusSync !== sync) {
       return;
     }
-    clearPlayerControlStatusSync();
+    clearPlayerControlStatusSync(sync);
     renderAfterPlayerControlStatusSync();
-  }, playerControlStatusSyncTimeoutMs));
-  state.playerControlStatusRefreshTimers = timers;
+  }, Math.max(0, sync.expiresAt - Date.now()));
+  state.playerControlStatusRefreshTimers = [timeoutId];
 }
 
 function beginPlayerControlStatusSync(currentItem) {
@@ -5914,34 +7908,50 @@ function beginPlayerControlStatusSync(currentItem) {
     clearPlayerControlStatusSync();
     return;
   }
-  state.playerControlStatusSync = {
+  const sync = {
     itemId,
+    playbackGeneration: state.data?.playback_generation,
     updatedAfter: playerStatusUpdatedAt(currentPlayerStatus(currentItem)),
     expiresAt: Date.now() + playerControlStatusSyncTimeoutMs,
   };
+  state.playerControlStatusSync = sync;
   schedulePlayerControlStatusRefresh();
+  return sync;
 }
 
 function renderPlayerControls(currentItem, playbackMode) {
+  playbackSheetGesture?.refresh();
+  playbackRestartMenu?.refresh();
   if (!currentItem) {
     state.playerControlsRenderSignature = "__empty__";
     elements.playerControlPanel.classList.add("hidden");
-    if (elements.floatingPlayerControlPanel) {
-      elements.floatingPlayerControlPanel.classList.add("hidden");
+    if (typeof clearRemoteIssueByPrefix === "function") {
+      clearRemoteIssueByPrefix("player-control-unsupported");
+      clearRemoteIssueByPrefix("player-control-cache-pending");
     }
-    elements.playerControlHint.textContent = "";
     return;
   }
 
+  const unsupportedIssueSignature = remotePlayerIssueSignature(
+    "player-control-unsupported",
+    currentItem,
+  );
   const canControl = canRemoteControlPlayer(currentItem, playbackMode);
   const playerStatus = currentPlayerStatus(currentItem);
-  const isPaused = Boolean(playerStatus?.is_paused);
+  const isPaused = playerStatus ? Boolean(playerStatus.is_paused) : true;
+  const itemDurationSeconds = durationSecondsForItem(currentItem);
+  const reportedDurationSeconds = Number(playerStatus?.duration || 0);
+  const durationSeconds = itemDurationSeconds > 0 ? itemDurationSeconds : reportedDurationSeconds;
+  const hasKnownDuration = Number.isFinite(durationSeconds) && durationSeconds > 0;
   const controlSignature = JSON.stringify({
     itemId: currentItem.id || "",
+    itemIncarnationId: currentItem.item_incarnation_id || "",
+    playbackGeneration: state.data?.playback_generation || 0,
     playbackMode,
     canControl,
     hasLocalSplitMedia: hasLocalSplitMedia(currentItem),
     isPaused,
+    hasKnownDuration,
     pendingAction: state.playerControlPendingAction || "",
   });
   if (controlSignature === state.playerControlsRenderSignature) {
@@ -5950,12 +7960,8 @@ function renderPlayerControls(currentItem, playbackMode) {
   state.playerControlsRenderSignature = controlSignature;
 
   const toggleButton = elements.playerControlPanel.querySelector('[data-control-action="toggle-play"]');
-  const floatingToggleButton = elements.floatingPlayerControlPanel?.querySelector('[data-control-action="toggle-play"]');
 
   elements.playerControlPanel.classList.remove("hidden");
-  if (elements.floatingPlayerControlPanel) {
-    elements.floatingPlayerControlPanel.classList.remove("hidden");
-  }
 
   const updateButtons = (panel) => {
     if (!panel) return;
@@ -5967,42 +7973,79 @@ function renderPlayerControls(currentItem, playbackMode) {
         : !canControl || Boolean(state.playerControlPendingAction);
       button.disabled = disabled;
       button.classList.toggle("is-pending", isPending);
+      if (isPending) {
+        button.setAttribute("aria-busy", "true");
+      } else {
+        button.removeAttribute("aria-busy");
+      }
     });
   };
 
   updateButtons(elements.playerControlPanel);
-  updateButtons(elements.floatingPlayerControlPanel);
+
+  if (elements.playbackSheetSeek) {
+    const seekPending = state.playerControlPendingAction === "seek-absolute";
+    elements.playbackSheetSeek.disabled = !canControl
+      || !hasKnownDuration
+      || Boolean(state.playerControlPendingAction);
+    if (seekPending) {
+      elements.playbackSheetSeek.setAttribute("aria-busy", "true");
+    } else {
+      elements.playbackSheetSeek.removeAttribute("aria-busy");
+    }
+  }
 
   const updateToggleState = (btn) => {
     if (!btn) return;
-    btn.textContent = isPaused ? t("remote.play") : t("remote.pause");
+    const label = isPaused ? t("remote.play") : t("remote.pause");
+    btn.setAttribute("aria-label", label);
+    btn.setAttribute("title", label);
+    btn.setAttribute("aria-pressed", String(!isPaused));
+    btn.querySelector('[data-player-icon="play"]')?.classList.toggle("hidden", !isPaused);
+    btn.querySelector('[data-player-icon="pause"]')?.classList.toggle("hidden", isPaused);
     btn.classList.toggle("is-paused", isPaused);
     btn.classList.toggle("is-playing", !isPaused);
   };
 
   updateToggleState(toggleButton);
-  updateToggleState(floatingToggleButton);
+  playbackRestartMenu?.refresh();
 
   if (playbackMode !== "local") {
-    elements.playerControlHint.textContent = t("remote.controlUnsupported");
+    if (typeof clearRemoteIssueByPrefix === "function") {
+      clearRemoteIssueByPrefix("player-control-cache-pending");
+    }
+    if (typeof reportRemoteIssue === "function") {
+      clearRemoteIssueByPrefix("player-control-unsupported", unsupportedIssueSignature);
+      reportRemoteIssue(unsupportedIssueSignature, t("remote.controlUnsupported"));
+    }
     return;
   }
   if (!hasLocalSplitMedia(currentItem)) {
-    elements.playerControlHint.textContent = t("remote.controlCachePending");
+    if (typeof clearRemoteIssueByPrefix === "function") {
+      clearRemoteIssueByPrefix("player-control-unsupported");
+    }
     return;
   }
-  elements.playerControlHint.textContent = isPaused
-    ? t("remote.controlPausedHint")
-    : t("remote.controlPlayingHint");
+  if (typeof clearRemoteIssueByPrefix === "function") {
+    clearRemoteIssueByPrefix("player-control-unsupported");
+    clearRemoteIssueByPrefix("player-control-cache-pending");
+  }
 }
 
 function renderListHeader(playlist, history) {
   const isHistoryView = state.listView === "history";
+  const displayCount = (key, shown) => {
+    const limit = state.data?.public_list_limits?.[key];
+    return Number.isSafeInteger(limit?.total) && limit.total > shown && limit.shown === shown
+      ? `${shown}/${limit.total}` : shown;
+  };
+  const playlistCount = displayCount("playlist", playlist.length);
+  const historyCount = displayCount("history", history.length);
   const signature = JSON.stringify({
     language: state.language,
     view: state.listView,
-    playlistLength: playlist.length,
-    historyLength: history.length,
+    playlistLength: playlistCount,
+    historyLength: historyCount,
   });
   if (signature === state.listHeaderRenderSignature) {
     return;
@@ -6010,14 +8053,19 @@ function renderListHeader(playlist, history) {
   state.listHeaderRenderSignature = signature;
 
   elements.listTag.textContent = isHistoryView ? t("history.tag") : t("list.tag");
-  elements.listTitle.textContent = isHistoryView ? t("history.title") : t("list.title");
-  elements.listCount.textContent = t("follow.countSongs", { count: isHistoryView ? history.length : playlist.length });
+  setTextContent(elements.listTitleText, isHistoryView ? "history.title" : "list.title");
+  setTextContent(
+    elements.listCount,
+    isHistoryView ? "history.count" : "list.count",
+    { count: isHistoryView ? historyCount : playlistCount },
+  );
 
   elements.queueViewButton.classList.toggle("active", !isHistoryView);
   elements.queueViewButton.setAttribute("aria-selected", String(!isHistoryView));
   elements.historyViewButton.classList.toggle("active", isHistoryView);
   elements.historyViewButton.setAttribute("aria-selected", String(isHistoryView));
-  elements.historyExportRow?.classList.toggle("hidden", !isHistoryView);
+  elements.resortPlaylistButton?.classList.toggle("hidden", isHistoryView);
+  elements.historyExportButton?.classList.toggle("hidden", !isHistoryView);
   setTextContent(elements.queueViewButton, "list.title");
   setTextContent(elements.historyViewButton, "history.title");
 }
@@ -6032,16 +8080,24 @@ function queueRenderSignatureForItem(item, index) {
   return {
     index,
     id: String(item?.id || ""),
+    incarnation: String(item?.item_incarnation_id || ""),
     title: String(item?.display_title || ""),
     requester: String(item?.requester_name || ""),
     cacheStatus: String(item?.cache_status || ""),
   };
 }
 
-function createQueueEmptyNode(message) {
+function createQueueEmptyNode() {
   const node = document.createElement("div");
   node.className = "queue-empty";
-  node.textContent = message;
+  const keys = state.data?.current_item
+    ? ["list.emptyWithCurrentTitle", "list.emptyWithCurrentHint"]
+    : ["list.emptyTitle", "list.emptyHint"];
+  for (const key of keys) {
+    const paragraph = document.createElement("p");
+    paragraph.textContent = t(key);
+    node.appendChild(paragraph);
+  }
   return node;
 }
 
@@ -6049,6 +8105,7 @@ function renderQueue(playlist) {
   const items = Array.isArray(playlist) ? playlist : [];
   const signature = JSON.stringify({
     language: state.language,
+    hasCurrentItem: Boolean(state.data?.current_item),
     playlist: items.map(queueRenderSignatureForItem),
   });
   if (signature === state.queueRenderSignature) {
@@ -6059,7 +8116,7 @@ function renderQueue(playlist) {
 
   elements.queueList.replaceChildren();
   if (!items.length) {
-    elements.queueList.appendChild(createQueueEmptyNode(t("remote.queueEmpty")));
+    elements.queueList.appendChild(createQueueEmptyNode());
     return;
   }
 
@@ -6214,13 +8271,16 @@ function syncCurrentCacheState(current) {
     if (textNode) textNode.textContent = "";
     else elements.currentCacheState.textContent = "";
     const retryBtn = elements.currentCacheState.querySelector("#current-cache-retry");
-    if (retryBtn) retryBtn.classList.add("hidden");
+    if (retryBtn) {
+      retryBtn.classList.add("hidden");
+      delete retryBtn.dataset.id;
+      delete retryBtn.dataset.itemIncarnationId;
+    }
     elements.currentCacheState.classList.add("hidden");
     elements.currentCacheState.classList.remove("ready", "failed");
     return;
   }
 
-  elements.currentCacheState.classList.remove("hidden");
   elements.currentCacheState.classList.toggle("ready", current.cache_status === "ready");
   elements.currentCacheState.classList.toggle("failed", current.cache_status === "failed");
 
@@ -6229,27 +8289,38 @@ function syncCurrentCacheState(current) {
   if (textNode) {
     if (textNode.textContent !== label) {
       textNode.textContent = label;
+      textNode.title = label;
     }
   } else {
     elements.currentCacheState.textContent = label;
   }
 
   const retryBtn = elements.currentCacheState.querySelector("#current-cache-retry");
+  let showRetry = false;
   if (retryBtn) {
-    const showRetry = shouldShowRetryButton(current);
+    showRetry = shouldShowRetryButton(current);
     retryBtn.classList.toggle("hidden", !showRetry);
     if (showRetry) {
       retryBtn.dataset.id = current.id;
+      retryBtn.dataset.itemIncarnationId = current.item_incarnation_id;
     } else {
       delete retryBtn.dataset.id;
+      delete retryBtn.dataset.itemIncarnationId;
     }
   }
+  const ready = current.cache_status === "ready";
+  elements.currentCacheState.classList.toggle("hidden", ready || (!label && !showRetry));
+  syncPlaybackMetadataFieldVisibility();
+  elements.currentCacheState.setAttribute("aria-hidden", String(ready));
 }
 
 
 
 function currentCacheStateLabel(item) {
   if (!item) {
+    return "";
+  }
+  if (item.cache_status === "ready") {
     return "";
   }
   if (item.cache_status === "downloading") {
@@ -6318,7 +8389,92 @@ function formatPlaybackClockSeconds(seconds) {
   return `${minutes}:${String(restSeconds).padStart(2, "0")}`;
 }
 
-function clearCurrentPlaybackClock() {
+function playbackProgressRatio(currentSeconds, durationSeconds) {
+  const current = Number(currentSeconds);
+  const duration = Number(durationSeconds);
+  if (!Number.isFinite(current) || !Number.isFinite(duration) || !(duration > 0)) {
+    return 0;
+  }
+  return Math.max(0, Math.min(1, current / duration));
+}
+
+function paintPlaybackClockSurfaces() {
+  const { currentSeconds, durationSeconds } = currentPlaybackClockSeconds();
+  const hasKnownDuration = Number.isFinite(durationSeconds) && durationSeconds > 0;
+  const currentText = hasKnownDuration ? formatPlaybackClockSeconds(currentSeconds) : "";
+  const durationText = hasKnownDuration ? formatPlaybackClockSeconds(durationSeconds) : "";
+  const dockText = hasKnownDuration
+    ? `${currentText} / ${durationText}`
+    : "";
+  const ratio = hasKnownDuration ? playbackProgressRatio(currentSeconds, durationSeconds) : 0;
+
+  if (elements.playbackDockClock) {
+    if (elements.playbackDockClock.textContent !== dockText) {
+      elements.playbackDockClock.textContent = dockText;
+    }
+    elements.playbackDockClock.classList.toggle("hidden", !hasKnownDuration);
+  }
+  if (
+    !state.playbackSheetSeekScrubbing
+    && elements.playbackSheetCurrentTime
+    && elements.playbackSheetCurrentTime.textContent !== currentText
+  ) {
+    elements.playbackSheetCurrentTime.textContent = currentText;
+  }
+  if (elements.playbackSheetDuration && elements.playbackSheetDuration.textContent !== durationText) {
+    elements.playbackSheetDuration.textContent = durationText;
+  }
+  elements.playbackSheetClock
+    ?.closest(".player-progress-unit")
+    ?.classList.toggle("is-unknown-duration", !hasKnownDuration);
+
+  if (elements.playbackDockProgress) {
+    elements.playbackDockProgress.style.transform = `scaleX(${ratio})`;
+    elements.playbackDockProgress.classList.toggle("has-progress", hasKnownDuration);
+  }
+  if (elements.playbackSheetSeek) {
+    const max = hasKnownDuration ? durationSeconds : 1;
+    const value = hasKnownDuration
+      ? Math.max(0, Math.min(durationSeconds, currentSeconds))
+      : 0;
+    if (elements.playbackSheetSeek.max !== String(max)) {
+      elements.playbackSheetSeek.max = String(max);
+    }
+    if (!state.playbackSheetSeekScrubbing) {
+      if (elements.playbackSheetSeek.value !== String(value)) {
+        elements.playbackSheetSeek.value = String(value);
+      }
+      setRangeFillPercent(elements.playbackSheetSeek, ratio * 100);
+      if (hasKnownDuration) {
+        if (elements.playbackSheetSeek.getAttribute("aria-valuetext") !== dockText) {
+          elements.playbackSheetSeek.setAttribute("aria-valuetext", dockText);
+        }
+      } else {
+        elements.playbackSheetSeek.removeAttribute("aria-valuetext");
+      }
+    }
+  }
+}
+
+function paintPlaybackSheetSeekPreview(targetSeconds) {
+  const durationSeconds = Number(elements.playbackSheetSeek?.max || 0);
+  if (!elements.playbackSheetSeek || !(durationSeconds > 0)) {
+    return;
+  }
+  const target = Math.max(0, Math.min(durationSeconds, Number(targetSeconds || 0)));
+  const currentText = formatPlaybackClockSeconds(target);
+  const durationText = formatPlaybackClockSeconds(durationSeconds);
+  setRangeFillPercent(elements.playbackSheetSeek, playbackProgressRatio(target, durationSeconds) * 100);
+  if (elements.playbackSheetCurrentTime) {
+    elements.playbackSheetCurrentTime.textContent = currentText;
+  }
+  if (elements.playbackSheetDuration) {
+    elements.playbackSheetDuration.textContent = durationText;
+  }
+  elements.playbackSheetSeek.setAttribute("aria-valuetext", `${currentText} / ${durationText}`);
+}
+
+function clearCurrentPlaybackClock({ paint = true } = {}) {
   if (state.currentPlaybackClockTimer) {
     window.clearInterval(state.currentPlaybackClockTimer);
     state.currentPlaybackClockTimer = null;
@@ -6328,31 +8484,14 @@ function clearCurrentPlaybackClock() {
   state.currentPlaybackClockDurationSeconds = 0;
   state.currentPlaybackClockStartedAt = 0;
   state.currentPlaybackClockPaused = true;
-}
-
-function currentPlaybackClockText() {
-  const { currentSeconds, durationSeconds } = currentPlaybackClockSeconds();
-  if (!(durationSeconds > 0)) {
-    return "";
+  state.playbackSheetSeekScrubbing = false;
+  if (paint) {
+    paintPlaybackClockSurfaces();
   }
-  return `${formatPlaybackClockSeconds(currentSeconds)} / ${formatPlaybackClockSeconds(durationSeconds)}`;
 }
 
 function paintCurrentPlaybackClock() {
-  const text = currentPlaybackClockText();
-  if (!text || !elements.currentCacheState) {
-    return;
-  }
-  const textNode = elements.currentCacheState.querySelector(".cache-state-text");
-  if (textNode) {
-    if (textNode.textContent !== text) {
-      textNode.textContent = text;
-    }
-  } else {
-    if (elements.currentCacheState.textContent !== text) {
-      elements.currentCacheState.textContent = text;
-    }
-  }
+  paintPlaybackClockSurfaces();
   try {
     maybeUpdateRemoteRatingPrompt(state.data?.current_item);
   } catch (error) {
@@ -6377,32 +8516,41 @@ function renderCurrentPlaybackState(current) {
   const itemDurationSeconds = durationSecondsForItem(current);
   const reportedDurationSeconds = Number(playerStatus?.duration || 0);
   const durationSeconds = itemDurationSeconds > 0 ? itemDurationSeconds : reportedDurationSeconds;
-  const currentSeconds = Math.max(0, Number(playerStatus?.current_time || 0));
-  const isPaused = Boolean(playerStatus?.is_paused);
+  const reportedCurrentSeconds = Number(playerStatus?.current_time);
+  const currentSeconds = Number.isFinite(reportedCurrentSeconds)
+    ? Math.max(0, reportedCurrentSeconds)
+    : 0;
+  const isPaused = playerStatus ? Boolean(playerStatus.is_paused) : true;
   const waitingForHostStatus = playerControlStatusSyncPending(current, playerStatus);
-  if (!(durationSeconds > 0) || (!currentSeconds && isPaused)) {
+  const connectionFrozen = Boolean(
+    state.remoteConnectionPhase && state.remoteConnectionPhase !== "connected",
+  );
+  if (!playerStatus || !Number.isFinite(durationSeconds) || !(durationSeconds > 0)) {
     clearCurrentPlaybackClock();
     syncCurrentCacheState(current);
     return;
   }
 
   const signature = [
+    state.data?.playback_generation || 0,
     current.id || "",
+    current.item_incarnation_id || "",
     Math.round(currentSeconds),
     Math.round(durationSeconds),
     isPaused ? "paused" : "playing",
     waitingForHostStatus ? "host-sync" : "live",
+    connectionFrozen ? "disconnected" : "connected",
   ].join("|");
   if (signature !== state.currentPlaybackClockSignature) {
     state.currentPlaybackClockSignature = signature;
     state.currentPlaybackClockBaseSeconds = currentSeconds;
     state.currentPlaybackClockDurationSeconds = durationSeconds;
     state.currentPlaybackClockStartedAt = Date.now();
-    state.currentPlaybackClockPaused = waitingForHostStatus || isPaused;
+    state.currentPlaybackClockPaused = waitingForHostStatus || isPaused || connectionFrozen;
   }
 
   paintCurrentPlaybackClock();
-  if (waitingForHostStatus || isPaused) {
+  if (waitingForHostStatus || isPaused || connectionFrozen) {
     if (state.currentPlaybackClockTimer) {
       window.clearInterval(state.currentPlaybackClockTimer);
       state.currentPlaybackClockTimer = null;
@@ -6412,6 +8560,23 @@ function renderCurrentPlaybackState(current) {
   if (!state.currentPlaybackClockTimer) {
     state.currentPlaybackClockTimer = window.setInterval(paintCurrentPlaybackClock, 1000);
   }
+}
+
+function freezeCurrentPlaybackClock() {
+  const { currentSeconds, durationSeconds } = currentPlaybackClockSeconds();
+  if (!(durationSeconds > 0)) {
+    return;
+  }
+  if (state.currentPlaybackClockTimer) {
+    window.clearInterval(state.currentPlaybackClockTimer);
+    state.currentPlaybackClockTimer = null;
+  }
+  state.currentPlaybackClockSignature = "";
+  state.currentPlaybackClockBaseSeconds = currentSeconds;
+  state.currentPlaybackClockDurationSeconds = durationSeconds;
+  state.currentPlaybackClockStartedAt = Date.now();
+  state.currentPlaybackClockPaused = true;
+  paintCurrentPlaybackClock();
 }
 
 function formatBytes(value) {
@@ -6592,9 +8757,26 @@ async function handleAddByHistory(url, position) {
 }
 
 async function resortPlaylistByCycle() {
-  state.data = await apiPost("/api/playlist/resort");
-  applyStateSnapshot(state.data, { forceRender: true });
-  setFormMessage(t("list.resorted"));
+  if (state.resortingPlaylist) {
+    return;
+  }
+  state.resortingPlaylist = true;
+  const button = elements.resortPlaylistButton;
+  const originallyDisabled = button?.disabled;
+  if (button) {
+    button.disabled = true;
+    button.setAttribute("aria-busy", "true");
+  }
+  try {
+    applyStateSnapshot(await apiPost("/api/playlist/resort"), { forceRender: true });
+    setFormMessage(t("list.resorted"));
+  } finally {
+    state.resortingPlaylist = false;
+    if (button) {
+      button.disabled = originallyDisabled;
+      button.removeAttribute("aria-busy");
+    }
+  }
 }
 
 async function addByUrl(url, position = "tail", source = "search") {
@@ -6603,24 +8785,24 @@ async function addByUrl(url, position = "tail", source = "search") {
     return false;
   }
   if (!requesterName) {
-    setMessageForSource(source, t("session.requireRequester"), true);
+    setAppMessage(t("session.requireRequester"), true);
     return false;
   }
 
   state.submitting = true;
-  setMessageForSource(source, t("remote.addingSelected"));
+  setAppMessage(t("remote.addingSelected"));
   try {
     const result = await submitAddRequestWithDuplicateConfirm(url, position, requesterName);
     if (result.cancelled) {
-      setMessageForSource(source, t("remote.cancelledDuplicate"));
+      setAppMessage(t("remote.cancelledDuplicate"));
       return false;
     }
     applyStateSnapshot(result.data, { forceRender: true });
     if (source === "gatcha") {
       state.gatchaCandidate = null;
-      renderGatchaUidView();
+      renderGatchaView();
     }
-    setMessageForSource(source, t("request.success"));
+    setAppMessage(t("request.success"));
     return true;
   } catch (error) {
     if (error.code === "manual_binding_required") {
@@ -6636,7 +8818,7 @@ async function addByUrl(url, position = "tail", source = "search") {
       );
       return false;
     }
-    setMessageForSource(source, error.message, true);
+    setAppMessage(error.message, true);
     return false;
   } finally {
     state.submitting = false;
@@ -6663,51 +8845,119 @@ async function confirmGatchaCandidate() {
   }
 }
 
-async function sendPlayerControl(action, deltaSeconds = 0) {
+function remotePlayerIssueSignature(kind, currentItem, playbackGeneration = state.data?.playback_generation) {
+  return [
+    String(kind || "").trim(),
+    String(currentItem?.id || "").trim(),
+    String(currentItem?.item_incarnation_id || "").trim(),
+    String(playbackGeneration ?? "").trim(),
+  ].join(":");
+}
+
+async function sendPlayerControl(action, controlValue = 0) {
   const currentItem = state.data?.current_item;
   const playbackMode = frontendPlaybackMode(state.data?.playback_mode);
-  if (!currentItem || !canRemoteControlPlayer(currentItem, playbackMode)) {
+  const expectedPlaybackGeneration = state.data?.playback_generation;
+  const numericControlValue = Number(controlValue);
+  if (
+    !currentItem
+    || !canRemoteControlPlayer(currentItem, playbackMode)
+    || !Number.isSafeInteger(expectedPlaybackGeneration)
+    || expectedPlaybackGeneration < 1
+    || Boolean(state.playerControlPendingAction)
+    || (
+      action === "seek-absolute"
+      && (!Number.isFinite(numericControlValue) || numericControlValue < 0)
+    )
+  ) {
     return;
   }
 
+  const issueSignature = remotePlayerIssueSignature(
+    `player-command:${action}`,
+    currentItem,
+    expectedPlaybackGeneration,
+  );
   const message = action === "toggle-play"
     ? t("remote.controlSentToggle")
-    : deltaSeconds > 0
-      ? t("remote.controlSentForward")
-      : t("remote.controlSentBack");
+    : action === "seek-absolute"
+      ? t("remote.controlSentSeek")
+      : numericControlValue > 0
+        ? t("remote.controlSentForward")
+        : t("remote.controlSentBack");
 
+  let controlSync = null;
   try {
     state.playerControlPendingAction = action;
-    beginPlayerControlStatusSync(currentItem);
+    controlSync = beginPlayerControlStatusSync(currentItem);
     renderCurrentPlaybackState(currentItem);
     renderPlayerControls(currentItem, playbackMode);
-    applyStateSnapshot(await apiPost("/api/player/control", {
+    const payload = {
       action,
       item_id: currentItem.id,
-      delta_seconds: deltaSeconds,
-    }));
-    setFormMessage(message);
+      delta_seconds: action === "seek-relative" ? numericControlValue : 0,
+      playback_generation: expectedPlaybackGeneration,
+    };
+    if (action === "seek-absolute") {
+      payload.target_seconds = Math.round(numericControlValue);
+    }
+    const outcome = await apiPostExactStateCommand("/api/player/control", payload);
+    if (outcome.commandApplied) {
+      if (typeof clearRemoteIssue === "function") {
+        clearRemoteIssue(issueSignature);
+      }
+      setFormMessage(message);
+    } else {
+      clearPlayerControlStatusSync(controlSync);
+      renderAfterPlayerControlStatusSync();
+      if (typeof reportRemoteIssue === "function") {
+        reportRemoteIssue(issueSignature, t("remote.controlRejected"));
+      }
+    }
   } catch (error) {
-    clearPlayerControlStatusSync();
+    clearPlayerControlStatusSync(controlSync);
     setFormMessage(error.message, true);
-    await fetchState().catch(() => {});
+    if (typeof reportRemoteIssue === "function") {
+      reportRemoteIssue(issueSignature, error.message || t("remote.controlCommandFailed"));
+    }
   }
   state.playerControlPendingAction = "";
   renderPlayerControls(state.data?.current_item, frontendPlaybackMode(state.data?.playback_mode));
 }
 
 async function sendPlayerNext() {
-  if (!state.data?.current_item) {
+  const currentItem = state.data?.current_item;
+  if (!currentItem) {
     return;
   }
+  const expectedPlaybackGeneration = state.data.playback_generation;
+  if (!Number.isSafeInteger(expectedPlaybackGeneration) || expectedPlaybackGeneration < 1) {
+    return;
+  }
+  const issueSignature = remotePlayerIssueSignature(
+    "player-command:next-track",
+    currentItem,
+    expectedPlaybackGeneration,
+  );
   try {
     state.playerControlPendingAction = "next-track";
     renderPlayerControls(state.data?.current_item, frontendPlaybackMode(state.data?.playback_mode));
-    applyStateSnapshot(await apiPost("/api/player/next"));
-    setFormMessage(t("remote.nextSent"));
+    const outcome = await apiPostExactStateCommand("/api/player/next", {
+      playback_generation: expectedPlaybackGeneration,
+    });
+    if (outcome.commandApplied) {
+      if (typeof clearRemoteIssue === "function") {
+        clearRemoteIssue(issueSignature);
+      }
+      setFormMessage(t("remote.nextSent"));
+    } else if (typeof reportRemoteIssue === "function") {
+      reportRemoteIssue(issueSignature, t("remote.controlRejected"));
+    }
   } catch (error) {
     setFormMessage(error.message, true);
-    await fetchState().catch(() => {});
+    if (typeof reportRemoteIssue === "function") {
+      reportRemoteIssue(issueSignature, error.message || t("remote.controlCommandFailed"));
+    }
   }
   state.playerControlPendingAction = "";
   renderPlayerControls(state.data?.current_item, frontendPlaybackMode(state.data?.playback_mode));
@@ -6722,7 +8972,12 @@ function disconnectClient() {
   } catch (error) {
     console.warn("Failed to flush pending auto-ratings on disconnect:", error);
   }
+  clearStateFallbackTimer();
   closeEventStream();
+  if (window.BilikaraRemoteTransport?.mode === "internet") {
+    window.BilikaraRemoteTransport.disconnect();
+    return;
+  }
   if (state.disconnectSent) {
     return;
   }
@@ -6740,6 +8995,40 @@ function disconnectClient() {
   }).catch(() => {});
 }
 
+elements.remoteRequestViewButtons?.forEach((button) => {
+  button.addEventListener("click", () => {
+    activateRemoteRequestView(button.dataset.remoteRequestView, {
+      focusSecondary: button.dataset.remoteRequestView !== "quick",
+    });
+  });
+  button.addEventListener("keydown", handleRemoteRequestTabKeydown);
+});
+
+elements.remoteRequestSecondaryBack?.addEventListener("click", () => {
+  collapseRemoteRequestSecondaryNavigation();
+});
+
+elements.remoteSearchModeButtons?.forEach((button) => {
+  button.addEventListener("click", () => {
+    activateRemoteSearchMode(button.dataset.remoteSearchMode);
+  });
+  button.addEventListener("keydown", handleRemoteSearchModeTabKeydown);
+});
+
+elements.remoteDiscoverModeButtons?.forEach((button) => {
+  button.addEventListener("click", () => {
+    activateRemoteDiscoverMode(button.dataset.remoteDiscoverMode);
+  });
+  button.addEventListener("keydown", handleRemoteDiscoverModeTabKeydown);
+});
+
+elements.remoteSourcesModeButtons?.forEach((button) => {
+  button.addEventListener("click", () => {
+    activateRemoteSourcesMode(button.dataset.remoteSourcesMode);
+  });
+  button.addEventListener("keydown", handleRemoteSourcesModeTabKeydown);
+});
+
 elements.requestForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   await submitRequest("tail");
@@ -6747,95 +9036,58 @@ elements.requestForm.addEventListener("submit", async (event) => {
 
 elements.searchForm.addEventListener("submit", async (event) => {
   event.preventDefault();
+  if (localLibrarySearch.loading) return;
   const query = String(elements.searchQuery.value || "").trim();
   if (!query) {
     hideSearchResults();
-    setSearchMessage(t("search.keywordRequired"), true);
+    setSearchMessage("");
+    setAppMessage(t("search.keywordRequired"), true);
     return;
   }
 
+  localLibrarySearch.loading = true;
   elements.searchButton.disabled = true;
+  elements.searchButton.setAttribute("aria-busy", "true");
   setSearchMessage(t("search.localSearching"));
   try {
-    const items = await searchGatchaCache(query);
+    localLibrarySearch.query = query;
+    localLibrarySearch.seq += 1;
+    const data = await searchGatchaCache(query);
+    localLibrarySearch.data = data;
+    const items = data.items;
+    localLibrarySearch.loading = false;
     renderSearchResults(items);
-    setSearchMessage(items.length ? t("search.localFound", { count: items.length }) : t("search.localNotFound"));
+    setSearchMessage(items.length ? "" : t("search.localNotFound"));
   } catch (error) {
     hideSearchResults();
-    setSearchMessage(error.message, true);
+    setSearchMessage("");
+    setAppMessage(error.message, true);
   } finally {
+    localLibrarySearch.loading = false;
     elements.searchButton.disabled = false;
+    elements.searchButton.removeAttribute("aria-busy");
   }
 });
 
 elements.searchResults.addEventListener("click", async (event) => {
+  if (openSearchResultDetail(event, elements.searchResults, "local")) {
+    return;
+  }
   const button = event.target.closest("button[data-url]");
   if (!button || button.disabled) {
     return;
   }
   const originalText = button.textContent;
+  const wasDisabled = button.disabled;
   button.disabled = true;
+  button.setAttribute("aria-busy", "true");
   button.textContent = t("search.adding") || "添加中...";
   try {
     await addByUrl(String(button.dataset.url || ""), "tail", "search");
   } finally {
-    button.disabled = false;
+    button.disabled = wasDisabled;
+    button.removeAttribute("aria-busy");
     button.textContent = originalText;
-  }
-});
-
-elements.searchLibraryOpen?.addEventListener("click", () => {
-  setSearchModalOpen(true);
-});
-
-elements.searchModalClose?.addEventListener("click", () => {
-  setSearchModalOpen(false);
-});
-
-elements.searchModalBackdrop?.addEventListener("click", () => {
-  setSearchModalOpen(false);
-});
-
-elements.searchModalTabs?.forEach((button) => {
-  button.addEventListener("click", () => {
-    renderSearchModalView(button.dataset.target || "search");
-  });
-});
-
-elements.searchModalLarkForm?.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  await executeCanonicalBilikaraSearch(elements.searchModalLarkQuery?.value);
-});
-
-elements.searchModalLarkResults?.addEventListener("click", async (event) => {
-  if (openSearchResultDetail(event, elements.searchModalLarkResults, "modalSearch")) {
-    return;
-  }
-  const target = event.target.closest(".search-result-item[data-url], button[data-url]");
-  if (!target || !elements.searchModalLarkResults.contains(target)) {
-    return;
-  }
-  const button = target.closest("button[data-url]");
-  if (button && button.disabled) {
-    return;
-  }
-  const url = String(target.dataset.url || button?.dataset.url || "").trim();
-  if (!url) {
-    return;
-  }
-  let originalText = "";
-  if (button) {
-    originalText = button.textContent;
-    button.disabled = true;
-    button.textContent = t("search.adding") || "添加中...";
-  }
-  try {
-    await addByUrl(url, "tail", "modalSearch");
-  } finally {
-    if (button) {
-      button.disabled = false;
-      button.textContent = originalText;
-    }
   }
 });
 
@@ -6875,7 +9127,7 @@ elements.favlistSearchForm?.addEventListener("submit", async (event) => {
 });
 
 elements.favlistSongResults?.addEventListener("click", async (event) => {
-  if (openSearchResultDetail(event, elements.favlistSongResults, "modalFavlist")) {
+  if (openSearchResultDetail(event, elements.favlistSongResults, "favorites")) {
     return;
   }
   const target = event.target.closest(".search-result-item[data-url], button[data-url]");
@@ -6891,24 +9143,28 @@ elements.favlistSongResults?.addEventListener("click", async (event) => {
     return;
   }
   let originalText = "";
+  let wasDisabled = false;
   if (button) {
     originalText = button.textContent;
+    wasDisabled = button.disabled;
     button.disabled = true;
+    button.setAttribute("aria-busy", "true");
     button.textContent = t("search.adding") || "添加中...";
   }
   try {
-    await addByUrl(url, "tail", "modalFavlist");
+    await addByUrl(url, "tail", "favorites");
   } finally {
     if (button) {
-      button.disabled = false;
+      button.disabled = wasDisabled;
+      button.removeAttribute("aria-busy");
       button.textContent = originalText;
     }
   }
 });
 
-elements.searchModalOtherView?.addEventListener("submit", (event) => {
+elements.remoteRequestDiscoverPanel?.addEventListener("submit", (event) => {
   const categoryForm = event.target.closest("[data-category-browse-search]");
-  if (categoryForm && elements.searchModalOtherView.contains(categoryForm)) {
+  if (categoryForm && elements.remoteRequestDiscoverPanel.contains(categoryForm)) {
     event.preventDefault();
     const input = categoryForm.querySelector("[data-category-browse-query]");
     loadCategoryBrowse({
@@ -6918,44 +9174,50 @@ elements.searchModalOtherView?.addEventListener("submit", (event) => {
     return;
   }
   const form = event.target.closest("[data-d1-browse-search]");
-  if (!form || !elements.searchModalOtherView.contains(form)) {
+  if (!form || !elements.remoteRequestDiscoverPanel.contains(form)) {
     return;
   }
   event.preventDefault();
+  const kind = form.closest("[data-remote-discover-panel]")?.dataset.remoteDiscoverPanel === "artist"
+    ? "artist"
+    : "name";
+  const mode = d1BrowseModeState(kind);
   const input = form.querySelector("[data-d1-browse-query]");
-  if (!state.d1BrowseLetter) {
+  if (!mode.letter) {
     if (input) {
       input.value = "";
     }
-    state.d1BrowseQuery = "";
-    state.d1BrowseTag = "";
-    state.d1BrowseLocale = "";
-    state.d1BrowseData = null;
-    renderD1BrowseView();
+    mode.query = "";
+    mode.tag = "";
+    mode.locale = "";
+    mode.data = null;
+    mode.error = "";
+    renderD1BrowseView(kind);
     return;
   }
-  if (state.d1BrowseTag) {
+  if (mode.tag) {
     loadD1Browse({
-      kind: state.d1BrowseKind || "name",
-      letter: state.d1BrowseLetter,
+      kind,
+      letter: mode.letter,
       query: input?.value || "",
-      tag: state.d1BrowseTag,
-      locale: state.d1BrowseLocale,
+      tag: mode.tag,
+      locale: mode.locale,
     });
     return;
   }
   loadD1Browse({
-    kind: state.d1BrowseKind || "name",
-    letter: state.d1BrowseLetter,
+    kind,
+    letter: mode.letter,
     query: input?.value || "",
     tag: "",
     locale: "",
   });
 });
 
-elements.searchModalOtherView?.addEventListener("click", (event) => {
+elements.remoteRequestDiscoverPanel?.addEventListener("click", async (event) => {
   const categoryBackButton = event.target.closest("[data-category-browse-back]");
-  if (categoryBackButton && elements.searchModalOtherView.contains(categoryBackButton)) {
+  if (categoryBackButton && elements.remoteRequestDiscoverPanel.contains(categoryBackButton)) {
+    state.categoryBrowseSeq += 1;
     state.categoryBrowseSelectedId = "";
     state.categoryBrowseQuery = "";
     state.categoryBrowseItems = [];
@@ -6966,7 +9228,7 @@ elements.searchModalOtherView?.addEventListener("click", (event) => {
     return;
   }
   const categoryButton = event.target.closest("[data-category-id]");
-  if (categoryButton && elements.searchModalOtherView.contains(categoryButton)) {
+  if (categoryButton && elements.remoteRequestDiscoverPanel.contains(categoryButton)) {
     loadCategoryBrowse({
       categoryId: categoryButton.dataset.categoryId || "",
       query: "",
@@ -6975,29 +9237,39 @@ elements.searchModalOtherView?.addEventListener("click", (event) => {
     return;
   }
   const backButton = event.target.closest("[data-d1-browse-back]");
-  if (backButton && elements.searchModalOtherView.contains(backButton)) {
-    if (state.d1BrowseTag) {
+  if (backButton && elements.remoteRequestDiscoverPanel.contains(backButton)) {
+    const kind = backButton.closest("[data-remote-discover-panel]")?.dataset.remoteDiscoverPanel === "artist"
+      ? "artist"
+      : "name";
+    const mode = d1BrowseModeState(kind);
+    if (mode.tag) {
       loadD1Browse({
-        kind: state.d1BrowseKind || "name",
-        letter: state.d1BrowseLetter,
+        kind,
+        letter: mode.letter,
         query: "",
         tag: "",
         locale: "",
       });
-    } else if (state.d1BrowseLetter) {
-      state.d1BrowseLetter = "";
-      state.d1BrowseTag = "";
-      state.d1BrowseLocale = "";
-      state.d1BrowseQuery = "";
-      state.d1BrowseData = null;
-      renderD1BrowseView();
+    } else if (mode.letter) {
+      mode.seq += 1;
+      mode.letter = "";
+      mode.tag = "";
+      mode.locale = "";
+      mode.query = "";
+      mode.data = null;
+      mode.loading = false;
+      mode.error = "";
+      renderD1BrowseView(kind);
     }
     return;
   }
   const letterButton = event.target.closest("[data-letter]");
-  if (letterButton && elements.searchModalOtherView.contains(letterButton)) {
+  if (letterButton && elements.remoteRequestDiscoverPanel.contains(letterButton)) {
+    const kind = letterButton.closest("[data-remote-discover-panel]")?.dataset.remoteDiscoverPanel === "artist"
+      ? "artist"
+      : "name";
     loadD1Browse({
-      kind: state.d1BrowseKind || "name",
+      kind,
       letter: letterButton.dataset.letter || "",
       query: "",
       tag: "",
@@ -7006,23 +9278,30 @@ elements.searchModalOtherView?.addEventListener("click", (event) => {
     return;
   }
   const tagButton = event.target.closest("[data-tag]");
-  if (tagButton && elements.searchModalOtherView.contains(tagButton)) {
+  if (tagButton && elements.remoteRequestDiscoverPanel.contains(tagButton)) {
+    const kind = tagButton.closest("[data-remote-discover-panel]")?.dataset.remoteDiscoverPanel === "artist"
+      ? "artist"
+      : "name";
+    const mode = d1BrowseModeState(kind);
     loadD1Browse({
-      kind: state.d1BrowseKind || "name",
-      letter: state.d1BrowseLetter,
+      kind,
+      letter: mode.letter,
       query: "",
       tag: tagButton.dataset.tag || "",
       locale: tagButton.dataset.locale || "",
     });
+    return;
   }
-});
-
-elements.searchModalOtherView?.addEventListener("click", async (event) => {
-  if (openSearchResultDetail(event, elements.searchModalOtherView, "modalBrowse")) {
+  const ownerPanel = event.target.closest("[data-remote-discover-panel]");
+  if (!ownerPanel || !elements.remoteRequestDiscoverPanel.contains(ownerPanel)) {
+    return;
+  }
+  const owner = normalizeRemoteDiscoverMode(ownerPanel.dataset.remoteDiscoverPanel, "");
+  if (openSearchResultDetail(event, ownerPanel, owner)) {
     return;
   }
   const target = event.target.closest(".search-result-item[data-url], button[data-url]");
-  if (!target || !elements.searchModalOtherView.contains(target)) {
+  if (!target || !ownerPanel.contains(target)) {
     return;
   }
   const button = target.closest("button[data-url]");
@@ -7034,46 +9313,27 @@ elements.searchModalOtherView?.addEventListener("click", async (event) => {
     return;
   }
   let originalText = "";
+  let wasDisabled = false;
   if (button) {
     originalText = button.textContent;
+    wasDisabled = button.disabled;
     button.disabled = true;
+    button.setAttribute("aria-busy", "true");
     button.textContent = t("search.adding") || "添加中...";
   }
   try {
-    await addByUrl(url, "tail", "modalBrowse");
+    await addByUrl(url, "tail", owner);
   } finally {
     if (button) {
-      button.disabled = false;
+      button.disabled = wasDisabled;
+      button.removeAttribute("aria-busy");
       button.textContent = originalText;
     }
   }
 });
 
-elements.searchModalOtherView?.addEventListener("scroll", (event) => {
-  const target = event.target;
-  if (target instanceof Element && target.matches("[data-category-browse-results]")) {
-    maybeLoadMoreCategoryBrowse(target);
-  }
-}, true);
-
-elements.larkSearchToggle?.addEventListener("click", () => {
-  state.followBrowseVisible = false;
-  state.larkSearchVisible = !state.larkSearchVisible;
-  renderFollowBrowse();
-});
-
 elements.larkSearchQuery?.addEventListener("input", () => {
   canonicalBilikaraSearch.query = String(elements.larkSearchQuery?.value || "");
-  if (elements.searchModalLarkQuery && elements.searchModalLarkQuery.value !== canonicalBilikaraSearch.query) {
-    elements.searchModalLarkQuery.value = canonicalBilikaraSearch.query;
-  }
-});
-
-elements.searchModalLarkQuery?.addEventListener("input", () => {
-  canonicalBilikaraSearch.query = String(elements.searchModalLarkQuery?.value || "");
-  if (elements.larkSearchQuery && elements.larkSearchQuery.value !== canonicalBilikaraSearch.query) {
-    elements.larkSearchQuery.value = canonicalBilikaraSearch.query;
-  }
 });
 
 elements.larkSearchForm?.addEventListener("submit", async (event) => {
@@ -7082,35 +9342,33 @@ elements.larkSearchForm?.addEventListener("submit", async (event) => {
 });
 
 elements.larkSearchResults?.addEventListener("click", async (event) => {
+  if (openSearchResultDetail(event, elements.larkSearchResults, "shared")) {
+    return;
+  }
   const button = event.target.closest("button[data-url]");
   if (!button || button.disabled) {
     return;
   }
   const originalText = button.textContent;
+  const wasDisabled = button.disabled;
   button.disabled = true;
+  button.setAttribute("aria-busy", "true");
   button.textContent = t("search.adding") || "添加中...";
   try {
     await addByUrl(String(button.dataset.url || ""), "tail", "lark");
   } finally {
-    button.disabled = false;
+    button.disabled = wasDisabled;
+    button.removeAttribute("aria-busy");
     button.textContent = originalText;
   }
 });
 
-elements.followBrowseToggle?.addEventListener("click", () => {
-  state.larkSearchVisible = false;
-  state.followBrowseVisible = !state.followBrowseVisible;
-  renderFollowBrowse();
-  if (state.followBrowseVisible && !state.followBrowseLoading) {
-    state.followBrowseSelectedUid = "";
-    if (elements.followSearchQuery) {
-      elements.followSearchQuery.value = "";
-    }
-    loadFollowBrowse({ uid: "", query: "" });
-  }
+elements.sourcesFollowUidForm?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  await addGatchaUidFromInput(elements.sourcesFollowUidInput, { messageTarget: "sources-follow" });
 });
 
-elements.followUpGrid?.addEventListener("click", async (event) => {
+elements.sourcesFollowGrid?.addEventListener("click", async (event) => {
   const button = event.target.closest("button[data-uid]");
   if (!button) {
     return;
@@ -7120,52 +9378,24 @@ elements.followUpGrid?.addEventListener("click", async (event) => {
     return;
   }
   state.followBrowseSelectedUid = uid;
-  if (elements.followSearchQuery) {
-    elements.followSearchQuery.value = "";
+  if (elements.sourcesFollowSearchQuery) {
+    elements.sourcesFollowSearchQuery.value = "";
   }
   await loadFollowBrowse({ uid, query: "" });
 });
 
-elements.modalFollowUidForm?.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  await addGatchaUidFromInput(elements.modalFollowUidInput, { messageTarget: "follow-modal" });
-});
-
-elements.modalFollowUpGrid?.addEventListener("click", async (event) => {
-  const button = event.target.closest("button[data-uid]");
-  if (!button) {
-    return;
-  }
-  const uid = String(button.dataset.uid || "").trim();
-  if (!uid) {
-    return;
-  }
-  state.followBrowseSelectedUid = uid;
-  if (elements.modalFollowSearchQuery) {
-    elements.modalFollowSearchQuery.value = "";
-  }
-  await loadFollowBrowse({ uid, query: "" });
-});
-
-elements.followBrowseBack?.addEventListener("click", () => {
+elements.sourcesFollowBack?.addEventListener("click", () => {
   state.followBrowseSelectedUid = "";
-  if (elements.followSearchQuery) {
-    elements.followSearchQuery.value = "";
+  if (elements.sourcesFollowSearchQuery) {
+    elements.sourcesFollowSearchQuery.value = "";
   }
-  renderFollowBrowse();
+  state.sourcesFollowBrowseRenderSignature = "";
+  renderSourcesFollowBrowse();
 });
 
-elements.modalFollowBrowseBack?.addEventListener("click", () => {
-  state.followBrowseSelectedUid = "";
-  if (elements.modalFollowSearchQuery) {
-    elements.modalFollowSearchQuery.value = "";
-  }
-  renderModalFollowBrowse();
-});
-
-elements.followSearchForm?.addEventListener("submit", async (event) => {
+elements.sourcesFollowSearchForm?.addEventListener("submit", async (event) => {
   event.preventDefault();
-  const query = String(elements.followSearchQuery?.value || "").trim();
+  const query = String(elements.sourcesFollowSearchQuery?.value || "").trim();
   await loadFollowBrowse({
     uid: state.followBrowseSelectedUid,
     query,
@@ -7173,42 +9403,12 @@ elements.followSearchForm?.addEventListener("submit", async (event) => {
   });
 });
 
-elements.modalFollowSearchForm?.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const query = String(elements.modalFollowSearchQuery?.value || "").trim();
-  await loadFollowBrowse({
-    uid: state.followBrowseSelectedUid,
-    query,
-    keepQuery: true,
-  });
-});
-
-elements.followSongResults?.addEventListener("click", async (event) => {
-  const button = event.target.closest("button[data-url]");
-  if (!button || button.disabled) {
-    return;
-  }
-  const url = String(button.dataset.url || "").trim();
-  if (!url) {
-    return;
-  }
-  const originalText = button.textContent;
-  button.disabled = true;
-  button.textContent = t("search.adding") || "添加中...";
-  try {
-    await addByUrl(url, "tail", "follow");
-  } finally {
-    button.disabled = false;
-    button.textContent = originalText;
-  }
-});
-
-elements.modalFollowSongResults?.addEventListener("click", async (event) => {
-  if (openSearchResultDetail(event, elements.modalFollowSongResults, "modalFollow")) {
+elements.sourcesFollowResults?.addEventListener("click", async (event) => {
+  if (openSearchResultDetail(event, elements.sourcesFollowResults, "uids")) {
     return;
   }
   const target = event.target.closest(".search-result-item[data-url], button[data-url]");
-  if (!target || !elements.modalFollowSongResults.contains(target)) {
+  if (!target || !elements.sourcesFollowResults.contains(target)) {
     return;
   }
   const button = target.closest("button[data-url]");
@@ -7220,16 +9420,20 @@ elements.modalFollowSongResults?.addEventListener("click", async (event) => {
     return;
   }
   let originalText = "";
+  let wasDisabled = false;
   if (button) {
     originalText = button.textContent;
+    wasDisabled = button.disabled;
     button.disabled = true;
+    button.setAttribute("aria-busy", "true");
     button.textContent = t("search.adding") || "添加中...";
   }
   try {
-    await addByUrl(url, "tail", "modalFollow");
+    await addByUrl(url, "tail", "uids");
   } finally {
     if (button) {
-      button.disabled = false;
+      button.disabled = wasDisabled;
+      button.removeAttribute("aria-busy");
       button.textContent = originalText;
     }
   }
@@ -7245,14 +9449,6 @@ elements.resortPlaylistButton?.addEventListener("click", async () => {
   } catch (error) {
     setFormMessage(error.message, true);
   }
-});
-
-elements.layoutModeSwitch?.addEventListener("click", (event) => {
-  const button = event.target.closest("button[data-layout-mode]");
-  if (!button) {
-    return;
-  }
-  setLayoutMode(button.dataset.layoutMode);
 });
 
 elements.languageSwitch?.addEventListener("click", (event) => {
@@ -7271,65 +9467,320 @@ elements.themeSwitch?.addEventListener("click", (event) => {
   applyTheme(button.dataset.theme);
 });
 
+elements.remoteMenuToggle?.addEventListener("click", () => {
+  setRemoteMenuOpen(!state.remoteMenuOpen);
+});
+
 elements.remoteQrToggle?.addEventListener("click", () => {
-  setRemoteQrPopoverOpen(!state.remoteQrPopoverOpen);
+  setRemoteQrSectionOpen(!state.remoteQrSectionOpen);
 });
 
-elements.remoteQrPopoverClose?.addEventListener("click", () => {
-  setRemoteQrPopoverOpen(false);
+elements.remoteSettingsToggle?.addEventListener("click", () => {
+  setRemoteSettingsSectionOpen(!state.remoteSettingsSectionOpen);
 });
 
-elements.displaySettingsToggle?.addEventListener("click", () => {
-  setDisplaySettingsOpen(!state.displaySettingsOpen);
+let remoteContextualInfoPositionFrame = null;
+let remoteContextualInfoNextId = 0;
+
+function remoteContextualTooltipForWrap(wrap) {
+  const button = wrap?.querySelector?.(".remote-info-button");
+  let tooltipId = button?.getAttribute("aria-describedby");
+  if (button && !tooltipId) {
+    const tooltip = wrap.querySelector(".remote-tooltip-bubble");
+    if (tooltip) {
+      if (!tooltip.id) tooltip.id = `remote-contextual-info-${++remoteContextualInfoNextId}`;
+      tooltipId = tooltip.id;
+      button.setAttribute("aria-describedby", tooltipId);
+    }
+  }
+  return tooltipId ? document.getElementById(tooltipId) : null;
+}
+
+function mountRemoteContextualTooltip(wrap) {
+  const tooltip = remoteContextualTooltipForWrap(wrap);
+  if (!tooltip) return null;
+  tooltip.__bilikaraCloseSequence = (tooltip.__bilikaraCloseSequence || 0) + 1;
+  // Keep the hidden entry frame laid out even without the Popover API.
+  // Otherwise display:none skips the shared opacity/slide transition.
+  tooltip.classList.add("is-closing");
+  const playbackPanel = wrap?.closest?.(".playback-sheet-panel");
+  if (playbackPanel && tooltip.parentElement !== playbackPanel) {
+    playbackPanel.append(tooltip);
+    tooltip.classList.add("is-portaled");
+  }
+  if (typeof tooltip.showPopover === "function") {
+    tooltip.setAttribute("popover", "manual");
+    if (!tooltip.matches(":popover-open")) tooltip.showPopover();
+  }
+  // Establish the hidden frame before toggling visibility, as on Host.
+  getComputedStyle(tooltip).opacity;
+  tooltip.classList.remove("is-closing");
+  tooltip.classList.add("is-visible");
+  return tooltip;
+}
+
+function hideRemoteContextualInfo(wrap) {
+  const tooltip = remoteContextualTooltipForWrap(wrap);
+  if (!tooltip) return;
+  tooltip.classList.add("is-closing");
+  wrap?.classList.remove("is-visible", "is-pinned");
+  wrap?.querySelector?.(".remote-info-button")?.setAttribute("aria-expanded", "false");
+  tooltip.classList.remove("is-visible");
+  const closing = tooltip.__bilikaraCloseSequence = (tooltip.__bilikaraCloseSequence || 0) + 1;
+  const animations = tooltip.getAnimations?.() || [];
+  Promise.allSettled(animations.map(animation => animation.finished)).then(() => {
+    if (tooltip.__bilikaraCloseSequence !== closing || wrap?.classList.contains("is-visible")) return;
+    if (typeof tooltip.hidePopover === "function" && tooltip.matches(":popover-open")) tooltip.hidePopover();
+    tooltip.classList.remove("is-closing");
+    if (tooltip.classList.contains("is-portaled") && wrap?.isConnected) {
+      tooltip.classList.remove("is-portaled");
+      wrap.append(tooltip);
+    }
+    for (const property of ["width", "max-width", "left", "right", "top", "bottom",
+      "--remote-tooltip-arrow-left", "--remote-tooltip-transform-origin"]) {
+      tooltip.style.removeProperty(property);
+    }
+    delete tooltip.dataset.tooltipDirection;
+  });
+}
+
+function positionRemoteContextualTooltip(wrap) {
+  const button = wrap?.querySelector?.(".remote-info-button");
+  const tooltip = remoteContextualTooltipForWrap(wrap);
+  if (!button || !tooltip || !wrap.classList.contains("is-visible")) {
+    return false;
+  }
+  const viewportInset = 8;
+  const tooltipGap = 7;
+  const containerRect = tooltip.hasAttribute("popover") ? null : wrap.closest(
+    ".playback-sheet-panel, .binding-sheet-panel, .remote-menu-panel, .history-export-dialog",
+  )?.getBoundingClientRect();
+  const boundaryLeft = Math.max(viewportInset, (containerRect?.left ?? viewportInset) + (containerRect ? 8 : 0));
+  const boundaryRight = Math.min(
+    window.innerWidth - viewportInset,
+    (containerRect?.right ?? (window.innerWidth - viewportInset)) - (containerRect ? 8 : 0),
+  );
+  const boundaryTop = Math.max(viewportInset, (containerRect?.top ?? viewportInset) + (containerRect ? 8 : 0));
+  const boundaryBottom = Math.min(
+    window.innerHeight - viewportInset,
+    (containerRect?.bottom ?? (window.innerHeight - viewportInset)) - (containerRect ? 8 : 0),
+  );
+  const buttonRect = button.getBoundingClientRect();
+  const widthLimit = Math.min(320, Math.max(0, boundaryRight - boundaryLeft));
+  tooltip.style.width = "max-content";
+  tooltip.style.maxWidth = `${Math.round(widthLimit)}px`;
+  tooltip.style.left = "0px";
+  tooltip.style.right = "auto";
+  tooltip.style.top = "0px";
+  tooltip.style.bottom = "auto";
+  const tooltipRect = tooltip.getBoundingClientRect();
+  const width = tooltipRect.width;
+  const height = tooltipRect.height;
+  const buttonCenter = buttonRect.left + (buttonRect.width / 2);
+  const left = Math.max(
+    boundaryLeft,
+    Math.min(buttonCenter - (width / 2), boundaryRight - width),
+  );
+  const spaceAbove = buttonRect.top - boundaryTop - tooltipGap;
+  const spaceBelow = boundaryBottom - buttonRect.bottom - tooltipGap;
+  let direction = "up";
+  if (spaceAbove < height && spaceBelow >= height) {
+    direction = "down";
+  } else if (spaceAbove < height && spaceBelow < height && spaceBelow > spaceAbove) {
+    direction = "down";
+  }
+  const preferredTop = direction === "up"
+    ? buttonRect.top - tooltipGap - height
+    : buttonRect.bottom + tooltipGap;
+  const top = Math.max(boundaryTop, Math.min(preferredTop, boundaryBottom - height));
+  const arrowCenter = Math.max(10, Math.min(width - 10, buttonCenter - left));
+  const offsetParent = tooltip.offsetParent;
+  const offsetParentRect = offsetParent?.getBoundingClientRect();
+  const offsetLeft = (offsetParentRect?.left ?? 0) + (offsetParent?.clientLeft ?? 0);
+  const offsetTop = (offsetParentRect?.top ?? 0) + (offsetParent?.clientTop ?? 0);
+  tooltip.dataset.tooltipDirection = direction;
+  tooltip.style.left = `${Math.round(left - offsetLeft)}px`;
+  tooltip.style.top = `${Math.round(top - offsetTop)}px`;
+  tooltip.style.setProperty("--remote-tooltip-arrow-left", `${arrowCenter - 6}px`);
+  tooltip.style.setProperty(
+    "--remote-tooltip-transform-origin",
+    `${Math.round(arrowCenter)}px ${direction === "up" ? "bottom" : "top"}`,
+  );
+  return true;
+}
+
+function syncVisibleRemoteContextualTooltipPosition() {
+  remoteContextualInfoPositionFrame = null;
+  document.querySelectorAll(".info-trigger-wrap.is-visible").forEach(positionRemoteContextualTooltip);
+}
+
+function scheduleRemoteContextualTooltipPositionSync() {
+  if (remoteContextualInfoPositionFrame !== null) {
+    return;
+  }
+  remoteContextualInfoPositionFrame = window.requestAnimationFrame(
+    syncVisibleRemoteContextualTooltipPosition,
+  );
+}
+
+function setRemoteContextualInfoVisible(wrap, { pinned = false } = {}) {
+  if (!wrap) {
+    return false;
+  }
+  document.querySelectorAll(".info-trigger-wrap.is-visible").forEach((candidate) => {
+    if (candidate === wrap) {
+      return;
+    }
+    hideRemoteContextualInfo(candidate);
+  });
+  mountRemoteContextualTooltip(wrap);
+  wrap.classList.add("is-visible");
+  wrap.classList.toggle("is-pinned", pinned);
+  wrap.querySelector(".remote-info-button")?.setAttribute("aria-expanded", "true");
+  positionRemoteContextualTooltip(wrap);
+  return true;
+}
+
+function closeRemoteContextualInfo({ includePinned = true } = {}) {
+  let closed = false;
+  document.querySelectorAll(".info-trigger-wrap.is-visible").forEach((wrap) => {
+    if (!includePinned && wrap.classList.contains("is-pinned")) {
+      return;
+    }
+    closed = true;
+    hideRemoteContextualInfo(wrap);
+  });
+  return closed;
+}
+
+function showRemoteContextualInfoTransient(wrap, source) {
+  if (wrap?.classList.contains("is-pinned")) {
+    return true;
+  }
+  const pinned = document.querySelector(".info-trigger-wrap.is-pinned");
+  if (source === "pointer" && pinned && pinned !== wrap) {
+    return false;
+  }
+  return setRemoteContextualInfoVisible(wrap);
+}
+
+// Remote help opens by tap/click or keyboard focus, never by hover.
+function bindRemoteContextualInfo(region) {
+  const wrap = region.querySelector(".info-trigger-wrap");
+  region.addEventListener("focusin", (event) => {
+    if (!event.target.closest(".remote-info-button")) {
+      return;
+    }
+    showRemoteContextualInfoTransient(wrap, "keyboard");
+  });
+  region.addEventListener("focusout", () => {
+    window.setTimeout(() => {
+      if (
+        !wrap?.classList.contains("is-pinned")
+        && !region.contains(document.activeElement)
+      ) {
+        hideRemoteContextualInfo(wrap);
+      }
+    }, 0);
+  });
+}
+document.querySelectorAll(".remote-contextual-info-region").forEach(bindRemoteContextualInfo);
+
+elements.playbackSheetSummaryCopy?.addEventListener("click", (event) => {
+  const wrapper = event.target.closest("[data-playback-metadata-field].is-disclosable");
+  if (!wrapper) {
+    return;
+  }
+  openPlaybackMetadataPopover(wrapper);
 });
 
-elements.displayPopoverClose?.addEventListener("click", () => {
-  setDisplaySettingsOpen(false);
+elements.playbackSheetSummaryCopy?.addEventListener("keydown", (event) => {
+  const wrapper = event.target.closest("[data-playback-metadata-field].is-disclosable");
+  if (!wrapper || (event.key !== "Enter" && event.key !== " ")) {
+    return;
+  }
+  event.preventDefault();
+  openPlaybackMetadataPopover(wrapper);
 });
 
 document.addEventListener("click", (event) => {
-  // Toggle info tooltip popovers
+  if (
+    state.playbackMetadataPopoverField
+    && !event.target.closest("#playback-metadata-popover")
+    && !event.target.closest("[data-playback-metadata-field].is-disclosable")
+  ) {
+    closePlaybackMetadataPopover();
+  }
+
+  if (state.audioVariantBarExpanded
+    && !event.target.closest("#audio-variant-bar")
+    && !event.target.closest("#audio-variant-popover")) {
+    setAudioVariantPopoverOpen(false);
+  }
+
   const infoBtn = event.target.closest(".remote-info-button");
   if (infoBtn) {
     const wrap = infoBtn.closest(".info-trigger-wrap");
-    if (wrap) {
-      const isShown = wrap.classList.contains("show-tooltip");
-      // Close all tooltips first
-      document.querySelectorAll(".info-trigger-wrap.show-tooltip").forEach((el) => {
-        el.classList.remove("show-tooltip");
-      });
-      // Toggle current
-      if (!isShown) {
-        wrap.classList.add("show-tooltip");
-      }
-      event.stopPropagation();
+    event.preventDefault();
+    event.stopPropagation();
+    if (wrap?.classList.contains("is-pinned")) {
+      closeRemoteContextualInfo();
+    } else {
+      closeRemoteContextualInfo();
+      setRemoteContextualInfoVisible(wrap, { pinned: true });
     }
-  } else {
-    // Clicked outside, close all tooltips
-    document.querySelectorAll(".info-trigger-wrap.show-tooltip").forEach((el) => {
-      el.classList.remove("show-tooltip");
-    });
+  } else if (!event.target.closest(".remote-contextual-info-region")) {
+    closeRemoteContextualInfo();
   }
 
-  if (state.remoteQrPopoverOpen && !event.target.closest("#remote-qr-control")) {
-    setRemoteQrPopoverOpen(false);
-  }
-
-  if (state.displaySettingsOpen && !event.target.closest("#display-control")) {
-    setDisplaySettingsOpen(false);
+  if (state.remoteMenuOpen && !event.target.closest("#remote-header-menu")) {
+    setRemoteMenuOpen(false);
   }
 });
 
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") {
-    if (state.searchModalOpen) {
-      setSearchModalOpen(false);
+    if (closePlaybackMetadataPopover({ restoreFocus: true })) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      return;
     }
-    setRemoteQrPopoverOpen(false);
-    setDisplaySettingsOpen(false);
-    document.querySelectorAll(".info-trigger-wrap.show-tooltip").forEach((el) => {
-      el.classList.remove("show-tooltip");
-    });
+    if (closeRemoteContextualInfo()) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      return;
+    }
+    if (state.remoteMenuOpen) {
+      setRemoteMenuOpen(false, { restoreFocus: true });
+      event.preventDefault();
+    }
+  }
+});
+
+window.addEventListener("resize", scheduleRemoteContextualTooltipPositionSync);
+window.addEventListener("resize", positionAudioVariantPopover);
+window.addEventListener("resize", handlePlaybackSheetViewportChange);
+window.addEventListener("resize", schedulePlaybackDockMarquee);
+window.visualViewport?.addEventListener("resize", handlePlaybackSheetViewportChange);
+window.addEventListener("scroll", scheduleRemoteContextualTooltipPositionSync, true);
+for (const scroller of [elements.playbackSheetBody, elements.playbackSheetPrimary, elements.playbackSheetSecondary]) {
+  scroller?.addEventListener("scroll", () => {
+    if (state.audioVariantBarExpanded && scroller.contains(elements.audioVariantBar)) {
+      setAudioVariantPopoverOpen(false);
+    }
+    if (state.playbackMetadataPopoverField) {
+      positionPlaybackMetadataPopover();
+    }
+  }, { passive: true });
+}
+elements.playbackSheetBody?.addEventListener("change", (event) => {
+  if (event.target.matches?.('input[type="range"], input[type="number"]')) {
+    schedulePlaybackSheetAdaptiveLayout({ force: true, interactionEnded: true });
+  }
+});
+elements.playbackSheetBody?.addEventListener("focusout", (event) => {
+  if (event.target.matches?.('input[type="range"], input[type="number"]')) {
+    schedulePlaybackSheetAdaptiveLayout({ force: true, interactionEnded: true });
   }
 });
 
@@ -7376,19 +9827,26 @@ elements.remoteAvOffsetInput?.addEventListener("keydown", async (event) => {
   await setRemoteAvOffset(event.target.value);
 });
 
-elements.remoteVolumeSlider?.addEventListener("input", async (event) => {
-  setRangeFillPercent(event.target, event.target.value);
-  await setRemoteVolumeSettings({
-    volumePercent: event.target.value,
-    isMuted: currentRemoteMuted(state.data?.player_settings),
-  }, {
-    debounce: true,
-  });
+globalThis.BilikaraVolumeControl?.bind({
+  slider: elements.remoteVolumeSlider,
+  value: elements.remoteVolumeValue,
+  t,
+  getValue: () => currentRemoteVolumePercent(),
+  getAutomatic: () => state.data?.automatic_volume,
+  bindInfo: (region) => bindRemoteContextualInfo(region),
+  closeInfo: () => closeRemoteContextualInfo(),
+  onInput: (percent) => setRemoteVolumeSettings({
+    volumePercent: percent,
+    isMuted: currentRemoteMuted(),
+  }, { debounce: true }),
+  onCommit: (percent) => setRemoteVolumeSettings({
+    volumePercent: percent,
+    isMuted: currentRemoteMuted(),
+  }),
 });
 
 elements.remoteVolumeMuteButton?.addEventListener("click", async () => {
   await setRemoteVolumeSettings({
-    volumePercent: currentRemoteVolumePercent(state.data?.player_settings),
     isMuted: !currentRemoteMuted(state.data?.player_settings),
   });
 });
@@ -7422,15 +9880,11 @@ elements.remoteKeyShiftInput?.addEventListener("keydown", async (event) => {
 
 elements.remoteIdentityRename?.addEventListener("click", openRemoteIdentityRename);
 elements.remoteIdentityCancel?.addEventListener("click", closeRemoteIdentityRename);
+elements.remoteIdentityBackdrop?.addEventListener("click", closeRemoteIdentityRename);
 elements.remoteIdentityForm?.addEventListener("submit", submitRemoteIdentity);
 
 elements.gatchaButton.addEventListener("click", handleGatchaDraw);
 elements.gatchaRetryButton.addEventListener("click", handleGatchaDraw);
-
-elements.gatchaUidToggle?.addEventListener("click", () => {
-  state.gatchaUidVisible = !state.gatchaUidVisible;
-  renderGatchaUidView();
-});
 
 elements.gatchaPoolConfigToggle?.addEventListener("click", async () => {
   await openPoolConfigSheet();
@@ -7448,79 +9902,71 @@ document.addEventListener("click", async (event) => {
   }
   const scoreButton = event.target.closest("[data-rating-score]");
   if (scoreButton) {
+    if (scoreButton.disabled || !isItemRateable(activeRatingPromptItem())) return;
+    state.ratingPromptScoreDirty = true;
     state.ratingPromptScore = Math.max(1, Math.min(5, Number(scoreButton.dataset.ratingScore || "5")));
     renderRatingStars();
-    return;
-  }
-  const optOutBtn = event.target.closest("[data-rating-opt-out-btn]");
-  if (optOutBtn) {
-    setRatingOptOut(true);
-    closeRatingPrompt({ submit: false });
     return;
   }
   const addUpButton = event.target.closest("[data-rating-add-up]");
   if (addUpButton) {
     const promptItem = activeRatingPromptItem();
     const uid = ratingOwnerUid(promptItem);
-    const message = root.querySelector("[data-rating-message]");
+    if (addUpButton.disabled) return;
     if (!uid) {
-      if (message) message.textContent = t("rating.missingUidMessage");
+      setAppMessage(t("rating.missingUidMessage"), true);
       return;
     }
     addUpButton.disabled = true;
-    if (message) message.textContent = t("rating.addingUp");
+    addUpButton.setAttribute("aria-busy", "true");
+    addUpButton.textContent = t("rating.addingUp");
     try {
       await addGatchaUid(uid);
-      if (message) message.textContent = t("rating.addedUp");
+      setAppMessage(t("rating.addedUp"));
     } catch (error) {
-      if (message) message.textContent = error.message || t("rating.addFailed");
+      setAppMessage(error.message || t("rating.addFailed"), true);
     } finally {
-      addUpButton.disabled = false;
+      addUpButton.removeAttribute("aria-busy");
+      if (state.ratingPromptElement === root) renderRatingPromptContent();
     }
+    return;
+  }
+  const submitButton = event.target.closest("[data-rating-submit]");
+  if (submitButton) {
+    if (submitButton.disabled || !isItemRateable(activeRatingPromptItem())) return;
+    closeRatingPrompt({ submit: true, trigger: submitButton });
     return;
   }
   if (event.target.closest("[data-rating-close]")) {
-    closeRatingPrompt({ submit: true });
+    closeRatingPrompt({ submit: false, trigger: event.target.closest("[data-rating-close]") });
   }
 });
 
-elements.gatchaUidForm?.addEventListener("submit", handleGatchaUidSubmit);
-
 elements.refreshGatchaCacheButton?.addEventListener("click", async () => {
+  if (state.gatchaRefreshSaving) return;
   if (gatchaTaskBusy()) {
     setGatchaUidMessage(gatchaTaskBusyMessage(), true);
-    renderGatchaUidView();
+    renderSourceManagementControls();
     return;
   }
   state.gatchaRefreshSaving = true;
-  renderGatchaUidView();
-  setGatchaUidMessage(t("gatcha.refreshingBackground"));
+  renderSourceManagementControls();
+  setGatchaUidLoadingMessage(t("gatcha.refreshingBackground"));
   try {
     const result = await refreshGatchaCache();
-    if (result?.started !== false && state.data) {
-      state.data.gatcha = {
-        ...(state.data.gatcha || {}),
-        busy: true,
-        message: gatchaTaskBusyMessage(),
-        last_status: "running",
-      };
-    }
+    await fetchState({ force: false });
     setGatchaUidMessage(result?.started === false ? t("gatcha.busyFallback") : t("gatcha.refreshStarted"));
   } catch (error) {
     setGatchaUidMessage(error.message, true);
   } finally {
     state.gatchaRefreshSaving = false;
-    renderGatchaUidView();
+    renderSourceManagementControls();
   }
 });
 
-elements.pullGatchaFavlistButton?.addEventListener("click", async () => {
-  await previewGatchaFavlistFromInput(elements.gatchaUidInput, { messageTarget: "gatcha" });
-});
-
-elements.modalFavlistPullForm?.addEventListener("submit", async (event) => {
+elements.sourcesFavlistPullForm?.addEventListener("submit", async (event) => {
   event.preventDefault();
-  await previewGatchaFavlistFromInput(elements.modalFavlistUidInput, { messageTarget: "favlist-modal" });
+  await previewGatchaFavlistFromInput(elements.sourcesFavlistUidInput, { messageTarget: "sources-favorites" });
 });
 
 elements.gatchaConfirmButton.addEventListener("click", async () => {
@@ -7625,24 +10071,53 @@ elements.bindingAudioToggle?.addEventListener("click", () => {
   renderBindingAccordion();
 });
 
-elements.audioVariantBar.addEventListener("click", async (event) => {
+function remoteRestartContext() {
+  const item = state.data?.current_item, generation = state.data?.playback_generation;
+  const status = currentPlayerStatus(item);
+  return { key: `${item?.id}:${item?.item_incarnation_id}:${generation}`,
+    itemId: item?.id, generation, title: item?.display_title || item?.title,
+    enabled: canRemoteControlPlayer(item, frontendPlaybackMode(state.data?.playback_mode))
+      && ["playing", "paused", "ready-paused", "ended"].includes(status?.observed_phase) };
+}
+let restartControlSync = null;
+playbackRestartMenu = globalThis.BilikaraPlaybackRestart?.create({
+  firstUse: globalThis.BilikaraPlaybackRestart.firstUseStore?.("remote") || null,
+  canShowHint: () => playbackSheetIsOpen() && !anotherRemoteModalIsOpen() && !playbackSheetGesture?.active,
+  anchor: elements.playerControlPanel.querySelector('[data-control-action="next-track"]'),
+  iconSource: elements.playerControlPanel.querySelector('[data-control-action="seek-relative"][data-delta="-15"]'),
+  getContext: remoteRestartContext, label: t,
+  onBusy: busy => {
+    state.playerControlPendingAction = busy ? "restart" : "";
+    if (busy) restartControlSync = beginPlayerControlStatusSync(state.data?.current_item);
+    renderPlayerControls(state.data?.current_item, frontendPlaybackMode(state.data?.playback_mode));
+  },
+  onRestart: async context => {
+    await globalThis.BilikaraPlaybackRestart.restart({ context,
+      isCurrent: () => remoteRestartContext().key === context.key,
+      post: apiPostExactStateCommand });
+    setFormMessage(t("player.restartSent"));
+  },
+  onError: () => { clearPlayerControlStatusSync(restartControlSync); setFormMessage(t("player.restartFailed"), true); },
+});
+
+elements.audioVariantBar.addEventListener("click", (event) => {
   const toggleButton = event.target.closest('button[data-action="toggle-audio-variants"]');
   if (toggleButton) {
-    state.audioVariantBarExpanded = !state.audioVariantBarExpanded;
-    if (state.data?.current_item) {
-      renderAudioVariantBar(state.data.current_item, frontendPlaybackMode(state.data.playback_mode));
-    }
-    return;
+    setAudioVariantPopoverOpen(!state.audioVariantBarExpanded);
   }
+});
 
+async function handleAudioVariantSelection(event) {
   const button = event.target.closest("button[data-variant-id]");
   const currentItem = state.data?.current_item;
-  if (!button || !currentItem) {
+  if (!button || button.disabled || !currentItem) {
     return;
   }
   if (button.dataset.itemId !== currentItem.id) {
     return;
   }
+
+  setAudioVariantPopoverOpen(false);
 
   if (button.dataset.bound !== "true") {
     const page = Number(button.dataset.page || 0);
@@ -7693,20 +10168,27 @@ elements.audioVariantBar.addEventListener("click", async (event) => {
     state.audioVariantSwitchInFlight = true;
     state.audioVariantSwitchUnlockAt = Date.now() + audioVariantSwitchDebounceMs;
     renderAudioVariantBar(currentItem, frontendPlaybackMode(state.data?.playback_mode));
-    applyStateSnapshot(await apiPost("/api/player/audio-variant", {
+    const outcome = await apiPostExactStateCommand("/api/player/audio-variant", {
       item_id: currentItem.id,
       variant_id: nextVariantId,
-    }));
-    const activeItem = state.data?.current_item;
-    const activeVariant = activeItem ? selectedAudioVariantForItem(activeItem) : null;
-    setFormMessage(t("player.switchedPart", { part: activeVariant?.label || nextVariantId }));
+      expected_item_incarnation_id: currentItem.item_incarnation_id,
+    });
+    if (outcome.commandApplied) {
+      const activeItem = state.data?.current_item;
+      const activeVariant = activeItem ? selectedAudioVariantForItem(activeItem) : null;
+      setFormMessage(t("player.switchedPart", { part: activeVariant?.label || nextVariantId }));
+    } else {
+      state.audioVariantSwitchUnlockAt = 0;
+    }
   } catch (error) {
     setFormMessage(error.message, true);
   } finally {
     state.audioVariantSwitchInFlight = false;
     scheduleAudioVariantSwitchUnlock();
   }
-});
+}
+elements.audioVariantBar.addEventListener("click", handleAudioVariantSelection);
+elements.audioVariantPopover?.addEventListener("click", handleAudioVariantSelection);
 
 elements.playerControlPanel.addEventListener("click", async (event) => {
   const button = event.target.closest("button[data-control-action]");
@@ -7722,21 +10204,85 @@ elements.playerControlPanel.addEventListener("click", async (event) => {
   await sendPlayerControl(action, deltaSeconds);
 });
 
-if (elements.floatingPlayerControlPanel) {
-  elements.floatingPlayerControlPanel.addEventListener("click", async (event) => {
-    const button = event.target.closest("button[data-control-action]");
-    if (!button) {
-      return;
+let playbackSeekRevealOnly = false;
+elements.playerControlPanel.addEventListener("input", (event) => {
+  const seek = event.target.closest('input[data-control-action="seek-absolute"]');
+  if (!seek || seek.disabled) {
+    return;
+  }
+  if (playbackSeekRevealOnly) {
+    state.playbackSheetSeekScrubbing = false;
+    paintPlaybackClockSurfaces();
+    return;
+  }
+  state.playbackSheetSeekScrubbing = true;
+  paintPlaybackSheetSeekPreview(Number(seek.value || 0));
+});
+
+elements.playbackSheetSeek?.addEventListener("pointerdown", event => {
+  if (elements.playbackSheetSeek.disabled || !event.isPrimary || event.button !== 0) return;
+  playbackSeekRevealOnly = !elements.playbackSheetSeek.classList.contains("is-engaged");
+  if (playbackSeekRevealOnly) {
+    // Reveal only. Prevent the range's native track-jump and retain the real
+    // current value; a subsequent pointer gesture or keyboard action can seek.
+    event.preventDefault();
+    elements.playbackSheetSeek.classList.add("is-engaged");
+    elements.playbackSheetSeek.focus({ preventScroll: true });
+  }
+});
+// Chromium's touch range default can run even when pointerdown was canceled.
+// Keep the entire first gesture reveal-only, including delayed input/change.
+elements.playbackSheetSeek?.addEventListener("touchstart", event => {
+  if (playbackSeekRevealOnly) event.preventDefault();
+}, { passive: false });
+elements.playbackSheetSeek?.addEventListener("keydown", event => {
+  if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown"].includes(event.key)) {
+    playbackSeekRevealOnly = false;
+    elements.playbackSheetSeek.classList.add("is-engaged");
+  }
+});
+elements.playbackSheet?.addEventListener("pointerdown", event => {
+  if (event.target !== elements.playbackSheetSeek) {
+    playbackSeekRevealOnly = false;
+    elements.playbackSheetSeek?.classList.remove("is-engaged");
+  }
+});
+for (const name of ["pointercancel", "blur"]) {
+  elements.playbackSheetSeek?.addEventListener(name, () => {
+    if (name === "pointercancel" || !state.playerControlPendingAction) {
+      elements.playbackSheetSeek.classList.remove("is-engaged");
     }
-    const action = button.dataset.controlAction || "";
-    if (action === "next-track") {
-      await sendPlayerNext();
-      return;
-    }
-    const deltaSeconds = Number(button.dataset.delta || "0");
-    await sendPlayerControl(action, deltaSeconds);
+    if (!state.playbackSheetSeekScrubbing) return;
+    state.playbackSheetSeekScrubbing = false;
+    paintPlaybackClockSurfaces();
+    schedulePlaybackSheetAdaptiveLayout({ force: true, interactionEnded: true });
   });
 }
+
+elements.playerControlPanel.addEventListener("change", async (event) => {
+  const seek = event.target.closest('input[data-control-action="seek-absolute"]');
+  if (!seek || seek.disabled || state.playerControlPendingAction) {
+    return;
+  }
+  if (playbackSeekRevealOnly) {
+    state.playbackSheetSeekScrubbing = false;
+    paintPlaybackClockSurfaces();
+    return;
+  }
+  const targetSeconds = Number(seek.value || 0);
+  state.playbackSheetSeekScrubbing = false;
+  try {
+    await sendPlayerControl("seek-absolute", targetSeconds);
+  } finally {
+    paintCurrentPlaybackClock();
+    schedulePlaybackSheetAdaptiveLayout({ force: true, interactionEnded: true });
+    // Disabling while the command is pending drops native range focus. Restore
+    // it only if the user is still working here, not after another interaction.
+    if (state.playbackSheetOpen && seek.classList.contains("is-engaged") && !seek.disabled) {
+      seek.focus({ preventScroll: true });
+    }
+  }
+});
 
 elements.queueViewButton.addEventListener("click", () => {
   state.listView = "queue";
@@ -7755,19 +10301,50 @@ elements.currentCacheState?.addEventListener("click", async (event) => {
   }
   event.stopPropagation();
   const itemId = retryBtn.dataset.id;
-  if (!itemId) {
+  const itemIncarnationId = retryBtn.dataset.itemIncarnationId;
+  if (!itemId || !itemIncarnationId) {
+    return;
+  }
+  if (retryBtn.getAttribute("aria-busy") === "true") {
     return;
   }
   const confirmed = window.confirm(t("cache.retryConfirm") || "确定要重新缓存吗？");
   if (!confirmed) {
     return;
   }
+  const originallyDisabled = retryBtn.disabled;
+  retryBtn.disabled = true;
+  retryBtn.setAttribute("aria-busy", "true");
   try {
-    state.data = await apiPost("/api/cache/retry", { item_id: itemId, force: true });
-    setFormMessage(t("cache.retryStarted"));
+    const outcome = await apiPostExactStateCommand("/api/cache/retry", {
+      item_id: itemId,
+      expected_item_incarnation_id: itemIncarnationId,
+      force: true,
+    });
     render();
+    if (outcome.commandApplied) {
+      setFormMessage(t("cache.retryStarted"));
+    }
   } catch (error) {
     setFormMessage(error.message, true);
+  } finally {
+    retryBtn.disabled = originallyDisabled;
+    retryBtn.removeAttribute("aria-busy");
+  }
+});
+
+elements.historyExportButton?.addEventListener("click", openHistoryExportDialog);
+elements.historyExportClose?.addEventListener("click", closeHistoryExportDialog);
+elements.historyExportDialog?.addEventListener("close", () => {
+  if (elements.historyExportDialog.open) return;
+  unlockPlaybackSheetDocumentScroll();
+  if (historyExportRestoreFocus) elements.historyExportButton?.focus({ preventScroll: true });
+});
+elements.historyExportDialog?.addEventListener("click", (event) => {
+  if (event.target !== elements.historyExportDialog) return;
+  const rect = elements.historyExportDialog.getBoundingClientRect();
+  if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) {
+    closeHistoryExportDialog();
   }
 });
 
@@ -7815,24 +10392,69 @@ document.addEventListener("click", (event) => {
 });
 
 document.addEventListener("keydown", (event) => {
+  if (remoteIdentityModalIsOpen()) {
+    if (event.key === "Tab") {
+      trapFocusWithin(elements.remoteIdentityModal, event, elements.remoteIdentityInput);
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      closeRemoteIdentityRename();
+    }
+    return;
+  }
+  if (elements.historyExportDialog?.open) {
+    if (event.key === "Tab") {
+      trapFocusWithin(elements.historyExportDialog, event, elements.historyExportClose);
+      return;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      closeHistoryExportDialog();
+    }
+    return;
+  }
+  if (event.key === "Tab") {
+    if (state.ratingPromptElement) {
+      trapFocusWithin(
+        state.ratingPromptElement,
+        event,
+        state.ratingPromptElement.querySelector(".rating-close"),
+      );
+      return;
+    }
+    if (state.bindingSheetOpen) {
+      trapFocusWithin(elements.bindingSheet, event, elements.bindingSheetClose);
+      return;
+    }
+    if (playbackSheetIsOpen()) {
+      trapFocusWithin(elements.playbackSheetPanel, event, elements.playbackSheetCollapse);
+    }
+    return;
+  }
+
   if (event.key !== "Escape") {
     return;
   }
-  if (state.bindingSheetOpen) {
-    closeBindingSheet();
-  }
-  if (state.gatchaFavlistSheetOpen) {
-    closeGatchaFavlistSheet();
-  }
-  if (state.poolConfigSheetOpen) {
-    closePoolConfigSheet();
-  }
-  if (state.reorderConfirmSheetOpen) {
+  if (state.ratingPromptElement) {
+    closeRatingPrompt({ submit: false });
+  } else if (state.audioVariantBarExpanded) {
+    setAudioVariantPopoverOpen(false, { restoreFocus: true });
+  } else if (playbackSheetIsOpen()) {
+    closePlaybackSheet();
+  } else if (state.reorderConfirmSheetOpen) {
     closeReorderConfirmSheet();
+  } else if (state.poolConfigSheetOpen) {
+    closePoolConfigSheet();
+  } else if (state.gatchaFavlistSheetOpen) {
+    closeGatchaFavlistSheet();
+  } else if (state.bindingSheetOpen) {
+    closeBindingSheet();
+  } else {
+    return;
   }
-  if (elements.floatingControlOverlay && !elements.floatingControlOverlay.classList.contains("hidden")) {
-    hideFloatingControlOverlay();
-  }
+  event.preventDefault();
+  event.stopImmediatePropagation();
 });
 
 document.addEventListener("visibilitychange", () => {
@@ -7869,272 +10491,266 @@ window.addEventListener("pagehide", clearViewportScaleResetTimers);
 window.addEventListener("pagehide", disconnectClient);
 window.addEventListener("beforeunload", disconnectClient);
 
-let floatingControlBackdropIgnoreUntil = 0;
+function playbackSheetIsOpen() {
+  return Boolean(
+    state.playbackSheetOpen
+    && elements.playbackSheet
+    && !elements.playbackSheet.classList.contains("hidden"),
+  );
+}
 
-function makeElementDraggable(element, onClick) {
-  let startX = 0;
-  let startY = 0;
-  let initialLeft = 0;
-  let initialTop = 0;
-  let isDragging = false;
-  let moved = false;
-  let suppressClickUntil = 0;
-  let pctX = null;
-  let pctY = null;
-  let activeTouchId = null;
+function remoteIdentityModalIsOpen() {
+  return Boolean(
+    elements.remoteIdentityModal
+    && !elements.remoteIdentityModal.classList.contains("hidden"),
+  );
+}
 
-  const invokeClick = () => {
-    if (typeof onClick === "function") {
-      onClick();
-    }
-  };
+function syncRemoteShellInert() {
+  if (!elements.remoteShell) {
+    return;
+  }
+  const playbackSheetOwnsPage = Boolean(
+    elements.playbackSheet
+    && !elements.playbackSheet.classList.contains("hidden"),
+  );
+  if (elements.playbackSheet && state.playbackSheetOpen) {
+    elements.playbackSheet.inert = Boolean(state.ratingPromptElement || remoteIdentityModalIsOpen());
+  }
+  elements.remoteShell.inert = Boolean(
+    playbackSheetOwnsPage
+    || state.ratingPromptElement
+    || remoteIdentityModalIsOpen(),
+  );
+}
 
-  const suppressNextClick = () => {
-    suppressClickUntil = Date.now() + 450;
-  };
+function anotherRemoteModalIsOpen() {
+  return Boolean(
+    elements.historyExportDialog?.open
+    || state.ratingPromptElement
+    || remoteIdentityModalIsOpen()
+    || state.bindingSheetOpen
+    || state.gatchaFavlistSheetOpen
+    || state.poolConfigSheetOpen
+    || state.reorderConfirmSheetOpen,
+  );
+}
 
-  const dragStart = (e) => {
-    if (e.type === "mousedown" && e.button !== 0) {
+function prefersReducedMotion() {
+  return Boolean(window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches);
+}
+
+function lockPlaybackSheetDocumentScroll() {
+  if (state.playbackSheetScrollLock) {
+    return;
+  }
+  // Keep the playback lifecycle marker until its closing animation finishes.
+  // The shared modal observer contains scroll input without repositioning the page.
+  state.playbackSheetScrollLock = true;
+  document.body.classList.add("playback-sheet-scroll-locked");
+}
+
+function unlockPlaybackSheetDocumentScroll() {
+  if (state.playbackSheetOpen || state.ratingPromptElement || elements.historyExportDialog?.open) {
+    return;
+  }
+  if (!state.playbackSheetScrollLock) return;
+  state.playbackSheetScrollLock = null;
+  document.body.classList.remove("playback-sheet-scroll-locked");
+}
+
+function trapFocusWithin(root, event, preferredElement = null) {
+  if (event.key !== "Tab" || !root) {
+    return false;
+  }
+  const focusable = [...root.querySelectorAll(
+    'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])',
+  )].filter((element) => (
+    !element.hidden
+    && !element.classList.contains("hidden")
+    && !element.closest?.("[hidden], .hidden, [inert]")
+    && element.getAttribute("aria-hidden") !== "true"
+  ));
+  if (!focusable.length) {
+    event.preventDefault();
+    preferredElement?.focus?.({ preventScroll: true });
+    return true;
+  }
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  const active = document.activeElement;
+  if (event.shiftKey && (active === first || !root.contains(active))) {
+    event.preventDefault();
+    last.focus({ preventScroll: true });
+    return true;
+  }
+  if (!event.shiftKey && (active === last || !root.contains(active))) {
+    event.preventDefault();
+    first.focus({ preventScroll: true });
+    return true;
+  }
+  return false;
+}
+
+function openPlaybackSheet({ animate = true } = {}) {
+  if (!state.data?.current_item || !elements.playbackSheet || anotherRemoteModalIsOpen()) {
+    return false;
+  }
+  if (animate && playbackSheetGesture?.animateTo) return playbackSheetGesture.animateTo(true);
+  if (playbackSheetGesture?.active) playbackSheetGesture.cancel({ restore: false });
+  setRemoteMenuOpen(false);
+  closeRemoteContextualInfo();
+  state.playbackSheetTransitionSequence += 1;
+  if (state.playbackSheetCloseTimer) {
+    window.clearTimeout(state.playbackSheetCloseTimer);
+    state.playbackSheetCloseTimer = null;
+  }
+  state.playbackSheetOpen = true;
+  elements.playbackSheet.classList.remove("hidden", "is-closing");
+  elements.playbackSheet.removeAttribute("inert");
+  elements.playbackSheet.setAttribute("aria-hidden", "false");
+  elements.playbackDock?.setAttribute("aria-expanded", "true");
+  lockPlaybackSheetDocumentScroll();
+  syncRemoteShellInert();
+  renderAudioVariantBar(
+    state.data.current_item,
+    frontendPlaybackMode(state.data.playback_mode),
+  );
+  state.playbackMetadataLayoutSignature = "";
+  void elements.playbackSheetPanel?.offsetHeight;
+  elements.playbackSheet.classList.add("is-open");
+  schedulePlaybackSheetAdaptiveLayout({ force: true });
+  playbackRestartMenu?.refresh();
+  if (document.documentElement.dataset.remoteInputModality === "keyboard") {
+    elements.playbackSheetCollapse?.focus?.({ preventScroll: true });
+  }
+  return true;
+}
+
+function closePlaybackSheet({ immediate = false, restoreFocus = true, animate = true } = {}) {
+  if (!immediate && animate && state.playbackSheetOpen && playbackSheetGesture?.animateTo) {
+    playbackRestartMenu?.close({ immediate: true });
+    setAudioVariantPopoverOpen(false);
+    closePlaybackMetadataPopover();
+    if (playbackSheetGesture.animateTo(false, { restoreFocus })) return;
+  }
+  playbackSheetGesture?.cancel({ restore: false });
+  playbackRestartMenu?.close({ immediate: true });
+  elements.playbackSheetSeek?.classList.remove("is-engaged");
+  if (!elements.playbackSheet) {
+    return;
+  }
+  const wasVisible = !elements.playbackSheet.classList.contains("hidden");
+  if (!wasVisible && !state.playbackSheetOpen) {
+    return;
+  }
+
+  setAudioVariantPopoverOpen(false);
+  closePlaybackMetadataPopover();
+  state.playbackSheetOpen = false;
+  state.playbackMetadataLayoutSignature = "";
+  state.playbackMetadataLayoutPendingSignature = "";
+  state.playbackMetadataLayoutViewportChange = false;
+  state.playbackMetadataLayoutInteractionEnded = false;
+  state.playbackMetadataLayoutDeferred = false;
+  if (state.playbackMetadataLayoutFrame !== null) {
+    window.cancelAnimationFrame(state.playbackMetadataLayoutFrame);
+    state.playbackMetadataLayoutFrame = null;
+  }
+  state.playbackSheetTransitionSequence += 1;
+  const sequence = state.playbackSheetTransitionSequence;
+  if (state.playbackSheetCloseTimer) {
+    window.clearTimeout(state.playbackSheetCloseTimer);
+    state.playbackSheetCloseTimer = null;
+  }
+  elements.playbackSheet.classList.remove("is-open");
+  elements.playbackSheet.classList.add("is-closing");
+  elements.playbackSheet.setAttribute("aria-hidden", "true");
+  elements.playbackSheet.setAttribute("inert", "");
+  elements.playbackDock?.setAttribute("aria-expanded", "false");
+
+  const finishClose = () => {
+    if (sequence !== state.playbackSheetTransitionSequence || state.playbackSheetOpen) {
       return;
     }
-
-    clearDragListeners();
-    const rect = element.getBoundingClientRect();
-    initialLeft = rect.left;
-    initialTop = rect.top;
-
-    if (e.type === "touchstart") {
-      const touch = e.changedTouches?.[0] || e.touches[0];
-      activeTouchId = Number.isFinite(touch?.identifier) ? touch.identifier : null;
-      startX = touch.clientX;
-      startY = touch.clientY;
-    } else {
-      activeTouchId = null;
-      startX = e.clientX;
-      startY = e.clientY;
-    }
-
-    isDragging = true;
-    moved = false;
-
-    if (e.type === "touchstart") {
-      document.addEventListener("touchmove", dragMove, { passive: false });
-      document.addEventListener("touchend", dragEnd, { passive: false });
-      document.addEventListener("touchcancel", dragCancel);
-    } else {
-      document.addEventListener("mousemove", dragMove);
-      document.addEventListener("mouseup", dragEnd);
-    }
-  };
-
-  const dragMove = (e) => {
-    if (!isDragging) return;
-
-    let currentX = 0;
-    let currentY = 0;
-
-    if (e.type === "touchmove") {
-      const touch = activeTouchId === null
-        ? e.touches[0]
-        : [...e.touches].find((candidate) => candidate.identifier === activeTouchId);
-      if (!touch) {
-        dragCancel();
-        return;
-      }
-      if (e.cancelable) {
-        e.preventDefault();
-      }
-      currentX = touch.clientX;
-      currentY = touch.clientY;
-    } else {
-      currentX = e.clientX;
-      currentY = e.clientY;
-    }
-
-    const deltaX = currentX - startX;
-    const deltaY = currentY - startY;
-
-    if (!moved && Math.hypot(deltaX, deltaY) > 5) {
-      moved = true;
-      element.classList.add("dragging");
-    }
-
-    if (moved) {
-      if (e.cancelable) {
-        e.preventDefault();
-      }
-      let newLeft = initialLeft + deltaX;
-      let newTop = initialTop + deltaY;
-
-      const maxLeft = window.innerWidth - element.offsetWidth;
-      const maxTop = window.innerHeight - element.offsetHeight;
-
-      newLeft = Math.max(0, Math.min(newLeft, maxLeft));
-      newTop = Math.max(0, Math.min(newTop, maxTop));
-
-      element.style.left = `${newLeft}px`;
-      element.style.top = `${newTop}px`;
-      element.style.bottom = "auto";
-      element.style.right = "auto";
-
-      pctX = maxLeft > 0 ? newLeft / maxLeft : 1.0;
-      pctY = maxTop > 0 ? newTop / maxTop : 1.0;
-    }
-  };
-
-  const clearDragListeners = () => {
-    document.removeEventListener("touchmove", dragMove);
-    document.removeEventListener("touchend", dragEnd);
-    document.removeEventListener("touchcancel", dragCancel);
-    document.removeEventListener("mousemove", dragMove);
-    document.removeEventListener("mouseup", dragEnd);
-  };
-
-  const dragEnd = (e) => {
+    state.playbackSheetCloseTimer = null;
+    elements.playbackSheet.classList.add("hidden");
+    elements.playbackSheet.classList.remove("is-closing");
+    unlockPlaybackSheetDocumentScroll();
+    syncRemoteShellInert();
     if (
-      e.type === "touchend"
-      && activeTouchId !== null
-      && ![...(e.changedTouches || [])].some((touch) => touch.identifier === activeTouchId)
+      restoreFocus
+      && document.documentElement.dataset.remoteInputModality === "keyboard"
+      && state.data?.current_item
+      && elements.playbackDock
+      && !elements.playbackDock.classList.contains("hidden")
     ) {
-      return;
+      elements.playbackDock.focus({ preventScroll: true });
     }
-    isDragging = false;
-    activeTouchId = null;
-    element.classList.remove("dragging");
-    clearDragListeners();
-
-    if (e.type === "touchend" && e.cancelable) {
-      e.preventDefault();
-    }
-
-    if (moved) {
-      suppressNextClick();
-      return;
-    }
-
-    invokeClick();
-    suppressNextClick();
   };
 
-  function dragCancel() {
-    const wasDragging = isDragging;
-    isDragging = false;
-    activeTouchId = null;
-    moved = false;
-    element.classList.remove("dragging");
-    clearDragListeners();
-    if (wasDragging) {
-      suppressNextClick();
-    }
-  }
-
-  element.addEventListener("click", (event) => {
-    if (Date.now() < suppressClickUntil) {
-      event.preventDefault();
-      event.stopPropagation();
-      return;
-    }
-    invokeClick();
-  });
-  element.addEventListener("mousedown", dragStart);
-  element.addEventListener("touchstart", dragStart);
-  window.addEventListener("blur", dragCancel);
-  window.addEventListener("pagehide", dragCancel);
-  document.addEventListener("visibilitychange", () => {
-    if (document.hidden) {
-      dragCancel();
-    }
-  });
-
-  window.addEventListener("resize", () => {
-    if (pctX === null || pctY === null) {
-      return;
-    }
-    const maxLeft = window.innerWidth - element.offsetWidth;
-    const maxTop = window.innerHeight - element.offsetHeight;
-    const nextLeft = Math.max(0, Math.min(pctX * maxLeft, maxLeft));
-    const nextTop = Math.max(0, Math.min(pctY * maxTop, maxTop));
-    element.style.left = `${nextLeft}px`;
-    element.style.top = `${nextTop}px`;
-    element.style.bottom = "auto";
-    element.style.right = "auto";
-  });
-}
-
-function showFloatingControlOverlay() {
-  if (!elements.floatingControlOverlay) return;
-  const wasHidden = elements.floatingControlOverlay.classList.contains("hidden");
-  elements.floatingControlOverlay.classList.remove("closing");
-  elements.floatingControlOverlay.classList.remove("hidden");
-  document.body.style.overflow = "hidden";
-  if (wasHidden) {
-    floatingControlBackdropIgnoreUntil = Date.now() + 450;
-  }
-}
-
-function hideFloatingControlOverlay() {
-  if (!elements.floatingControlOverlay) return;
-  if (elements.floatingControlOverlay.classList.contains("hidden")) return;
-
-  elements.floatingControlOverlay.classList.add("closing");
-
-  setTimeout(() => {
-    if (elements.floatingControlOverlay.classList.contains("closing")) {
-      elements.floatingControlOverlay.classList.add("hidden");
-      elements.floatingControlOverlay.classList.remove("closing");
-      document.body.style.overflow = "";
-    }
-  }, 250);
-}
-
-function initFloatingControlConsole() {
-  if (!elements.floatingControlTrigger) {
+  if (immediate || prefersReducedMotion()) {
+    finishClose();
     return;
   }
-  makeElementDraggable(elements.floatingControlTrigger, () => {
-    showFloatingControlOverlay();
-  });
-  elements.floatingControlClose?.addEventListener("click", () => {
-    hideFloatingControlOverlay();
-  });
-  elements.floatingControlOverlay?.addEventListener("click", (event) => {
-    if (Date.now() < floatingControlBackdropIgnoreUntil) {
-      event.preventDefault();
-      event.stopPropagation();
-    }
-  }, true);
-  elements.floatingControlBackdrop?.addEventListener("click", (event) => {
-    if (Date.now() < floatingControlBackdropIgnoreUntil) {
-      event.preventDefault();
-      event.stopPropagation();
-      return;
-    }
-    hideFloatingControlOverlay();
-  });
+  state.playbackSheetCloseTimer = window.setTimeout(finishClose, 220);
 }
 
-function renderFloatingControlTrigger(currentItem, playbackMode) {
-  if (!elements.floatingControlTrigger) {
-    return;
+function retirePlaybackSheetForModal() {
+  if (playbackSheetIsOpen()) {
+    closePlaybackSheet({ immediate: true, restoreFocus: false });
+    return true;
   }
-  const isLocalMode = playbackMode === "local";
-  const hasCurrentItem = Boolean(currentItem);
-  const visible = isLocalMode && hasCurrentItem;
-  elements.floatingControlTrigger.classList.toggle("hidden", !visible);
+  return false;
+}
 
-  if (!visible && elements.floatingControlOverlay && !elements.floatingControlOverlay.classList.contains("hidden")) {
-    hideFloatingControlOverlay();
+function retireTransientPlaybackModalForModal() {
+  if (elements.historyExportDialog?.open) closeHistoryExportDialog({ restoreFocus: false });
+  const retiredPlaybackSheet = retirePlaybackSheetForModal();
+  if (state.ratingPromptElement) {
+    closeRatingPrompt({ submit: false, restoreFocus: false });
   }
+  return retiredPlaybackSheet;
+}
+
+function initPlaybackSheet() {
+  playbackSheetGesture = globalThis.BilikaraPlaybackSheetGestures?.create({
+    dock: elements.playbackDock, sheet: elements.playbackSheet, panel: elements.playbackSheetPanel,
+    header: elements.playbackSheetPanel?.querySelector(".playback-sheet-status-header"),
+    body: elements.playbackSheetBody, collapse: elements.playbackSheetCollapse,
+    isOpen: () => state.playbackSheetOpen,
+    canUse: () => Boolean(state.data?.current_item && !anotherRemoteModalIsOpen()),
+    getKey: () => remoteRestartContext().key,
+    open: () => openPlaybackSheet({ animate: false }),
+    close: options => closePlaybackSheet({ ...options, animate: false }),
+    layout: () => applyPlaybackSheetAdaptiveLayout(),
+    onFinish: () => {
+      schedulePlaybackSheetAdaptiveLayout({ force: true, interactionEnded: true });
+      playbackRestartMenu?.refresh();
+    },
+  });
+  elements.playbackDock?.addEventListener("click", openPlaybackSheet);
+  document.fonts?.ready?.then(() => {
+    schedulePlaybackSheetAdaptiveLayout({ force: true });
+    schedulePlaybackDockMarquee();
+  });
+  elements.playbackSheetCollapse?.addEventListener("click", () => {
+    closePlaybackSheet();
+  });
+  elements.playbackSheetBackdrop?.addEventListener("click", () => {
+    closePlaybackSheet();
+  });
 }
 
 async function startRemoteSession() {
-  setupRemoteFlipStages();
   hydrateLocalPreferences();
-  initFloatingControlConsole();
+  initPlaybackSheet();
   await loadTranslations();
+  renderRemoteConnectionStatus();
   initSearchDetailController();
-  renderLayoutMode();
+  syncRemoteRequestViewSelection();
   renderRemoteIdentity();
+  renderGatchaView();
   await fetchRemoteIdentity();
   try {
     await fetchState();
@@ -8143,5 +10759,77 @@ async function startRemoteSession() {
   }
   connectStateStream();
 }
+
+// One document lock for every visible Remote modal, including nested editors.
+// Keep it until the last closing animation finishes; the top menu is not modal.
+(function installRemoteModalScrollLock() {
+  const selector = '.song-detail-view, .rating-modal, .binding-sheet, .remote-identity-modal, .playback-sheet, dialog';
+  let locked = false;
+  let touch = null;
+  const visible = element => (element.tagName !== 'DIALOG' || element.open)
+    && !element.closest('[hidden], .hidden') && element.getClientRects().length;
+  function sync() {
+    const open = [...document.querySelectorAll(selector)].some(visible);
+    if (open === locked) return;
+    locked = open;
+    document.documentElement.classList.toggle('remote-modal-scroll-locked', locked);
+  }
+  // Keep the root in normal flow: fixing body changes scrollY/viewport geometry
+  // even when its negative top visually disguises the jump. Consume only input
+  // that would scroll the background, including chaining at a panel boundary.
+  function scrollable(target, dx, dy) {
+    const boundary = target?.closest?.(selector);
+    if (!boundary || !visible(boundary)) return null;
+    const horizontal = Math.abs(dx) > Math.abs(dy);
+    const delta = horizontal ? dx : dy;
+    for (let element = target; element; element = element.parentElement) {
+      const style = getComputedStyle(element);
+      const overflow = horizontal ? style.overflowX : style.overflowY;
+      const position = horizontal ? element.scrollLeft : element.scrollTop;
+      const extent = horizontal ? element.scrollWidth - element.clientWidth : element.scrollHeight - element.clientHeight;
+      if (/^(auto|scroll)$/.test(overflow) && extent > 1
+        && (delta < 0 ? position > 0 : position < extent - 1)) return element;
+      if (element === boundary) break;
+    }
+    return null;
+  }
+  document.addEventListener('wheel', event => {
+    if (locked && !event.ctrlKey && !scrollable(event.target, event.deltaX, event.deltaY)) event.preventDefault();
+  }, {passive:false});
+  document.addEventListener('touchstart', event => {
+    touch = event.touches.length === 1 ? {x:event.touches[0].clientX, y:event.touches[0].clientY} : null;
+  }, {passive:true});
+  document.addEventListener('touchmove', event => {
+    if (!touch || event.touches.length !== 1) return;
+    const next = {x:event.touches[0].clientX, y:event.touches[0].clientY};
+    const dx = touch.x - next.x, dy = touch.y - next.y;
+    // Native range dragging also uses touchmove's default action. Keep that
+    // horizontal gesture inside the panel while blocking background scrolling.
+    const rangeDrag = Math.abs(dx) > Math.abs(dy)
+      && event.target.matches?.('input[type="range"]:not(:disabled)')
+      && event.target.closest(selector);
+    if (locked && !rangeDrag && !scrollable(event.target, dx, dy)) event.preventDefault();
+    touch = next;
+  }, {passive:false});
+  document.addEventListener('keydown', event => {
+    if (!locked || event.defaultPrevented || event.ctrlKey || event.metaKey || event.altKey
+      || !['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','PageUp','PageDown','Home','End',' '].includes(event.key)
+      || event.target.closest?.('input,textarea,select,[contenteditable="true"]')
+      || (event.key === ' ' && event.target.closest?.('button,[role="button"]'))) return;
+    const delta = ['ArrowUp','ArrowLeft','PageUp','Home'].includes(event.key) || (event.key === ' ' && event.shiftKey) ? -1 : 1;
+    const horizontal = ['ArrowLeft','ArrowRight'].includes(event.key);
+    const element = scrollable(event.target, horizontal ? delta : 0, horizontal ? 0 : delta);
+    event.preventDefault();
+    if (element) {
+      const amount = ['Home','End'].includes(event.key) ? element.scrollHeight
+        : event.key.startsWith('Arrow') ? 40 : element.clientHeight * 0.9;
+      element.scrollBy(horizontal ? delta * amount : 0, horizontal ? 0 : delta * amount);
+    }
+  });
+  new MutationObserver(sync).observe(document.body, {
+    subtree: true, childList: true, attributes: true, attributeFilter: ['class', 'hidden', 'open'],
+  });
+  sync();
+})();
 
 startRemoteSession();

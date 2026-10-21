@@ -1,0 +1,906 @@
+//! Native transport for the shared Internet Remote protocol. Only Rust-validated
+//! Host effects reach I/O; never interpret an unvalidated peer envelope here.
+use super::*;
+use crate::app_state::{AppState, AppStateRequest, native_session::text};
+use crate::native_video::{NativeVideoRequest, fetch_native_video};
+
+fn public_state(app: &mut AppState) -> Result<Value, ApiError> {
+    let mut state = app
+        .native_execute(AppStateRequest::InternetRemoteState { schema_version: 1 })?["remote_state"]
+        .clone();
+    let snapshot = app.native_snapshot(false)?;
+    state["song_ratings"] = snapshot["song_ratings"].clone();
+    // Rating navigation needs only the current/previous plays. Explicitly
+    // project public fields; catalog projection wraps arrays and omits eligibility.
+    state["session_played"] = json!(
+        snapshot["session_played"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .rev()
+            .take(2)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .map(|entry| {
+                let mut item = json!({});
+                for key in [
+                    "item_id",
+                    "bvid",
+                    "title",
+                    "display_title",
+                    "part_title",
+                    "cover_url",
+                    "owner_mid",
+                    "owner_name",
+                    "threshold_reached",
+                ] {
+                    item[key] = entry[key].clone();
+                }
+                item
+            })
+            .collect::<Vec<_>>()
+    );
+    state["state_revision"] = snapshot["state_revision"].clone();
+    state["state_epoch"] = snapshot["state_epoch"].clone();
+    let status = &snapshot["player_status"];
+    state["player_status"] = if status.is_object() {
+        json!({"playing":status["is_paused"] == false,
+            "position_seconds":status["current_time"], "duration_seconds":status["duration"]})
+    } else {
+        Value::Null
+    };
+    state["gatcha"] = public_source_status(&snapshot["gatcha"]);
+    state["capabilities"]["source_queue"] = json!(true);
+    state["capabilities"]["source_queue_titles"] = json!(true);
+    state["bilibili_logged_in"] = json!(
+        snapshot["bbdown"]["login"]["logged_in"] == true || snapshot["bbdown"]["logged_in"] == true
+    );
+    Ok(state)
+}
+
+pub(super) fn route(
+    context: &Arc<HostContext>,
+    identity: &Identity,
+    path: &str,
+    body: &Value,
+) -> Result<Value, ApiError> {
+    with_app(|app| app.native_authorize(identity, true))?;
+    match path {
+        "/api/internet-remote/qr" => {
+            let value = text(body, "url")?;
+            if value.chars().count() > 2048
+                || !value.starts_with("https://rtc.kevinx96.icu/remote.html#")
+                || value.chars().any(char::is_control)
+            {
+                return Err(ApiError::invalid("无效的公网 Remote 链接"));
+            }
+            Ok(json!({"image":access_qr_image(&value)?}))
+        }
+        "/api/internet-remote/state" => with_app(public_state),
+        "/api/internet-remote/peer/open" | "/api/internet-remote/peer/close" => {
+            let mut command = body.clone();
+            command["command"] = json!(if path.ends_with("/open") {
+                "open_internet_remote_peer"
+            } else {
+                "close_internet_remote_peer"
+            });
+            command["schema_version"] = json!(1);
+            if path.ends_with("/open") && command.get("profile").is_none() {
+                command["profile"] = json!("controller");
+            }
+            let request = serde_json::from_value(command)
+                .map_err(|_| ApiError::invalid("Remote 连接参数无效"))?;
+            with_app(|app| app.native_execute(request))
+        }
+        "/api/internet-remote/dispatch" => {
+            let peer = text(body, "peer_id")?;
+            let lane = serde_json::from_value(body["lane"].clone())
+                .map_err(|_| ApiError::invalid("Remote 通道无效"))?;
+            let message = body["message"]
+                .as_str()
+                .filter(|value| !value.is_empty() && value.len() <= 65536)
+                .ok_or_else(|| ApiError::invalid("Remote 消息长度无效"))?
+                .to_owned();
+            let (reply, rating) = with_app(|app| {
+                app.native_authorize(identity, true)?;
+                if context.stop.load(Ordering::Acquire) {
+                    return Err(ApiError::new(503, "stopped", "Host 已停止"));
+                }
+                let reset_av_delay = app.native().cache_policy.reset_offset_on_next;
+                let mut reply =
+                    app.native_execute(AppStateRequest::DispatchInternetRemoteMessage {
+                        schema_version: 1,
+                        peer_id: peer.clone(),
+                        lane,
+                        message,
+                        reset_av_delay,
+                        now: now(),
+                    })?;
+                // Reserve while typed peer identity, session and play validation
+                // still hold the same lock. Never re-admit a peer as a Host name.
+                let rating = if reply["_host_effect"]["kind"] == "submit_rating" {
+                    let effect = reply
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("_host_effect")
+                        .unwrap();
+                    Some(ratings::prepare(
+                        app,
+                        identity,
+                        &json!({
+                            "session_user_name":effect["session_name"], "play_id":effect["play_id"],
+                            "bvid":effect["bvid"], "score":effect["score"]
+                        }),
+                    )?)
+                } else {
+                    None
+                };
+                Ok((reply, rating))
+            })?;
+            if let Some(submission) = rating {
+                let mut reply = reply;
+                reply["data"] = ratings::submit_reserved(submission)?;
+                return Ok(reply);
+            }
+            let mut reply = effect(context, identity, &peer, reply)?;
+            // Refresh under the same state lock as observations. Never publish a
+            // stale core snapshot paired with a newer player's position.
+            with_app(|app| {
+                if is_state(&reply["data"]) {
+                    reply["data"] = public_state(app)?;
+                } else if is_state(&reply["data"]["state"]) {
+                    reply["data"]["state"] = public_state(app)?;
+                }
+                Ok(reply)
+            })
+        }
+        _ => Err(ApiError::new(404, "not_found", "未知 Remote 操作")),
+    }
+}
+
+fn is_state(value: &Value) -> bool {
+    value["playlist"].is_array()
+        && value["player_settings"].is_object()
+        && value.get("revision").is_some()
+}
+
+fn query(effect: &Value, fields: &[(&str, &str)]) -> String {
+    let mut params = url::form_urlencoded::Serializer::new(String::new());
+    for (key, source) in fields {
+        let value = &effect[*source];
+        if let Some(values) = value.as_array() {
+            for value in values {
+                if let Some(value) = value.as_str() {
+                    params.append_pair(key, value);
+                }
+            }
+        } else if let Some(value) = value.as_str() {
+            params.append_pair(key, value);
+        } else if value.is_number() {
+            params.append_pair(key, &value.to_string());
+        }
+    }
+    params.finish()
+}
+
+fn effect(
+    context: &Arc<HostContext>,
+    identity: &Identity,
+    peer: &str,
+    mut reply: Value,
+) -> Result<Value, ApiError> {
+    let Some(effect) = reply
+        .as_object_mut()
+        .and_then(|reply| reply.remove("_host_effect"))
+    else {
+        return Ok(reply);
+    };
+    let kind = effect["kind"].as_str().unwrap_or_default();
+    let library_identity = Identity {
+        client: format!("native-internet:{peer}"),
+        ..identity.clone()
+    };
+    let page_fields = [
+        ("q", "query"),
+        ("limit", "limit"),
+        ("offset", "offset"),
+        ("uid", "uid"),
+        ("folder_id", "folder_id"),
+        ("requester_name", "requester_name"),
+    ];
+    let result = match kind {
+        "sync_cache" => return Ok(reply), // Native pump observes committed AppState.
+        "player_control" => {
+            with_app(|app| app.native_control(identity, &effect, now()))?;
+            return Ok(reply);
+        }
+        "retry_cache" => {
+            api::dispatch(
+                context,
+                identity,
+                true,
+                &Method::POST,
+                "/api/cache/retry",
+                "",
+                json!({
+                    "item_id":effect["item_id"], "expected_item_incarnation_id":effect["item_incarnation_id"], "force":effect["force"]
+                }),
+            )?;
+            return Ok(reply);
+        }
+        "catalog_search" => catalog::read(
+            context,
+            "/api/catalog/search",
+            &query(&effect, &page_fields),
+        )?,
+        "catalog_browse" => catalog::read(
+            context,
+            "/api/d1/browse",
+            &query(
+                &effect,
+                &[
+                    ("kind", "browse_kind"),
+                    ("letter", "letter"),
+                    ("q", "query"),
+                    ("tag", "tag"),
+                    ("locale", "locale"),
+                    ("offset", "offset"),
+                    ("limit", "limit"),
+                ],
+            ),
+        )?,
+        "catalog_category_browse" => catalog::read(
+            context,
+            "/api/d1/category-browse",
+            &query(
+                &effect,
+                &[
+                    ("q", "query"),
+                    ("tag", "tags"),
+                    ("tag45", "tag45s"),
+                    ("offset", "offset"),
+                    ("limit", "limit"),
+                ],
+            ),
+        )?,
+        "catalog_song_detail" => {
+            let id = text(&effect, "catalog_item_id")?;
+            let (bvid, page) = catalog_parts(&id)?;
+            let data = catalog::read(
+                context,
+                "/api/catalog/search",
+                &format!("q={bvid}&limit=20"),
+            )?;
+            let mut item = data["items"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|item| item["bvid"] == bvid)
+                .cloned()
+                .unwrap_or_else(
+                    || json!({"bvid":bvid,"title":bvid,"owner_name":"","cover_url":""}),
+                );
+            item["page"] = json!(page);
+            item
+        }
+        "gatcha_search"
+        | "gatcha_browse"
+        | "gatcha_favlist_browse"
+        | "gatcha_pool_config_get"
+        | "gatcha_candidate" => {
+            let path = match kind {
+                "gatcha_search" => "/api/gatcha/search",
+                "gatcha_browse" => "/api/gatcha/browse",
+                "gatcha_favlist_browse" => "/api/gatcha/favlist/browse",
+                "gatcha_pool_config_get" => "/api/gatcha/pool-config",
+                _ => "/api/gatcha/candidate",
+            };
+            let value = library::read(
+                context,
+                &library_identity,
+                path,
+                &query(&effect, &page_fields),
+            )?;
+            if kind == "gatcha_candidate" && !value.is_object() {
+                return Err(ApiError::new(
+                    404,
+                    "gatcha_empty_pool",
+                    "没找到符合条件的歌曲，再试一次吧",
+                ));
+            }
+            value
+        }
+        "gatcha_pool_config_set"
+        | "gatcha_uid_preview"
+        | "gatcha_uid_add"
+        | "gatcha_source_remove"
+        | "gatcha_refresh"
+        | "gatcha_favlist_preview"
+        | "gatcha_favlist_refresh" => {
+            let path = match kind {
+                "gatcha_pool_config_set" => "/api/gatcha/pool-config",
+                "gatcha_uid_preview" => "/api/gatcha/uids/preview",
+                "gatcha_uid_add" => "/api/gatcha/uids/add",
+                "gatcha_source_remove" => "/api/gatcha/source/remove",
+                "gatcha_refresh" => "/api/gatcha/refresh",
+                "gatcha_favlist_preview" => "/api/gatcha/favlist/preview",
+                _ => "/api/gatcha/favlist",
+            };
+            let mut body = effect.clone();
+            body.as_object_mut().unwrap().remove("kind");
+            // Native source additions share the same bounded queue on both
+            // transports. The existing public protocol carries only UID/folders.
+            if matches!(kind, "gatcha_uid_add" | "gatcha_favlist_refresh") {
+                body["queue"] = json!(true);
+            }
+            library::write(context, &library_identity, path, &body)?
+        }
+        "fetch_playlist_item" => {
+            let request_id = text(&reply, "request_id")?;
+            let result = add(context, peer, &request_id, &effect);
+            if result.is_err() {
+                let _ = with_app(|app| {
+                    app.native_execute(AppStateRequest::CancelInternetRemotePlaylistAdd {
+                        schema_version: 1,
+                        peer_id: peer.into(),
+                        request_id,
+                    })
+                });
+            }
+            // Completion can only return sync_cache; still strip it at the boundary.
+            return result.map(|mut value| {
+                value.as_object_mut().unwrap().remove("_host_effect");
+                value
+            });
+        }
+        _ => {
+            return Err(ApiError::new(
+                503,
+                "unsupported_effect",
+                "Remote 操作尚未接入",
+            ));
+        }
+    };
+    reply["data"] = public_data(&result);
+    Ok(reply)
+}
+
+fn catalog_parts(id: &str) -> Result<(&str, u32), ApiError> {
+    let (bvid, page) = id.split_once("_p").map_or((id, "1"), |value| value);
+    let page = page
+        .parse::<u32>()
+        .ok()
+        .filter(|page| (1..=10000).contains(page));
+    if bvid.len() != 12
+        || !bvid.starts_with("BV")
+        || !bvid.bytes().all(|b| b.is_ascii_alphanumeric())
+        || page.is_none()
+    {
+        return Err(ApiError::invalid("曲库歌曲标识无效"));
+    }
+    Ok((bvid, page.unwrap()))
+}
+
+fn add(
+    context: &HostContext,
+    peer: &str,
+    request_id: &str,
+    effect: &Value,
+) -> Result<Value, ApiError> {
+    let id = effect["catalog_item_id"].as_str().unwrap_or_default();
+    let url = if let Some(id) = id.strip_prefix("youtube:") {
+        if !bilikara_rust::media_source::valid_youtube_id(id) {
+            return Err(ApiError::invalid("Invalid YouTube video ID"));
+        }
+        format!("https://www.youtube.com/watch?v={id}")
+    } else {
+        let (bvid, page) = catalog_parts(id)?;
+        format!("https://www.bilibili.com/video/{bvid}?p={page}")
+    };
+    let cookie = with_app(|app| {
+        if !context.desktop {
+            api::queue_space(app.native_core_snapshot()?.playlist.len())?;
+        }
+        Ok(app.native().cookie.clone())
+    })?;
+    let request: NativeVideoRequest = serde_json::from_value(json!({"url":url,"selected_video_page":effect.get("selected_video_page"),"selected_audio_pages":effect.get("selected_audio_pages")})).map_err(|_| ApiError::invalid("分 P 参数无效"))?;
+    let item = fetch_native_video(&request, &cookie).map_err(|error| {
+        if let Some(bvid) = &error.missing_bvid {
+            catalog::delete_invalid(bvid);
+        }
+        api::video_error(error)
+    })?;
+    let (result, accepted_item) = with_app(|app| {
+        if context.stop.load(Ordering::Acquire) {
+            return Err(ApiError::new(503, "stopped", "Host 已停止"));
+        }
+        if !context.desktop {
+            api::queue_space(app.native_core_snapshot()?.playlist.len())?;
+        }
+        let reset_av_delay = app.native().cache_policy.reset_offset_on_next;
+        let result = app.native_execute(AppStateRequest::CompleteInternetRemotePlaylistAdd {
+            schema_version: 1,
+            peer_id: peer.into(),
+            request_id: request_id.into(),
+            item: item.clone(),
+            reset_av_delay,
+            now: now(),
+        })?;
+        let accepted_item = if result["accepted"] == true {
+            Some(catalog_append::accepted_item(app, &item.id)?)
+        } else {
+            None
+        };
+        Ok((result, accepted_item))
+    })?;
+    if let Some(item) = accepted_item {
+        catalog_append::enqueue(&item);
+    }
+    Ok(result)
+}
+
+fn bounded(value: &Value, limit: usize) -> String {
+    let text = match value {
+        Value::String(v) => v.clone(),
+        Value::Number(v) => v.to_string(),
+        _ => String::new(),
+    };
+    text.chars()
+        .filter(|c| !c.is_control())
+        .take(limit)
+        .collect()
+}
+
+fn asset_url(value: &Value) -> String {
+    let raw = bounded(value, 2048);
+    let raw = if raw.starts_with("//") {
+        format!("https:{raw}")
+    } else {
+        raw.replacen("http://", "https://", 1)
+    };
+    let Ok(mut url) = url::Url::parse(&raw) else {
+        return String::new();
+    };
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port_or_known_default() != Some(443)
+        || !url
+            .host_str()
+            .is_some_and(|host| host == "hdslb.com" || host.ends_with(".hdslb.com"))
+    {
+        return String::new();
+    }
+    url.set_fragment(None);
+    url.to_string()
+}
+
+/// Allowlisted public metadata only, shared by all library/catalog effects.
+/// No arbitrary nesting, caller URLs, filesystem paths, cookies or task results.
+fn public_data(value: &Value) -> Value {
+    project_public_data(value, 0)
+}
+
+// Remote needs source progress and commit counters to update its library during
+// a refresh. Never forward the rest of the internal task result (paths/errors).
+fn public_source_status(value: &Value) -> Value {
+    let mut result = public_data(value);
+    if let Some(
+        operation @ ("remove_source" | "remove_sources" | "source_order" | "source_cleanup"),
+    ) = value["last_result"]["operation"].as_str()
+    {
+        result["last_result"]["operation"] = json!(operation);
+        if let Some(version) = value["last_result"]["source_order_version"].as_str()
+            && version.len() == 64
+            && version.bytes().all(|v| v.is_ascii_hexdigit())
+        {
+            // Opaque display/membership identity, no source list or private path.
+            result["last_result"]["source_order_version"] = json!(version);
+        }
+    }
+    if value["source_queue"].is_object() {
+        result["source_queue"] = value["source_queue"].clone();
+    }
+    for key in ["errors", "favlist_errors"] {
+        if let Some(errors) = value["last_result"][key].as_array() {
+            result["last_result"][key] = json!(errors.iter().take(1000).map(|v| json!({"uid":bounded(&v["uid"],80),"folder_id":bounded(&v["folder_id"],80)})).collect::<Vec<_>>());
+        }
+    }
+    if let Some(progress) = value
+        .pointer("/last_result/rebuild")
+        .filter(|v| v.is_object())
+    {
+        let mut public = json!({});
+        for key in ["phase", "current_uid", "current_folder_id"] {
+            if !progress[key].is_null() {
+                public[key] = json!(bounded(&progress[key], 80));
+            }
+        }
+        for key in ["pending_uids", "failed_uids"] {
+            if let Some(ids) = progress[key].as_array() {
+                public[key] = json!(
+                    ids.iter()
+                        .take(1000)
+                        .map(|id| bounded(id, 80))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+        for key in ["generation", "uids", "favorites"] {
+            if let Some(count) = progress["sources"][key].as_u64() {
+                public["sources"][key] = json!(count);
+            }
+        }
+        result["last_result"]["rebuild"] = public;
+    }
+    result
+}
+
+fn project_public_data(value: &Value, depth: u8) -> Value {
+    if depth > 3 {
+        return json!({});
+    }
+    let Some(object) = value.as_object() else {
+        return if let Some(items) = value.as_array() {
+            let mut result = json!({"items":items.iter().take(100).map(|v| project_public_data(v, depth + 1)).collect::<Vec<_>>()});
+            if items.len() > 100 {
+                result["public_list_limits"] = json!({"items":{"total":items.len(),"shown":100}});
+            }
+            result
+        } else {
+            json!({})
+        };
+    };
+    let mut result = json!({});
+    for key in [
+        "kind",
+        "letter",
+        "locale",
+        "query",
+        "tag",
+        "selected_uid",
+        "selected_folder_id",
+        "uid",
+        "fid",
+        "folder_id",
+        "id",
+        "title",
+        "name",
+        "owner_name",
+        "author",
+        "cache_mode",
+        "cache_mode_label",
+        "mode",
+        "message",
+        "last_status",
+        "last_message",
+        "last_error",
+        "bvid",
+        "mid",
+        "fav_uid",
+        "source",
+        "local_source",
+        "played_count",
+        "preserved_1",
+        "rank",
+        "tag_1",
+        "tag_2",
+        "tag_3",
+        "tag_4",
+        "tag_5",
+        "yomi",
+    ] {
+        if let Some(value) = object.get(key) {
+            result[key] = json!(bounded(value, if key == "title" { 512 } else { 400 }));
+        }
+    }
+    for key in [
+        "count",
+        "page",
+        "offset",
+        "limit",
+        "next_offset",
+        "matched_count",
+        "updated_at",
+        "media_count",
+        "uid_weight",
+        "favlist_weight",
+        "cached_count",
+        "added_count",
+        "total_count",
+        "folder_count",
+        "public_folder_count",
+        "matched_folder_count",
+        "item_count",
+        "last_updated_at",
+    ] {
+        if object
+            .get(key)
+            .and_then(Value::as_f64)
+            .filter(|n| n.is_finite() && *n >= 0.0)
+            .is_some()
+        {
+            result[key] = object[key].clone();
+        }
+    }
+    for key in [
+        "busy",
+        "background_busy",
+        "blocking",
+        "has_more",
+        "selected",
+        "is_local",
+        "already_followed",
+        "added",
+        "started",
+        "queued",
+        "duplicate",
+    ] {
+        if let Some(value) = object.get(key).and_then(Value::as_bool) {
+            result[key] = json!(value);
+        }
+    }
+    for key in ["cover_url", "avatar_url"] {
+        if let Some(value) = object.get(key) {
+            result[key] = json!(asset_url(value));
+        }
+    }
+    if let Some(edits) = object
+        .get("source_edit_revisions")
+        .and_then(Value::as_object)
+    {
+        result["source_edit_revisions"] = json!({
+            "uids":edits.get("uids").and_then(Value::as_u64).unwrap_or(0),
+            "favorites":edits.get("favorites").and_then(Value::as_u64).unwrap_or(0),
+        });
+    }
+    for key in [
+        "items",
+        "owners",
+        "folders",
+        "uid_options",
+        "favlist_folder_options",
+        "tags",
+        "tag45s",
+        "excluded_uids",
+        "excluded_favlist_folders",
+        "selected_folder_ids",
+        "uids",
+    ] {
+        if let Some(values) = object.get(key).and_then(Value::as_array) {
+            let limit = if key == "items" {
+                100
+            } else if key == "tags" {
+                500
+            } else {
+                256
+            };
+            result[key] = json!(
+                values
+                    .iter()
+                    .take(limit)
+                    .map(|value| if value.is_object() {
+                        project_public_data(value, depth + 1)
+                    } else {
+                        json!(bounded(value, 400))
+                    })
+                    .collect::<Vec<_>>()
+            );
+            if values.len() > limit {
+                if !result["public_list_limits"].is_object() {
+                    result["public_list_limits"] = json!({});
+                }
+                result["public_list_limits"][key] = json!({"total":values.len(),"shown":limit});
+                if key == "items"
+                    && value["has_more"].is_boolean()
+                    && let Some(offset) = value["offset"].as_u64()
+                    && offset
+                        .checked_add(values.len() as u64)
+                        .is_some_and(|next| Some(next) == value["next_offset"].as_u64())
+                {
+                    result["next_offset"] = json!(offset + limit as u64);
+                    result["has_more"] = json!(true);
+                    result["public_list_limits"][key]["paged"] = json!(true);
+                }
+            }
+        }
+    }
+    if let Some(cache) = object.get("cache").filter(|v| v.is_object()) {
+        result["cache"] = project_public_data(cache, depth + 1);
+    }
+    if let Some(bvid) = object.get("bvid").and_then(Value::as_str) {
+        if result["owner_name"].as_str().unwrap_or_default().is_empty() {
+            result["owner_name"] = json!(bounded(&value["author"], 256));
+        }
+        let page = object
+            .get("page")
+            .and_then(Value::as_u64)
+            .unwrap_or(1)
+            .clamp(1, 10000);
+        result["catalog_item_id"] = json!(if page == 1 {
+            bvid.into()
+        } else {
+            format!("{bvid}_p{page}")
+        });
+        result["page"] = json!(page);
+        result["cached"] = json!(value["is_local"] == true);
+        if result["cover_url"].as_str().unwrap_or_default().is_empty() {
+            for key in ["cover", "pic", "pic_url", "thumbnail"] {
+                let url = asset_url(&value[key]);
+                if !url.is_empty() {
+                    result["cover_url"] = json!(url);
+                    break;
+                }
+            }
+        }
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn public_source_refresh_keeps_progress_and_commit_counters_only() {
+        let projected = public_source_status(&json!({
+            "busy": true, "background_busy": true, "last_status": "running",
+            "source_edit_revisions": {"uids":3,"favorites":2,"cookie":"secret"},
+            "last_result": {"path": "private", "rebuild": {
+                "phase": "uid", "current_uid": "42", "cookie": "secret",
+                "sources": {"generation": 9, "uids": 2, "favorites": 1, "path": "private"}
+            }}
+        }));
+        assert_eq!(projected["background_busy"], true);
+        assert_eq!(
+            projected["source_edit_revisions"],
+            json!({"uids":3,"favorites":2})
+        );
+        assert_eq!(
+            projected["last_result"]["rebuild"],
+            json!({
+                "phase": "uid", "current_uid": "42",
+                "sources": {"generation": 9, "uids": 2, "favorites": 1}
+            })
+        );
+        assert!(!projected.to_string().contains("secret"));
+        assert!(!projected.to_string().contains("private"));
+    }
+    #[test]
+    fn public_source_removal_keeps_completion_marker_without_private_metadata() {
+        let projected = public_source_status(&json!({"last_status":"success", "last_result":{
+            "operation":"remove_source","source":"uid","id":"42","path":"private","cookie":"secret"
+        }}));
+        assert_eq!(projected["last_result"]["operation"], "remove_source");
+        assert!(!projected.to_string().contains("private"));
+        assert!(!projected.to_string().contains("secret"));
+    }
+    #[test]
+    fn rating_state_keeps_previous_eligibility_without_exporting_private_records() {
+        let mut app = AppState::default();
+        let played = (0..3)
+            .map(|n| {
+                json!({"key":format!("p{n}"),"item_id":format!("p{n}"),
+            "bvid":"BV1z84y1p7oS","title":"song","display_title":"song","part_title":"P1",
+            "original_url":"https://private.test/token","resolved_url":"https://private.test/token",
+            "aid":1,"cid":2,"page":1,"played_at":n+1,"threshold_reached":n==1})
+            })
+            .collect::<Vec<_>>();
+        let seed = serde_json::from_value(json!({"session_users":["Alice"],"session_started_at":1,
+            "updated_at":4,"session_played_file":"private.json","session_played":played}))
+        .unwrap();
+        app.native_execute(AppStateRequest::Initialize {
+            schema_version: 1,
+            state: Box::new(seed),
+        })
+        .unwrap();
+        app.native().state_epoch = "fixture-host-epoch".into();
+        let state = public_state(&mut app).unwrap();
+        assert_eq!(state["state_epoch"], "fixture-host-epoch");
+        let played = state["session_played"].as_array().unwrap();
+        assert_eq!(played.len(), 2);
+        assert_eq!(played[0]["item_id"], "p1");
+        assert_eq!(played[0]["threshold_reached"], true);
+        assert_eq!(played[1]["threshold_reached"], false);
+        assert_eq!(state["song_ratings"], json!([]));
+        assert!(!state["session_played"].to_string().contains("private"));
+    }
+
+    #[test]
+    fn public_list_caps_report_independent_totals_without_exposing_private_fields() {
+        for (key, limit) in [
+            ("items", 100),
+            ("owners", 256),
+            ("folders", 256),
+            ("uid_options", 256),
+            ("favlist_folder_options", 256),
+            ("tags", 500),
+            ("tag45s", 256),
+            ("excluded_uids", 256),
+            ("excluded_favlist_folders", 256),
+            ("selected_folder_ids", 256),
+            ("uids", 256),
+        ] {
+            for count in [limit - 1, limit, limit + 3] {
+                let rows = (0..count)
+                    .map(|i| json!({"id":i.to_string(),"cookie":"private-secret"}))
+                    .collect::<Vec<_>>();
+                let input = json!({key:rows,"cookie":"private-secret","public_list_limits":{"injected":true}});
+                let projected = public_data(&input);
+                assert_eq!(projected[key].as_array().unwrap().len(), count.min(limit));
+                assert_eq!(input[key].as_array().unwrap().len(), count);
+                assert!(!projected.to_string().contains("private-secret"));
+                assert!(projected["public_list_limits"]["injected"].is_null());
+                if count > limit {
+                    assert_eq!(
+                        projected["public_list_limits"][key],
+                        json!({"total":count,"shown":limit})
+                    );
+                } else {
+                    assert!(projected.get("public_list_limits").is_none());
+                }
+            }
+        }
+        let rows = vec![json!({"id":"one"}); 103];
+        let projected = public_data(&json!(rows));
+        assert_eq!(projected["items"].as_array().unwrap().len(), 100);
+        assert_eq!(
+            projected["public_list_limits"]["items"],
+            json!({"total":103,"shown":100})
+        );
+        let nested = public_data(&json!({"cache":{"uids":vec!["42";259]}}));
+        assert_eq!(
+            nested["cache"]["public_list_limits"]["uids"],
+            json!({"total":259,"shown":256})
+        );
+        let input = json!({"items":vec![json!({"id":"entry"});103],
+            "offset":41,"next_offset":144,"has_more":false,"matched_count":144});
+        let page = public_data(&input);
+        assert_eq!(page["next_offset"], 141);
+        assert_eq!(page["has_more"], true);
+        assert_eq!(page["matched_count"], 144);
+        assert_eq!(
+            page["public_list_limits"]["items"],
+            json!({"total":103,"shown":100,"paged":true})
+        );
+        assert_eq!(input["items"].as_array().unwrap().len(), 103);
+    }
+
+    #[test]
+    fn public_effect_results_keep_covers_and_pagination_but_never_secrets_or_paths() {
+        let value = public_data(
+            &json!({"items":[{"bvid":"BV1zm41117sU","title":"Song","cover":"//i1.hdslb.com/x.jpg","page":2,"is_local":true,"path":"private","cookie":"secret","url":"https://evil.test"}], "has_more":true,"next_offset":200,"offset":100,"cookie":"secret","entries":[{"secret":"secret"}]}),
+        );
+        assert_eq!(value["items"][0]["catalog_item_id"], "BV1zm41117sU_p2");
+        assert_eq!(value["items"][0]["cover_url"], "https://i1.hdslb.com/x.jpg");
+        assert_eq!(value["has_more"], true);
+        assert_eq!(value["next_offset"], 200);
+        assert!(!value.to_string().contains("secret"));
+        assert!(!value.to_string().contains("private"));
+        assert!(!value.to_string().contains("evil"));
+        for raw in [
+            "https://hdslb.com.evil.test/x",
+            "https://127.0.0.1/x",
+            "https://user@i1.hdslb.com/x",
+            "https://i1.hdslb.com:123/x",
+        ] {
+            assert!(asset_url(&json!(raw)).is_empty());
+        }
+    }
+    #[test]
+    fn catalog_ids_cannot_be_paths_or_urls() {
+        assert_eq!(
+            catalog_parts("BV1zm41117sU_p2").unwrap(),
+            ("BV1zm41117sU", 2)
+        );
+        for raw in [
+            "https://evil.test",
+            "../../private",
+            "BV1zm41117sU_p0",
+            "BV1zm41117sU_p2?x",
+            "BV1zm41117sU_p10001",
+        ] {
+            assert!(catalog_parts(raw).is_err());
+        }
+    }
+}

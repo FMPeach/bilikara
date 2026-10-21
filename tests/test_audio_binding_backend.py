@@ -3,7 +3,7 @@ import os
 import unittest
 from unittest.mock import patch
 
-from bilikara import bilibili, rust_backend
+from bilikara import rust_backend
 from bilikara.bilibili import AudioBindingDecision, VideoPage, decide_audio_binding
 
 
@@ -32,17 +32,6 @@ def request_for(pages: list[VideoPage], tolerance_seconds: int = 3) -> dict[str,
     }
 
 
-def decision_from_response(response: dict[str, object] | None) -> AudioBindingDecision | None:
-    assert response is not None
-    if response["status"] == "no_match":
-        return None
-    return AudioBindingDecision(
-        mode=response["mode"],
-        selected_indices=tuple(response["selected_indices"]),
-        automatic_video_index=response["automatic_video_index"],
-    )
-
-
 class AudioBindingBackendTest(unittest.TestCase):
     def setUp(self):
         strict_patcher = patch.dict(
@@ -50,7 +39,6 @@ class AudioBindingBackendTest(unittest.TestCase):
         )
         strict_patcher.start()
         self.addCleanup(strict_patcher.stop)
-        self.original_py_decide = bilibili._py_decide_audio_binding
 
     def _mock_rust_response(self, response_json: str, capabilities=None):
         if capabilities is None:
@@ -97,9 +85,9 @@ class AudioBindingBackendTest(unittest.TestCase):
     ) -> None:
         self._mock_rust_response(json.dumps(response, ensure_ascii=False))
         with patch.object(
-            bilibili,
-            "_py_decide_audio_binding",
-            wraps=self.original_py_decide,
+            rust_backend,
+            "python_fallback",
+            side_effect=AssertionError("retired audio policy executed"),
         ) as fallback:
             self.assertEqual(decide_audio_binding(pages), expected)
             fallback.assert_not_called()
@@ -156,21 +144,19 @@ class AudioBindingBackendTest(unittest.TestCase):
             None,
         )
 
-    def test_missing_symbol_disables_only_audio_binding(self):
+    def test_missing_symbol_fails_audio_binding_without_affecting_other_capabilities(self):
         pages = [page(1, "plain")]
         with patch.dict(
             rust_backend._CAPABILITIES,
             {"decide_audio_binding": False, "select_media_pages": True},
         ), patch.object(
-            bilibili,
-            "_py_decide_audio_binding",
-            wraps=self.original_py_decide,
-        ) as fallback:
-            self.assertEqual(
-                decide_audio_binding(pages), AudioBindingDecision("single", (0,), None)
-            )
-            fallback.assert_called_once_with(pages, 3)
-            self.assertTrue(rust_backend._CAPABILITIES["select_media_pages"])
+            rust_backend,
+            "python_fallback",
+            side_effect=AssertionError("retired audio policy executed"),
+        ) as fallback, self.assertRaises(rust_backend.PlaybackCapabilityError):
+            decide_audio_binding(pages)
+        fallback.assert_not_called()
+        self.assertTrue(rust_backend._CAPABILITIES["select_media_pages"])
 
     def test_another_capability_remains_enabled_after_native_audio_decision(self):
         self._mock_rust_response(
@@ -302,33 +288,29 @@ class AudioBindingBackendTest(unittest.TestCase):
                     rust_backend._valid_audio_binding_response(response, indices)
                 )
 
-    def test_malformed_json_response_uses_python_fallback(self):
+    def test_malformed_json_response_fails_closed(self):
         self._mock_rust_response("not json")
         pages = [page(1, "plain")]
         with patch.object(
-            bilibili,
-            "_py_decide_audio_binding",
-            wraps=self.original_py_decide,
-        ) as fallback:
-            self.assertEqual(
-                decide_audio_binding(pages), AudioBindingDecision("single", (0,), None)
-            )
-            fallback.assert_called_once()
+            rust_backend,
+            "python_fallback",
+            side_effect=AssertionError("retired audio policy executed"),
+        ) as fallback, self.assertRaises(rust_backend.PlaybackCapabilityError):
+            decide_audio_binding(pages)
+        fallback.assert_not_called()
 
-    def test_non_object_native_response_uses_python_fallback(self):
+    def test_non_object_native_response_fails_closed(self):
         self._mock_rust_response("[]")
         pages = [page(1, "plain")]
         with patch.object(
-            bilibili,
-            "_py_decide_audio_binding",
-            wraps=self.original_py_decide,
-        ) as fallback:
-            self.assertEqual(
-                decide_audio_binding(pages), AudioBindingDecision("single", (0,), None)
-            )
-            fallback.assert_called_once()
+            rust_backend,
+            "python_fallback",
+            side_effect=AssertionError("retired audio policy executed"),
+        ) as fallback, self.assertRaises(rust_backend.PlaybackCapabilityError):
+            decide_audio_binding(pages)
+        fallback.assert_not_called()
 
-    def test_impossible_native_cardinality_uses_python_fallback(self):
+    def test_impossible_native_cardinality_fails_closed(self):
         self._mock_rust_response(
             json.dumps(
                 {
@@ -342,16 +324,14 @@ class AudioBindingBackendTest(unittest.TestCase):
         )
         pages = [page(1, "plain")]
         with patch.object(
-            bilibili,
-            "_py_decide_audio_binding",
-            wraps=self.original_py_decide,
-        ) as fallback:
-            self.assertEqual(
-                decide_audio_binding(pages), AudioBindingDecision("single", (0,), None)
-            )
-            fallback.assert_called_once()
+            rust_backend,
+            "python_fallback",
+            side_effect=AssertionError("retired audio policy executed"),
+        ) as fallback, self.assertRaises(rust_backend.PlaybackCapabilityError):
+            decide_audio_binding(pages)
+        fallback.assert_not_called()
 
-    def test_native_exception_uses_python_fallback(self):
+    def test_native_exception_fails_closed(self):
         class DummyLibrary:
             pass
 
@@ -364,30 +344,26 @@ class AudioBindingBackendTest(unittest.TestCase):
             side_effect=RuntimeError("native failure"),
             create=True,
         ), patch.object(
-            bilibili,
-            "_py_decide_audio_binding",
-            wraps=self.original_py_decide,
-        ) as fallback:
+            rust_backend,
+            "python_fallback",
+            side_effect=AssertionError("retired audio policy executed"),
+        ) as fallback, self.assertRaises(rust_backend.PlaybackCapabilityError):
             pages = [page(1, "plain")]
-            self.assertEqual(
-                decide_audio_binding(pages), AudioBindingDecision("single", (0,), None)
-            )
-            fallback.assert_called_once()
+            decide_audio_binding(pages)
+        fallback.assert_not_called()
 
-    def test_incompatible_abi_uses_python_fallback(self):
+    def test_incompatible_abi_fails_closed(self):
         pages = [page(1, "plain")]
         with patch.object(rust_backend, "_rust_lib", None), patch(
             "bilikara.rust_backend._CAPABILITIES",
             rust_backend._empty_capabilities(),
         ), patch.object(
-            bilibili,
-            "_py_decide_audio_binding",
-            wraps=self.original_py_decide,
-        ) as fallback:
-            self.assertEqual(
-                decide_audio_binding(pages), AudioBindingDecision("single", (0,), None)
-            )
-            fallback.assert_called_once()
+            rust_backend,
+            "python_fallback",
+            side_effect=AssertionError("retired audio policy executed"),
+        ) as fallback, self.assertRaises(rust_backend.PlaybackCapabilityError):
+            decide_audio_binding(pages)
+        fallback.assert_not_called()
 
     def test_input_order_and_original_page_identity_are_preserved(self):
         p2 = page(2, "off", 301)
@@ -407,55 +383,6 @@ class AudioBindingBackendTest(unittest.TestCase):
         )
         self.assertEqual(tuple(id(item) for item in pages), identities)
 
-    def test_real_rust_python_and_public_equivalence_without_fallback(self):
-        if rust_backend._rust_lib is None or not rust_backend._CAPABILITIES.get(
-            "decide_audio_binding"
-        ):
-            if os.environ.get("BILIKARA_REQUIRE_RUST_LIB") == "1":
-                self.fail(
-                    "BILIKARA_REQUIRE_RUST_LIB=1 but native decide_audio_binding is unavailable"
-                )
-            self.skipTest("Rust audio-binding capability is unavailable")
-
-        cases = [
-            [],
-            [page(7, "plain")],
-            [page(1, "main track"), page(2, "music track", 301)],
-            [page(1, "plain"), page(2, "ON", 301)],
-            [page(1, "plain"), page(2, "Off", 301)],
-            [page(1, "plain"), page(2, "人声", 301)],
-            [page(1, "plain"), page(2, "原唱", 301)],
-            [page(1, "plain"), page(2, "伴奏", 301)],
-            [page(1, "plain"), page(2, " office ", 301)],
-            [page(1, "on_vocal"), page(2, "off-vocal", 301)],
-            [page(1, "off vocal", 300, 101), page(1, "on vocal", 301, 102)],
-            [page(1, "plain", 300), page(2, "off", 302)],
-            [page(1, "plain", 300), page(2, "off", 303)],
-            [page(1, "plain", 300), page(2, "off", 304)],
-            [page(2, "off", 301), page(1, "plain", 300)],
-            [page(1, "on", 300), page(2, "plain", 301)],
-            [page(1, "on", 300), page(2, "off", 301)],
-            [page(3, "plain", 300), page(4, "off", 301)],
-            [page(1, "plain", 300, 101), page(1, "off", 301, 102)],
-            [page(1, "on"), page(2, "off", 301), page(3, "伴奏", 302)],
-        ]
-        for pages in cases:
-            with self.subTest(pages=pages):
-                python_result = self.original_py_decide(pages, 3)
-                completed, native_response = rust_backend.try_decide_audio_binding(
-                    request_for(pages)
-                )
-                self.assertTrue(completed)
-                self.assertEqual(
-                    decision_from_response(native_response), python_result
-                )
-                with patch.object(
-                    bilibili,
-                    "_py_decide_audio_binding",
-                    side_effect=AssertionError("Python fallback was called"),
-                ):
-                    public_result = decide_audio_binding(pages)
-                self.assertEqual(public_result, python_result)
 
 
 if __name__ == "__main__":

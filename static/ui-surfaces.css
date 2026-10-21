@@ -1,0 +1,1141 @@
+/* Shared panel surfaces; Remote modal backgrounds provide extra separation. */
+/* Remote queue numbering and presentation previews share one badge surface. */
+:root {
+  --queue-order-bg: rgba(255, 255, 255, 0.96);
+  --queue-order-border: 1.4px solid rgba(109, 98, 88, 0.18);
+  --queue-order-color: rgba(91, 78, 69, 0.92);
+  --queue-order-shadow: 0 8px 18px rgba(88, 56, 30, 0.05);
+  --queue-ready-border-color: rgba(43, 123, 96, 0.4);
+  --queue-ready-shadow: 0 0 0 3px rgba(43, 123, 96, 0.07);
+}
+:root[data-theme="dark"] {
+  --queue-order-bg: rgba(30, 26, 23, 0.96);
+  --queue-order-border: 1.4px solid rgba(246, 241, 235, 0.15);
+  --queue-order-color: var(--ink);
+  --queue-order-shadow: 0 8px 18px rgba(0, 0, 0, 0.22);
+  --queue-ready-border-color: rgba(45, 212, 191, 0.36);
+  --queue-ready-shadow: 0 0 0 3px rgba(45, 212, 191, 0.1);
+}
+:root[data-theme="blue"] {
+  --queue-order-bg: rgba(8, 18, 32, 0.96);
+  --queue-order-border: 1.4px solid rgba(148, 202, 233, 0.18);
+  --queue-order-color: var(--ink);
+  --queue-order-shadow: 0 8px 18px rgba(2, 8, 23, 0.28);
+  --queue-ready-border-color: rgba(52, 211, 153, 0.42);
+  --queue-ready-shadow: 0 0 0 3px rgba(52, 211, 153, 0.1);
+}
+.queue-order {
+  box-sizing: border-box;
+  width: var(--queue-order-size, 34px);
+  height: var(--queue-order-size, 34px);
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--queue-order-bg);
+  border: var(--queue-order-border);
+  color: var(--queue-order-color);
+  font-size: var(--queue-order-font-size, 14px);
+  font-weight: 700;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  box-shadow: var(--queue-order-shadow);
+}
+.queue-order[data-cache-state] { color: var(--muted); }
+.queue-item.ready .queue-order,
+.queue-order[data-cache-state="ready"] {
+  border-color: var(--queue-ready-border-color);
+  color: var(--green);
+  box-shadow: var(--queue-order-shadow), var(--queue-ready-shadow);
+}
+.queue-order[data-cache-state="failed"] {
+  border-color: var(--red);
+  color: var(--red);
+  box-shadow: var(--queue-order-shadow), 0 0 0 3px var(--danger-btn-bg, rgba(177, 69, 69, 0.1));
+}
+.queue-badge-play,
+.queue-badge-error {
+  width: 70%;
+  height: 70%;
+  flex: 0 0 auto;
+}
+.queue-badge-error,
+.queue-order[data-cache-state="failed"] :is(.queue-badge-label, .queue-badge-play),
+.queue-order [hidden],
+.player-delay-section-title[hidden] { display: none; }
+.queue-order[data-cache-state="failed"] .queue-badge-error { display: block; }
+.queue-order.is-empty { visibility: hidden; }
+
+.request-workspace-actions { flex: 0 0 auto; }
+html[data-host-layout="portrait"] .developer-mode .request-workspace-head { display: flex; }
+.request-workspace-actions > [hidden] { display: none !important; }
+.request-workspace-modal { z-index: calc(var(--host-layer-modal) - 1); }
+:root .request-workspace-modal > .selection-modal-card {
+  width: min(1280px, calc(100vw - 48px));
+  height: min(1000px, calc(calc(var(--legacy-vh, 1vh) * 100) - 48px)); height: min(1000px, calc(100dvh - 48px));
+  max-height: calc(calc(var(--legacy-vh, 1vh) * 100) - 48px); max-height: calc(100dvh - 48px);
+  grid-template-rows: minmax(0, 1fr);
+  padding: 0;
+}
+:root .request-workspace-modal .request-workspace {
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+}
+:root .request-workspace-modal .request-workspace-head.host-peer-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  padding: 20px;
+  align-items: start;
+}
+:root .request-workspace-modal .request-workspace-head > .host-peer-heading {
+  display: block;
+  grid-area: 1 / 1;
+}
+:root .request-workspace-modal .request-workspace-head::after { content: none; }
+:root .request-workspace-modal .host-peer-heading .section-tag { display: none; }
+:root .request-workspace-modal .host-peer-heading h2 {
+  font-size: var(--panel-title-font-size);
+  line-height: var(--panel-title-line-height);
+  min-height: var(--panel-header-control-size);
+}
+:root .request-workspace-modal .request-workspace-head > .request-subview-tabs {
+  grid-area: 2 / 1 / 3 / -1;
+  margin-inline-start: 0;
+  max-width: 100%;
+  justify-self: start;
+}
+:root .request-workspace-modal .request-workspace-actions {
+  display: flex;
+  align-self: start;
+  grid-area: 1 / 2;
+  margin-inline-end: var(--panel-header-control-offset);
+}
+:root #request-workspace-collapse {
+  width: var(--panel-header-control-size);
+  min-height: var(--panel-header-control-size);
+  height: var(--panel-header-control-size);
+  margin-top: var(--panel-header-control-offset);
+  border-radius: 50%;
+  padding: 0;
+  background: var(--btn-secondary-bg);
+  color: var(--ink);
+  transform: none;
+}
+:root .request-workspace-modal .pending-review-actions { gap: 8px; flex-wrap: wrap; }
+@media (max-width: 600px) {
+  .request-workspace-modal { padding: 12px; }
+  :root .request-workspace-modal > .selection-modal-card {
+    width: calc(100vw - 24px);
+    height: calc(calc(var(--legacy-vh, 1vh) * 100) - 24px); height: calc(100dvh - 24px);
+    max-height: calc(calc(var(--legacy-vh, 1vh) * 100) - 24px); max-height: calc(100dvh - 24px);
+  }
+}
+.audio-variant-popover .audio-variant-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.audio-variant-popover .audio-variant-button {
+  flex: 0 0 auto;
+  width: max-content;
+  max-width: 100%;
+}
+.audio-variant-button-label {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-align: left;
+}
+.audio-variant-button-text {
+  display: inline-block;
+  white-space: nowrap;
+}
+.audio-variant-button-label.is-overflowing { text-overflow: clip; }
+.audio-variant-button-label.is-overflowing .audio-variant-button-text {
+  animation: part-label-scroll var(--part-scroll-duration, 8s) linear infinite;
+}
+@keyframes part-label-scroll {
+  0%, 15% { transform: translateX(0); }
+  75%, 90% { transform: translateX(calc(-1 * var(--part-scroll-distance))); }
+  100% { transform: translateX(0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .audio-variant-button-label.is-overflowing { overflow-x: auto; scrollbar-width: none; }
+  .audio-variant-button-label.is-overflowing .audio-variant-button-text { animation: none; }
+}
+:root {
+  --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", "Noto Sans SC", sans-serif;
+  --font-display: var(--font-sans);
+  --modal-surface-rgb: 255, 250, 244;
+  --modal-card-bg: rgba(var(--modal-surface-rgb), 0.90);
+  --modal-card-border: 1px solid var(--line);
+  --modal-surface-blur: 12px;
+  --modal-backdrop-blur: 0px;
+  --panel-title-font-size: 18px;
+  --panel-title-line-height: 24px;
+  --panel-header-control-size: 32px;
+  --panel-header-control-offset: calc((var(--panel-title-line-height) - var(--panel-header-control-size)) / 2);
+  --panel-header-action-inset: calc(20px + var(--panel-header-control-offset));
+  --host-control-hover-bg: rgba(255, 255, 255, 0.95);
+  --host-control-pressed-bg: color-mix(in srgb, var(--sync-btn-bg, var(--btn-secondary-bg)), var(--ink) 6%);
+  --rating-card-shadow: 0 18px 48px rgba(35, 26, 20, 0.24);
+}
+:root[data-theme="dark"] {
+  --host-control-hover-bg: var(--dark-control-hover-bg);
+  --modal-surface-rgb: 30, 26, 23;
+  --modal-card-bg: rgba(var(--modal-surface-rgb), 0.90);
+  --modal-card-border: 1px solid var(--line);
+  --rating-card-shadow: 0 18px 48px rgba(0, 0, 0, 0.48);
+}
+:root[data-theme="blue"] {
+  --host-control-hover-bg: var(--dark-control-hover-bg);
+  --modal-surface-rgb: 17, 25, 40;
+  --modal-card-bg: rgba(var(--modal-surface-rgb), 0.90);
+  --modal-card-border: 1px solid var(--line);
+  --rating-card-shadow: 0 18px 48px rgba(0, 0, 0, 0.48);
+}
+
+/* Every dialog title starts at the same inset, independent of action height. */
+:root :is(.selection-modal-head h2, .binding-sheet-head h2,
+  #confirm-title,
+  .remote-identity-card h2, .song-detail-title, .rating-title,
+  .volume-adjust-heading h2, .playback-sheet-status-label, .stage-control-tray-head > strong) {
+  margin: 0;
+  font-size: var(--panel-title-font-size);
+  font-weight: 700;
+  line-height: var(--panel-title-line-height);
+  letter-spacing: normal;
+  text-align: start;
+  white-space: normal;
+}
+:root :is(.selection-modal-head, .binding-sheet-head, .volume-adjust-heading, .stage-control-tray-head) {
+  min-height: var(--panel-header-control-size);
+  align-items: start;
+}
+/* Absolute close controls must reserve the same title-row space as flex/grid
+   headers. Extra title lines grow naturally. */
+:root :is(.song-detail-card > .song-detail-title, .rating-title, .remote-identity-card h2) {
+  min-height: var(--panel-header-control-size);
+}
+:root .selection-modal-head.host-peer-head > :not(.host-peer-heading) { align-self: start; }
+:root .pool-config-head-actions { align-items: start; }
+/* Header pills and close controls reuse ordinary secondary-button colors.
+   Center 32px controls on the title's 24px first line, while
+   preserving the header's flow height and its horizontal insets. */
+:root :is(.pool-config-head-actions > .toolbar-button,
+  .pool-config-head-actions > .ghost-button,
+  .playback-sheet-status-actions > #open-rating-button,
+  .playback-sheet-status-actions > #refresh-button) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: var(--panel-header-control-size);
+  min-height: var(--panel-header-control-size);
+  margin-top: var(--panel-header-control-offset);
+  margin-bottom: calc(-1 * var(--panel-header-control-offset));
+  padding: 0 12px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--btn-secondary-bg);
+  color: var(--ink);
+  font-size: 14px;
+  line-height: 1;
+  white-space: nowrap;
+}
+:root :is(.session-user-rename-head .banner-close, .selection-modal-head .banner-close, .binding-sheet-close,
+  #confirm-close,
+  .rating-close, .song-detail-close, .stage-control-tray-head .banner-close),
+:root[data-host-layout="portrait"] #binding-modal .selection-modal-head .banner-close {
+  width: var(--panel-header-control-size);
+  min-width: var(--panel-header-control-size);
+  height: var(--panel-header-control-size);
+  min-height: var(--panel-header-control-size);
+  margin-top: var(--panel-header-control-offset);
+  margin-bottom: calc(-1 * var(--panel-header-control-offset));
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: var(--btn-secondary-bg);
+  color: var(--ink);
+  transform: none;
+}
+/* Desktop pointer feedback shares the existing secondary/danger palette. */
+:root:not([data-ui-client="remote"]) :is(.banner-close, .binding-sheet-close,
+  #confirm-close, .rating-close, .song-detail-close) {
+  transition: background-color 120ms ease, color 120ms ease;
+}
+@media (hover: hover) and (pointer: fine) {
+  :root:not([data-ui-client="remote"]) :is(.banner-close, .binding-sheet-close,
+    #confirm-close, .rating-close, .song-detail-close):hover:not(:disabled) {
+    background-color: color-mix(in srgb, var(--btn-secondary-bg) 88%, var(--ink) 12%);
+    color: var(--danger-btn-color, var(--red));
+    transform: none;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  :root:not([data-ui-client="remote"]) :is(.banner-close, .binding-sheet-close,
+    #confirm-close, .rating-close, .song-detail-close) { transition: none; }
+}
+:root :is(.selection-modal-card, .binding-sheet-panel, .remote-identity-card,
+  .confirm-popover, .history-export-dialog, .volume-adjust-popover, .rating-body) {
+  padding: 20px;
+}
+#confirm-title { min-height: var(--panel-header-control-size); padding-right: 40px; }
+#confirm-close { position: absolute; top: 20px; right: var(--panel-header-action-inset); }
+/* The title alignment moves controls up by 4px; move the whole action group
+   right by the same amount so its top/right distances remain equal. */
+:root :is(.selection-modal-head > .banner-close,
+  .selection-modal-head > .pool-config-head-actions,
+  .binding-sheet-head > .binding-sheet-close,
+  .binding-sheet-head > .pool-config-head-actions,
+  .volume-adjust-heading > [data-volume-close],
+  .stage-control-tray-head > .banner-close) {
+  margin-inline-end: var(--panel-header-control-offset);
+}
+
+/* Explicit form geometry avoids Safari's compact native select rendering. */
+:root :is(.confirm-source, .confirm-page-size, .history-export-source, .history-export-page-size) {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 100%;
+  height: 44px;
+  min-height: 44px;
+  padding: 0 36px 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background-color: var(--input-bg);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24'%3E%3Cpath fill='none' stroke='%2388817b' stroke-width='2' stroke-linecap='round' stroke-linejoin='round' d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  color: var(--ink);
+  font-size: 16px;
+  font-weight: 400;
+  line-height: normal;
+}
+:root .session-user-rename-panel input {
+  height: 44px;
+  min-height: 44px;
+  padding: 0 12px;
+  font-size: 16px;
+}
+
+/* Small playback setting headings share one quiet label treatment. */
+:root :is(.av-sync-copy .section-tag, .volume-copy .section-tag,
+  .remote-setting-header .panel-tag, .automatic-volume-row [data-auto-label]) {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.2;
+  letter-spacing: normal;
+  text-transform: none;
+}
+
+/* Native inputs retain keyboard/label semantics without text-field sizing or
+   platform-specific radio/checkbox painting (notably iOS Safari). */
+:root :is(.selection-option, .binding-option) > input:is([type="radio"], [type="checkbox"]) {
+  appearance: none;
+  -webkit-appearance: none;
+  box-sizing: border-box;
+  width: 20px;
+  min-width: 20px;
+  height: 20px;
+  min-height: 20px;
+  margin: 0;
+  padding: 0;
+  align-self: center;
+  border: 2px solid var(--muted);
+  border-radius: 5px;
+  background: var(--input-bg);
+  cursor: pointer;
+}
+:root :is(.selection-option, .binding-option) > input[type="radio"] { border-radius: 50%; }
+:root :is(.selection-option, .binding-option) > input:checked {
+  border-color: var(--accent);
+  background-color: var(--accent);
+  background-position: center;
+  background-repeat: no-repeat;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20'%3E%3Cpath d='m4 10 4 4 8-8' fill='none' stroke='white' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+}
+:root :is(.selection-option, .binding-option) > input[type="radio"]:checked {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20'%3E%3Ccircle cx='10' cy='10' r='4' fill='white'/%3E%3C/svg%3E");
+}
+:root :is(.selection-option, .binding-option) > input:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+:root :is(.selection-option, .binding-option) > input:disabled { opacity: 0.5; cursor: default; }
+:root .song-detail-card {
+  padding: 20px;
+}
+:root .song-detail-card > .song-detail-title,
+:root .rating-title { padding-right: 40px; }
+:root .rating-body > [data-rating-content] { display: grid; gap: 16px; }
+:root :is(.song-detail-card > .song-detail-close, .rating-card > .rating-close) {
+  top: 20px;
+  right: var(--panel-header-action-inset);
+}
+:root .app-shell[data-stage-controls-layout="popup"] .stage-control-tray { padding: 20px; }
+:root .playback-sheet-status-header {
+  /* Controls have a -4px optical offset: both outer insets are 16px. */
+  padding: 20px 16px 4px 20px;
+  align-items: start;
+  grid-template-columns: minmax(0, 1fr) 44px minmax(min-content, 1fr);
+}
+:root .playback-sheet-status-label { grid-column: 1; grid-row: 1; }
+:root[data-ui-client="remote"] #playback-sheet-collapse { grid-column: 2; grid-row: 1; background: transparent; }
+/* Keep the handle on the header's first-line center while its invisible
+   44px target extends around the former 32px icon slot. */
+:root .playback-sheet-collapse {
+  margin-top: calc(var(--panel-header-control-offset) - 6px);
+  margin-bottom: calc(-1 * var(--panel-header-control-offset) - 6px);
+}
+/* Equal outer tracks center collapse; the actions' minimum width shifts it
+   left only when the right-hand buttons need more room. */
+:root .playback-sheet-status-actions { grid-column: 3; grid-row: 1; flex-wrap: nowrap; }
+:root .playback-sheet-status-header.is-stacked-actions { grid-template-columns: minmax(0, 1fr) 44px; }
+:root .playback-sheet-status-header.is-stacked-actions .playback-sheet-collapse { grid-column: 2; }
+:root .playback-sheet-status-header.is-stacked-actions .playback-sheet-status-actions { grid-column: 1 / -1; grid-row: 2; }
+
+/* Scrolling does not add header/footer separators. */
+:root :is(.selection-modal-head, .binding-sheet-head, .playback-sheet-status-header,
+  .settings-workspace-head, .request-workspace-head, .request-mode-head, .pending-review-head) {
+  border-bottom: 0;
+}
+/* Semantic heading/content divisions stay inset; these are not scroll edges. */
+:root :is(.request-workspace-head, .settings-workspace-head) { position: relative; }
+:root :is(.request-workspace-head, .settings-workspace-head)::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 1px;
+  padding-left: inherit;
+  padding-right: inherit;
+  background: var(--line);
+  background-clip: content-box;
+  pointer-events: none;
+}
+:root :is(.selection-modal-actions, .binding-sheet-actions, .pending-review-actions) {
+  border-top: 0;
+}
+
+/* This footer scrolls with the settings content; it cannot obscure that content. */
+:root .settings-workspace-body .cache-panel-footer { border-top-color: transparent; }
+
+:root .playback-restart-popover::before,
+:root :is(.app-shell[data-narrow-tool-layout="overlay"] .host-workspace-region,
+  .session-user-rename-panel, .confirm-popover, .selection-modal-card, .app-shell .song-detail-card,
+  .song-detail-card, .rating-card, .volume-adjust-popover, .audio-variant-popover,
+  .remote-access-card, .remote-identity-card, .binding-sheet-panel, .history-export-dialog,
+  .playback-sheet-panel, .remote-menu-panel, .menu-content, .topbar .cache-panel,
+  .presentation-feedback-card,
+  .app-shell[data-stage-controls-layout="popup"] .stage-control-tray) {
+  background: var(--modal-card-bg);
+  border: var(--modal-card-border);
+  border-radius: var(--floating-panel-radius, 18px);
+  box-shadow: var(--rating-card-shadow);
+  backdrop-filter: blur(var(--modal-surface-blur));
+  -webkit-backdrop-filter: blur(var(--modal-surface-blur));
+}
+
+/* Only the collapsed popup is a floating capsule. Desktop Host and landscape
+   use ordinary circles in the control row, without an enclosing surface. */
+:root .playback-song-actions {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-self: end;
+  width: 44px;
+  height: 44px;
+}
+:root .playback-song-actions.is-expanded { width: 94px; gap: 6px; }
+:root [data-playback-restart-anchor] { position: relative; z-index: 2; }
+:root .playback-song-actions button {
+  /* Native tap highlights can linger after a captured hold is released.
+     These controls already own pressed and keyboard-focus feedback. */
+  -webkit-tap-highlight-color: transparent;
+}
+:root .playback-restart-popover {
+  --floating-panel-radius: 999px;
+  box-sizing: border-box;
+  width: 100px;
+  height: 52px;
+  padding: 4px;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 4px;
+}
+:root .playback-restart-popover {
+  position: absolute;
+  inset: auto;
+  margin: 0;
+  z-index: 1;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  opacity: 1;
+  transform: none;
+}
+:root .playback-restart-popover::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  box-sizing: border-box;
+  pointer-events: none;
+  clip-path: inset(4px 4px 4px 52px round 22px);
+}
+:root .playback-restart-popover[hidden],
+:root .playback-song-actions .playback-restart-action[hidden] { display: none; }
+:root .playback-restart-popover.is-open::before { animation: playback-capsule-open 240ms ease both; }
+:root .playback-restart-popover.is-closing::before { animation: playback-capsule-close 240ms ease both; }
+@keyframes playback-capsule-open {
+  0% { clip-path: inset(4px 4px 4px 52px round 22px); }
+  35% { clip-path: inset(0 0 0 48px round 26px); }
+  100% { clip-path: inset(0 round 26px); }
+}
+@keyframes playback-capsule-close {
+  0% { clip-path: inset(0 round 26px); }
+  65% { clip-path: inset(0 0 0 48px round 26px); }
+  100% { clip-path: inset(4px 4px 4px 52px round 22px); }
+}
+:root .playback-restart-popover button,
+:root .playback-song-actions .playback-restart-action {
+  box-sizing: border-box;
+  flex: 0 0 44px;
+  width: 44px;
+  min-width: 44px;
+  max-width: 44px;
+  height: 44px;
+  min-height: 44px;
+  max-height: 44px;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  border: var(--player-btn-border, 1px solid var(--line));
+  border-radius: 50%;
+  background: var(--btn-secondary-bg);
+  color: var(--ink);
+  box-shadow: none;
+  transform: none;
+  transition: background 120ms ease, border-color 120ms ease;
+  touch-action: manipulation;
+}
+:root .playback-song-actions .playback-restart-action:disabled {
+  background: var(--remote-secondary-button-disabled-bg, var(--btn-secondary-bg));
+  color: var(--remote-secondary-button-disabled-color, var(--muted));
+  cursor: default;
+}
+:root .playback-restart-popover > .playback-restart-action {
+  position: relative;
+  opacity: 0;
+  clip-path: inset(0 0 0 44px);
+  transition: opacity 180ms ease, background 120ms ease, border-color 120ms ease;
+}
+:root .playback-restart-popover.is-open > .playback-restart-action { opacity: 1; animation: playback-capsule-action-open 240ms ease both; }
+:root .playback-restart-popover.is-closing > .playback-restart-action { animation: playback-capsule-action-close 240ms ease both; }
+@keyframes playback-capsule-action-open {
+  0%, 35% { clip-path: inset(0 0 0 44px); }
+  100% { clip-path: inset(0); }
+}
+@keyframes playback-capsule-action-close {
+  0% { clip-path: inset(0); }
+  65%, 100% { clip-path: inset(0 0 0 44px); }
+}
+:root [data-playback-restart-anchor][aria-haspopup="menu"] { touch-action: none; }
+:root .playback-restart-popover .playback-restart-action:not(:disabled):is(:active, .is-held-target),
+:root .playback-song-actions.is-expanded .playback-restart-action:not(:disabled):active { background: var(--host-control-pressed-bg); border-color: var(--accent); }
+/* Inline Next retains its existing feedback. Remote pointer use must not
+   inherit a keyboard outline from modal focus restoration. */
+:root:not([data-remote-input-modality="pointer"]) .playback-restart-popover button:focus-visible,
+:root:not([data-remote-input-modality="pointer"]) .playback-song-actions.is-expanded .playback-restart-action:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+:root .playback-restart-popover svg,
+:root .playback-song-actions .playback-restart-action svg { width: 26px; height: 26px; }
+/* Playback gestures must not select button labels or SVG text. Keep editable
+   fields outside this rule so numbers and ranges retain their native behavior. */
+:root :is(
+  .playback-sheet,
+  .presentation-host-controls,
+  .stage-control-tray,
+  .stage-extended-controls,
+  .volume-adjust-popover,
+  .playback-restart-popover
+) :is(button, button *),
+:root :is(.playback-dock, .audio-variant-button, .audio-variant-toggle),
+:root :is(.playback-dock, .audio-variant-button, .audio-variant-toggle) * {
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+:root .playback-restart-popover.is-hint {
+  pointer-events: auto;
+}
+:root .playback-restart-popover.is-hint .playback-restart-action:disabled { opacity: 1; cursor: default; }
+:root .playback-sheet-panel.is-spacious-transport .playback-song-actions { grid-area: next; }
+:root :is(.player-control-row, .presentation-host-transport-row):is(:has(.playback-song-actions.is-expanded), :where([data-legacy-has~="r0"])) {
+  --playback-song-actions-width: 94px;
+}
+@media (hover: hover) and (pointer: fine) {
+  :root:is(:has(.app-shell), :where([data-legacy-has~="r1"])) .playback-restart-popover .playback-restart-action:not(:disabled):hover,
+  :root:is(:has(.app-shell), :where([data-legacy-has~="r1"])) .playback-song-actions.is-expanded .playback-restart-action:not(:disabled):hover { border-color: var(--accent); }
+}
+@media (prefers-reduced-motion: reduce) {
+  :root .playback-restart-popover::before { animation-duration: 1ms !important; }
+  :root .playback-restart-popover.is-hint { transition: none; }
+  :root .playback-restart-popover > .playback-restart-action,
+  :root .playback-restart-popover button,
+  :root .playback-song-actions.is-expanded .playback-restart-action { transition: none; animation-duration: 1ms !important; }
+}
+:root .source-tools .source-remove-selected.drag-over { background: var(--red); color: white; }
+
+/* Passive feedback belongs inside the fullscreen/audience root, never a body portal. */
+:root .presentation-feedback-card {
+  /* These closely stacked annotations keep the shared border/fill/blur, but
+     must not cast the floating-panel shadow onto the neighboring card. */
+  --rating-card-shadow: none;
+}
+.presentation-feedback {
+  position: absolute;
+  top: 50%;
+  right: max(16px, env(safe-area-inset-right));
+  z-index: 20;
+  display: none;
+  width: min(112px, calc(100% - 32px));
+  height: 0;
+  pointer-events: none;
+}
+.presentation-feedback-card {
+  position: absolute;
+  top: 0;
+  width: 100%;
+  height: 112px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  padding: 6px;
+  color: var(--ink);
+  font-size: 20px;
+  line-height: 24px;
+  font-variant-numeric: tabular-nums;
+  opacity: 0;
+  visibility: hidden;
+  transform: translateY(var(--feedback-offset, -50%)) translateX(3px);
+  transition: opacity 120ms ease, transform 120ms ease, visibility 120ms;
+  pointer-events: none;
+}
+:is(.presentation-output-shell, .player-panel:fullscreen, .player-panel:-webkit-full-screen,
+  .player-panel.is-tauri-fullscreen, body.is-presentation-stage-only .player-panel) > .presentation-feedback {
+  display: block;
+}
+.presentation-feedback-card.is-visible {
+  opacity: 1;
+  visibility: visible;
+  transform: translateY(var(--feedback-offset, -50%)) translateX(0);
+}
+.presentation-feedback-icon { display: flex; flex: 0 0 32px; }
+.presentation-feedback svg { width: 32px; height: 32px; }
+.presentation-feedback-label {
+  font-size: 13px;
+  line-height: 18px;
+  font-weight: 400;
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+.presentation-feedback-value { max-width: 100%; min-width: 0; color: var(--accent); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.presentation-feedback-value[hidden] { display: none; }
+@media (prefers-reduced-motion: reduce) {
+  .presentation-feedback-card { transition: none; }
+}
+
+/* A narrow Host tool sheet is one floating surface. Inline workspaces retain
+   their ordinary cards; sheet content must not add a second opaque fill. */
+:root .app-shell[data-narrow-tool-layout="overlay"] .host-workspace-region > [data-host-workspace-panel] {
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+/* Flat fills inside a floating panel must not stack its translucency twice. */
+.playback-sheet-status-header { background: transparent; }
+:root .remote-menu-panel .remote-access-card.remote-share-card {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+/* Host and small anchored controls keep invisible click-away targets. */
+:root, :root[data-theme] { --modal-backdrop-bg: transparent; }
+:root :is(.selection-modal-backdrop, .rating-modal-backdrop, .binding-sheet-backdrop,
+  .remote-identity-backdrop, .song-detail-backdrop, .playback-sheet-backdrop,
+  .stage-control-backdrop, .audio-variant-backdrop, .host-workspace-backdrop,
+  .song-detail-view),
+:root .history-export-dialog::backdrop,
+:root .volume-adjust-popover::backdrop {
+  background: transparent;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+.song-detail-backdrop { position: absolute; inset: 0; }
+.song-detail-surface { position: relative; z-index: 1; pointer-events: none; }
+.song-detail-card { pointer-events: auto; }
+
+/* Dim the stacked Remote page behind large panels; anchored controls keep shadow only. */
+:root[data-ui-client="remote"] {
+  --remote-modal-backdrop-bg: rgba(29, 26, 24, 0.24);
+}
+:root[data-ui-client="remote"][data-theme="blue"] {
+  --remote-modal-backdrop-bg: rgba(2, 6, 23, 0.38);
+}
+:root[data-ui-client="remote"] :is(.remote-identity-backdrop, .song-detail-backdrop,
+  .rating-modal-backdrop, .binding-sheet-backdrop, .playback-sheet-backdrop),
+:root[data-ui-client="remote"] .history-export-dialog::backdrop {
+  background: var(--remote-modal-backdrop-bg);
+}
+@media (orientation: portrait) and (max-width: 699px) {
+  :root[data-ui-client="remote"] .playback-sheet .playback-sheet-panel {
+    border-radius: 18px 18px min(18px, var(--remote-safe-area-bottom)) min(18px, var(--remote-safe-area-bottom));
+  }
+}
+
+/* Fade the Remote backdrop independently of panel motion.
+   Host backgrounds stay transparent. */
+@keyframes remote-backdrop-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes remote-backdrop-out {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+:root[data-ui-client="remote"] :is(.remote-identity-backdrop, .song-detail-backdrop, .rating-modal-backdrop),
+:root[data-ui-client="remote"] .history-export-dialog[open]::backdrop {
+  animation: remote-backdrop-in 200ms ease-out both;
+}
+:root[data-ui-client="remote"] .closing :is(.remote-identity-backdrop, .song-detail-backdrop, .rating-modal-backdrop),
+:root[data-ui-client="remote"] .history-export-dialog.closing::backdrop {
+  animation: remote-backdrop-out 200ms ease-out forwards;
+}
+:root[data-ui-client="remote"] .song-detail-view { animation: none; }
+:root[data-ui-client="remote"] :is(.binding-sheet-backdrop, .playback-sheet-backdrop) {
+  transition-property: opacity;
+}
+@media (prefers-reduced-motion: reduce) {
+  :root[data-ui-client="remote"] :is(.remote-identity-backdrop, .song-detail-backdrop,
+    .rating-modal-backdrop, .binding-sheet-backdrop, .playback-sheet-backdrop),
+  :root[data-ui-client="remote"] .history-export-dialog::backdrop {
+    animation-duration: 1ms !important;
+    transition-duration: 1ms !important;
+  }
+}
+
+/* Info bubbles share Remote's shape/copy and Host's short fade/slide motion.
+   They are annotations in the top layer, not another modal surface. */
+:root :is(.cache-advanced-info .cache-advanced-tooltip, .remote-tooltip-bubble) {
+  --info-bubble-arrow-left: var(--remote-tooltip-arrow-left, var(--contextual-tooltip-arrow-left, 13px));
+  width: max-content;
+  max-width: min(320px, calc(100vw - 16px));
+  box-sizing: border-box;
+  padding: 10px 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--modal-card-bg);
+  color: var(--muted);
+  box-shadow: var(--rating-card-shadow);
+  backdrop-filter: blur(var(--modal-surface-blur));
+  -webkit-backdrop-filter: blur(var(--modal-surface-blur));
+  font-family: var(--font-sans);
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 1.45;
+  letter-spacing: normal;
+  text-align: left;
+  text-transform: none;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  transform: translateY(3px);
+  transition: opacity 120ms ease, transform 120ms ease, visibility 0s linear 120ms;
+}
+:root :is(.cache-advanced-tooltip, .remote-tooltip-bubble)[popover] {
+  position: fixed;
+  inset: auto;
+  margin: 0;
+  overflow: visible;
+}
+:root :is(.cache-advanced-info.is-visible .cache-advanced-tooltip, .remote-tooltip-bubble.is-visible) {
+  opacity: 1;
+  visibility: visible;
+  transform: translateY(0);
+  transition-delay: 0s;
+}
+:root :is(.cache-advanced-tooltip, .remote-tooltip-bubble)::before,
+:root :is(.cache-advanced-info .cache-advanced-tooltip, .remote-tooltip-bubble)::after {
+  content: "";
+  position: absolute;
+  top: 100%;
+  bottom: auto;
+  left: var(--info-bubble-arrow-left);
+  width: 0;
+  height: 0;
+  background: transparent;
+  transform: none;
+  border: 6px solid transparent;
+  border-top-color: var(--modal-card-bg);
+}
+:root :is(.cache-advanced-tooltip, .remote-tooltip-bubble)::before {
+  left: calc(var(--info-bubble-arrow-left) - 1px);
+  border-width: 7px;
+  border-top-color: var(--line);
+  z-index: -1;
+}
+:root :is(.cache-advanced-info .cache-advanced-tooltip, .remote-tooltip-bubble)[data-tooltip-direction="down"]::after,
+:root :is(.cache-advanced-tooltip, .remote-tooltip-bubble)[data-tooltip-direction="down"]::before {
+  top: auto;
+  bottom: 100%;
+  border-top-color: transparent;
+  border-bottom-color: var(--modal-card-bg);
+}
+:root :is(.cache-advanced-tooltip, .remote-tooltip-bubble)[data-tooltip-direction="down"]::before {
+  border-bottom-color: var(--line);
+}
+@media (prefers-reduced-motion: reduce) {
+  :root :is(.cache-advanced-info .cache-advanced-tooltip, .remote-tooltip-bubble) { transition-duration: 1ms; transition-delay: 0s; }
+}
+
+:root :is(.cache-advanced-tooltip, .remote-tooltip-bubble)[data-i18n],
+:root :is(.cache-advanced-tooltip, .remote-tooltip-bubble) [data-i18n] { white-space: pre-line; }
+
+/* Playback hints reuse the i bubble, including its tokens and motion.
+   Remote uses holds; Host also supports hover and keyboard focus. */
+:root .playback-control-hint {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+:root .remote-tooltip-bubble.playback-control-hint { white-space: pre-line; }
+:root .playback-control-hint[hidden] { display: none; }
+:root :is(.player-control-row .player-transport-button,
+  .presentation-host-transport-row .presentation-host-seek-button,
+  .presentation-host-transport-row .presentation-host-play,
+  .presentation-host-transport-row .presentation-host-next,
+  .playback-song-actions .playback-restart-action) {
+  /* Keep a held slide between icons under the shared pointer gesture owner. */
+  touch-action: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* Peer cards align their corner axes within each row/column. Keep the
+   established outer panel and insets; exact concentric subtraction would
+   flatten small cards into nearly square corners. */
+:root { --request-inner-card-radius: 16px; }
+
+/* One cache status surface for the audience screen and single-screen fullscreen. */
+.presentation-download-status {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  padding: 28px;
+  background: radial-gradient(circle at center, #25201d, #050505 72%);
+  color: rgba(255, 255, 255, 0.86);
+  text-align: center;
+  pointer-events: none;
+}
+.presentation-download-status[hidden] { display: none; }
+.presentation-download-title { max-width: 900px; font-size: clamp(18px, 2.4vw, 30px); font-weight: 650; }
+.presentation-download-detail { font-size: clamp(14px, 1.6vw, 20px); line-height: 1.5; white-space: pre-line; }
+.presentation-download-status progress { width: min(360px, 100%); height: 8px; border: 0; border-radius: 999px; accent-color: var(--accent); }
+.presentation-download-status progress[hidden] { display: none; }
+.presentation-download-status progress::-webkit-progress-bar { background: rgba(255, 255, 255, 0.18); border-radius: 999px; }
+.presentation-download-status progress::-webkit-progress-value { background: var(--accent); border-radius: 999px; }
+.presentation-download-status progress::-moz-progress-bar { background: var(--accent); border-radius: 999px; }
+:root :is(#host-workspace-request, .request-workspace, .search-card-surface, .request-panel,
+  .gatcha-panel, .selection-modal, .binding-sheet)
+  :is(.follow-up-button, .tag-browser-tag, .category-browser-card, .search-result-item) {
+  border-radius: var(--request-inner-card-radius);
+}
+
+/* Compact entries keep two title lines above one metadata line. */
+:root :is(#host-workspace-request, .request-workspace, .request-panel, .selection-modal, .binding-sheet)
+  :is(.follow-up-button, .tag-browser-tag) {
+  box-sizing: border-box;
+  height: 72px;
+  min-height: 72px;
+  padding: 10px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: 32px 16px;
+  align-content: start;
+  gap: 2px;
+  text-align: left;
+}
+:root :is(#host-workspace-request, .request-workspace, .request-panel, .selection-modal, .binding-sheet)
+  :is(.follow-up-name, .tag-browser-tag-name) {
+  margin: 0;
+  min-width: 0;
+  height: 32px;
+  min-height: 32px;
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 16px;
+  white-space: nowrap;
+  overflow: visible;
+  text-overflow: clip;
+  display: flex;
+  flex-direction: column;
+}
+:root :is(#host-workspace-request, .request-workspace, .request-panel, .selection-modal, .binding-sheet)
+  :is(.follow-up-count, .tag-browser-tag-count) {
+  margin: 0;
+  min-width: 0;
+  height: 16px;
+  display: block;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 16px;
+}
+:root :is(#host-workspace-request, .request-workspace, .request-panel, .selection-modal, .binding-sheet)
+  .follow-up-button:is(:has(.follow-up-avatar), :where([data-legacy-has~="r2"])) .follow-up-count {
+  padding-inline-end: 32px;
+}
+:root :is(#host-workspace-request, .request-workspace, .request-panel, .selection-modal, .binding-sheet)
+  .follow-up-avatar {
+  width: 24px;
+  height: 24px;
+  right: 10px;
+  bottom: 10px;
+}
+
+/* Cover cards keep 16:9 media, with the same two-line title box below it. */
+:root :is(#host-workspace-request, .request-workspace, .search-card-surface, .remote-search-browser-view)
+  .search-result-item {
+  gap: 10px;
+  padding-bottom: 10px;
+}
+:root :is(#host-workspace-request, .request-workspace, .search-card-surface, .remote-search-browser-view)
+  .search-result-meta {
+  padding-inline: 10px;
+  gap: 6px;
+}
+:root :is(#host-workspace-request, .request-workspace, .search-card-surface, .remote-search-browser-view)
+  .search-result-title {
+  height: 40px;
+  min-height: 40px;
+  max-height: 40px;
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 20px;
+}
+:root[data-ui-client="remote"] .category-browser-card-name {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 20px;
+  max-height: 52px;
+}
+
+.request-card-title-line {
+  display: block;
+  flex: none;
+  box-sizing: content-box;
+  height: 16px;
+  line-height: 16px;
+  /* Keep the 16px text rhythm, but leave ink room for emoji/diacritics.
+     The matching negative margins preserve both title and metadata positions. */
+  padding-block: 4px;
+  margin-block: -4px;
+  overflow: hidden;
+  white-space: pre;
+}
+.follow-up-button:is(:has(.follow-up-avatar), :where([data-legacy-has~="r2"])) .request-card-title-remainder {
+  width: calc(100% - 32px);
+}
+.request-card-title-track {
+  display: block;
+  width: max-content;
+  max-width: none;
+  white-space: nowrap;
+}
+.is-card-title-overflowing .request-card-title-track {
+  animation: request-card-title-scroll var(--request-card-title-duration, 8s) linear infinite;
+  animation-play-state: paused;
+}
+.is-card-title-overflowing.is-card-title-visible .request-card-title-track {
+  animation-play-state: running;
+}
+@keyframes request-card-title-scroll {
+  0%, 15% { transform: translateX(0); }
+  75%, 90% { transform: translateX(calc(-1 * var(--request-card-title-distance))); }
+  100% { transform: translateX(0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  :root :is(.follow-up-name, .tag-browser-tag-name).is-card-title-overflowing .request-card-title-remainder {
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    scrollbar-width: none;
+  }
+  .is-card-title-overflowing .request-card-title-remainder::-webkit-scrollbar { display: none; }
+  .is-card-title-overflowing .request-card-title-track { animation: none; }
+}
+
+/* Large overflow moves left continuously; small overflow keeps its existing
+   back-and-forth motion. The second copy is visual only, never announced. */
+:root .is-text-marquee-loop { position: relative; }
+:root :is(#current-title, .playback-dock-title, .playback-dock-requester, .playback-metadata-field, .request-card-title-remainder).is-text-marquee-loop > .text-marquee-loop-track {
+  animation: text-marquee-loop var(--text-marquee-loop-duration) linear infinite;
+  animation-play-state: var(--text-marquee-play-state, running);
+}
+:root .is-text-marquee-loop > .text-marquee-copy {
+  position: absolute;
+  top: 0;
+  left: var(--text-marquee-copy-left);
+  pointer-events: none;
+}
+:root .is-card-title-overflowing { --text-marquee-play-state: paused; }
+:root .is-card-title-overflowing.is-card-title-visible { --text-marquee-play-state: running; }
+@keyframes text-marquee-loop {
+  from { transform: translateX(0); }
+  to { transform: translateX(calc(-1 * var(--text-marquee-loop-distance))); }
+}
+@media (prefers-reduced-motion: reduce) {
+  :root :is(#current-title, .playback-dock-title, .playback-dock-requester, .playback-metadata-field, .request-card-title-remainder).is-text-marquee-loop > .text-marquee-loop-track { animation: none; }
+  :root .is-text-marquee-loop > .text-marquee-copy { display: none; }
+}
+
+/* Shared discovery controls and a single inline status inside the list. */
+:root .tag-browser-alphabet {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(40px, 1fr));
+  gap: 6px;
+}
+:root .tag-letter-button {
+  width: 100%;
+  height: 40px;
+  min-height: 40px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--btn-secondary-bg);
+  color: var(--muted);
+  font-size: 16px;
+  font-weight: 700;
+  box-shadow: none;
+}
+:root .tag-letter-button.active {
+  color: var(--accent-deep);
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 15%, var(--btn-secondary-bg));
+}
+:root[data-theme] :is(.tag-browser, .category-browser, .follow-browser, .favlist-browser) .search-empty {
+  grid-column: 1 / -1;
+  align-self: start;
+  margin: 0;
+  padding: 8px 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 1.5;
+  text-align: center;
+}
+@media (hover: hover) and (pointer: fine) {
+  :root:not([data-ui-client="remote"]) .browse-search-bar:not(.is-open) .browse-search-form:not([aria-busy="true"]):hover,
+  :root:not([data-ui-client="remote"]) .browse-search-cancel:hover:not(:disabled) {
+    transform: translateY(-2px);
+    box-shadow: none;
+  }
+}
+:root:not([data-ui-client="remote"]) .browse-search-bar .browse-search-form,
+:root:not([data-ui-client="remote"]) .browse-search-cancel {
+  transition: width 220ms cubic-bezier(.2, .8, .2, 1), transform 120ms ease;
+}
+@media (prefers-reduced-motion: reduce) {
+  :root:not([data-ui-client="remote"]) .browse-search-bar .browse-search-form,
+  :root:not([data-ui-client="remote"]) .browse-search-cancel { transition: none; transform: none; }
+}
+
+/* The expanded input owns its submit hover; keep the base state still. */
+:root .browse-search-bar .browse-search-form > button {
+  transform: none;
+  box-shadow: none;
+}
+
+/* Related browse back actions share one role across Host and Remote. */
+:root :is(.tag-browser-back, .android-settings-back, #follow-browse-back, #favlist-browse-back, #catalog-advanced-back, #sources-follow-back) {
+  height: var(--host-control-height, 44px);
+  min-height: var(--host-control-height, 44px);
+  padding: 0 14px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--btn-secondary-bg);
+  color: var(--ink);
+  font-size: 16px;
+  font-weight: 400;
+  line-height: 1;
+  box-shadow: none;
+}
+:root:not([data-ui-client="remote"]) :is(.tag-letter-button, .tag-browser-back, .android-settings-back,
+  #follow-browse-back, #favlist-browse-back, #catalog-advanced-back,
+  .av-sync-step-button, .av-sync-reset-button, [data-volume-step], [data-volume-reset],
+  .critical-banner-region .banner-action) {
+  transition: transform 120ms ease, background 120ms ease, border-color 120ms ease;
+}
+@media (hover: hover) and (pointer: fine) {
+  :root:not([data-ui-client="remote"]) :is(.tag-letter-button, .tag-browser-back, .android-settings-back,
+    #follow-browse-back, #favlist-browse-back, #catalog-advanced-back,
+    .av-sync-step-button, .av-sync-reset-button, [data-volume-step], [data-volume-reset],
+    .critical-banner-region .banner-action):hover:not(:disabled) {
+    transform: translateY(-1px);
+    background: var(--host-control-hover-bg);
+    border-color: var(--sync-button-hover-border);
+  }
+  :root:not([data-ui-client="remote"]) .browse-search-bar.is-open .browse-search-form > button:hover:not(:disabled) {
+    transform: translateY(-2px);
+  }
+}
+:root:not([data-ui-client="remote"]) :is(.tag-letter-button, .tag-browser-back, .android-settings-back,
+  #follow-browse-back, #favlist-browse-back, #catalog-advanced-back,
+  .av-sync-step-button, .av-sync-reset-button, [data-volume-step], [data-volume-reset],
+  .critical-banner-region .banner-action):active:not(:disabled) {
+  transform: none;
+  background: var(--host-control-pressed-bg);
+  border-color: var(--sync-focus-border);
+}
+@media (prefers-reduced-motion: reduce) {
+  :root:not([data-ui-client="remote"]) :is(.tag-letter-button, .tag-browser-back, .android-settings-back,
+    #follow-browse-back, #favlist-browse-back, #catalog-advanced-back,
+    .av-sync-step-button, .av-sync-reset-button, [data-volume-step], [data-volume-reset],
+    .critical-banner-region .banner-action) {
+    transition: none;
+  }
+}
+:root :is(.tag-letter-button, .tag-browser-back, .android-settings-back, #follow-browse-back,
+  #favlist-browse-back, #sources-follow-back, #catalog-advanced-back):focus-visible,
+:root:not([data-ui-client="remote"]) :is(.av-sync-step-button, .av-sync-reset-button,
+  .critical-banner-region .banner-action):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+:root:not([data-ui-client="remote"]) .browse-search-bar:is(:has(> .category-browser-tabs), :where([data-legacy-has~="r3"])) { --browse-track-inset: 2px; }
+:root:not([data-ui-client="remote"]) .category-browser-tabs { padding-top: 2px; }

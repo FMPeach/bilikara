@@ -1,0 +1,10245 @@
+use crate::internet_remote::{
+    InternetRemoteError, InternetRemotePeers, InternetRemoteValidation,
+    PlaylistAddBindingSelection, project_remote_state,
+};
+use bilikara_rust::{
+    AvDelayAction, AvDelayState, DuplicateActiveItem, DuplicateHistoryEntry,
+    PlaylistDuplicateRequest, PlaylistIdentity, PlaylistOrderItem, PlaylistOrderOperation,
+    PlaylistOrderRequest, PlaylistSlotType, RemoteAvDelayActionV1, RemoteLane,
+    RemotePlaylistPositionV1, RemoteProfile, RemoteRequestV1, decide_av_delay,
+    decide_playlist_duplicate, plan_playlist_order,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
+use std::path::{Component, Path};
+use std::sync::{Mutex, OnceLock};
+
+pub(crate) mod automatic_volume;
+mod native_persistence;
+pub use automatic_volume::{AutomaticVolumePreference, AutomaticVolumeSnapshot};
+#[cfg(test)]
+mod session_user_tests;
+mod session_users;
+#[cfg(feature = "native-host")]
+pub(crate) use native_persistence::prepare_import;
+pub use session_users::{SessionUserEdit, SessionUserEntry};
+pub(crate) mod artifact_lifetime;
+mod player_control;
+pub use player_control::PlayerControlInput;
+#[cfg(feature = "native-host")]
+pub(crate) mod native_session;
+use crate::native_host_storage::NativeHostStorage;
+use native_persistence::storage_error_response;
+
+const SCHEMA_VERSION: u32 = 1;
+const MAX_ITEMS: usize = 10_000;
+const MAX_SESSION_USERS: usize = 32;
+const MAX_SESSION_USER_NAME_CHARS: usize = 24;
+const MAX_ITEM_ID_BYTES: usize = 512;
+const MAX_STRING_BYTES: usize = 1_048_576;
+pub(crate) use bilikara_rust::MAX_VOLUME_PERCENT;
+const DEFAULT_SONG_ADVANCE_DELAY_SECONDS: i32 = 3;
+const MAX_SONG_ADVANCE_DELAY_SECONDS: i32 = 30;
+const MIN_KEY_SHIFT: i32 = -6;
+const MAX_KEY_SHIFT: i32 = 6;
+const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
+const PLAYER_STATUS_MAX_SECONDS: f64 = 7.0 * 24.0 * 60.0 * 60.0;
+const PLAYER_STATUS_THRESHOLD_RATIO: f64 = 0.5;
+const IDENTITY_NAMESPACE_BYTES: usize = 16;
+const ARTIFACT_ROOT_COMPONENT: &str = "artifacts";
+
+fn default_page() -> i64 {
+    1
+}
+
+fn default_queue_slot_type() -> String {
+    "cycle".to_owned()
+}
+
+fn default_cache_status() -> String {
+    "pending".to_owned()
+}
+
+fn default_cache_message() -> String {
+    "等待缓存".to_owned()
+}
+
+fn default_volume_percent() -> i32 {
+    100
+}
+
+fn default_song_advance_delay_seconds() -> i32 {
+    DEFAULT_SONG_ADVANCE_DELAY_SECONDS
+}
+
+fn default_playback_mode() -> String {
+    "local".to_owned()
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct CacheDownloadTrack {
+    pub key: String,
+    pub label: String,
+    pub current_bytes: u64,
+    pub target_bytes: u64,
+    pub done: bool,
+    pub phase: String,
+    pub attempt: u32,
+    pub max_attempts: u32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct CacheDownloadProgress {
+    pub current_bytes: u64,
+    pub total_bytes: u64,
+    pub tracks: Vec<CacheDownloadTrack>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PlaylistItem {
+    #[serde(
+        default,
+        skip_serializing_if = "bilikara_rust::media_source::MediaSource::is_bilibili"
+    )]
+    pub media_source: bilikara_rust::media_source::MediaSource,
+    pub id: String,
+    pub original_url: String,
+    pub resolved_url: String,
+    pub bvid: String,
+    pub aid: i64,
+    pub cid: i64,
+    #[serde(default = "default_page")]
+    pub page: i64,
+    pub title: String,
+    pub part_title: String,
+    pub display_title: String,
+    pub cover_url: String,
+    pub embed_url: String,
+    #[serde(default)]
+    pub selected_pages: Vec<i64>,
+    #[serde(default)]
+    pub selected_cids: Vec<i64>,
+    #[serde(default)]
+    pub selected_durations: Vec<i64>,
+    #[serde(default)]
+    pub selected_parts: Vec<String>,
+    #[serde(default)]
+    pub available_pages: Vec<i64>,
+    #[serde(default)]
+    pub available_cids: Vec<i64>,
+    #[serde(default)]
+    pub available_durations: Vec<i64>,
+    #[serde(default)]
+    pub available_parts: Vec<String>,
+    #[serde(default)]
+    pub audio_variants: Vec<Map<String, Value>>,
+    #[serde(default)]
+    pub selected_audio_variant_id: String,
+    #[serde(default = "default_page")]
+    pub video_page: i64,
+    #[serde(default)]
+    pub manual_selection: bool,
+    #[serde(default)]
+    pub owner_mid: i64,
+    #[serde(default)]
+    pub owner_name: String,
+    #[serde(default)]
+    pub owner_url: String,
+    #[serde(default)]
+    pub requester_name: String,
+    #[serde(default = "default_queue_slot_type")]
+    pub queue_slot_type: String,
+    #[serde(default = "default_cache_status")]
+    pub cache_status: String,
+    #[serde(default)]
+    pub cache_progress: f64,
+    #[serde(default)]
+    pub cache_activity_at: f64,
+    #[serde(default)]
+    pub cache_download_current_bytes: u64,
+    #[serde(default)]
+    pub cache_download_total_bytes: u64,
+    #[serde(default)]
+    pub cache_download_tracks: Vec<CacheDownloadTrack>,
+    #[serde(default = "default_cache_message")]
+    pub cache_message: String,
+    #[serde(default)]
+    pub video_relative_path: String,
+    #[serde(default)]
+    pub video_media_url: String,
+    #[serde(default)]
+    pub item_incarnation_id: String,
+    #[serde(default)]
+    pub artifact_set_id: String,
+    #[serde(default)]
+    pub artifact_relative_directory: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryEntry {
+    pub key: String,
+    pub display_title: String,
+    pub original_url: String,
+    pub resolved_url: String,
+    pub requested_at: f64,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub part_title: String,
+    #[serde(default)]
+    pub owner_mid: i64,
+    #[serde(default)]
+    pub owner_name: String,
+    #[serde(default)]
+    pub owner_url: String,
+    #[serde(default)]
+    pub requester_name: String,
+    #[serde(default = "default_request_count")]
+    pub request_count: u64,
+}
+
+fn default_request_count() -> u64 {
+    1
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SessionPlayedEntry {
+    pub key: String,
+    pub item_id: String,
+    pub display_title: String,
+    pub title: String,
+    pub part_title: String,
+    pub original_url: String,
+    pub resolved_url: String,
+    pub bvid: String,
+    pub aid: i64,
+    pub cid: i64,
+    pub page: i64,
+    pub played_at: f64,
+    #[serde(default)]
+    pub ended_at: Option<f64>,
+    #[serde(default)]
+    pub owner_mid: i64,
+    #[serde(default)]
+    pub owner_name: String,
+    #[serde(default)]
+    pub owner_url: String,
+    #[serde(default)]
+    pub requester_name: String,
+    #[serde(default)]
+    pub cover_url: String,
+    #[serde(default)]
+    pub threshold_reached: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SessionArchiveSeed {
+    pub file_name: String,
+    pub session_started_at: f64,
+    #[serde(default)]
+    pub items: Vec<SessionPlayedEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct BackupSeed {
+    #[serde(default)]
+    pub current_item: Option<PlaylistItem>,
+    #[serde(default)]
+    pub playlist: Vec<PlaylistItem>,
+    #[serde(default)]
+    pub played_session: Option<SessionArchiveSeed>,
+    pub updated_at: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PlayerSettingsSeed {
+    #[serde(default)]
+    pub global_av_delay_ms: i32,
+    #[serde(default)]
+    pub local_av_delay_ms: i32,
+    #[serde(default)]
+    pub av_delay_locked: bool,
+    #[serde(default = "default_volume_percent")]
+    pub volume_percent: i32,
+    #[serde(default)]
+    pub is_muted: bool,
+    #[serde(default = "default_song_advance_delay_seconds")]
+    pub song_advance_delay_seconds: i32,
+    #[serde(default)]
+    pub key_shift: i32,
+}
+
+impl Default for PlayerSettingsSeed {
+    fn default() -> Self {
+        Self {
+            global_av_delay_ms: 0,
+            local_av_delay_ms: 0,
+            av_delay_locked: false,
+            volume_percent: default_volume_percent(),
+            is_muted: false,
+            song_advance_delay_seconds: default_song_advance_delay_seconds(),
+            key_shift: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AppStateSeed {
+    #[serde(default, deserialize_with = "automatic_volume::read_preference")]
+    pub automatic_volume: AutomaticVolumePreference,
+    #[serde(default = "default_playback_mode")]
+    pub playback_mode: String,
+    #[serde(default)]
+    pub player_settings: PlayerSettingsSeed,
+    #[serde(default)]
+    pub current_item: Option<PlaylistItem>,
+    #[serde(default)]
+    pub current_item_started: bool,
+    #[serde(default)]
+    pub playlist: Vec<PlaylistItem>,
+    #[serde(default)]
+    pub history: Vec<HistoryEntry>,
+    #[serde(default)]
+    pub session_history: Vec<HistoryEntry>,
+    #[serde(default)]
+    pub session_users: Vec<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub session_user_ids: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub requester_user_ids: HashMap<String, String>,
+    /// Private LAN registration digests, never bearer tokens or public state.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub remote_identities: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub gatcha_pool_preferences: HashMap<String, Value>,
+    pub session_started_at: f64,
+    pub session_played_file: String,
+    #[serde(default)]
+    pub session_played: Vec<SessionPlayedEntry>,
+    /// Native Host's closed sessions; absent in legacy desktop seeds.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub session_archives: Vec<SessionArchiveSeed>,
+    #[serde(default)]
+    pub previous_session: Option<SessionArchiveSeed>,
+    #[serde(default)]
+    pub backup: Option<BackupSeed>,
+    pub updated_at: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PlaylistItemPatch {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub part_title: Option<String>,
+    #[serde(default)]
+    pub display_title: Option<String>,
+    #[serde(default)]
+    pub cover_url: Option<String>,
+    #[serde(default)]
+    pub embed_url: Option<String>,
+    #[serde(default)]
+    pub owner_mid: Option<i64>,
+    #[serde(default)]
+    pub owner_name: Option<String>,
+    #[serde(default)]
+    pub owner_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AvDelayCommand {
+    Snapshot,
+    SetEffective { effective_delay_ms: i32 },
+    SetPersistent { effective_delay_ms: i32 },
+    Adjust { delta_ms: i32 },
+    ResetLocal,
+    ToggleLock,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CacheEvent {
+    Queued {
+        #[serde(default)]
+        message: String,
+    },
+    Started {
+        #[serde(default)]
+        message: String,
+    },
+    Progress {
+        #[serde(default)]
+        download: Option<CacheDownloadProgress>,
+        progress: f64,
+        #[serde(default)]
+        message: Option<String>,
+    },
+    Ready {
+        #[serde(default = "default_ready_progress")]
+        progress: f64,
+        message: String,
+        video_relative_path: String,
+        video_media_url: String,
+        audio_variants: Vec<Map<String, Value>>,
+        #[serde(default)]
+        selected_audio_variant_id: String,
+        item_incarnation_id: String,
+        artifact_set_id: String,
+        artifact_relative_directory: String,
+    },
+    Failed {
+        message: String,
+    },
+    Cancelled {
+        message: String,
+    },
+    Evicted {
+        message: String,
+    },
+    Reset {
+        message: String,
+        #[serde(default)]
+        clear_selected_audio_variant: bool,
+    },
+}
+
+fn default_ready_progress() -> f64 {
+    100.0
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AppStateRequest {
+    Initialize {
+        schema_version: u32,
+        state: Box<AppStateSeed>,
+    },
+    Snapshot {
+        schema_version: u32,
+    },
+    IssuePlayerControl {
+        schema_version: u32,
+        control: PlayerControlInput,
+        now: f64,
+    },
+    AckPlayerControl {
+        schema_version: u32,
+        seq: u64,
+    },
+    PlayerControlSnapshot {
+        schema_version: u32,
+    },
+    AddItem {
+        schema_version: u32,
+        item: PlaylistItem,
+        position: String,
+        requester_name: String,
+        #[serde(default)]
+        requester_user_id: Option<String>,
+        #[serde(default)]
+        reset_av_delay: bool,
+        #[serde(default)]
+        allow_repeat: bool,
+        now: f64,
+    },
+    UpdateItem {
+        schema_version: u32,
+        item_id: String,
+        changes: PlaylistItemPatch,
+        #[serde(default)]
+        persist_backup: bool,
+        now: f64,
+    },
+    RemoveItem {
+        schema_version: u32,
+        item_id: String,
+        now: f64,
+    },
+    ClearPlaylist {
+        schema_version: u32,
+        now: f64,
+    },
+    ClearHistory {
+        schema_version: u32,
+        now: f64,
+    },
+    RemoveHistoryEntry {
+        schema_version: u32,
+        key: String,
+        now: f64,
+    },
+    AdvanceToNext {
+        schema_version: u32,
+        expected_playback_generation: u64,
+        #[serde(default)]
+        reset_av_delay: bool,
+        now: f64,
+    },
+    MoveItem {
+        schema_version: u32,
+        item_id: String,
+        direction: String,
+        now: f64,
+    },
+    MoveToNext {
+        schema_version: u32,
+        item_id: String,
+        now: f64,
+    },
+    MoveItemToIndex {
+        schema_version: u32,
+        item_id: String,
+        target_index: i64,
+        #[serde(default)]
+        expected_queue_version: Option<String>,
+        now: f64,
+    },
+    DeferCurrentItem {
+        schema_version: u32,
+        item_id: String,
+        expected_item_incarnation_id: String,
+        expected_playback_generation: u64,
+        expected_playlist_item_ids: Vec<String>,
+        // Index in the waiting queue AFTER its original head becomes current.
+        target_index: usize,
+        #[serde(default)]
+        reset_av_delay: bool,
+        now: f64,
+    },
+    ResortPlaylistByCycle {
+        schema_version: u32,
+        now: f64,
+    },
+    MoveToFront {
+        schema_version: u32,
+        item_id: String,
+        #[serde(default)]
+        reset_av_delay: bool,
+        now: f64,
+    },
+    SetCurrentItem {
+        schema_version: u32,
+        #[serde(default)]
+        item_id: Option<String>,
+        #[serde(default)]
+        reset_av_delay: bool,
+        now: f64,
+    },
+    SetPlaybackMode {
+        schema_version: u32,
+        mode: String,
+        now: f64,
+    },
+    ApplyAvDelay {
+        schema_version: u32,
+        action: AvDelayCommand,
+        now: f64,
+    },
+    SetVolume {
+        schema_version: u32,
+        volume_percent: i32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_item_incarnation_id: Option<String>,
+        now: f64,
+    },
+    SetMuted {
+        schema_version: u32,
+        is_muted: bool,
+        now: f64,
+    },
+    SetSongAdvanceDelay {
+        schema_version: u32,
+        delay_seconds: i32,
+        now: f64,
+    },
+    SetKeyShift {
+        schema_version: u32,
+        key_shift: i32,
+        now: f64,
+    },
+    SetAudioVariant {
+        schema_version: u32,
+        item_id: String,
+        expected_item_incarnation_id: String,
+        variant_id: String,
+        now: f64,
+    },
+    RegisterRemoteUser {
+        schema_version: u32,
+        name: String,
+        current_name: Option<String>,
+        digest: String,
+        resident_devices: Vec<String>,
+        guest_config: Option<Value>,
+        now: f64,
+    },
+    AddSessionUser {
+        schema_version: u32,
+        name: String,
+        now: f64,
+    },
+    RemoveSessionUser {
+        schema_version: u32,
+        name: String,
+        now: f64,
+    },
+    RenameSessionUser {
+        schema_version: u32,
+        current_name: String,
+        new_name: String,
+        #[serde(default)]
+        expected_user_id: Option<String>,
+        #[serde(default)]
+        expected_name: Option<String>,
+        now: f64,
+    },
+    EditSessionUsers {
+        schema_version: u32,
+        expected_version: String,
+        edit: SessionUserEdit,
+        now: f64,
+    },
+    MoveSessionUserToIndex {
+        schema_version: u32,
+        name: String,
+        target_index: i64,
+        now: f64,
+    },
+    SetSessionUsers {
+        schema_version: u32,
+        users: Vec<String>,
+        now: f64,
+    },
+    RestoreBackup {
+        schema_version: u32,
+        #[serde(default)]
+        reset_av_delay: bool,
+        now: f64,
+    },
+    DiscardBackup {
+        schema_version: u32,
+        new_session: SessionArchiveSeed,
+        now: f64,
+    },
+    ContinuePreviousSession {
+        schema_version: u32,
+        #[serde(default)]
+        archive: Option<SessionArchiveSeed>,
+        now: f64,
+    },
+    BeginSession {
+        schema_version: u32,
+        new_session: SessionArchiveSeed,
+        now: f64,
+    },
+    ResolveNativeSession {
+        schema_version: u32,
+        continue_previous: bool,
+        new_session: SessionArchiveSeed,
+        now: f64,
+    },
+    ResetRuntime {
+        schema_version: u32,
+        new_session: SessionArchiveSeed,
+        now: f64,
+    },
+    ResetPlayer {
+        schema_version: u32,
+        now: f64,
+    },
+    RestartPlaybackProgram {
+        schema_version: u32,
+    },
+    ApplyPlayerStatusObservation {
+        schema_version: u32,
+        expected_playback_generation: u64,
+        item_id: String,
+        is_paused: bool,
+        current_time: f64,
+        duration: f64,
+        now: f64,
+    },
+    MarkCurrentItemStarted {
+        schema_version: u32,
+        item_id: String,
+        now: f64,
+    },
+    MarkSessionPlayedThreshold {
+        schema_version: u32,
+        item_id: String,
+        now: f64,
+    },
+    AppendHistory {
+        schema_version: u32,
+        entry: HistoryEntry,
+        now: f64,
+    },
+    AppendSessionPlayed {
+        schema_version: u32,
+        entry: SessionPlayedEntry,
+        now: f64,
+    },
+    UpdateOwnerInfo {
+        schema_version: u32,
+        source_url: String,
+        owner_mid: i64,
+        owner_name: String,
+        owner_url: String,
+        now: f64,
+    },
+    QueryDuplicate {
+        schema_version: u32,
+        item: PlaylistItem,
+    },
+    BeginCacheAttempt {
+        schema_version: u32,
+        item_id: String,
+        expected_item_incarnation_id: String,
+    },
+    AuthorizeCachePublication {
+        schema_version: u32,
+        item_id: String,
+        cache_attempt_token: u64,
+        item_incarnation_id: String,
+        artifact_set_id: String,
+        artifact_relative_directory: String,
+    },
+    ApplyCacheEvent {
+        schema_version: u32,
+        item_id: String,
+        cache_attempt_token: u64,
+        event: CacheEvent,
+        now: f64,
+    },
+    OpenInternetRemotePeer {
+        schema_version: u32,
+        peer_id: String,
+        epoch: String,
+        profile: RemoteProfile,
+    },
+    CloseInternetRemotePeer {
+        schema_version: u32,
+        peer_id: String,
+    },
+    InternetRemoteState {
+        schema_version: u32,
+    },
+    DispatchInternetRemoteMessage {
+        schema_version: u32,
+        peer_id: String,
+        lane: RemoteLane,
+        message: String,
+        #[serde(default)]
+        reset_av_delay: bool,
+        now: f64,
+    },
+    CompleteInternetRemotePlaylistAdd {
+        schema_version: u32,
+        peer_id: String,
+        request_id: String,
+        item: PlaylistItem,
+        #[serde(default)]
+        reset_av_delay: bool,
+        now: f64,
+    },
+    CancelInternetRemotePlaylistAdd {
+        schema_version: u32,
+        peer_id: String,
+        request_id: String,
+    },
+    Shutdown {
+        schema_version: u32,
+    },
+}
+
+impl AppStateRequest {
+    fn schema_version(&self) -> u32 {
+        match self {
+            Self::Initialize { schema_version, .. }
+            | Self::Snapshot { schema_version }
+            | Self::IssuePlayerControl { schema_version, .. }
+            | Self::AckPlayerControl { schema_version, .. }
+            | Self::PlayerControlSnapshot { schema_version }
+            | Self::AddItem { schema_version, .. }
+            | Self::UpdateItem { schema_version, .. }
+            | Self::RemoveItem { schema_version, .. }
+            | Self::ClearPlaylist { schema_version, .. }
+            | Self::ClearHistory { schema_version, .. }
+            | Self::RemoveHistoryEntry { schema_version, .. }
+            | Self::AdvanceToNext { schema_version, .. }
+            | Self::MoveItem { schema_version, .. }
+            | Self::MoveToNext { schema_version, .. }
+            | Self::MoveItemToIndex { schema_version, .. }
+            | Self::DeferCurrentItem { schema_version, .. }
+            | Self::ResortPlaylistByCycle { schema_version, .. }
+            | Self::MoveToFront { schema_version, .. }
+            | Self::SetCurrentItem { schema_version, .. }
+            | Self::SetPlaybackMode { schema_version, .. }
+            | Self::ApplyAvDelay { schema_version, .. }
+            | Self::SetVolume { schema_version, .. }
+            | Self::SetMuted { schema_version, .. }
+            | Self::SetSongAdvanceDelay { schema_version, .. }
+            | Self::SetKeyShift { schema_version, .. }
+            | Self::SetAudioVariant { schema_version, .. }
+            | Self::AddSessionUser { schema_version, .. }
+            | Self::RegisterRemoteUser { schema_version, .. }
+            | Self::RemoveSessionUser { schema_version, .. }
+            | Self::RenameSessionUser { schema_version, .. }
+            | Self::EditSessionUsers { schema_version, .. }
+            | Self::MoveSessionUserToIndex { schema_version, .. }
+            | Self::SetSessionUsers { schema_version, .. }
+            | Self::RestoreBackup { schema_version, .. }
+            | Self::DiscardBackup { schema_version, .. }
+            | Self::ContinuePreviousSession { schema_version, .. }
+            | Self::BeginSession { schema_version, .. }
+            | Self::ResolveNativeSession { schema_version, .. }
+            | Self::ResetRuntime { schema_version, .. }
+            | Self::ResetPlayer { schema_version, .. }
+            | Self::RestartPlaybackProgram { schema_version }
+            | Self::ApplyPlayerStatusObservation { schema_version, .. }
+            | Self::MarkCurrentItemStarted { schema_version, .. }
+            | Self::MarkSessionPlayedThreshold { schema_version, .. }
+            | Self::AppendHistory { schema_version, .. }
+            | Self::AppendSessionPlayed { schema_version, .. }
+            | Self::UpdateOwnerInfo { schema_version, .. }
+            | Self::QueryDuplicate { schema_version, .. }
+            | Self::BeginCacheAttempt { schema_version, .. }
+            | Self::AuthorizeCachePublication { schema_version, .. }
+            | Self::ApplyCacheEvent { schema_version, .. }
+            | Self::OpenInternetRemotePeer { schema_version, .. }
+            | Self::CloseInternetRemotePeer { schema_version, .. }
+            | Self::InternetRemoteState { schema_version }
+            | Self::DispatchInternetRemoteMessage { schema_version, .. }
+            | Self::CompleteInternetRemotePlaylistAdd { schema_version, .. }
+            | Self::CancelInternetRemotePlaylistAdd { schema_version, .. }
+            | Self::Shutdown { schema_version } => *schema_version,
+        }
+    }
+
+    fn now(&self) -> Option<f64> {
+        match self {
+            Self::IssuePlayerControl { now, .. }
+            | Self::AddItem { now, .. }
+            | Self::UpdateItem { now, .. }
+            | Self::RemoveItem { now, .. }
+            | Self::ClearPlaylist { now, .. }
+            | Self::ClearHistory { now, .. }
+            | Self::RemoveHistoryEntry { now, .. }
+            | Self::AdvanceToNext { now, .. }
+            | Self::MoveItem { now, .. }
+            | Self::MoveToNext { now, .. }
+            | Self::MoveItemToIndex { now, .. }
+            | Self::DeferCurrentItem { now, .. }
+            | Self::ResortPlaylistByCycle { now, .. }
+            | Self::MoveToFront { now, .. }
+            | Self::SetCurrentItem { now, .. }
+            | Self::SetPlaybackMode { now, .. }
+            | Self::ApplyAvDelay { now, .. }
+            | Self::SetVolume { now, .. }
+            | Self::SetMuted { now, .. }
+            | Self::SetSongAdvanceDelay { now, .. }
+            | Self::SetKeyShift { now, .. }
+            | Self::SetAudioVariant { now, .. }
+            | Self::AddSessionUser { now, .. }
+            | Self::RegisterRemoteUser { now, .. }
+            | Self::RemoveSessionUser { now, .. }
+            | Self::RenameSessionUser { now, .. }
+            | Self::EditSessionUsers { now, .. }
+            | Self::MoveSessionUserToIndex { now, .. }
+            | Self::SetSessionUsers { now, .. }
+            | Self::RestoreBackup { now, .. }
+            | Self::DiscardBackup { now, .. }
+            | Self::ContinuePreviousSession { now, .. }
+            | Self::BeginSession { now, .. }
+            | Self::ResolveNativeSession { now, .. }
+            | Self::ResetRuntime { now, .. }
+            | Self::ResetPlayer { now, .. }
+            | Self::ApplyPlayerStatusObservation { now, .. }
+            | Self::MarkCurrentItemStarted { now, .. }
+            | Self::MarkSessionPlayedThreshold { now, .. }
+            | Self::AppendHistory { now, .. }
+            | Self::AppendSessionPlayed { now, .. }
+            | Self::UpdateOwnerInfo { now, .. }
+            | Self::ApplyCacheEvent { now, .. } => Some(*now),
+            Self::DispatchInternetRemoteMessage { now, .. }
+            | Self::CompleteInternetRemotePlaylistAdd { now, .. } => Some(*now),
+            Self::Initialize { .. }
+            | Self::Snapshot { .. }
+            | Self::AckPlayerControl { .. }
+            | Self::PlayerControlSnapshot { .. }
+            | Self::RestartPlaybackProgram { .. }
+            | Self::QueryDuplicate { .. }
+            | Self::BeginCacheAttempt { .. }
+            | Self::AuthorizeCachePublication { .. }
+            | Self::OpenInternetRemotePeer { .. }
+            | Self::CloseInternetRemotePeer { .. }
+            | Self::InternetRemoteState { .. }
+            | Self::CancelInternetRemotePlaylistAdd { .. }
+            | Self::Shutdown { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct AvDelaySnapshot {
+    pub(crate) schema_version: u32,
+    pub(crate) global_delay_ms: i32,
+    pub(crate) local_delay_ms: i32,
+    pub(crate) effective_delay_ms: i32,
+    pub(crate) locked: bool,
+    pub(crate) has_local_adjustment: bool,
+    pub(crate) lock_button_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct PlayerSettingsSnapshot {
+    pub(crate) av_offset_ms: i32,
+    pub(crate) av_delay: AvDelaySnapshot,
+    pub(crate) volume_percent: i32,
+    pub(crate) is_muted: bool,
+    pub(crate) song_advance_delay_seconds: i32,
+    pub(crate) key_shift: i32,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct BackupSummary {
+    available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    playlist_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    updated_at: Option<f64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    preview_titles: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    playback_mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct PreviousSessionSummary {
+    available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    item_count: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PlaybackProgram {
+    pub item_id: String,
+    pub item_incarnation_id: String,
+    pub selected_audio_variant_id: String,
+    pub artifact_set_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct AppSnapshot {
+    pub automatic_volume: AutomaticVolumeSnapshot,
+    pub schema_version: u32,
+    pub revision: u64,
+    pub queue_version: String,
+    pub session_generation: u64,
+    pub playback_generation: u64,
+    pub playback_program: Option<PlaybackProgram>,
+    pub playback_mode: String,
+    pub player_settings: PlayerSettingsSnapshot,
+    pub current_item: Option<PlaylistItem>,
+    pub current_item_started: bool,
+    pub playlist: Vec<PlaylistItem>,
+    pub history: Vec<HistoryEntry>,
+    pub session_history: Vec<HistoryEntry>,
+    pub session_users: Vec<String>,
+    pub session_user_entries: Vec<SessionUserEntry>,
+    pub session_users_version: String,
+    pub session_user_edit_version: u32,
+    pub session_played: Vec<SessionPlayedEntry>,
+    pub updated_at: f64,
+    pub backup: BackupSummary,
+    pub previous_session: PreviousSessionSummary,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct PersistenceSnapshot {
+    automatic_volume: AutomaticVolumePreference,
+    playback_mode: String,
+    player_settings: PlayerSettingsSeed,
+    history: Vec<HistoryEntry>,
+    session_users: Vec<String>,
+    session_user_ids: HashMap<String, String>,
+    requester_user_ids: HashMap<String, String>,
+    session_started_at: f64,
+    session_played_file: String,
+    session_played: Vec<SessionPlayedEntry>,
+    backup: Option<BackupSeed>,
+    updated_at: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+pub struct PersistenceEffects {
+    pub write_core: bool,
+    pub write_session_played: bool,
+    pub write_backup: bool,
+    pub delete_backup: bool,
+    pub delete_runtime_files: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct AppStateSuccess {
+    schema_version: u32,
+    status: &'static str,
+    committed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) snapshot: Option<AppSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    persistence: Option<PersistenceSnapshot>,
+    effects: PersistenceEffects,
+    result: Value,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct AppStateFailure {
+    schema_version: u32,
+    status: &'static str,
+    error: AppStateError,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct AppStateError {
+    pub kind: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(untagged)]
+pub enum AppStateResponse {
+    Success(Box<AppStateSuccess>),
+    Failure(AppStateFailure),
+}
+
+impl AppStateResponse {
+    pub fn result(&self) -> Option<&Value> {
+        match self {
+            Self::Success(success) => Some(&success.result),
+            Self::Failure(_) => None,
+        }
+    }
+    /// Borrow the authoritative projection without JSON or the compatibility ABI.
+    /// Keep the response intact so transport adapters can still persist its effects.
+    pub fn snapshot(&self) -> Option<&AppSnapshot> {
+        match self {
+            Self::Success(success) => success.snapshot.as_ref(),
+            Self::Failure(_) => None,
+        }
+    }
+
+    pub fn error(&self) -> Option<&AppStateError> {
+        match self {
+            Self::Success(_) => None,
+            Self::Failure(failure) => Some(&failure.error),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct AppStateData {
+    automatic_volume: AutomaticVolumePreference,
+    automatic_playback: automatic_volume::AutomaticPlayback,
+    revision: u64,
+    native_session_choice_pending: bool,
+    session_generation: u64,
+    playback_generation: u64,
+    playback_mode: String,
+    player_settings: PlayerSettingsSeed,
+    current_item: Option<PlaylistItem>,
+    current_item_started: bool,
+    playlist: Vec<PlaylistItem>,
+    history: Vec<HistoryEntry>,
+    session_history: Vec<HistoryEntry>,
+    session_users: Vec<String>,
+    session_user_ids: HashMap<String, String>,
+    requester_user_ids: HashMap<String, String>,
+    session_user_epoch: String,
+    remote_identities: HashMap<String, String>,
+    gatcha_pool_preferences: HashMap<String, Value>,
+    session_started_at: f64,
+    session_played_file: String,
+    session_played: Vec<SessionPlayedEntry>,
+    session_archives: Vec<SessionArchiveSeed>,
+    previous_session: Option<SessionArchiveSeed>,
+    backup: Option<BackupSeed>,
+    updated_at: f64,
+    active_cache_attempts: HashMap<String, ActiveCacheAttempt>,
+}
+
+#[derive(Debug)]
+pub struct AppState {
+    #[cfg(feature = "native-host")]
+    analysis_signal: Option<automatic_volume::AnalysisSignal>,
+    data: Option<AppStateData>,
+    native_storage: Option<NativeHostStorage>,
+    next_cache_attempt_token: u64,
+    next_item_incarnation_id: u64,
+    next_artifact_set_id: u64,
+    identity_namespace: Result<[u8; IDENTITY_NAMESPACE_BYTES], String>,
+    internet_remote_peers: InternetRemotePeers,
+    player_controls: player_control::PlayerControls,
+    catalog: crate::shared_catalog::CatalogState,
+    artifact_lifetime: artifact_lifetime::ArtifactLifetime,
+    source_monthly_refresh_active: bool,
+    #[cfg(feature = "native-host")]
+    native_session: native_session::NativeSession,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ActiveCacheAttempt {
+    token: u64,
+    reservation: CacheAttemptReservation,
+    refresh: bool,
+    terminal_event: Option<CacheEvent>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub(crate) struct CacheAttemptReservation {
+    pub cache_attempt_token: u64,
+    pub item_id: String,
+    pub item_incarnation_id: String,
+    pub artifact_set_id: String,
+    pub artifact_relative_directory: String,
+    pub refresh: bool,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        let mut namespace = [0_u8; IDENTITY_NAMESPACE_BYTES];
+        let identity_namespace = getrandom::fill(&mut namespace)
+            .map_err(|error| format!("operating-system identity entropy is unavailable: {error}"))
+            .and_then(|()| {
+                if namespace.iter().all(|byte| *byte == 0) {
+                    Err(
+                        "operating-system identity entropy returned an all-zero namespace"
+                            .to_owned(),
+                    )
+                } else {
+                    Ok(namespace)
+                }
+            });
+        Self {
+            data: None,
+            #[cfg(feature = "native-host")]
+            analysis_signal: None,
+            native_storage: None,
+            next_cache_attempt_token: 0,
+            next_item_incarnation_id: 0,
+            next_artifact_set_id: 0,
+            identity_namespace,
+            internet_remote_peers: InternetRemotePeers::default(),
+            player_controls: player_control::PlayerControls::default(),
+            catalog: crate::shared_catalog::CatalogState::default(),
+            artifact_lifetime: artifact_lifetime::ArtifactLifetime::default(),
+            source_monthly_refresh_active: false,
+            #[cfg(feature = "native-host")]
+            native_session: native_session::NativeSession::default(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct MutationResult {
+    changed: bool,
+    operational_changed: bool,
+    force_program_lifetime: bool,
+    result: Value,
+    effects: PersistenceEffects,
+}
+
+impl MutationResult {
+    fn unchanged(result: Value) -> Self {
+        Self {
+            changed: false,
+            operational_changed: false,
+            force_program_lifetime: false,
+            result,
+            effects: PersistenceEffects::default(),
+        }
+    }
+
+    fn changed(result: Value, persist_backup: bool) -> Self {
+        Self {
+            changed: true,
+            operational_changed: false,
+            force_program_lifetime: false,
+            result,
+            effects: PersistenceEffects {
+                write_core: true,
+                write_session_played: true,
+                write_backup: persist_backup,
+                ..PersistenceEffects::default()
+            },
+        }
+    }
+
+    fn with_operational_change(mut self) -> Self {
+        self.operational_changed = true;
+        self
+    }
+}
+
+#[derive(Debug)]
+enum ExecuteError {
+    Rejected(AppStateError),
+    Internal(String),
+}
+
+static APP_STATE: OnceLock<Mutex<AppState>> = OnceLock::new();
+
+pub(crate) fn source_monthly_guard<T>(action: impl FnOnce(&mut bool) -> T) -> Result<T, ()> {
+    let mut state = APP_STATE
+        .get_or_init(|| Mutex::new(AppState::default()))
+        .lock()
+        .map_err(|_| ())?;
+    Ok(action(&mut state.source_monthly_refresh_active))
+}
+
+fn rejected(kind: &str, message: impl Into<String>) -> ExecuteError {
+    ExecuteError::Rejected(AppStateError {
+        kind: kind.to_owned(),
+        message: message.into(),
+        details: None,
+    })
+}
+
+fn rejected_with_details(kind: &str, message: impl Into<String>, details: Value) -> ExecuteError {
+    ExecuteError::Rejected(AppStateError {
+        kind: kind.to_owned(),
+        message: message.into(),
+        details: Some(details),
+    })
+}
+
+fn valid_string(value: &str, max_bytes: usize, allow_empty: bool) -> bool {
+    (allow_empty || !value.is_empty()) && !value.contains('\0') && value.len() <= max_bytes
+}
+
+fn format_authoritative_identity(
+    prefix: char,
+    namespace: &[u8; IDENTITY_NAMESPACE_BYTES],
+    counter: u64,
+) -> String {
+    let namespace = namespace
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("{prefix}-{namespace}-{counter:016x}")
+}
+
+pub(crate) fn valid_authoritative_identity(value: &str, prefix: char) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 51
+        && bytes[0] == prefix as u8
+        && bytes[1] == b'-'
+        && bytes[34] == b'-'
+        && bytes[2..34]
+            .iter()
+            .chain(bytes[35..51].iter())
+            .all(u8::is_ascii_hexdigit)
+        && bytes[35..51].iter().any(|byte| *byte != b'0')
+}
+
+fn artifact_relative_directory(item_incarnation_id: &str, artifact_set_id: &str) -> String {
+    format!("{ARTIFACT_ROOT_COMPONENT}/{item_incarnation_id}/{artifact_set_id}")
+}
+
+pub(crate) fn valid_artifact_relative_directory(
+    value: &str,
+    item_incarnation_id: &str,
+    artifact_set_id: &str,
+) -> bool {
+    value == artifact_relative_directory(item_incarnation_id, artifact_set_id)
+}
+
+fn invalid_playback_program(message: &str) -> ExecuteError {
+    rejected("invalid_playback_program", message)
+}
+
+fn derive_playback_program(item: &PlaylistItem) -> Result<PlaybackProgram, ExecuteError> {
+    if !valid_string(&item.id, MAX_ITEM_ID_BYTES, false)
+        || !valid_authoritative_identity(&item.item_incarnation_id, 'i')
+        || !valid_string(&item.selected_audio_variant_id, MAX_STRING_BYTES, true)
+    {
+        return Err(invalid_playback_program(
+            "current item identity or selected audio variant is invalid",
+        ));
+    }
+
+    let has_artifact_input = !item.artifact_set_id.is_empty()
+        || !item.artifact_relative_directory.is_empty()
+        || !item.video_relative_path.is_empty()
+        || !item.video_media_url.is_empty()
+        || !item.audio_variants.is_empty();
+    let artifact_set_id = if !has_artifact_input {
+        None
+    } else {
+        if !valid_authoritative_identity(&item.artifact_set_id, 'a')
+            || !valid_artifact_relative_directory(
+                &item.artifact_relative_directory,
+                &item.item_incarnation_id,
+                &item.artifact_set_id,
+            )
+            || !valid_artifact_file_path(
+                &item.video_relative_path,
+                &item.artifact_relative_directory,
+            )
+            || !valid_cache_media_url(&item.video_media_url)
+            || cache_media_path(&item.video_media_url).as_deref()
+                != Some(item.video_relative_path.as_str())
+        {
+            return Err(invalid_playback_program(
+                "current item committed video or artifact identity is invalid",
+            ));
+        }
+        let mut seen_paths = HashSet::from([item.video_relative_path.clone()]);
+        let variant_ids = validate_ready_audio_variants(
+            &item.audio_variants,
+            &item.artifact_relative_directory,
+            &mut seen_paths,
+        )
+        .map_err(|_| {
+            invalid_playback_program("current item committed audio variants are invalid")
+        })?;
+        if variant_ids
+            .iter()
+            .filter(|variant_id| *variant_id == &item.selected_audio_variant_id)
+            .count()
+            != 1
+        {
+            return Err(invalid_playback_program(
+                "current item selected audio variant is not exactly mountable",
+            ));
+        }
+        Some(item.artifact_set_id.clone())
+    };
+
+    Ok(PlaybackProgram {
+        item_id: item.id.clone(),
+        item_incarnation_id: item.item_incarnation_id.clone(),
+        selected_audio_variant_id: item.selected_audio_variant_id.clone(),
+        artifact_set_id,
+    })
+}
+
+fn clear_download_progress(item: &mut PlaylistItem) {
+    item.cache_download_current_bytes = 0;
+    item.cache_download_total_bytes = 0;
+    item.cache_download_tracks.clear();
+}
+
+fn clear_committed_artifact(item: &mut PlaylistItem, clear_selected_audio_variant: bool) {
+    clear_download_progress(item);
+    item.video_relative_path.clear();
+    item.video_media_url.clear();
+    item.audio_variants.clear();
+    item.artifact_set_id.clear();
+    item.artifact_relative_directory.clear();
+    if clear_selected_audio_variant {
+        item.selected_audio_variant_id.clear();
+    }
+}
+
+fn has_committed_artifact(item: &PlaylistItem) -> bool {
+    !item.artifact_set_id.is_empty()
+        && !item.artifact_relative_directory.is_empty()
+        && !item.video_relative_path.is_empty()
+        && !item.video_media_url.is_empty()
+        && !item.audio_variants.is_empty()
+}
+
+fn allocate_authoritative_identity(
+    prefix: char,
+    namespace: &[u8; IDENTITY_NAMESPACE_BYTES],
+    counter: &mut u64,
+    exhausted_kind: &str,
+) -> Result<String, ExecuteError> {
+    let next = counter
+        .checked_add(1)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            rejected(
+                exhausted_kind,
+                format!("{prefix} identity allocator is exhausted"),
+            )
+        })?;
+    *counter = next;
+    Ok(format_authoritative_identity(prefix, namespace, next))
+}
+
+fn assign_new_item_incarnation(
+    item: &mut PlaylistItem,
+    namespace: &[u8; IDENTITY_NAMESPACE_BYTES],
+    counter: &mut u64,
+) -> Result<(), ExecuteError> {
+    item.item_incarnation_id =
+        allocate_authoritative_identity('i', namespace, counter, "item_incarnation_id_exhausted")?;
+    clear_committed_artifact(item, true);
+    item.cache_status = "pending".to_owned();
+    item.cache_progress = 0.0;
+    item.cache_activity_at = 0.0;
+    Ok(())
+}
+
+fn validate_time(value: f64, field: &str) -> Result<(), ExecuteError> {
+    if !value.is_finite() || value < 0.0 {
+        return Err(rejected(
+            "invalid_time",
+            format!("{field} must be finite and non-negative"),
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_session_user_name(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(MAX_SESSION_USER_NAME_CHARS)
+        .collect()
+}
+
+fn validate_session_users(users: &[String]) -> Result<(), ExecuteError> {
+    if users.len() > MAX_SESSION_USERS {
+        return Err(rejected("too_many_session_users", "too many session users"));
+    }
+    let mut seen = HashSet::with_capacity(users.len());
+    for user in users {
+        if user != &normalize_session_user_name(user) || user.is_empty() {
+            return Err(rejected(
+                "invalid_session_user",
+                "session user is not normalized",
+            ));
+        }
+        if !seen.insert(user.as_str()) {
+            return Err(rejected("duplicate_session_user", "duplicate session user"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_audio_variants(variants: &[Map<String, Value>]) -> Result<(), ExecuteError> {
+    if variants.len() > 1_024 {
+        return Err(rejected(
+            "too_many_audio_variants",
+            "too many audio variants",
+        ));
+    }
+    for variant in variants {
+        let encoded = serde_json::to_vec(variant)
+            .map_err(|_| rejected("invalid_audio_variant", "audio variant is not serializable"))?;
+        if encoded.len() > MAX_STRING_BYTES {
+            return Err(rejected(
+                "invalid_audio_variant",
+                "audio variant is too large",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn valid_cache_relative_path(value: &str) -> bool {
+    if !valid_string(value, MAX_STRING_BYTES, false) {
+        return false;
+    }
+    let normalized = value.trim().replace('\\', "/");
+    let path = Path::new(&normalized);
+    !normalized.is_empty()
+        && !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
+fn decode_cache_url_path(value: &str) -> Option<String> {
+    fn hex(value: u8) -> Option<u8> {
+        match value {
+            b'0'..=b'9' => Some(value - b'0'),
+            b'a'..=b'f' => Some(value - b'a' + 10),
+            b'A'..=b'F' => Some(value - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let (Some(high), Some(low)) = (hex(bytes[index + 1]), hex(bytes[index + 2]))
+        {
+            decoded.push((high << 4) | low);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn cache_media_path(value: &str) -> Option<String> {
+    let without_query = value.split(['?', '#']).next().unwrap_or(value);
+    if let Some(relative) = without_query.strip_prefix("/media/") {
+        return decode_cache_url_path(relative);
+    }
+    if let Some(relative) = without_query.strip_prefix("media/") {
+        return decode_cache_url_path(relative);
+    }
+    let parsed = url::Url::parse(value).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    parsed
+        .path()
+        .strip_prefix("/media/")
+        .and_then(decode_cache_url_path)
+}
+
+fn valid_cache_media_url(value: &str) -> bool {
+    if !valid_string(value, MAX_STRING_BYTES, false) {
+        return false;
+    }
+    cache_media_path(value).is_some_and(|relative| {
+        !relative.is_empty()
+            && !relative
+                .split('/')
+                .any(|segment| segment.eq_ignore_ascii_case("%2e%2e"))
+            && valid_cache_relative_path(&relative)
+    })
+}
+
+fn valid_artifact_file_path(value: &str, artifact_directory: &str) -> bool {
+    if !valid_cache_relative_path(value) {
+        return false;
+    }
+    let normalized = value.trim().replace('\\', "/");
+    let path = Path::new(&normalized);
+    path.parent()
+        .is_some_and(|parent| parent.to_string_lossy().replace('\\', "/") == artifact_directory)
+        && path.file_name().is_some_and(|name| {
+            let name = name.to_string_lossy();
+            !name.is_empty() && !name.starts_with('.')
+        })
+}
+
+fn validate_ready_audio_variants(
+    variants: &[Map<String, Value>],
+    artifact_directory: &str,
+    seen_paths: &mut HashSet<String>,
+) -> Result<Vec<String>, ExecuteError> {
+    if variants.is_empty() {
+        return Err(rejected(
+            "invalid_cache_ready",
+            "ready cache projection requires at least one audio variant",
+        ));
+    }
+    validate_audio_variants(variants)?;
+    let mut ids = Vec::with_capacity(variants.len());
+    let mut seen = HashSet::with_capacity(variants.len());
+    for variant in variants {
+        let Some(id) = variant.get("id").and_then(Value::as_str) else {
+            return Err(rejected(
+                "invalid_cache_ready",
+                "ready audio variant id must be a string",
+            ));
+        };
+        let Some(audio_url) = variant.get("audio_url").and_then(Value::as_str) else {
+            return Err(rejected(
+                "invalid_cache_ready",
+                "ready audio variant URL must be a string",
+            ));
+        };
+        if id.trim().is_empty() || !valid_string(id, MAX_STRING_BYTES, false) {
+            return Err(rejected(
+                "invalid_cache_ready",
+                "ready audio variant id is invalid",
+            ));
+        }
+        if !seen.insert(id.to_owned()) {
+            return Err(rejected(
+                "duplicate_audio_variant_id",
+                "ready audio variant ids must be unique",
+            ));
+        }
+        if !valid_cache_media_url(audio_url) {
+            return Err(rejected(
+                "invalid_cache_ready",
+                "ready audio variant URL is invalid",
+            ));
+        }
+        let Some(relative_path) = cache_media_path(audio_url) else {
+            return Err(rejected(
+                "invalid_cache_ready",
+                "ready audio variant URL is invalid",
+            ));
+        };
+        if !valid_artifact_file_path(&relative_path, artifact_directory) {
+            return Err(rejected(
+                "invalid_cache_ready",
+                "ready audio variant is outside its immutable artifact set",
+            ));
+        }
+        if !seen_paths.insert(relative_path) {
+            return Err(rejected(
+                "duplicate_artifact_path",
+                "ready cache descriptor paths must be unique",
+            ));
+        }
+        ids.push(id.to_owned());
+    }
+    Ok(ids)
+}
+
+fn validate_item(item: &PlaylistItem) -> Result<(), ExecuteError> {
+    if !item.media_source.is_valid() {
+        return Err(rejected("invalid_item", "invalid media source"));
+    }
+    if let Some(url) = item.media_source.canonical_url()
+        && (!item.bvid.is_empty()
+            || item.aid != 0
+            || item.cid != 0
+            || item.original_url != url
+            || item.resolved_url != url
+            || item.page != 1
+            || item.video_page != 1
+            || item.owner_mid != 0
+            || item.selected_pages != [1]
+            || item.available_pages != [1]
+            || item.selected_cids != [0]
+            || item.available_cids != [0])
+    {
+        return Err(rejected(
+            "invalid_item",
+            "YouTube item contains inconsistent Bilibili identity or parts",
+        ));
+    }
+    if !valid_string(&item.id, MAX_ITEM_ID_BYTES, false) {
+        return Err(rejected("invalid_item", "playlist item id is invalid"));
+    }
+    for value in [
+        &item.original_url,
+        &item.resolved_url,
+        &item.bvid,
+        &item.title,
+        &item.part_title,
+        &item.display_title,
+        &item.cover_url,
+        &item.embed_url,
+        &item.selected_audio_variant_id,
+        &item.owner_name,
+        &item.owner_url,
+        &item.requester_name,
+        &item.cache_status,
+        &item.cache_message,
+        &item.video_relative_path,
+        &item.video_media_url,
+        &item.item_incarnation_id,
+        &item.artifact_set_id,
+        &item.artifact_relative_directory,
+    ] {
+        if !valid_string(value, MAX_STRING_BYTES, true) {
+            return Err(rejected("invalid_item", "playlist item string is invalid"));
+        }
+    }
+    if !item.item_incarnation_id.is_empty()
+        && !valid_authoritative_identity(&item.item_incarnation_id, 'i')
+    {
+        return Err(rejected(
+            "invalid_item",
+            "playlist item incarnation identity is invalid",
+        ));
+    }
+    if item.artifact_set_id.is_empty() != item.artifact_relative_directory.is_empty()
+        || (!item.artifact_set_id.is_empty()
+            && (!valid_authoritative_identity(&item.artifact_set_id, 'a')
+                || !valid_artifact_relative_directory(
+                    &item.artifact_relative_directory,
+                    &item.item_incarnation_id,
+                    &item.artifact_set_id,
+                )))
+    {
+        return Err(rejected(
+            "invalid_item",
+            "playlist item artifact identity is invalid",
+        ));
+    }
+    if item.aid < 0
+        || item.cid < 0
+        || item.owner_mid < 0
+        || item.page <= 0
+        || item.video_page <= 0
+        || !item.cache_progress.is_finite()
+        || !item.cache_activity_at.is_finite()
+        || !matches!(
+            item.queue_slot_type.as_str(),
+            "cycle" | "priority" | "manual"
+        )
+    {
+        return Err(rejected(
+            "invalid_item",
+            "playlist item numeric or slot data is invalid",
+        ));
+    }
+    if item.selected_pages.len() > 256
+        || item.selected_cids.len() > 256
+        || item.selected_durations.len() > 256
+        || item.selected_parts.len() > 256
+        || item.available_pages.len() > 256
+        || item.available_cids.len() > 256
+        || item.available_durations.len() > 256
+        || item.available_parts.len() > 256
+    {
+        return Err(rejected(
+            "invalid_item",
+            "playlist item page data is too large",
+        ));
+    }
+    if item
+        .selected_parts
+        .iter()
+        .chain(item.available_parts.iter())
+        .any(|value| !valid_string(value, MAX_STRING_BYTES, true))
+    {
+        return Err(rejected(
+            "invalid_item",
+            "playlist item part label is invalid",
+        ));
+    }
+    validate_audio_variants(&item.audio_variants)
+}
+
+fn validate_history_entry(entry: &HistoryEntry) -> Result<(), ExecuteError> {
+    validate_time(entry.requested_at, "history requested_at")?;
+    if entry.request_count == 0 {
+        return Err(rejected(
+            "invalid_history",
+            "history request_count must be positive",
+        ));
+    }
+    for value in [
+        &entry.key,
+        &entry.display_title,
+        &entry.original_url,
+        &entry.resolved_url,
+        &entry.title,
+        &entry.part_title,
+        &entry.owner_name,
+        &entry.owner_url,
+        &entry.requester_name,
+    ] {
+        if !valid_string(value, MAX_STRING_BYTES, true) {
+            return Err(rejected("invalid_history", "history string is invalid"));
+        }
+    }
+    if entry.owner_mid < 0 {
+        return Err(rejected("invalid_history", "history owner id is invalid"));
+    }
+    Ok(())
+}
+
+fn validate_session_played_entry(entry: &SessionPlayedEntry) -> Result<(), ExecuteError> {
+    validate_time(entry.played_at, "session played_at")?;
+    if let Some(ended_at) = entry.ended_at {
+        validate_time(ended_at, "session ended_at")?;
+    }
+    if !valid_string(&entry.item_id, MAX_ITEM_ID_BYTES, false)
+        || entry.aid < 0
+        || entry.cid < 0
+        || entry.owner_mid < 0
+        || entry.page <= 0
+    {
+        return Err(rejected(
+            "invalid_session_played",
+            "session played entry is invalid",
+        ));
+    }
+    for value in [
+        &entry.key,
+        &entry.display_title,
+        &entry.title,
+        &entry.part_title,
+        &entry.original_url,
+        &entry.resolved_url,
+        &entry.bvid,
+        &entry.owner_name,
+        &entry.owner_url,
+        &entry.requester_name,
+        &entry.cover_url,
+    ] {
+        if !valid_string(value, MAX_STRING_BYTES, true) {
+            return Err(rejected(
+                "invalid_session_played",
+                "session played string is invalid",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_archive(archive: &SessionArchiveSeed) -> Result<(), ExecuteError> {
+    if !valid_string(&archive.file_name, MAX_STRING_BYTES, false)
+        || archive.file_name.contains('/')
+        || archive.file_name.contains('\\')
+    {
+        return Err(rejected(
+            "invalid_session_archive",
+            "session archive filename is invalid",
+        ));
+    }
+    validate_time(archive.session_started_at, "session_started_at")?;
+    for entry in &archive.items {
+        validate_session_played_entry(entry)?;
+    }
+    Ok(())
+}
+
+fn validate_item_collection(
+    current_item: Option<&PlaylistItem>,
+    playlist: &[PlaylistItem],
+) -> Result<(), ExecuteError> {
+    if playlist.len() + usize::from(current_item.is_some()) > MAX_ITEMS {
+        return Err(rejected("too_many_items", "too many playlist items"));
+    }
+    let mut ids = HashSet::with_capacity(playlist.len() + 1);
+    if let Some(item) = current_item {
+        validate_item(item)?;
+        ids.insert(item.id.as_str());
+    }
+    for item in playlist {
+        validate_item(item)?;
+        if !ids.insert(item.id.as_str()) {
+            return Err(rejected("duplicate_item_id", "duplicate playlist item id"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_backup(backup: &BackupSeed) -> Result<(), ExecuteError> {
+    validate_time(backup.updated_at, "backup updated_at")?;
+    validate_item_collection(backup.current_item.as_ref(), &backup.playlist)?;
+    if let Some(archive) = &backup.played_session {
+        validate_archive(archive)?;
+    }
+    Ok(())
+}
+
+fn validate_seed(seed: &AppStateSeed) -> Result<(), ExecuteError> {
+    session_users::validate_user_ids(seed)?;
+    if seed.remote_identities.iter().any(|(digest, name)| {
+        digest.len() != 64
+            || !digest.bytes().all(|c| c.is_ascii_hexdigit())
+            || !seed.session_users.contains(name)
+    }) {
+        return Err(rejected(
+            "invalid_initial_state",
+            "invalid remote registration",
+        ));
+    }
+    validate_time(seed.updated_at, "updated_at")?;
+    validate_time(seed.session_started_at, "session_started_at")?;
+    if !valid_string(&seed.playback_mode, MAX_STRING_BYTES, false)
+        || !valid_string(&seed.session_played_file, MAX_STRING_BYTES, false)
+    {
+        return Err(rejected(
+            "invalid_initial_state",
+            "initial state string is invalid",
+        ));
+    }
+    if seed.session_played_file.contains('/') || seed.session_played_file.contains('\\') {
+        return Err(rejected(
+            "invalid_initial_state",
+            "session played filename must be a basename",
+        ));
+    }
+    if seed.player_settings.volume_percent < 0
+        || seed.player_settings.volume_percent > MAX_VOLUME_PERCENT
+        || seed.player_settings.song_advance_delay_seconds < 0
+        || seed.player_settings.song_advance_delay_seconds > MAX_SONG_ADVANCE_DELAY_SECONDS
+        || seed.player_settings.key_shift < MIN_KEY_SHIFT
+        || seed.player_settings.key_shift > MAX_KEY_SHIFT
+    {
+        return Err(rejected(
+            "invalid_initial_state",
+            "player settings are out of range",
+        ));
+    }
+    let av_state = AvDelayState {
+        global_delay_ms: seed.player_settings.global_av_delay_ms,
+        local_delay_ms: seed.player_settings.local_av_delay_ms,
+        locked: seed.player_settings.av_delay_locked,
+    };
+    let effective_delay = i64::from(seed.player_settings.global_av_delay_ms)
+        + i64::from(seed.player_settings.local_av_delay_ms);
+    if !(-i64::from(bilikara_rust::MAX_AV_DELAY_MS)..=i64::from(bilikara_rust::MAX_AV_DELAY_MS))
+        .contains(&effective_delay)
+        || !(-bilikara_rust::MAX_AV_DELAY_MS..=bilikara_rust::MAX_AV_DELAY_MS)
+            .contains(&av_state.global_delay_ms)
+        || !(-(bilikara_rust::MAX_AV_DELAY_MS * 2)..=(bilikara_rust::MAX_AV_DELAY_MS * 2))
+            .contains(&av_state.local_delay_ms)
+    {
+        return Err(rejected(
+            "invalid_initial_state",
+            "AV delay state is out of range",
+        ));
+    }
+    validate_item_collection(seed.current_item.as_ref(), &seed.playlist)?;
+    for entry in seed.history.iter().chain(seed.session_history.iter()) {
+        validate_history_entry(entry)?;
+    }
+    for entry in &seed.session_played {
+        validate_session_played_entry(entry)?;
+    }
+    let mut archive_names = HashSet::new();
+    for archive in &seed.session_archives {
+        validate_archive(archive)?;
+        if !archive_names.insert(&archive.file_name) {
+            return Err(rejected(
+                "invalid_session_archive",
+                "duplicate session archive identity",
+            ));
+        }
+    }
+    validate_session_users(&seed.session_users)?;
+    if let Some(previous) = &seed.previous_session {
+        validate_archive(previous)?;
+    }
+    if let Some(backup) = &seed.backup {
+        validate_backup(backup)?;
+    }
+    Ok(())
+}
+
+impl AppStateData {
+    fn from_seed(
+        mut seed: AppStateSeed,
+        namespace: &[u8; IDENTITY_NAMESPACE_BYTES],
+        next_item_incarnation_id: &mut u64,
+    ) -> Result<Self, ExecuteError> {
+        if let Some(item) = seed.current_item.as_mut() {
+            assign_new_item_incarnation(item, namespace, next_item_incarnation_id)?;
+        }
+        for item in &mut seed.playlist {
+            assign_new_item_incarnation(item, namespace, next_item_incarnation_id)?;
+        }
+        validate_seed(&seed)?;
+        let mut data = Self {
+            automatic_volume: seed.automatic_volume,
+            automatic_playback: automatic_volume::AutomaticPlayback {
+                manual_override: seed.current_item.is_some(),
+                ..Default::default()
+            },
+            revision: 1,
+            native_session_choice_pending: false,
+            session_generation: 1,
+            playback_generation: 1,
+            playback_mode: seed.playback_mode,
+            player_settings: seed.player_settings,
+            current_item: seed.current_item,
+            current_item_started: seed.current_item_started,
+            playlist: seed.playlist,
+            history: seed.history,
+            session_history: seed.session_history,
+            session_users: seed.session_users,
+            session_user_ids: seed.session_user_ids,
+            requester_user_ids: seed.requester_user_ids,
+            session_user_epoch: namespace.iter().map(|byte| format!("{byte:02x}")).collect(),
+            remote_identities: seed.remote_identities,
+            gatcha_pool_preferences: seed.gatcha_pool_preferences,
+            session_started_at: seed.session_started_at,
+            session_played_file: seed.session_played_file,
+            session_played: seed.session_played,
+            session_archives: seed.session_archives,
+            previous_session: seed
+                .previous_session
+                .filter(|entry| !entry.items.is_empty()),
+            backup: seed
+                .backup
+                .filter(|entry| entry.current_item.is_some() || !entry.playlist.is_empty()),
+            updated_at: seed.updated_at,
+            active_cache_attempts: HashMap::new(),
+        };
+        data.sync_user_ids(namespace);
+        data.restore_requester_ids();
+        Ok(data)
+    }
+
+    fn current_identity(&self) -> Option<&str> {
+        self.current_item.as_ref().map(|item| item.id.as_str())
+    }
+
+    fn playback_program(&self) -> Result<Option<PlaybackProgram>, ExecuteError> {
+        self.current_item
+            .as_ref()
+            .map(derive_playback_program)
+            .transpose()
+    }
+
+    fn find_item(&self, item_id: &str) -> Option<&PlaylistItem> {
+        self.current_item
+            .as_ref()
+            .filter(|item| item.id == item_id)
+            .or_else(|| self.playlist.iter().find(|item| item.id == item_id))
+    }
+
+    fn find_item_mut(&mut self, item_id: &str) -> Option<&mut PlaylistItem> {
+        if self
+            .current_item
+            .as_ref()
+            .is_some_and(|item| item.id == item_id)
+        {
+            return self.current_item.as_mut();
+        }
+        self.playlist.iter_mut().find(|item| item.id == item_id)
+    }
+
+    fn av_snapshot(&self) -> AvDelaySnapshot {
+        let state = AvDelayState {
+            global_delay_ms: self.player_settings.global_av_delay_ms,
+            local_delay_ms: self.player_settings.local_av_delay_ms,
+            locked: self.player_settings.av_delay_locked,
+        };
+        let decision = bilikara_rust::decide_av_delay(state, AvDelayAction::Adjust { delta_ms: 0 });
+        AvDelaySnapshot {
+            schema_version: SCHEMA_VERSION,
+            global_delay_ms: decision.state.global_delay_ms,
+            local_delay_ms: decision.state.local_delay_ms,
+            effective_delay_ms: decision.effective_delay_ms,
+            locked: decision.state.locked,
+            has_local_adjustment: decision.has_local_adjustment,
+            lock_button_enabled: decision.lock_button_enabled,
+        }
+    }
+
+    fn backup_summary(&self) -> BackupSummary {
+        let Some(backup) = &self.backup else {
+            return BackupSummary {
+                available: false,
+                playlist_count: None,
+                updated_at: None,
+                preview_titles: Vec::new(),
+                playback_mode: None,
+            };
+        };
+        let mut preview_titles = Vec::new();
+        if let Some(current) = &backup.current_item
+            && !current.display_title.is_empty()
+        {
+            preview_titles.push(current.display_title.clone());
+        }
+        preview_titles.extend(
+            backup
+                .playlist
+                .iter()
+                .take(3)
+                .filter(|item| !item.display_title.is_empty())
+                .map(|item| item.display_title.clone()),
+        );
+        preview_titles.truncate(3);
+        BackupSummary {
+            available: true,
+            playlist_count: Some(
+                backup.playlist.len() + usize::from(backup.current_item.is_some()),
+            ),
+            updated_at: Some(backup.updated_at),
+            preview_titles,
+            playback_mode: Some(self.playback_mode.clone()),
+        }
+    }
+
+    fn snapshot(&self) -> Result<AppSnapshot, ExecuteError> {
+        let playback_program = self.playback_program()?;
+        Ok(self.snapshot_with_playback_program(playback_program))
+    }
+
+    fn snapshot_with_playback_program(
+        &self,
+        playback_program: Option<PlaybackProgram>,
+    ) -> AppSnapshot {
+        let av_delay = self.av_snapshot();
+        AppSnapshot {
+            automatic_volume: self.automatic_snapshot(),
+            schema_version: SCHEMA_VERSION,
+            revision: self.revision,
+            queue_version: self.queue_version(),
+            session_generation: self.session_generation,
+            playback_generation: self.playback_generation,
+            playback_program,
+            playback_mode: self.playback_mode.clone(),
+            player_settings: PlayerSettingsSnapshot {
+                av_offset_ms: av_delay.effective_delay_ms,
+                av_delay,
+                volume_percent: self.player_settings.volume_percent,
+                is_muted: self.player_settings.is_muted,
+                song_advance_delay_seconds: self.player_settings.song_advance_delay_seconds,
+                key_shift: self.player_settings.key_shift,
+            },
+            current_item: self.current_item.clone(),
+            current_item_started: self.current_item_started,
+            playlist: self.playlist.clone(),
+            history: self.history.clone(),
+            session_history: self.session_history.clone(),
+            session_users: self.session_users.clone(),
+            session_user_entries: self.user_entries(),
+            session_users_version: self.users_version(),
+            session_user_edit_version: 1,
+            session_played: self.session_played.clone(),
+            updated_at: self.updated_at,
+            backup: self.backup_summary(),
+            previous_session: PreviousSessionSummary {
+                available: self.previous_session.is_some(),
+                item_count: self
+                    .previous_session
+                    .as_ref()
+                    .map(|entry| entry.items.len()),
+            },
+        }
+    }
+
+    // Bind positional edits to the queue the user saw. Cache progress, playback
+    // ticks and metadata do not change ordering policy. Incarnations distinguish
+    // re-admissions (including a restarted Host that reuses an item ID).
+    fn queue_version(&self) -> String {
+        let mut digest = Sha256::new();
+        let mut field = |value: &str| {
+            digest.update((value.len() as u64).to_le_bytes());
+            digest.update(value.as_bytes());
+        };
+        field(&self.session_generation.to_string());
+        field(&self.session_users.len().to_string());
+        for name in &self.session_users {
+            field(&self.session_user_ids[name]);
+        }
+        for item in self.current_item.iter().chain(self.playlist.iter()) {
+            field(&item.id);
+            field(&item.item_incarnation_id);
+            field(&self.requester_order_key(item));
+            field(&item.queue_slot_type);
+        }
+        field(if self.current_item.is_some() {
+            "current"
+        } else {
+            "empty"
+        });
+        format!("{:x}", digest.finalize())
+    }
+
+    fn persistence_snapshot(&self) -> PersistenceSnapshot {
+        PersistenceSnapshot {
+            automatic_volume: self.automatic_volume.clone(),
+            playback_mode: self.playback_mode.clone(),
+            player_settings: self.player_settings.clone(),
+            history: self.history.clone(),
+            session_users: self.session_users.clone(),
+            session_user_ids: self.session_user_ids.clone(),
+            requester_user_ids: self.requester_user_ids.clone(),
+            session_started_at: self.session_started_at,
+            session_played_file: self.session_played_file.clone(),
+            session_played: self.session_played.clone(),
+            backup: self.backup.clone(),
+            updated_at: self.updated_at,
+        }
+    }
+}
+
+fn playlist_identity(item: &PlaylistItem) -> Result<PlaylistIdentity, ExecuteError> {
+    let aid = u64::try_from(item.aid)
+        .map_err(|_| rejected("invalid_item", "playlist item aid is invalid"))?;
+    let video_page = usize::try_from(item.page)
+        .map_err(|_| rejected("invalid_item", "playlist item page is invalid"))?;
+    Ok(PlaylistIdentity {
+        media_source: item.media_source.clone(),
+        bvid: item.bvid.clone(),
+        aid,
+        video_page,
+        selected_audio_pages: item.selected_pages.clone(),
+    })
+}
+
+fn duplicate_decision(
+    data: &AppStateData,
+    candidate: &PlaylistItem,
+    include_active: bool,
+    history: &[HistoryEntry],
+) -> Result<bilikara_rust::PlaylistDuplicateDecision, ExecuteError> {
+    let current_item = if include_active {
+        data.current_item
+            .as_ref()
+            .map(|item| {
+                Ok(DuplicateActiveItem {
+                    original_index: 0,
+                    item_id: item.id.clone(),
+                    identity: playlist_identity(item)?,
+                })
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    let queued_items = if include_active {
+        data.playlist
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                Ok(DuplicateActiveItem {
+                    original_index: index + 1,
+                    item_id: item.id.clone(),
+                    identity: playlist_identity(item)?,
+                })
+            })
+            .collect::<Result<Vec<_>, ExecuteError>>()?
+    } else {
+        Vec::new()
+    };
+    let history_entries = history
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| DuplicateHistoryEntry {
+            original_index: index,
+            key: entry.key.clone(),
+        })
+        .collect();
+    decide_playlist_duplicate(PlaylistDuplicateRequest {
+        candidate: playlist_identity(candidate)?,
+        current_item,
+        queued_items,
+        history_entries,
+    })
+    .map_err(|error| {
+        rejected(
+            "playlist_policy_failed",
+            format!("playlist duplicate policy rejected input: {error:?}"),
+        )
+    })
+}
+
+fn slot_type(value: &str) -> Result<PlaylistSlotType, ExecuteError> {
+    match value {
+        "cycle" => Ok(PlaylistSlotType::Cycle),
+        "priority" => Ok(PlaylistSlotType::Priority),
+        "manual" => Ok(PlaylistSlotType::Manual),
+        _ => Err(rejected("invalid_slot_type", "invalid playlist slot type")),
+    }
+}
+
+fn rebuild_playlist_order(
+    data: &mut AppStateData,
+    candidate: Option<PlaylistItem>,
+) -> Result<(), ExecuteError> {
+    let operation = if candidate.is_some() {
+        PlaylistOrderOperation::InsertCycle
+    } else {
+        PlaylistOrderOperation::Rebuild
+    };
+    let items = data
+        .playlist
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            Ok(PlaylistOrderItem {
+                original_index: index,
+                item_id: item.id.clone(),
+                requester_name: data.requester_order_key(item),
+                slot_type: slot_type(&item.queue_slot_type)?,
+            })
+        })
+        .collect::<Result<Vec<_>, ExecuteError>>()?;
+    let candidate_descriptor = candidate
+        .as_ref()
+        .map(|item| {
+            Ok(PlaylistOrderItem {
+                original_index: items.len(),
+                item_id: item.id.clone(),
+                requester_name: data.requester_order_key(item),
+                slot_type: slot_type(&item.queue_slot_type)?,
+            })
+        })
+        .transpose()?;
+    let plan = plan_playlist_order(PlaylistOrderRequest {
+        operation,
+        session_users: data
+            .user_entries()
+            .into_iter()
+            .map(|user| user.id)
+            .collect(),
+        current_requester: data
+            .current_item
+            .as_ref()
+            .map(|item| data.requester_order_key(item)),
+        items,
+        candidate: candidate_descriptor,
+    })
+    .map_err(|error| {
+        rejected(
+            "playlist_policy_failed",
+            format!("playlist order policy rejected input: {error:?}"),
+        )
+    })?;
+    let mut objects = HashMap::with_capacity(data.playlist.len() + 1);
+    for item in data.playlist.drain(..) {
+        objects.insert(item.id.clone(), item);
+    }
+    if let Some(item) = candidate
+        && objects.insert(item.id.clone(), item).is_some()
+    {
+        return Err(rejected(
+            "duplicate_item_id",
+            "playlist candidate id already exists",
+        ));
+    }
+    if plan.ordered_ids.len() != objects.len() {
+        return Err(ExecuteError::Internal(
+            "playlist policy violated object conservation".to_owned(),
+        ));
+    }
+    let mut rebuilt = Vec::with_capacity(objects.len());
+    for item_id in plan.ordered_ids {
+        let item = objects.remove(&item_id).ok_or_else(|| {
+            ExecuteError::Internal("playlist policy returned an unknown item id".to_owned())
+        })?;
+        rebuilt.push(item);
+    }
+    if !objects.is_empty() {
+        return Err(ExecuteError::Internal(
+            "playlist policy omitted an item".to_owned(),
+        ));
+    }
+    data.playlist = rebuilt;
+    Ok(())
+}
+
+fn history_entry_from_item(item: &PlaylistItem, key: String, now: f64) -> HistoryEntry {
+    HistoryEntry {
+        key,
+        display_title: item.display_title.clone(),
+        original_url: item.original_url.clone(),
+        resolved_url: item.resolved_url.clone(),
+        requested_at: now,
+        title: item.title.clone(),
+        part_title: item.part_title.clone(),
+        owner_mid: item.owner_mid,
+        owner_name: item.owner_name.clone(),
+        owner_url: item.owner_url.clone(),
+        requester_name: item.requester_name.clone(),
+        request_count: 1,
+    }
+}
+
+fn record_history(
+    data: &AppStateData,
+    history: &mut Vec<HistoryEntry>,
+    item: &PlaylistItem,
+    now: f64,
+) -> Result<(), ExecuteError> {
+    let decision = duplicate_decision(data, item, false, history)?;
+    let mut entry = history_entry_from_item(item, decision.identity_key, now);
+    if let Some(index) = decision.history_duplicate_index {
+        let previous = history.remove(index);
+        entry.request_count = previous.request_count.saturating_add(1);
+    }
+    history.insert(0, entry);
+    Ok(())
+}
+
+fn record_session_played(
+    data: &mut AppStateData,
+    item: &PlaylistItem,
+    now: f64,
+) -> Result<(), ExecuteError> {
+    let key = duplicate_decision(data, item, false, &[])?.identity_key;
+    data.session_played.push(SessionPlayedEntry {
+        key,
+        item_id: item.id.clone(),
+        display_title: item.display_title.clone(),
+        title: item.title.clone(),
+        part_title: item.part_title.clone(),
+        original_url: item.original_url.clone(),
+        resolved_url: item.resolved_url.clone(),
+        bvid: item.bvid.clone(),
+        aid: item.aid,
+        cid: item.cid,
+        page: item.page,
+        played_at: now,
+        ended_at: None,
+        owner_mid: item.owner_mid,
+        owner_name: item.owner_name.clone(),
+        owner_url: item.owner_url.clone(),
+        requester_name: item.requester_name.clone(),
+        cover_url: item.cover_url.clone(),
+        threshold_reached: false,
+    });
+    Ok(())
+}
+
+fn mark_session_played_ended(data: &mut AppStateData, item_id: &str, now: f64) {
+    if let Some(entry) = data
+        .session_played
+        .iter_mut()
+        .rev()
+        .find(|entry| entry.item_id == item_id && entry.ended_at.is_none())
+    {
+        entry.ended_at = Some(now);
+    }
+}
+
+fn archive_current(data: &mut AppStateData, now: f64) -> Result<(), ExecuteError> {
+    let Some(item) = data.current_item.clone() else {
+        return Ok(());
+    };
+    mark_session_played_ended(data, &item.id, now);
+    if !data.current_item_started {
+        return Ok(());
+    }
+    let state_for_policy = data.clone();
+    record_history(&state_for_policy, &mut data.session_history, &item, now)?;
+    record_history(&state_for_policy, &mut data.history, &item, now)?;
+    Ok(())
+}
+
+fn apply_av_delay(data: &mut AppStateData, action: &AvDelayCommand) -> AvDelaySnapshot {
+    let state = AvDelayState {
+        global_delay_ms: data.player_settings.global_av_delay_ms,
+        local_delay_ms: data.player_settings.local_av_delay_ms,
+        locked: data.player_settings.av_delay_locked,
+    };
+    let decision = match action {
+        AvDelayCommand::Snapshot => decide_av_delay(state, AvDelayAction::Adjust { delta_ms: 0 }),
+        AvDelayCommand::SetEffective { effective_delay_ms } => decide_av_delay(
+            state,
+            AvDelayAction::SetEffective {
+                effective_delay_ms: *effective_delay_ms,
+            },
+        ),
+        AvDelayCommand::SetPersistent { effective_delay_ms } => decide_av_delay(
+            state,
+            AvDelayAction::SetPersistent {
+                effective_delay_ms: *effective_delay_ms,
+            },
+        ),
+        AvDelayCommand::Adjust { delta_ms } => decide_av_delay(
+            state,
+            AvDelayAction::Adjust {
+                delta_ms: *delta_ms,
+            },
+        ),
+        AvDelayCommand::ResetLocal => decide_av_delay(state, AvDelayAction::ResetLocal),
+        AvDelayCommand::ToggleLock => decide_av_delay(state, AvDelayAction::ToggleLock),
+    };
+    data.player_settings.global_av_delay_ms = decision.state.global_delay_ms;
+    data.player_settings.local_av_delay_ms = decision.state.local_delay_ms;
+    data.player_settings.av_delay_locked = decision.state.locked;
+    AvDelaySnapshot {
+        schema_version: SCHEMA_VERSION,
+        global_delay_ms: decision.state.global_delay_ms,
+        local_delay_ms: decision.state.local_delay_ms,
+        effective_delay_ms: decision.effective_delay_ms,
+        locked: decision.state.locked,
+        has_local_adjustment: decision.has_local_adjustment,
+        lock_button_enabled: decision.lock_button_enabled,
+    }
+}
+
+fn reset_local_av_delay(data: &mut AppStateData) {
+    let _ = apply_av_delay(data, &AvDelayCommand::ResetLocal);
+}
+
+fn sanitize_backup_item(mut item: PlaylistItem) -> PlaylistItem {
+    item.cache_status = "pending".to_owned();
+    item.cache_progress = 0.0;
+    item.cache_message = "待缓存".to_owned();
+    item.item_incarnation_id.clear();
+    clear_committed_artifact(&mut item, true);
+    item
+}
+
+fn update_backup_from_state(data: &mut AppStateData) {
+    if data.current_item.is_none() && data.playlist.is_empty() {
+        data.backup = None;
+        return;
+    }
+    data.backup = Some(BackupSeed {
+        current_item: data.current_item.clone().map(sanitize_backup_item),
+        playlist: data
+            .playlist
+            .clone()
+            .into_iter()
+            .map(sanitize_backup_item)
+            .collect(),
+        played_session: Some(SessionArchiveSeed {
+            file_name: data.session_played_file.clone(),
+            session_started_at: data.session_started_at,
+            items: data.session_played.clone(),
+        }),
+        updated_at: data.updated_at,
+    });
+}
+
+fn mutation_value(changed: bool) -> Value {
+    json!({"changed": changed})
+}
+
+fn apply_item_patch(item: &mut PlaylistItem, patch: &PlaylistItemPatch) {
+    macro_rules! replace {
+        ($field:ident) => {
+            if let Some(value) = &patch.$field {
+                item.$field = value.clone();
+            }
+        };
+    }
+    replace!(title);
+    replace!(part_title);
+    replace!(display_title);
+    replace!(cover_url);
+    replace!(embed_url);
+    replace!(owner_mid);
+    replace!(owner_name);
+    replace!(owner_url);
+}
+
+fn variant_id(page: i64, label: &str, index: usize) -> String {
+    let mut normalized = String::new();
+    let mut previous_separator = false;
+    for character in label.to_lowercase().chars() {
+        if character.is_ascii_lowercase() || character.is_ascii_digit() {
+            normalized.push(character);
+            previous_separator = false;
+        } else if !previous_separator && !normalized.is_empty() {
+            normalized.push('_');
+            previous_separator = true;
+        }
+    }
+    while normalized.ends_with('_') {
+        normalized.pop();
+    }
+    let suffix = if normalized.is_empty() {
+        format!("track_{}", index + 1)
+    } else {
+        normalized
+    };
+    format!("p{}_{}", page.max(1), suffix)
+}
+
+fn predicted_audio_variant_ids(item: &PlaylistItem) -> HashSet<String> {
+    item.selected_parts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, label)| {
+            let label = label.trim();
+            if label.is_empty() {
+                return None;
+            }
+            let page = item
+                .selected_pages
+                .get(index)
+                .copied()
+                .unwrap_or(index as i64 + 1);
+            Some(variant_id(page, label, index))
+        })
+        .collect()
+}
+
+fn duplicate_result(data: &AppStateData, item: &PlaylistItem) -> Result<Value, ExecuteError> {
+    validate_item(item)?;
+    let active = duplicate_decision(data, item, true, &[])?;
+    let session = duplicate_decision(data, item, false, &data.session_history)?;
+    let active_item = active
+        .active_duplicate_id
+        .as_deref()
+        .and_then(|item_id| data.find_item(item_id))
+        .cloned();
+    let session_entry = session
+        .history_duplicate_index
+        .and_then(|index| data.session_history.get(index))
+        .cloned();
+    Ok(json!({
+        "identity_key": active.identity_key,
+        "active_item": active_item,
+        "session_entry": session_entry,
+    }))
+}
+
+fn duplicate_rejection_details(
+    data: &AppStateData,
+    item: &PlaylistItem,
+) -> Result<Option<Value>, ExecuteError> {
+    let result = duplicate_result(data, item)?;
+    let active = result.get("active_item").filter(|value| !value.is_null());
+    let session = result.get("session_entry").filter(|value| !value.is_null());
+    if active.is_none() && session.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(result))
+}
+
+fn replace_session_archive(data: &mut AppStateData, archive: &SessionArchiveSeed) {
+    data.session_started_at = archive.session_started_at;
+    data.session_played_file.clone_from(&archive.file_name);
+    data.session_played.clone_from(&archive.items);
+}
+
+fn reset_current_identity(data: &mut AppStateData) {
+    data.current_item = None;
+    data.current_item_started = false;
+    data.playlist.clear();
+}
+
+fn increment_session_generation(data: &mut AppStateData) -> Result<(), ExecuteError> {
+    data.session_generation = data
+        .session_generation
+        .checked_add(1)
+        .ok_or_else(|| ExecuteError::Internal("AppState session generation overflow".to_owned()))?;
+    Ok(())
+}
+
+fn terminal_cache_event(event: &CacheEvent) -> bool {
+    matches!(
+        event,
+        CacheEvent::Ready { .. }
+            | CacheEvent::Failed { .. }
+            | CacheEvent::Cancelled { .. }
+            | CacheEvent::Evicted { .. }
+            | CacheEvent::Reset { .. }
+    )
+}
+
+fn validate_cache_attempt_ownership(
+    data: &AppStateData,
+    item_id: &str,
+    cache_attempt_token: u64,
+    issued_through: u64,
+) -> Result<ActiveCacheAttempt, ExecuteError> {
+    if cache_attempt_token == 0 {
+        return Err(rejected(
+            "invalid_cache_attempt_token",
+            "cache attempt token must be positive",
+        ));
+    }
+    if cache_attempt_token > issued_through {
+        return Err(rejected_with_details(
+            "unissued_cache_attempt_token",
+            "cache attempt token has not been issued",
+            json!({
+                "cache_attempt_token": cache_attempt_token,
+                "issued_through": issued_through,
+            }),
+        ));
+    }
+    let belongs_to = data
+        .active_cache_attempts
+        .iter()
+        .find_map(|(owner_item_id, attempt)| {
+            (attempt.token == cache_attempt_token).then_some(owner_item_id.as_str())
+        });
+    if let Some(owner_item_id) = belongs_to
+        && owner_item_id != item_id
+    {
+        return Err(rejected_with_details(
+            "cache_attempt_wrong_item",
+            "cache attempt belongs to a different live item",
+            json!({
+                "cache_attempt_token": cache_attempt_token,
+                "item_id": item_id,
+                "owner_item_id": owner_item_id,
+            }),
+        ));
+    }
+    let Some(active) = data.active_cache_attempts.get(item_id).cloned() else {
+        return Err(rejected_with_details(
+            "cache_attempt_not_active",
+            "cache attempt does not own this live item",
+            json!({
+                "cache_attempt_token": cache_attempt_token,
+                "item_id": item_id,
+            }),
+        ));
+    };
+    if active.token != cache_attempt_token {
+        return Err(rejected_with_details(
+            "cache_attempt_superseded",
+            "cache attempt has been superseded",
+            json!({
+                "cache_attempt_token": cache_attempt_token,
+                "active_cache_attempt_token": active.token,
+                "item_id": item_id,
+            }),
+        ));
+    }
+    if data.find_item(item_id).is_none() {
+        return Err(rejected(
+            "cache_attempt_item_removed",
+            "cache attempt item no longer exists",
+        ));
+    }
+    Ok(active)
+}
+
+fn validate_cache_publication_reservation(
+    active: &ActiveCacheAttempt,
+    item_incarnation_id: &str,
+    artifact_set_id: &str,
+    artifact_relative_directory: &str,
+) -> Result<(), ExecuteError> {
+    let reservation = &active.reservation;
+    if item_incarnation_id != reservation.item_incarnation_id
+        || artifact_set_id != reservation.artifact_set_id
+        || artifact_relative_directory != reservation.artifact_relative_directory
+    {
+        return Err(rejected(
+            "cache_publication_identity_mismatch",
+            "cache publication does not match its Rust reservation",
+        ));
+    }
+    if !valid_authoritative_identity(item_incarnation_id, 'i')
+        || !valid_authoritative_identity(artifact_set_id, 'a')
+        || !valid_artifact_relative_directory(
+            artifact_relative_directory,
+            item_incarnation_id,
+            artifact_set_id,
+        )
+    {
+        return Err(rejected(
+            "invalid_cache_publication_identity",
+            "cache publication identity is invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn apply_cache_event(
+    data: &mut AppStateData,
+    item_id: &str,
+    cache_attempt_token: u64,
+    issued_through: u64,
+    event: &CacheEvent,
+    now: f64,
+) -> Result<MutationResult, ExecuteError> {
+    let active =
+        validate_cache_attempt_ownership(data, item_id, cache_attempt_token, issued_through)?;
+    if let Some(terminal_event) = active.terminal_event {
+        if terminal_cache_event(event) && terminal_event == *event {
+            return Ok(MutationResult::unchanged(json!({
+                "applied": true,
+                "replayed": true,
+            })));
+        }
+        return Err(rejected_with_details(
+            if terminal_cache_event(event) {
+                "cache_terminal_conflict"
+            } else {
+                "cache_attempt_already_terminal"
+            },
+            "cache attempt is already terminal",
+            json!({
+                "cache_attempt_token": cache_attempt_token,
+                "item_id": item_id,
+            }),
+        ));
+    }
+    let before = data
+        .find_item(item_id)
+        .cloned()
+        .ok_or_else(|| rejected("item_not_found", "playlist item does not exist"))?;
+    let ready_selected_audio_variant_id = match event {
+        CacheEvent::Ready {
+            progress,
+            message,
+            video_relative_path,
+            video_media_url,
+            audio_variants,
+            selected_audio_variant_id,
+            item_incarnation_id,
+            artifact_set_id,
+            artifact_relative_directory,
+        } => {
+            validate_cache_publication_reservation(
+                &active,
+                item_incarnation_id,
+                artifact_set_id,
+                artifact_relative_directory,
+            )?;
+            if !progress.is_finite()
+                || !valid_string(message, MAX_STRING_BYTES, true)
+                || !valid_cache_relative_path(video_relative_path)
+                || !valid_cache_media_url(video_media_url)
+                || !valid_string(selected_audio_variant_id, MAX_STRING_BYTES, true)
+                || !valid_artifact_file_path(video_relative_path, artifact_relative_directory)
+                || cache_media_path(video_media_url).as_deref()
+                    != Some(video_relative_path.as_str())
+            {
+                return Err(rejected(
+                    "invalid_cache_ready",
+                    "ready cache projection is invalid",
+                ));
+            }
+            let mut seen_paths = HashSet::from([video_relative_path.clone()]);
+            let variant_ids = validate_ready_audio_variants(
+                audio_variants,
+                artifact_relative_directory,
+                &mut seen_paths,
+            )?;
+            let current = before.selected_audio_variant_id.as_str();
+            let proposal = selected_audio_variant_id.as_str();
+            Some(
+                variant_ids
+                    .iter()
+                    .find(|variant_id| variant_id.as_str() == current)
+                    .or_else(|| {
+                        variant_ids
+                            .iter()
+                            .find(|variant_id| variant_id.as_str() == proposal)
+                    })
+                    .unwrap_or(&variant_ids[0])
+                    .clone(),
+            )
+        }
+        _ => None,
+    };
+    let item = data
+        .find_item_mut(item_id)
+        .ok_or_else(|| rejected("item_not_found", "playlist item does not exist"))?;
+    if !matches!(event, CacheEvent::Progress { .. }) {
+        clear_download_progress(item);
+    }
+    match event {
+        CacheEvent::Queued { message } => {
+            if !active.refresh {
+                item.cache_status = "queued".to_owned();
+            }
+            item.cache_progress = 0.0;
+            item.cache_message = message.clone();
+        }
+        CacheEvent::Started { message } => {
+            if !active.refresh {
+                item.cache_status = "downloading".to_owned();
+            }
+            item.cache_progress = 0.0;
+            item.cache_message = message.clone();
+            if !active.refresh {
+                clear_committed_artifact(item, false);
+            }
+        }
+        CacheEvent::Progress {
+            progress,
+            message,
+            download,
+        } => {
+            if !progress.is_finite() {
+                return Err(rejected(
+                    "invalid_cache_progress",
+                    "cache progress must be finite",
+                ));
+            }
+            if !active.refresh {
+                item.cache_status = "downloading".to_owned();
+            }
+            item.cache_progress = progress.clamp(0.0, 100.0);
+            if let Some(download) = download {
+                item.cache_download_current_bytes = download.current_bytes;
+                item.cache_download_total_bytes = download.total_bytes;
+                item.cache_download_tracks.clone_from(&download.tracks);
+            }
+            if let Some(message) = message {
+                item.cache_message.clone_from(message);
+            }
+        }
+        CacheEvent::Ready {
+            progress,
+            message,
+            video_relative_path,
+            video_media_url,
+            audio_variants,
+            selected_audio_variant_id: _,
+            item_incarnation_id: _,
+            artifact_set_id,
+            artifact_relative_directory,
+        } => {
+            item.cache_status = "ready".to_owned();
+            item.cache_progress = progress.clamp(0.0, 100.0);
+            item.cache_message.clone_from(message);
+            item.video_relative_path.clone_from(video_relative_path);
+            item.video_media_url.clone_from(video_media_url);
+            item.audio_variants.clone_from(audio_variants);
+            item.artifact_set_id.clone_from(artifact_set_id);
+            item.artifact_relative_directory
+                .clone_from(artifact_relative_directory);
+            item.selected_audio_variant_id.clone_from(
+                ready_selected_audio_variant_id.as_ref().ok_or_else(|| {
+                    ExecuteError::Internal("validated Ready selection is missing".to_owned())
+                })?,
+            );
+        }
+        CacheEvent::Failed { message } => {
+            if !active.refresh {
+                item.cache_status = "failed".to_owned();
+            }
+            item.cache_message.clone_from(message);
+        }
+        CacheEvent::Cancelled { message } if active.refresh => {
+            item.cache_message.clone_from(message);
+        }
+        CacheEvent::Cancelled { message }
+        | CacheEvent::Evicted { message }
+        | CacheEvent::Reset { message, .. } => {
+            item.cache_status = "pending".to_owned();
+            item.cache_progress = 0.0;
+            item.cache_message.clone_from(message);
+            clear_committed_artifact(
+                item,
+                matches!(
+                    event,
+                    CacheEvent::Reset {
+                        clear_selected_audio_variant: true,
+                        ..
+                    }
+                ),
+            );
+        }
+    }
+    item.cache_activity_at = now;
+    validate_item(item)?;
+    let changed = before != *item;
+    let terminal = terminal_cache_event(event);
+    if terminal {
+        let active = data.active_cache_attempts.get_mut(item_id).ok_or_else(|| {
+            ExecuteError::Internal("active cache attempt disappeared during apply".to_owned())
+        })?;
+        active.terminal_event = Some(event.clone());
+    }
+    let result = if changed {
+        MutationResult::changed(json!({"applied": true, "replayed": false}), false)
+    } else {
+        MutationResult::unchanged(json!({"applied": true, "replayed": false}))
+    };
+    if terminal {
+        Ok(result.with_operational_change())
+    } else {
+        Ok(result)
+    }
+}
+
+fn apply_mutation(
+    data: &mut AppStateData,
+    request: AppStateRequest,
+    issued_cache_attempt_tokens: u64,
+    identity_namespace: &[u8; IDENTITY_NAMESPACE_BYTES],
+    next_item_incarnation_id: &mut u64,
+) -> Result<MutationResult, ExecuteError> {
+    match request {
+        AppStateRequest::AddItem {
+            mut item,
+            position,
+            requester_name,
+            requester_user_id,
+            reset_av_delay,
+            allow_repeat,
+            now,
+            ..
+        } => {
+            validate_item(&item)?;
+            if data.find_item(&item.id).is_some() {
+                return Err(rejected(
+                    "duplicate_item_id",
+                    "playlist item id already exists",
+                ));
+            }
+            let requester = normalize_session_user_name(&requester_name);
+            if data.session_users.is_empty() {
+                return Err(rejected(
+                    "session_user_required",
+                    "请先在服务端添加本场 KTV 用户",
+                ));
+            }
+            let requester = if let Some(id) = requester_user_id.as_deref() {
+                let current = data.user_name_for_id(id).ok_or_else(|| {
+                    rejected("session_user_not_found", "点歌人已移除，请重新选择")
+                })?;
+                if requester.is_empty() {
+                    current.to_owned()
+                } else {
+                    requester
+                }
+            } else if requester.is_empty() {
+                data.session_users[0].clone()
+            } else if data.session_users.contains(&requester) {
+                requester
+            } else {
+                return Err(rejected(
+                    "session_user_not_found",
+                    "所选用户名不存在，请重新选择",
+                ));
+            };
+            if !allow_repeat && let Some(details) = duplicate_rejection_details(data, &item)? {
+                return Err(rejected_with_details(
+                    "duplicate_session_request",
+                    format!("本次已经点过《{}》", item.display_title),
+                    details,
+                ));
+            }
+            if !matches!(position.as_str(), "tail" | "next") {
+                return Err(rejected("invalid_position", "playlist position is invalid"));
+            }
+            // Keep every admission path within the same bound as saved-state
+            // validation, including priority inserts and an empty current slot.
+            if data.playlist.len() + usize::from(data.current_item.is_some()) >= MAX_ITEMS {
+                return Err(rejected("too_many_items", "too many playlist items"));
+            }
+            // Keep a fresh request's parsed preference while retiring artifacts.
+            // Seed/backup restoration still discards prior audio selections.
+            let selected_audio_variant_id = std::mem::take(&mut item.selected_audio_variant_id);
+            assign_new_item_incarnation(&mut item, identity_namespace, next_item_incarnation_id)?;
+            item.selected_audio_variant_id = selected_audio_variant_id;
+            let user_id =
+                requester_user_id.unwrap_or_else(|| data.session_user_ids[&requester].clone());
+            data.requester_user_ids.insert(item.id.clone(), user_id);
+            item.requester_name = requester;
+            item.queue_slot_type = if position == "next" {
+                "priority".to_owned()
+            } else {
+                "cycle".to_owned()
+            };
+            if data.current_item.is_none() {
+                data.previous_session = None;
+                if reset_av_delay {
+                    reset_local_av_delay(data);
+                }
+                record_session_played(data, &item, now)?;
+                data.current_item = Some(item);
+                data.current_item_started = false;
+            } else if position == "next" {
+                data.playlist.insert(0, item);
+            } else {
+                rebuild_playlist_order(data, Some(item))?;
+            }
+            Ok(MutationResult::changed(mutation_value(true), true))
+        }
+        AppStateRequest::UpdateItem {
+            item_id,
+            changes,
+            persist_backup,
+            ..
+        } => {
+            let item = data
+                .find_item_mut(&item_id)
+                .ok_or_else(|| rejected("item_not_found", "playlist item does not exist"))?;
+            let before = item.clone();
+            apply_item_patch(item, &changes);
+            validate_item(item)?;
+            if before == *item {
+                return Ok(MutationResult::unchanged(mutation_value(false)));
+            }
+            Ok(MutationResult::changed(
+                mutation_value(true),
+                persist_backup,
+            ))
+        }
+        AppStateRequest::RemoveItem { item_id, now, .. } => {
+            if data
+                .current_item
+                .as_ref()
+                .is_some_and(|item| item.id == item_id)
+            {
+                archive_current(data, now)?;
+                data.current_item = None;
+                data.current_item_started = false;
+                rebuild_playlist_order(data, None)?;
+                return Ok(MutationResult::changed(mutation_value(true), true));
+            }
+            let Some(index) = data.playlist.iter().position(|item| item.id == item_id) else {
+                return Err(rejected(
+                    "queue_item_missing",
+                    "歌曲已离开等待队列，请刷新后重试",
+                ));
+            };
+            data.playlist.remove(index);
+            rebuild_playlist_order(data, None)?;
+            Ok(MutationResult::changed(mutation_value(true), true))
+        }
+        AppStateRequest::ClearPlaylist { .. } => {
+            let changed = !data.playlist.is_empty() || data.backup.is_some();
+            data.playlist.clear();
+            data.backup = None;
+            if !changed {
+                return Ok(MutationResult::unchanged(mutation_value(false)));
+            }
+            let mut result = MutationResult::changed(mutation_value(true), false);
+            result.effects.delete_backup = true;
+            Ok(result)
+        }
+        AppStateRequest::ClearHistory { .. } => {
+            if data.history.is_empty() {
+                return Ok(MutationResult::unchanged(mutation_value(false)));
+            }
+            data.history.clear();
+            Ok(MutationResult::changed(mutation_value(true), false))
+        }
+        AppStateRequest::RemoveHistoryEntry { key, .. } => {
+            let key = key.trim();
+            if key.is_empty() {
+                return Ok(MutationResult::unchanged(mutation_value(false)));
+            }
+            let before = (
+                data.history.len(),
+                data.session_history.len(),
+                data.session_played.len(),
+            );
+            data.history.retain(|entry| entry.key != key);
+            data.session_history.retain(|entry| entry.key != key);
+            data.session_played.retain(|entry| entry.key != key);
+            let changed = before
+                != (
+                    data.history.len(),
+                    data.session_history.len(),
+                    data.session_played.len(),
+                );
+            if !changed {
+                return Ok(MutationResult::unchanged(mutation_value(false)));
+            }
+            Ok(MutationResult::changed(mutation_value(true), true))
+        }
+        AppStateRequest::AdvanceToNext {
+            expected_playback_generation,
+            reset_av_delay,
+            now,
+            ..
+        } => {
+            if expected_playback_generation != data.playback_generation {
+                return Err(rejected_with_details(
+                    "playback_generation_mismatch",
+                    "playback program changed before Next was applied",
+                    json!({
+                        "expected_playback_generation": expected_playback_generation,
+                        "actual_playback_generation": data.playback_generation,
+                    }),
+                ));
+            }
+            if data.current_item.is_none() && data.playlist.is_empty() {
+                return Ok(MutationResult::unchanged(mutation_value(false)));
+            }
+            archive_current(data, now)?;
+            data.current_item = if data.playlist.is_empty() {
+                None
+            } else {
+                Some(data.playlist.remove(0))
+            };
+            data.current_item_started = false;
+            data.player_settings.key_shift = 0;
+            if data.current_item.is_some() && reset_av_delay {
+                reset_local_av_delay(data);
+            }
+            if let Some(item) = data.current_item.clone() {
+                record_session_played(data, &item, now)?;
+            }
+            rebuild_playlist_order(data, None)?;
+            Ok(MutationResult::changed(mutation_value(true), true))
+        }
+        AppStateRequest::DeferCurrentItem {
+            item_id,
+            expected_item_incarnation_id,
+            expected_playback_generation,
+            expected_playlist_item_ids,
+            target_index,
+            reset_av_delay,
+            now,
+            ..
+        } => {
+            // Reject a stale drag as a whole. Progress-only revisions may advance
+            // during a gesture, so compare playback identity and queue order,
+            // not the global revision. Never compose this from Next + Add.
+            if expected_playback_generation != data.playback_generation
+                || !data.current_item.as_ref().is_some_and(|item| {
+                    item.id == item_id && item.item_incarnation_id == expected_item_incarnation_id
+                })
+                || !data
+                    .playlist
+                    .iter()
+                    .map(|item| &item.id)
+                    .eq(expected_playlist_item_ids.iter())
+            {
+                return Err(rejected(
+                    "defer_current_conflict",
+                    "playback or queue changed before the current song could be deferred",
+                ));
+            }
+            if data.playlist.is_empty() || target_index >= data.playlist.len() {
+                return Err(rejected(
+                    "invalid_defer_target",
+                    "deferring requires a next song and a valid waiting-queue position",
+                ));
+            }
+            let mut deferred = data.current_item.take().expect("validated current item");
+            // This is a suspended request, not a completed/removed request. End
+            // its playback segment without inflating the history request count.
+            mark_session_played_ended(data, &deferred.id, now);
+            let next = data.playlist.remove(0);
+            record_session_played(data, &next, now)?;
+            data.current_item = Some(next);
+            data.current_item_started = false;
+            data.player_settings.key_shift = 0;
+            if reset_av_delay {
+                reset_local_av_delay(data);
+            }
+            deferred.queue_slot_type = "manual".to_owned();
+            data.playlist.insert(target_index, deferred);
+            // Keep the user's explicit order, including all other manual slots.
+            // The normal fair-order rebuild on subsequent Next preserves A's
+            // manual position. Item/cache identities are deliberately unchanged.
+            Ok(MutationResult::changed(mutation_value(true), true))
+        }
+        AppStateRequest::MoveItem {
+            item_id, direction, ..
+        } => {
+            let Some(index) = data.playlist.iter().position(|item| item.id == item_id) else {
+                return Err(rejected(
+                    "queue_item_missing",
+                    "歌曲已离开等待队列，请刷新后重试",
+                ));
+            };
+            let target = match direction.as_str() {
+                "up" if index > 0 => Some(index - 1),
+                "down" if index + 1 < data.playlist.len() => Some(index + 1),
+                "up" | "down" => None,
+                _ => {
+                    return Err(rejected(
+                        "invalid_direction",
+                        "playlist direction is invalid",
+                    ));
+                }
+            };
+            let Some(target) = target else {
+                return Ok(MutationResult::unchanged(mutation_value(false)));
+            };
+            data.playlist[index].queue_slot_type = "manual".to_owned();
+            data.playlist.swap(index, target);
+            rebuild_playlist_order(data, None)?;
+            Ok(MutationResult::changed(mutation_value(true), true))
+        }
+        AppStateRequest::MoveToNext { item_id, .. } => {
+            let Some(index) = data.playlist.iter().position(|item| item.id == item_id) else {
+                return Err(rejected(
+                    "queue_item_missing",
+                    "歌曲已离开等待队列，请刷新后重试",
+                ));
+            };
+            let mut item = data.playlist.remove(index);
+            item.queue_slot_type = "priority".to_owned();
+            data.playlist.insert(0, item);
+            rebuild_playlist_order(data, None)?;
+            Ok(MutationResult::changed(mutation_value(true), true))
+        }
+        AppStateRequest::MoveItemToIndex {
+            item_id,
+            target_index,
+            expected_queue_version,
+            ..
+        } => {
+            if expected_queue_version.is_some_and(|version| version != data.queue_version()) {
+                return Err(rejected("queue_changed", "队列已更新，请重新拖动"));
+            }
+            let Some(index) = data.playlist.iter().position(|item| item.id == item_id) else {
+                return Err(rejected(
+                    "queue_item_missing",
+                    "歌曲已离开等待队列，请刷新后重试",
+                ));
+            };
+            let target = target_index.clamp(0, data.playlist.len() as i64 - 1) as usize;
+            if target == index {
+                return Ok(MutationResult::unchanged(
+                    json!({"changed": false, "found": true}),
+                ));
+            }
+            let mut item = data.playlist.remove(index);
+            item.queue_slot_type = "manual".to_owned();
+            data.playlist.insert(target, item);
+            rebuild_playlist_order(data, None)?;
+            Ok(MutationResult::changed(mutation_value(true), true))
+        }
+        AppStateRequest::ResortPlaylistByCycle { .. } => {
+            if data.playlist.len() < 2
+                && data
+                    .playlist
+                    .iter()
+                    .all(|item| item.queue_slot_type == "cycle")
+            {
+                return Ok(MutationResult::unchanged(mutation_value(false)));
+            }
+            for item in &mut data.playlist {
+                item.queue_slot_type = "cycle".to_owned();
+            }
+            rebuild_playlist_order(data, None)?;
+            Ok(MutationResult::changed(mutation_value(true), true))
+        }
+        AppStateRequest::MoveToFront {
+            item_id,
+            reset_av_delay,
+            now,
+            ..
+        } => {
+            let Some(index) = data.playlist.iter().position(|item| item.id == item_id) else {
+                return Err(rejected(
+                    "queue_item_missing",
+                    "歌曲已离开等待队列，请刷新后重试",
+                ));
+            };
+            archive_current(data, now)?;
+            let item = data.playlist.remove(index);
+            if reset_av_delay {
+                reset_local_av_delay(data);
+            }
+            record_session_played(data, &item, now)?;
+            data.current_item = Some(item);
+            data.current_item_started = false;
+            rebuild_playlist_order(data, None)?;
+            Ok(MutationResult::changed(mutation_value(true), true))
+        }
+        AppStateRequest::SetCurrentItem {
+            item_id,
+            reset_av_delay,
+            now,
+            ..
+        } => match item_id {
+            Some(item_id) => {
+                if data.current_identity() == Some(item_id.as_str()) {
+                    return Ok(MutationResult::unchanged(
+                        json!({"changed": false, "found": true}),
+                    ));
+                }
+                let Some(index) = data.playlist.iter().position(|item| item.id == item_id) else {
+                    return Ok(MutationResult::unchanged(
+                        json!({"changed": false, "found": false}),
+                    ));
+                };
+                archive_current(data, now)?;
+                let item = data.playlist.remove(index);
+                if reset_av_delay {
+                    reset_local_av_delay(data);
+                }
+                record_session_played(data, &item, now)?;
+                data.current_item = Some(item);
+                data.current_item_started = false;
+                rebuild_playlist_order(data, None)?;
+                Ok(MutationResult::changed(
+                    json!({"changed": true, "found": true}),
+                    true,
+                ))
+            }
+            None => {
+                if data.current_item.is_none() {
+                    return Ok(MutationResult::unchanged(mutation_value(false)));
+                }
+                archive_current(data, now)?;
+                data.current_item = None;
+                data.current_item_started = false;
+                Ok(MutationResult::changed(mutation_value(true), true))
+            }
+        },
+        AppStateRequest::SetPlaybackMode { mode, .. } => {
+            if !valid_string(&mode, MAX_STRING_BYTES, false) {
+                return Err(rejected(
+                    "invalid_playback_mode",
+                    "playback mode is invalid",
+                ));
+            }
+            if data.playback_mode == mode {
+                return Ok(MutationResult::unchanged(json!({"mode": mode})));
+            }
+            data.playback_mode = mode.clone();
+            Ok(MutationResult::changed(json!({"mode": mode}), true))
+        }
+        AppStateRequest::ApplyAvDelay { action, .. } => {
+            let before = data.player_settings.clone();
+            let snapshot = apply_av_delay(data, &action);
+            let result = serde_json::to_value(snapshot).map_err(|error| {
+                ExecuteError::Internal(format!("failed to serialize AV delay decision: {error}"))
+            })?;
+            if before == data.player_settings {
+                return Ok(MutationResult::unchanged(result));
+            }
+            Ok(MutationResult::changed(result, true))
+        }
+        AppStateRequest::SetVolume {
+            volume_percent,
+            expected_item_incarnation_id,
+            ..
+        } => {
+            if let Some(expected) = expected_item_incarnation_id {
+                let actual = data
+                    .current_item
+                    .as_ref()
+                    .map(|item| item.item_incarnation_id.as_str())
+                    .unwrap_or("");
+                if expected != actual {
+                    return Err(rejected_with_details(
+                        "item_incarnation_mismatch",
+                        "current song changed before volume adjustment",
+                        json!({"expected_item_incarnation_id": expected, "actual_item_incarnation_id": actual}),
+                    ));
+                }
+            }
+            let value = volume_percent.clamp(0, MAX_VOLUME_PERCENT);
+            if value == data.player_settings.volume_percent && !data.automatic_volume.enabled {
+                return Ok(MutationResult::unchanged(json!({"value": value})));
+            }
+            data.mark_manual_volume();
+            data.player_settings.volume_percent = value;
+            Ok(MutationResult::changed(json!({"value": value}), true))
+        }
+        AppStateRequest::SetMuted { is_muted, .. } => {
+            if data.player_settings.is_muted == is_muted {
+                return Ok(MutationResult::unchanged(json!({"value": is_muted})));
+            }
+            data.automatic_playback.intent_revision =
+                data.automatic_playback.intent_revision.saturating_add(1);
+            data.player_settings.is_muted = is_muted;
+            Ok(MutationResult::changed(json!({"value": is_muted}), true))
+        }
+        AppStateRequest::SetSongAdvanceDelay { delay_seconds, .. } => {
+            let value = delay_seconds.clamp(0, MAX_SONG_ADVANCE_DELAY_SECONDS);
+            if data.player_settings.song_advance_delay_seconds == value {
+                return Ok(MutationResult::unchanged(json!({"value": value})));
+            }
+            data.player_settings.song_advance_delay_seconds = value;
+            Ok(MutationResult::changed(json!({"value": value}), true))
+        }
+        AppStateRequest::SetKeyShift { key_shift, .. } => {
+            let value = key_shift.clamp(MIN_KEY_SHIFT, MAX_KEY_SHIFT);
+            if data.player_settings.key_shift == value {
+                return Ok(MutationResult::unchanged(json!({"value": value})));
+            }
+            data.player_settings.key_shift = value;
+            Ok(MutationResult::changed(json!({"value": value}), true))
+        }
+        AppStateRequest::SetAudioVariant {
+            item_id,
+            expected_item_incarnation_id,
+            variant_id,
+            ..
+        } => {
+            if !valid_authoritative_identity(&expected_item_incarnation_id, 'i') {
+                return Err(rejected(
+                    "invalid_item_incarnation_id",
+                    "audio variant selection requires a valid item incarnation",
+                ));
+            }
+            let item = data
+                .find_item_mut(&item_id)
+                .ok_or_else(|| rejected("item_not_found", "playlist item does not exist"))?;
+            if item.item_incarnation_id != expected_item_incarnation_id {
+                return Err(rejected_with_details(
+                    "item_incarnation_mismatch",
+                    "playlist item changed before audio variant selection",
+                    json!({
+                        "expected_item_incarnation_id": expected_item_incarnation_id,
+                        "actual_item_incarnation_id": item.item_incarnation_id,
+                    }),
+                ));
+            }
+            let normalized = variant_id.trim();
+            if normalized.is_empty() {
+                return Ok(MutationResult::unchanged(mutation_value(false)));
+            }
+            let mut allowed: HashSet<String> = item
+                .audio_variants
+                .iter()
+                .filter_map(|variant| variant.get("id").and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .collect();
+            if allowed.is_empty() {
+                allowed = predicted_audio_variant_ids(item);
+            }
+            if !allowed.contains(normalized) {
+                return Ok(MutationResult::unchanged(mutation_value(false)));
+            }
+            if item.selected_audio_variant_id == normalized {
+                return Ok(MutationResult::unchanged(
+                    json!({"changed": false, "found": true}),
+                ));
+            }
+            item.selected_audio_variant_id = normalized.to_owned();
+            Ok(MutationResult::changed(
+                json!({"changed": true, "found": true}),
+                true,
+            ))
+        }
+        AppStateRequest::RegisterRemoteUser {
+            name,
+            current_name,
+            digest,
+            resident_devices,
+            guest_config,
+            now,
+            ..
+        } => {
+            if digest.len() != 64 || !digest.bytes().all(|c| c.is_ascii_hexdigit()) {
+                return Err(rejected("invalid_identity", "Invalid device digest"));
+            }
+            let name = normalize_session_user_name(&name);
+            let command = if let Some(current_name) = current_name {
+                Some(AppStateRequest::RenameSessionUser {
+                    schema_version: 1,
+                    current_name,
+                    new_name: name.clone(),
+                    expected_user_id: None,
+                    expected_name: None,
+                    now,
+                })
+            } else if !data.session_users.contains(&name) {
+                Some(AppStateRequest::AddSessionUser {
+                    schema_version: 1,
+                    name: name.clone(),
+                    now,
+                })
+            } else {
+                None
+            };
+            if let Some(command) = command {
+                apply_mutation(
+                    data,
+                    command,
+                    issued_cache_attempt_tokens,
+                    identity_namespace,
+                    next_item_incarnation_id,
+                )?;
+            }
+            data.remote_identities.insert(digest.clone(), name.clone());
+            while data.remote_identities.len() > 256 {
+                let oldest = data
+                    .remote_identities
+                    .keys()
+                    .filter(|key| **key != digest && !resident_devices.contains(*key))
+                    .min()
+                    .cloned()
+                    .or_else(|| {
+                        resident_devices
+                            .iter()
+                            .find(|key| {
+                                **key != digest && data.remote_identities.contains_key(*key)
+                            })
+                            .cloned()
+                    });
+                if let Some(oldest) = oldest {
+                    data.remote_identities.remove(&oldest);
+                } else {
+                    break;
+                }
+            }
+            let guest_key = format!("device:{digest}");
+            if let Some(config) =
+                guest_config.or_else(|| data.gatcha_pool_preferences.remove(&guest_key))
+            {
+                data.gatcha_pool_preferences
+                    .entry(format!("user:{name}"))
+                    .or_insert(config);
+            }
+            Ok(MutationResult::changed(json!({"name":name}), true))
+        }
+        AppStateRequest::AddSessionUser { name, .. } => {
+            let normalized = normalize_session_user_name(&name);
+            if normalized.is_empty() {
+                return Err(rejected("invalid_session_user", "用户名不能为空"));
+            }
+            if data.session_users.contains(&normalized) {
+                return Err(rejected("duplicate_session_user", "该用户已存在"));
+            }
+            if data.session_users.len() >= MAX_SESSION_USERS {
+                return Err(rejected(
+                    "too_many_session_users",
+                    format!("最多只能添加 {MAX_SESSION_USERS} 个用户"),
+                ));
+            }
+            data.session_users.push(normalized);
+            data.sync_user_ids(identity_namespace);
+            rebuild_playlist_order(data, None)?;
+            Ok(MutationResult::changed(mutation_value(true), true))
+        }
+        AppStateRequest::RemoveSessionUser { name, .. } => {
+            let normalized = normalize_session_user_name(&name);
+            let Some(index) = data
+                .session_users
+                .iter()
+                .position(|user| user == &normalized)
+            else {
+                return Ok(MutationResult::unchanged(mutation_value(false)));
+            };
+            data.session_users.remove(index);
+            data.sync_user_ids(identity_namespace);
+            rebuild_playlist_order(data, None)?;
+            Ok(MutationResult::changed(mutation_value(true), true))
+        }
+        AppStateRequest::RenameSessionUser {
+            current_name,
+            new_name,
+            expected_user_id,
+            expected_name,
+            ..
+        } => {
+            if expected_name
+                .as_ref()
+                .is_some_and(|name| name != &current_name)
+                || expected_user_id
+                    .as_ref()
+                    .is_some_and(|id| data.user_name_for_id(id) != Some(current_name.as_str()))
+            {
+                return Err(rejected(
+                    "session_users_changed",
+                    "用户名已更新，请重新打开修改",
+                ));
+            }
+            session_users::rename(data, &current_name, &new_name)
+        }
+        AppStateRequest::EditSessionUsers {
+            expected_version,
+            edit,
+            ..
+        } => session_users::apply_edit(data, &expected_version, edit),
+        AppStateRequest::MoveSessionUserToIndex {
+            name, target_index, ..
+        } => {
+            let normalized = normalize_session_user_name(&name);
+            let Some(index) = data
+                .session_users
+                .iter()
+                .position(|user| user == &normalized)
+            else {
+                return Ok(MutationResult::unchanged(mutation_value(false)));
+            };
+            let target = target_index.clamp(0, data.session_users.len() as i64 - 1) as usize;
+            if target == index {
+                return Ok(MutationResult::unchanged(
+                    json!({"changed": false, "found": true}),
+                ));
+            }
+            let user = data.session_users.remove(index);
+            data.session_users.insert(target, user);
+            rebuild_playlist_order(data, None)?;
+            Ok(MutationResult::changed(
+                json!({"changed": true, "found": true}),
+                true,
+            ))
+        }
+        AppStateRequest::SetSessionUsers { users, .. } => {
+            let normalized: Vec<String> = users
+                .iter()
+                .map(|user| normalize_session_user_name(user))
+                .collect();
+            validate_session_users(&normalized)?;
+            if data.session_users == normalized {
+                return Ok(MutationResult::unchanged(mutation_value(false)));
+            }
+            data.session_users = normalized;
+            data.sync_user_ids(identity_namespace);
+            rebuild_playlist_order(data, None)?;
+            Ok(MutationResult::changed(mutation_value(true), true))
+        }
+        AppStateRequest::RestoreBackup { reset_av_delay, .. } => {
+            let Some(backup) = data.backup.clone() else {
+                return Ok(MutationResult::unchanged(mutation_value(false)));
+            };
+            if backup.current_item.is_none() && backup.playlist.is_empty() {
+                return Ok(MutationResult::unchanged(mutation_value(false)));
+            }
+            data.current_item = backup.current_item.map(sanitize_backup_item);
+            data.playlist = backup
+                .playlist
+                .into_iter()
+                .map(sanitize_backup_item)
+                .collect();
+            if let Some(item) = data.current_item.as_mut() {
+                assign_new_item_incarnation(item, identity_namespace, next_item_incarnation_id)?;
+            }
+            for item in &mut data.playlist {
+                assign_new_item_incarnation(item, identity_namespace, next_item_incarnation_id)?;
+            }
+            data.current_item_started = false;
+            if data.current_item.is_some() && reset_av_delay {
+                reset_local_av_delay(data);
+            }
+            if let Some(archive) = backup.played_session {
+                replace_session_archive(data, &archive);
+            } else {
+                data.session_played.clear();
+            }
+            data.previous_session = None;
+            increment_session_generation(data)?;
+            rebuild_playlist_order(data, None)?;
+            Ok(MutationResult::changed(mutation_value(true), false))
+        }
+        AppStateRequest::DiscardBackup { new_session, .. } => {
+            validate_archive(&new_session)?;
+            let existed =
+                data.backup.is_some() || data.current_item.is_some() || !data.playlist.is_empty();
+            reset_current_identity(data);
+            if existed {
+                replace_session_archive(data, &new_session);
+                increment_session_generation(data)?;
+            }
+            data.previous_session = None;
+            data.backup = None;
+            if !existed {
+                return Ok(MutationResult::unchanged(mutation_value(false)));
+            }
+            let mut result = MutationResult::changed(mutation_value(true), false);
+            result.effects.delete_backup = true;
+            Ok(result)
+        }
+        AppStateRequest::ContinuePreviousSession { archive, .. } => {
+            if data.current_item.is_some()
+                || !data.playlist.is_empty()
+                || !data.session_played.is_empty()
+            {
+                return Ok(MutationResult::unchanged(mutation_value(false)));
+            }
+            let Some(previous) = data.previous_session.take() else {
+                return Ok(MutationResult::unchanged(mutation_value(false)));
+            };
+            let Some(archive) = archive else {
+                return Ok(MutationResult::changed(mutation_value(false), false));
+            };
+            validate_archive(&archive)?;
+            if archive.file_name != previous.file_name {
+                return Err(rejected(
+                    "previous_session_changed",
+                    "previous session archive identity changed",
+                ));
+            }
+            if archive.items.is_empty() {
+                return Ok(MutationResult::changed(mutation_value(false), false));
+            }
+            replace_session_archive(data, &archive);
+            data.session_archives
+                .retain(|closed| closed.file_name != archive.file_name);
+            increment_session_generation(data)?;
+            Ok(MutationResult::changed(mutation_value(true), false))
+        }
+        AppStateRequest::BeginSession { new_session, .. } => {
+            validate_archive(&new_session)?;
+            reset_current_identity(data);
+            data.session_history.clear();
+            replace_session_archive(data, &new_session);
+            data.previous_session = None;
+            data.backup = None;
+            increment_session_generation(data)?;
+            let mut result = MutationResult::changed(mutation_value(true), false);
+            result.effects.delete_backup = true;
+            Ok(result)
+        }
+        AppStateRequest::ResolveNativeSession {
+            continue_previous,
+            new_session,
+            ..
+        } => {
+            if !data.native_session_choice_pending {
+                return Ok(MutationResult::unchanged(mutation_value(false)));
+            }
+            validate_archive(&new_session)?;
+            if !continue_previous {
+                if new_session.file_name == data.session_played_file
+                    || data.session_archives.iter().any(|archive| {
+                        archive.file_name == new_session.file_name
+                            || archive.file_name == data.session_played_file
+                    })
+                {
+                    return Err(rejected(
+                        "duplicate_session",
+                        "session archive identity must be unique",
+                    ));
+                }
+                if !data.session_played.is_empty() {
+                    data.session_archives.push(SessionArchiveSeed {
+                        file_name: data.session_played_file.clone(),
+                        session_started_at: data.session_started_at,
+                        items: data.session_played.clone(),
+                    });
+                }
+                reset_current_identity(data);
+                data.session_history.clear();
+                data.session_users.clear();
+                replace_session_archive(data, &new_session);
+                data.previous_session = None;
+                data.backup = None;
+                increment_session_generation(data)?;
+            }
+            data.native_session_choice_pending = false;
+            let mut result = MutationResult::changed(mutation_value(true), false);
+            result.effects.delete_backup = !continue_previous;
+            Ok(result)
+        }
+        AppStateRequest::ResetRuntime { new_session, .. } => {
+            validate_archive(&new_session)?;
+            data.playback_mode = "local".to_owned();
+            data.player_settings = PlayerSettingsSeed::default();
+            data.gatcha_pool_preferences = HashMap::from([(
+                ":default".into(),
+                crate::gatcha_repository::normalize_pool_config(&Value::Null),
+            )]);
+            reset_current_identity(data);
+            data.history.clear();
+            data.session_history.clear();
+            data.session_users.clear();
+            // Reset data promises to keep played records, including this
+            // session. The queue/settings reset must not rotate that archive.
+            data.previous_session = None;
+            data.backup = None;
+            data.native_session_choice_pending = false;
+            increment_session_generation(data)?;
+            let mut result = MutationResult::changed(mutation_value(true), false);
+            result.effects = PersistenceEffects {
+                delete_backup: true,
+                delete_runtime_files: true,
+                ..PersistenceEffects::default()
+            };
+            Ok(result)
+        }
+        AppStateRequest::ResetPlayer { .. } => {
+            let persisted_settings_changed = data.playback_mode != "local"
+                || data.player_settings != PlayerSettingsSeed::default();
+            let force_program_lifetime = data.current_item.is_some();
+            let changed =
+                persisted_settings_changed || data.current_item_started || force_program_lifetime;
+            if !changed {
+                return Ok(MutationResult::unchanged(mutation_value(false)));
+            }
+            data.playback_mode = "local".to_owned();
+            data.player_settings = PlayerSettingsSeed::default();
+            data.mark_manual_volume();
+            data.current_item_started = false;
+            let mut result = MutationResult::changed(mutation_value(true), false);
+            result.force_program_lifetime = force_program_lifetime;
+            if !persisted_settings_changed {
+                result.effects = PersistenceEffects::default();
+            }
+            Ok(result)
+        }
+        AppStateRequest::RestartPlaybackProgram { .. } => {
+            if data.current_item.is_none() {
+                return Ok(MutationResult::unchanged(mutation_value(false)));
+            }
+            let mut result = MutationResult::changed(mutation_value(true), false);
+            result.force_program_lifetime = true;
+            result.effects = PersistenceEffects::default();
+            Ok(result)
+        }
+        AppStateRequest::ApplyPlayerStatusObservation {
+            expected_playback_generation,
+            item_id,
+            is_paused,
+            current_time,
+            duration,
+            ..
+        } => {
+            if expected_playback_generation != data.playback_generation {
+                return Err(rejected_with_details(
+                    "playback_generation_mismatch",
+                    "playback program changed before player status was applied",
+                    json!({
+                        "expected_playback_generation": expected_playback_generation,
+                        "actual_playback_generation": data.playback_generation,
+                    }),
+                ));
+            }
+            let Some(program) = data.playback_program()? else {
+                return Err(rejected(
+                    "no_current_playback_program",
+                    "player status requires a current playback program",
+                ));
+            };
+            let normalized_item_id = item_id.trim();
+            if !valid_string(normalized_item_id, MAX_ITEM_ID_BYTES, false)
+                || program.item_id != normalized_item_id
+            {
+                return Err(rejected_with_details(
+                    "playback_program_mismatch",
+                    "player status item does not match the current playback program",
+                    json!({
+                        "expected_item_id": normalized_item_id,
+                        "actual_item_id": program.item_id,
+                    }),
+                ));
+            }
+            validate_time(current_time, "current_time")?;
+            validate_time(duration, "duration")?;
+            if current_time > PLAYER_STATUS_MAX_SECONDS || duration > PLAYER_STATUS_MAX_SECONDS {
+                return Err(rejected(
+                    "invalid_player_status_time",
+                    "player status time exceeds the supported bound",
+                ));
+            }
+
+            let started_changed =
+                duration > 0.0 && (!is_paused || current_time > 0.0) && !data.current_item_started;
+            if started_changed {
+                data.current_item_started = true;
+            }
+            let threshold_reached =
+                duration > 0.0 && current_time / duration >= PLAYER_STATUS_THRESHOLD_RATIO;
+            let mut threshold_changed = false;
+            if threshold_reached {
+                for entry in &mut data.session_played {
+                    if entry.item_id == normalized_item_id && !entry.threshold_reached {
+                        entry.threshold_reached = true;
+                        threshold_changed = true;
+                    }
+                }
+            }
+            let changed = started_changed || threshold_changed;
+            let result = json!({
+                "changed": changed,
+                "started_changed": started_changed,
+                "threshold_changed": threshold_changed,
+            });
+            if changed {
+                Ok(MutationResult::changed(result, threshold_changed))
+            } else {
+                Ok(MutationResult::unchanged(result))
+            }
+        }
+        AppStateRequest::MarkCurrentItemStarted { item_id, .. } => {
+            if data.current_identity() != Some(item_id.trim()) {
+                return Ok(MutationResult::unchanged(mutation_value(false)));
+            }
+            if data.current_item_started {
+                return Ok(MutationResult::unchanged(
+                    json!({"changed": false, "found": true}),
+                ));
+            }
+            data.current_item_started = true;
+            Ok(MutationResult::changed(
+                json!({"changed": true, "found": true}),
+                false,
+            ))
+        }
+        AppStateRequest::MarkSessionPlayedThreshold { item_id, .. } => {
+            let mut changed = false;
+            for entry in &mut data.session_played {
+                if entry.item_id == item_id && !entry.threshold_reached {
+                    entry.threshold_reached = true;
+                    changed = true;
+                }
+            }
+            if !changed {
+                return Ok(MutationResult::unchanged(mutation_value(false)));
+            }
+            Ok(MutationResult::changed(mutation_value(true), true))
+        }
+        AppStateRequest::AppendHistory { entry, .. } => {
+            validate_history_entry(&entry)?;
+            data.history.insert(0, entry);
+            Ok(MutationResult::changed(mutation_value(true), false))
+        }
+        AppStateRequest::AppendSessionPlayed { entry, .. } => {
+            validate_session_played_entry(&entry)?;
+            data.session_played.push(entry);
+            Ok(MutationResult::changed(mutation_value(true), true))
+        }
+        AppStateRequest::UpdateOwnerInfo {
+            source_url,
+            owner_mid,
+            owner_name,
+            owner_url,
+            ..
+        } => {
+            let source = source_url.trim();
+            if source.is_empty() || owner_mid < 0 {
+                return Ok(MutationResult::unchanged(mutation_value(false)));
+            }
+            if !valid_string(&owner_name, MAX_STRING_BYTES, true)
+                || !valid_string(&owner_url, MAX_STRING_BYTES, true)
+            {
+                return Err(rejected("invalid_owner", "owner metadata is invalid"));
+            }
+            let mut changed = false;
+            let mut update_item = |item: &mut PlaylistItem| {
+                if source != item.resolved_url.trim() && source != item.original_url.trim() {
+                    return;
+                }
+                if item.owner_mid == owner_mid
+                    && item.owner_name == owner_name
+                    && item.owner_url == owner_url
+                {
+                    return;
+                }
+                item.owner_mid = owner_mid;
+                item.owner_name.clone_from(&owner_name);
+                item.owner_url.clone_from(&owner_url);
+                changed = true;
+            };
+            if let Some(item) = &mut data.current_item {
+                update_item(item);
+            }
+            for item in &mut data.playlist {
+                update_item(item);
+            }
+            let mut update_history = |entry: &mut HistoryEntry| {
+                if source != entry.resolved_url.trim() && source != entry.original_url.trim() {
+                    return;
+                }
+                if entry.owner_mid == owner_mid
+                    && entry.owner_name == owner_name
+                    && entry.owner_url == owner_url
+                {
+                    return;
+                }
+                entry.owner_mid = owner_mid;
+                entry.owner_name.clone_from(&owner_name);
+                entry.owner_url.clone_from(&owner_url);
+                changed = true;
+            };
+            for entry in data
+                .history
+                .iter_mut()
+                .chain(data.session_history.iter_mut())
+            {
+                update_history(entry);
+            }
+            for entry in &mut data.session_played {
+                if source != entry.resolved_url.trim() && source != entry.original_url.trim() {
+                    continue;
+                }
+                if entry.owner_mid == owner_mid
+                    && entry.owner_name == owner_name
+                    && entry.owner_url == owner_url
+                {
+                    continue;
+                }
+                entry.owner_mid = owner_mid;
+                entry.owner_name.clone_from(&owner_name);
+                entry.owner_url.clone_from(&owner_url);
+                changed = true;
+            }
+            if !changed {
+                return Ok(MutationResult::unchanged(mutation_value(false)));
+            }
+            Ok(MutationResult::changed(mutation_value(true), true))
+        }
+        AppStateRequest::QueryDuplicate { item, .. } => {
+            Ok(MutationResult::unchanged(duplicate_result(data, &item)?))
+        }
+        AppStateRequest::ApplyCacheEvent {
+            item_id,
+            cache_attempt_token,
+            event,
+            now,
+            ..
+        } => apply_cache_event(
+            data,
+            &item_id,
+            cache_attempt_token,
+            issued_cache_attempt_tokens,
+            &event,
+            now,
+        ),
+        AppStateRequest::Initialize { .. }
+        | AppStateRequest::Snapshot { .. }
+        | AppStateRequest::IssuePlayerControl { .. }
+        | AppStateRequest::AckPlayerControl { .. }
+        | AppStateRequest::PlayerControlSnapshot { .. }
+        | AppStateRequest::BeginCacheAttempt { .. }
+        | AppStateRequest::AuthorizeCachePublication { .. }
+        | AppStateRequest::OpenInternetRemotePeer { .. }
+        | AppStateRequest::CloseInternetRemotePeer { .. }
+        | AppStateRequest::InternetRemoteState { .. }
+        | AppStateRequest::DispatchInternetRemoteMessage { .. }
+        | AppStateRequest::CompleteInternetRemotePlaylistAdd { .. }
+        | AppStateRequest::CancelInternetRemotePlaylistAdd { .. }
+        | AppStateRequest::Shutdown { .. } => Err(ExecuteError::Internal(
+            "lifecycle request reached mutation dispatcher".to_owned(),
+        )),
+    }
+}
+
+impl AppState {
+    fn initialize_once(&mut self, seed: AppStateSeed) -> AppStateResponse {
+        // Activity recreation must not reset an existing queue, playback generation,
+        // cache attempt, or authenticated Remote peer. The check and initialization
+        // execute under the same authoritative lock in the process-wide entry point.
+        if self.data.is_some() {
+            self.execute(AppStateRequest::Snapshot {
+                schema_version: SCHEMA_VERSION,
+            })
+        } else {
+            self.execute(AppStateRequest::Initialize {
+                schema_version: SCHEMA_VERSION,
+                state: Box::new(seed),
+            })
+        }
+    }
+
+    fn execute_internet_remote_message(
+        &mut self,
+        peer_id: String,
+        lane: RemoteLane,
+        message: String,
+        reset_av_delay: bool,
+        now: f64,
+    ) -> AppStateResponse {
+        let Some(data) = self.data.as_ref() else {
+            return uninitialized_response();
+        };
+        let snapshot = match data.snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => return execute_error_response(error),
+        };
+        let validation = match self
+            .internet_remote_peers
+            .validate(&peer_id, lane, &message, &snapshot)
+        {
+            Ok(validation) => validation,
+            Err(error) => return internet_remote_error_response(error),
+        };
+        if !validation.accepted {
+            let mut response = internet_remote_reply(
+                data,
+                &validation,
+                json!(project_remote_state(&snapshot)),
+                None,
+                true,
+            );
+            if let AppStateResponse::Success(success) = &mut response {
+                let (code, message) =
+                    if matches!(validation.request, RemoteRequestV1::PlaylistMove { .. }) {
+                        ("queue_changed", "队列已更新，请重新拖动")
+                    } else {
+                        ("stale_command", "操作对应的状态已更新，请刷新后重试")
+                    };
+                success.result["code"] = json!(code);
+                success.result["error"] = json!(message);
+            }
+            return response;
+        }
+
+        let request = validation.request.clone();
+        let (mutation, host_effect, identity_reply) = match request {
+            RemoteRequestV1::ConnectionHealth => {
+                return internet_remote_reply(
+                    data,
+                    &validation,
+                    json!({
+                        "healthy": true,
+                        "state": project_remote_state(&snapshot),
+                    }),
+                    None,
+                    false,
+                );
+            }
+            RemoteRequestV1::StateGet { .. } => {
+                return internet_remote_reply(
+                    data,
+                    &validation,
+                    json!(project_remote_state(&snapshot)),
+                    None,
+                    false,
+                );
+            }
+            RemoteRequestV1::CatalogSearch {
+                query,
+                limit,
+                offset,
+            } => {
+                return internet_remote_reply(
+                    data,
+                    &validation,
+                    Value::Null,
+                    Some(
+                        json!({"kind": "catalog_search", "query": query, "limit": limit, "offset": offset}),
+                    ),
+                    false,
+                );
+            }
+            RemoteRequestV1::CatalogBrowse {
+                kind,
+                letter,
+                query,
+                tag,
+                locale,
+                limit,
+                offset,
+            } => {
+                return internet_remote_reply(
+                    data,
+                    &validation,
+                    Value::Null,
+                    Some(json!({
+                        "kind": "catalog_browse",
+                        "browse_kind": kind,
+                        "offset": offset,
+                        "letter": letter,
+                        "query": query,
+                        "tag": tag,
+                        "locale": locale,
+                        "limit": limit,
+                    })),
+                    false,
+                );
+            }
+            RemoteRequestV1::CatalogCategoryBrowse {
+                tags,
+                tag45s,
+                query,
+                offset,
+                limit,
+            } => {
+                return internet_remote_reply(
+                    data,
+                    &validation,
+                    Value::Null,
+                    Some(json!({
+                        "kind": "catalog_category_browse",
+                        "tags": tags,
+                        "tag45s": tag45s,
+                        "query": query,
+                        "offset": offset,
+                        "limit": limit,
+                    })),
+                    false,
+                );
+            }
+            RemoteRequestV1::SongDetail { catalog_item_id } => {
+                return internet_remote_reply(
+                    data,
+                    &validation,
+                    Value::Null,
+                    Some(json!({
+                        "kind": "catalog_song_detail",
+                        "catalog_item_id": catalog_item_id,
+                    })),
+                    false,
+                );
+            }
+            RemoteRequestV1::GatchaSearch {
+                query,
+                limit,
+                offset,
+            } => {
+                return internet_remote_reply(
+                    data,
+                    &validation,
+                    Value::Null,
+                    Some(
+                        json!({"kind": "gatcha_search", "query": query, "limit": limit, "offset": offset}),
+                    ),
+                    false,
+                );
+            }
+            RemoteRequestV1::GatchaBrowse {
+                uid,
+                query,
+                offset,
+                limit,
+            } => {
+                return internet_remote_reply(
+                    data,
+                    &validation,
+                    Value::Null,
+                    Some(json!({
+                        "kind": "gatcha_browse",
+                        "uid": uid,
+                        "query": query,
+                        "offset": offset,
+                        "limit": limit,
+                    })),
+                    false,
+                );
+            }
+            RemoteRequestV1::GatchaFavlistBrowse {
+                folder_id,
+                query,
+                offset,
+                limit,
+            } => {
+                return internet_remote_reply(
+                    data,
+                    &validation,
+                    Value::Null,
+                    Some(json!({
+                        "kind": "gatcha_favlist_browse",
+                        "folder_id": folder_id,
+                        "query": query,
+                        "offset": offset,
+                        "limit": limit,
+                    })),
+                    false,
+                );
+            }
+            RemoteRequestV1::GatchaPoolConfigGet => {
+                return internet_remote_reply(
+                    data,
+                    &validation,
+                    Value::Null,
+                    Some(
+                        json!({"kind": "gatcha_pool_config_get", "requester_name":validation.session_name}),
+                    ),
+                    false,
+                );
+            }
+            RemoteRequestV1::GatchaCandidate => {
+                return internet_remote_reply(
+                    data,
+                    &validation,
+                    Value::Null,
+                    Some(
+                        json!({"kind": "gatcha_candidate", "requester_name":validation.session_name}),
+                    ),
+                    false,
+                );
+            }
+            RemoteRequestV1::GatchaPoolConfigSet {
+                uid_weight,
+                favlist_weight,
+                excluded_uids,
+                excluded_favlist_folders,
+            } => {
+                return internet_remote_reply(
+                    data,
+                    &validation,
+                    Value::Null,
+                    Some(json!({
+                        "kind": "gatcha_pool_config_set",
+                        "requester_name": validation.session_name,
+                        "uid_weight": uid_weight,
+                        "favlist_weight": favlist_weight,
+                        "excluded_uids": excluded_uids,
+                        "excluded_favlist_folders": excluded_favlist_folders,
+                    })),
+                    false,
+                );
+            }
+            RemoteRequestV1::GatchaUidPreview { uid } => {
+                return internet_remote_reply(
+                    data,
+                    &validation,
+                    Value::Null,
+                    Some(json!({"kind": "gatcha_uid_preview", "uid": uid})),
+                    false,
+                );
+            }
+            RemoteRequestV1::GatchaUidAdd { uid } => {
+                return internet_remote_reply(
+                    data,
+                    &validation,
+                    Value::Null,
+                    Some(json!({"kind": "gatcha_uid_add", "uid": uid})),
+                    false,
+                );
+            }
+            RemoteRequestV1::GatchaSourceRemove { source, id } => {
+                return internet_remote_reply(
+                    data,
+                    &validation,
+                    Value::Null,
+                    Some(json!({"kind":"gatcha_source_remove", "source":source, "id":id})),
+                    false,
+                );
+            }
+            RemoteRequestV1::GatchaRefresh => {
+                return internet_remote_reply(
+                    data,
+                    &validation,
+                    Value::Null,
+                    Some(json!({"kind": "gatcha_refresh"})),
+                    false,
+                );
+            }
+            RemoteRequestV1::GatchaFavlistPreview { uid } => {
+                return internet_remote_reply(
+                    data,
+                    &validation,
+                    Value::Null,
+                    Some(json!({"kind": "gatcha_favlist_preview", "uid": uid})),
+                    false,
+                );
+            }
+            RemoteRequestV1::GatchaFavlistRefresh {
+                uid,
+                folder_ids,
+                folder_titles,
+            } => {
+                return internet_remote_reply(
+                    data,
+                    &validation,
+                    Value::Null,
+                    Some(json!({
+                        "kind": "gatcha_favlist_refresh",
+                        "uid": uid,
+                        "folder_ids": folder_ids,
+                        "folder_titles": folder_titles,
+                    })),
+                    false,
+                );
+            }
+            RemoteRequestV1::PlaylistAdd {
+                catalog_item_id,
+                position,
+                allow_repeat,
+                selected_video_page,
+                selected_audio_pages,
+                expected_revision: _,
+            } => {
+                if let Err(error) = self.internet_remote_peers.begin_playlist_add(
+                    &validation,
+                    &catalog_item_id,
+                    position,
+                    allow_repeat,
+                    selected_video_page.map(|video_page| PlaylistAddBindingSelection {
+                        video_page,
+                        audio_pages: &selected_audio_pages,
+                    }),
+                    &snapshot,
+                ) {
+                    return internet_remote_error_response(error);
+                }
+                return internet_remote_reply(
+                    data,
+                    &validation,
+                    Value::Null,
+                    Some(json!({
+                        "kind": "fetch_playlist_item",
+                        "catalog_item_id": catalog_item_id,
+                        "selected_video_page": selected_video_page,
+                        "selected_audio_pages": selected_audio_pages,
+                    })),
+                    false,
+                );
+            }
+            RemoteRequestV1::PlaylistRemove { item_id, .. } => (
+                AppStateRequest::RemoveItem {
+                    schema_version: SCHEMA_VERSION,
+                    item_id,
+                    now,
+                },
+                Some(json!({"kind": "sync_cache"})),
+                None,
+            ),
+            RemoteRequestV1::PlaylistMove {
+                item_id,
+                target_index,
+                expected_queue_version,
+                ..
+            } => (
+                AppStateRequest::MoveItemToIndex {
+                    schema_version: SCHEMA_VERSION,
+                    item_id,
+                    target_index: i64::from(target_index),
+                    expected_queue_version,
+                    now,
+                },
+                Some(json!({"kind": "sync_cache"})),
+                None,
+            ),
+            RemoteRequestV1::PlaylistResort { .. } => (
+                AppStateRequest::ResortPlaylistByCycle {
+                    schema_version: SCHEMA_VERSION,
+                    now,
+                },
+                Some(json!({"kind": "sync_cache"})),
+                None,
+            ),
+            RemoteRequestV1::PlaylistMoveNext { item_id, .. } => (
+                AppStateRequest::MoveToNext {
+                    schema_version: SCHEMA_VERSION,
+                    item_id,
+                    now,
+                },
+                Some(json!({"kind": "sync_cache"})),
+                None,
+            ),
+            RemoteRequestV1::PlaylistPlayNow { item_id, .. } => (
+                AppStateRequest::MoveToFront {
+                    schema_version: SCHEMA_VERSION,
+                    item_id,
+                    reset_av_delay,
+                    now,
+                },
+                Some(json!({"kind": "sync_cache"})),
+                None,
+            ),
+            RemoteRequestV1::PlaybackPlay { .. }
+            | RemoteRequestV1::PlaybackPause { .. }
+            | RemoteRequestV1::PlaybackToggle { .. }
+            | RemoteRequestV1::PlaybackSeekRelative { .. }
+            | RemoteRequestV1::PlaybackSeekAbsolute { .. }
+            | RemoteRequestV1::PlaybackNext { .. } => {
+                let (action, item_id, playback_generation, delta_seconds, target_seconds) =
+                    match request {
+                        RemoteRequestV1::PlaybackPlay {
+                            item_id,
+                            playback_generation,
+                        } => ("play", item_id, playback_generation, 0, None),
+                        RemoteRequestV1::PlaybackPause {
+                            item_id,
+                            playback_generation,
+                        } => ("pause", item_id, playback_generation, 0, None),
+                        RemoteRequestV1::PlaybackToggle {
+                            item_id,
+                            playback_generation,
+                        } => ("toggle-play", item_id, playback_generation, 0, None),
+                        RemoteRequestV1::PlaybackSeekRelative {
+                            item_id,
+                            playback_generation,
+                            delta_seconds,
+                        } => (
+                            "seek-relative",
+                            item_id,
+                            playback_generation,
+                            delta_seconds,
+                            None,
+                        ),
+                        RemoteRequestV1::PlaybackSeekAbsolute {
+                            item_id,
+                            playback_generation,
+                            target_seconds,
+                        } => (
+                            "seek-absolute",
+                            item_id,
+                            playback_generation,
+                            0,
+                            Some(target_seconds),
+                        ),
+                        RemoteRequestV1::PlaybackNext {
+                            playback_generation,
+                        } => (
+                            "next-track",
+                            snapshot
+                                .current_item
+                                .as_ref()
+                                .map(|item| item.id.clone())
+                                .unwrap_or_default(),
+                            playback_generation,
+                            0,
+                            None,
+                        ),
+                        _ => unreachable!("playback request group changed"),
+                    };
+                return internet_remote_reply(
+                    data,
+                    &validation,
+                    json!(project_remote_state(&snapshot)),
+                    Some(json!({
+                        "kind": "player_control",
+                        "action": action,
+                        "playback_generation": playback_generation,
+                        "item_id": item_id,
+                        "delta_seconds": delta_seconds,
+                        "target_seconds": target_seconds,
+                    })),
+                    false,
+                );
+            }
+            RemoteRequestV1::PlayerSetVolume {
+                volume_percent,
+                expected_item_incarnation_id,
+            } => (
+                AppStateRequest::SetVolume {
+                    schema_version: SCHEMA_VERSION,
+                    volume_percent: i32::from(volume_percent),
+                    expected_item_incarnation_id,
+                    now,
+                },
+                None,
+                None,
+            ),
+            RemoteRequestV1::PlayerSetMuted { is_muted } => (
+                AppStateRequest::SetMuted {
+                    schema_version: SCHEMA_VERSION,
+                    is_muted,
+                    now,
+                },
+                None,
+                None,
+            ),
+            RemoteRequestV1::PlayerSetKeyShift { key_shift } => (
+                AppStateRequest::SetKeyShift {
+                    schema_version: SCHEMA_VERSION,
+                    key_shift: i32::from(key_shift),
+                    now,
+                },
+                None,
+                None,
+            ),
+            RemoteRequestV1::PlayerSetAudioVariant {
+                item_id,
+                variant_id,
+                expected_item_incarnation_id,
+                ..
+            } => (
+                AppStateRequest::SetAudioVariant {
+                    schema_version: SCHEMA_VERSION,
+                    item_id,
+                    expected_item_incarnation_id,
+                    variant_id,
+                    now,
+                },
+                None,
+                None,
+            ),
+            RemoteRequestV1::PlayerSetAvDelay { effective_delay_ms } => (
+                AppStateRequest::ApplyAvDelay {
+                    schema_version: SCHEMA_VERSION,
+                    action: AvDelayCommand::SetEffective { effective_delay_ms },
+                    now,
+                },
+                None,
+                None,
+            ),
+            RemoteRequestV1::PlayerAvDelayAction(action) => (
+                AppStateRequest::ApplyAvDelay {
+                    schema_version: SCHEMA_VERSION,
+                    action: match action {
+                        RemoteAvDelayActionV1::Adjust { delta_ms } => {
+                            AvDelayCommand::Adjust { delta_ms }
+                        }
+                        RemoteAvDelayActionV1::SetEffective { effective_delay_ms } => {
+                            AvDelayCommand::SetEffective { effective_delay_ms }
+                        }
+                        RemoteAvDelayActionV1::ResetLocal {} => AvDelayCommand::ResetLocal,
+                        RemoteAvDelayActionV1::ToggleLock {} => AvDelayCommand::ToggleLock,
+                    },
+                    now,
+                },
+                None,
+                None,
+            ),
+            RemoteRequestV1::SessionResume { user_id } => {
+                let Some(name) = data.user_name_for_id(&user_id).map(str::to_owned) else {
+                    return execute_error_response(rejected(
+                        "identity_required",
+                        "点歌人已移除，请重新登记",
+                    ));
+                };
+                if let Err(error) = self
+                    .internet_remote_peers
+                    .commit_identity(&validation.peer_id, name.clone())
+                {
+                    return internet_remote_error_response(error);
+                }
+                return internet_remote_reply(
+                    data,
+                    &validation,
+                    json!({"name":name,"state":project_remote_state(&snapshot)}),
+                    None,
+                    false,
+                );
+            }
+            RemoteRequestV1::SessionRename {
+                name,
+                user_id,
+                expected_name,
+            } => {
+                let name = normalize_session_user_name(&name);
+                let current = validation.session_name.as_deref();
+                if current != Some(expected_name.as_str())
+                    || data.user_name_for_id(&user_id) != current
+                {
+                    return execute_error_response(rejected(
+                        "session_users_changed",
+                        "用户名已更新，请重新打开修改",
+                    ));
+                }
+                (
+                    AppStateRequest::EditSessionUsers {
+                        schema_version: SCHEMA_VERSION,
+                        expected_version: data.users_version(),
+                        edit: SessionUserEdit::Rename {
+                            user_id,
+                            name: name.clone(),
+                        },
+                        now,
+                    },
+                    None,
+                    Some(name),
+                )
+            }
+            RemoteRequestV1::SessionSetIdentity { name } => {
+                let normalized = normalize_session_user_name(&name);
+                if data.session_users.contains(&normalized) {
+                    if let Err(error) = self
+                        .internet_remote_peers
+                        .commit_identity(&validation.peer_id, normalized.clone())
+                    {
+                        return internet_remote_error_response(error);
+                    }
+                    return internet_remote_reply(
+                        data,
+                        &validation,
+                        json!({
+                            "name": normalized,
+                            "state": project_remote_state(&snapshot),
+                        }),
+                        None,
+                        false,
+                    );
+                }
+                (
+                    AppStateRequest::AddSessionUser {
+                        schema_version: SCHEMA_VERSION,
+                        name: normalized.clone(),
+                        now,
+                    },
+                    None,
+                    Some(normalized),
+                )
+            }
+            RemoteRequestV1::RatingSubmit { play_id, score } => {
+                let bvid = snapshot
+                    .current_item
+                    .as_ref()
+                    .filter(|item| item.id == play_id)
+                    .map(|item| item.bvid.as_str())
+                    .or_else(|| {
+                        snapshot
+                            .session_played
+                            .iter()
+                            .find(|item| item.item_id == play_id)
+                            .map(|item| item.bvid.as_str())
+                    });
+                let Some(bvid) = bvid.filter(|bvid| !bvid.is_empty()) else {
+                    return execute_error_response(rejected(
+                        "rating_stale",
+                        "Song is not in this session's played records",
+                    ));
+                };
+                let session_name = match validation.session_name.as_deref() {
+                    Some(name) if !name.trim().is_empty() => name,
+                    _ => {
+                        return internet_remote_error_response(
+                            InternetRemoteError::IdentityRequired,
+                        );
+                    }
+                };
+                return internet_remote_reply(
+                    data,
+                    &validation,
+                    json!(project_remote_state(&snapshot)),
+                    Some(json!({
+                        "kind": "submit_rating",
+                        "session_name": session_name,
+                        "play_id": play_id,
+                        "bvid": bvid,
+                        "score": score,
+                    })),
+                    false,
+                );
+            }
+            RemoteRequestV1::CacheRetry {
+                force,
+                item_id,
+                expected_item_incarnation_id,
+                ..
+            } => {
+                return internet_remote_reply(
+                    data,
+                    &validation,
+                    json!(project_remote_state(&snapshot)),
+                    Some(json!({
+                        "kind": "retry_cache",
+                        "force": force,
+                        "item_id": item_id,
+                        "item_incarnation_id": expected_item_incarnation_id,
+                    })),
+                    false,
+                );
+            }
+        };
+
+        let mutation_response = self.execute(mutation);
+        if let Some(name) = identity_reply.as_ref()
+            && matches!(mutation_response, AppStateResponse::Success(_))
+            && let Err(error) = self
+                .internet_remote_peers
+                .commit_identity(&validation.peer_id, name.clone())
+        {
+            return internet_remote_error_response(error);
+        }
+        wrap_internet_remote_mutation(mutation_response, &validation, host_effect, identity_reply)
+    }
+
+    fn complete_internet_remote_playlist_add(
+        &mut self,
+        peer_id: String,
+        request_id: String,
+        item: PlaylistItem,
+        reset_av_delay: bool,
+        now: f64,
+    ) -> AppStateResponse {
+        let pending = match self
+            .internet_remote_peers
+            .take_playlist_add(&peer_id, &request_id)
+        {
+            Ok(pending) => pending,
+            Err(error) => return internet_remote_error_response(error),
+        };
+        let Some(data) = self.data.as_ref() else {
+            return uninitialized_response();
+        };
+        if data.session_generation != pending.session_generation
+            || data.user_name_for_id(&pending.session_user_id).is_none()
+        {
+            return execute_error_response(rejected(
+                "internet_remote_identity_missing",
+                "Internet Remote identity is no longer active",
+            ));
+        }
+        let expected_bvid = pending
+            .catalog_item_id
+            .split_once("_p")
+            .map_or(pending.catalog_item_id.as_str(), |(bvid, _)| bvid);
+        let selected_page_mismatch = pending
+            .selected_video_page
+            .is_some_and(|page| item.page != i64::from(page));
+        let expected_audio_pages = pending
+            .selected_audio_pages
+            .iter()
+            .map(|page| i64::from(*page))
+            .collect::<Vec<_>>();
+        let manual_selection_mismatch = item.manual_selection
+            != pending.selected_video_page.is_some()
+            || (!expected_audio_pages.is_empty() && item.selected_pages != expected_audio_pages);
+        let identity_matches = match &item.media_source {
+            bilikara_rust::media_source::MediaSource::Bilibili => item.bvid == expected_bvid,
+            bilikara_rust::media_source::MediaSource::YouTube { video_id } => {
+                pending.catalog_item_id == format!("youtube:{video_id}")
+            }
+        };
+        if !identity_matches || selected_page_mismatch || manual_selection_mismatch {
+            return execute_error_response(rejected(
+                "internet_remote_catalog_item_mismatch",
+                "Fetched playlist item does not match the admitted catalog item",
+            ));
+        }
+        let response = self.execute(AppStateRequest::AddItem {
+            requester_user_id: Some(pending.session_user_id),
+
+            schema_version: SCHEMA_VERSION,
+            item,
+            position: match pending.position {
+                RemotePlaylistPositionV1::Tail => "tail",
+                RemotePlaylistPositionV1::Next => "next",
+            }
+            .to_owned(),
+            requester_name: pending.session_name,
+            reset_av_delay,
+            allow_repeat: pending.allow_repeat,
+            now,
+        });
+        wrap_internet_remote_completion(
+            response,
+            &pending.request_id,
+            pending.sequence,
+            Some(json!({"kind": "sync_cache"})),
+        )
+    }
+
+    pub fn execute(&mut self, request: AppStateRequest) -> AppStateResponse {
+        if request.schema_version() != SCHEMA_VERSION {
+            return invalid_request_response(
+                "unsupported_schema_version",
+                "AppState schema_version must be 1",
+            );
+        }
+        if let Some(now) = request.now()
+            && let Err(error) = validate_time(now, "now")
+        {
+            return execute_error_response(error);
+        }
+        let terminal = match &request {
+            AppStateRequest::ApplyCacheEvent {
+                item_id,
+                cache_attempt_token,
+                event:
+                    CacheEvent::Ready { .. }
+                    | CacheEvent::Failed { .. }
+                    | CacheEvent::Cancelled { .. }
+                    | CacheEvent::Evicted { .. }
+                    | CacheEvent::Reset { .. },
+                ..
+            } => Some((item_id.clone(), *cache_attempt_token)),
+            _ => None,
+        };
+        // Registration and terminal settlement precede every visible observation,
+        // even for rejected/stale completion. Collection cannot enter this lock.
+        if let AppStateRequest::ApplyCacheEvent {
+            item_id,
+            cache_attempt_token,
+            event:
+                CacheEvent::Ready {
+                    item_incarnation_id,
+                    artifact_set_id,
+                    artifact_relative_directory,
+                    ..
+                },
+            ..
+        } = &request
+        {
+            self.register_ready_artifact(
+                item_id,
+                *cache_attempt_token,
+                item_incarnation_id,
+                artifact_set_id,
+                artifact_relative_directory,
+            );
+        }
+        let response = if let AppStateRequest::ApplyCacheEvent {
+            event:
+                CacheEvent::Ready {
+                    item_incarnation_id,
+                    artifact_set_id,
+                    ..
+                },
+            ..
+        } = &request
+            && !self.artifact_ready_registered(item_incarnation_id, artifact_set_id)
+        {
+            execute_error_response(rejected(
+                "artifact_unregistered",
+                "ready artifact is not registered with the Runtime",
+            ))
+        } else {
+            self.execute_inner(request)
+        };
+        if let Some((item, token)) = terminal {
+            self.settle_artifact_attempt(&item, token);
+        }
+        self.observe_artifact_program();
+        response
+    }
+
+    fn execute_inner(&mut self, request: AppStateRequest) -> AppStateResponse {
+        match request {
+            AppStateRequest::Initialize { state, .. } => {
+                if self.artifact_drain_pending() {
+                    return execute_error_response(rejected(
+                        "artifact_drain_pending",
+                        "media resources must drain before reinitialization",
+                    ));
+                }
+                if self.native_storage.is_some() && self.data.is_some() {
+                    return invalid_request_response(
+                        "native_storage_conflict",
+                        "Use native initialization to reopen persisted AppState without replacing it",
+                    );
+                }
+                let namespace = match &self.identity_namespace {
+                    Ok(namespace) => *namespace,
+                    Err(message) => return internal_error_response(message),
+                };
+                let mut next_item_incarnation_id = self.next_item_incarnation_id;
+                match AppStateData::from_seed(*state, &namespace, &mut next_item_incarnation_id) {
+                    Ok(data) => {
+                        let snapshot = match data.snapshot() {
+                            Ok(snapshot) => snapshot,
+                            Err(error) => return execute_error_response(error),
+                        };
+                        let persistence = data.persistence_snapshot();
+                        if let Err(error) = self.persist_native(&data) {
+                            return storage_error_response(error);
+                        }
+                        self.data = Some(data);
+                        self.artifact_lifetime = artifact_lifetime::ArtifactLifetime::default();
+                        self.next_item_incarnation_id = next_item_incarnation_id;
+                        self.internet_remote_peers.clear();
+                        self.player_controls.clear();
+                        AppStateResponse::Success(Box::new(AppStateSuccess {
+                            schema_version: SCHEMA_VERSION,
+                            status: "completed",
+                            committed: true,
+                            snapshot: Some(snapshot),
+                            persistence: Some(persistence),
+                            effects: PersistenceEffects {
+                                write_core: true,
+                                write_session_played: true,
+                                ..PersistenceEffects::default()
+                            },
+                            result: json!({"initialized": true}),
+                        }))
+                    }
+                    Err(error) => execute_error_response(error),
+                }
+            }
+            AppStateRequest::Snapshot { .. } => {
+                let Some(data) = &self.data else {
+                    return uninitialized_response();
+                };
+                let snapshot = match data.snapshot() {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => return execute_error_response(error),
+                };
+                AppStateResponse::Success(Box::new(AppStateSuccess {
+                    schema_version: SCHEMA_VERSION,
+                    status: "completed",
+                    committed: false,
+                    snapshot: Some(snapshot),
+                    persistence: Some(data.persistence_snapshot()),
+                    effects: PersistenceEffects::default(),
+                    result: json!({"snapshot": true}),
+                }))
+            }
+            request @ (AppStateRequest::IssuePlayerControl { .. }
+            | AppStateRequest::AckPlayerControl { .. }
+            | AppStateRequest::PlayerControlSnapshot { .. }) => {
+                self.execute_player_control(request)
+            }
+            AppStateRequest::OpenInternetRemotePeer {
+                peer_id,
+                epoch,
+                profile,
+                ..
+            } => {
+                let Some(data) = &self.data else {
+                    return uninitialized_response();
+                };
+                if let Err(error) = self.internet_remote_peers.open(&peer_id, &epoch, profile) {
+                    return internet_remote_error_response(error);
+                }
+                let snapshot = match data.snapshot() {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => return execute_error_response(error),
+                };
+                AppStateResponse::Success(Box::new(AppStateSuccess {
+                    schema_version: SCHEMA_VERSION,
+                    status: "completed",
+                    committed: false,
+                    snapshot: Some(snapshot),
+                    persistence: Some(data.persistence_snapshot()),
+                    effects: PersistenceEffects::default(),
+                    result: json!({"opened": true, "peer_id": peer_id}),
+                }))
+            }
+            AppStateRequest::CloseInternetRemotePeer { peer_id, .. } => {
+                let Some(data) = &self.data else {
+                    return uninitialized_response();
+                };
+                let closed = self.internet_remote_peers.close(&peer_id);
+                let snapshot = match data.snapshot() {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => return execute_error_response(error),
+                };
+                AppStateResponse::Success(Box::new(AppStateSuccess {
+                    schema_version: SCHEMA_VERSION,
+                    status: "completed",
+                    committed: false,
+                    snapshot: Some(snapshot),
+                    persistence: Some(data.persistence_snapshot()),
+                    effects: PersistenceEffects::default(),
+                    result: json!({"closed": closed, "peer_id": peer_id}),
+                }))
+            }
+            AppStateRequest::InternetRemoteState { .. } => {
+                let Some(data) = &self.data else {
+                    return uninitialized_response();
+                };
+                let snapshot = match data.snapshot() {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => return execute_error_response(error),
+                };
+                let remote_state = project_remote_state(&snapshot);
+                AppStateResponse::Success(Box::new(AppStateSuccess {
+                    schema_version: SCHEMA_VERSION,
+                    status: "completed",
+                    committed: false,
+                    snapshot: Some(snapshot),
+                    persistence: Some(data.persistence_snapshot()),
+                    effects: PersistenceEffects::default(),
+                    result: json!({"remote_state": remote_state}),
+                }))
+            }
+            AppStateRequest::DispatchInternetRemoteMessage {
+                peer_id,
+                lane,
+                message,
+                reset_av_delay,
+                now,
+                ..
+            } => self.execute_internet_remote_message(peer_id, lane, message, reset_av_delay, now),
+            AppStateRequest::CompleteInternetRemotePlaylistAdd {
+                peer_id,
+                request_id,
+                item,
+                reset_av_delay,
+                now,
+                ..
+            } => self.complete_internet_remote_playlist_add(
+                peer_id,
+                request_id,
+                item,
+                reset_av_delay,
+                now,
+            ),
+            AppStateRequest::CancelInternetRemotePlaylistAdd {
+                peer_id,
+                request_id,
+                ..
+            } => {
+                let Some(data) = &self.data else {
+                    return uninitialized_response();
+                };
+                let cancelled = match self
+                    .internet_remote_peers
+                    .cancel_playlist_add(&peer_id, &request_id)
+                {
+                    Ok(cancelled) => cancelled,
+                    Err(error) => return internet_remote_error_response(error),
+                };
+                let snapshot = match data.snapshot() {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => return execute_error_response(error),
+                };
+                AppStateResponse::Success(Box::new(AppStateSuccess {
+                    schema_version: SCHEMA_VERSION,
+                    status: "completed",
+                    committed: false,
+                    snapshot: Some(snapshot),
+                    persistence: Some(data.persistence_snapshot()),
+                    effects: PersistenceEffects::default(),
+                    result: json!({
+                        "cancelled": cancelled,
+                        "peer_id": peer_id,
+                        "request_id": request_id,
+                    }),
+                }))
+            }
+            AppStateRequest::BeginCacheAttempt {
+                item_id,
+                expected_item_incarnation_id,
+                ..
+            } => {
+                let Some(data) = self.data.as_ref() else {
+                    return uninitialized_response();
+                };
+                let Some(item) = data.find_item(&item_id) else {
+                    return execute_error_response(rejected(
+                        "item_not_found",
+                        "playlist item does not exist",
+                    ));
+                };
+                if !valid_authoritative_identity(&item.item_incarnation_id, 'i') {
+                    return execute_error_response(rejected(
+                        "invalid_item_incarnation_id",
+                        "live playlist item has no valid Rust incarnation identity",
+                    ));
+                }
+                if item.item_incarnation_id != expected_item_incarnation_id {
+                    return execute_error_response(rejected_with_details(
+                        "item_incarnation_mismatch",
+                        "playlist item incarnation changed before cache reservation",
+                        json!({
+                            "item_id": item_id,
+                            "expected_item_incarnation_id": expected_item_incarnation_id,
+                            "actual_item_incarnation_id": item.item_incarnation_id,
+                        }),
+                    ));
+                }
+                let snapshot = match data.snapshot() {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => return execute_error_response(error),
+                };
+                let persistence = data.persistence_snapshot();
+                let Some(cache_attempt_token) = self.next_cache_attempt_token.checked_add(1) else {
+                    return execute_error_response(rejected(
+                        "cache_attempt_token_exhausted",
+                        "cache attempt token allocator is exhausted",
+                    ));
+                };
+                let Some(next_artifact_set_id) = self
+                    .next_artifact_set_id
+                    .checked_add(1)
+                    .filter(|value| *value > 0)
+                else {
+                    return execute_error_response(rejected(
+                        "artifact_set_id_exhausted",
+                        "artifact set identity allocator is exhausted",
+                    ));
+                };
+                let namespace = match &self.identity_namespace {
+                    Ok(namespace) => *namespace,
+                    Err(message) => return internal_error_response(message),
+                };
+                let artifact_set_id =
+                    format_authoritative_identity('a', &namespace, next_artifact_set_id);
+                let reservation = CacheAttemptReservation {
+                    cache_attempt_token,
+                    item_id: item_id.clone(),
+                    item_incarnation_id: item.item_incarnation_id.clone(),
+                    artifact_relative_directory: artifact_relative_directory(
+                        &item.item_incarnation_id,
+                        &artifact_set_id,
+                    ),
+                    artifact_set_id,
+                    refresh: has_committed_artifact(item),
+                };
+                self.next_cache_attempt_token = cache_attempt_token;
+                self.next_artifact_set_id = next_artifact_set_id;
+                self.track_artifact_attempt(&reservation);
+                let data = self
+                    .data
+                    .as_mut()
+                    .expect("initialized AppState disappeared during cache reservation");
+                data.active_cache_attempts.insert(
+                    item_id,
+                    ActiveCacheAttempt {
+                        token: cache_attempt_token,
+                        reservation: reservation.clone(),
+                        refresh: reservation.refresh,
+                        terminal_event: None,
+                    },
+                );
+                AppStateResponse::Success(Box::new(AppStateSuccess {
+                    schema_version: SCHEMA_VERSION,
+                    status: "completed",
+                    committed: false,
+                    snapshot: Some(snapshot),
+                    persistence: Some(persistence),
+                    effects: PersistenceEffects::default(),
+                    result: serde_json::to_value(reservation)
+                        .unwrap_or_else(|_| json!({"cache_attempt_token": cache_attempt_token})),
+                }))
+            }
+            AppStateRequest::AuthorizeCachePublication {
+                item_id,
+                cache_attempt_token,
+                item_incarnation_id,
+                artifact_set_id,
+                artifact_relative_directory,
+                ..
+            } => {
+                let Some(data) = self.data.as_ref() else {
+                    return uninitialized_response();
+                };
+                let active = match validate_cache_attempt_ownership(
+                    data,
+                    &item_id,
+                    cache_attempt_token,
+                    self.next_cache_attempt_token,
+                ) {
+                    Ok(active) => active,
+                    Err(error) => return execute_error_response(error),
+                };
+                if active.terminal_event.is_some() {
+                    return execute_error_response(rejected(
+                        "cache_attempt_already_terminal",
+                        "cache attempt is already terminal",
+                    ));
+                }
+                if let Err(error) = validate_cache_publication_reservation(
+                    &active,
+                    &item_incarnation_id,
+                    &artifact_set_id,
+                    &artifact_relative_directory,
+                ) {
+                    return execute_error_response(error);
+                }
+                let snapshot = match data.snapshot() {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => return execute_error_response(error),
+                };
+                AppStateResponse::Success(Box::new(AppStateSuccess {
+                    schema_version: SCHEMA_VERSION,
+                    status: "completed",
+                    committed: false,
+                    snapshot: Some(snapshot),
+                    persistence: Some(data.persistence_snapshot()),
+                    effects: PersistenceEffects::default(),
+                    result: json!({"authorized": true}),
+                }))
+            }
+            AppStateRequest::Shutdown { .. } => {
+                #[cfg(feature = "native-host")]
+                self.notify_analysis(true);
+                let was_initialized = self.data.take().is_some();
+                self.native_storage = None;
+                self.internet_remote_peers.clear();
+                self.player_controls.clear();
+                self.shutdown_artifact_lifetime();
+                #[cfg(feature = "native-host")]
+                {
+                    self.native_session = native_session::NativeSession::default();
+                }
+                AppStateResponse::Success(Box::new(AppStateSuccess {
+                    schema_version: SCHEMA_VERSION,
+                    status: "completed",
+                    committed: was_initialized,
+                    snapshot: None,
+                    persistence: None,
+                    effects: PersistenceEffects::default(),
+                    result: json!({"shutdown": was_initialized}),
+                }))
+            }
+            request => {
+                let Some(current) = self.data.as_ref() else {
+                    return uninitialized_response();
+                };
+                let mut next = current.clone();
+                let namespace = match &self.identity_namespace {
+                    Ok(namespace) => *namespace,
+                    Err(message) => return internal_error_response(message),
+                };
+                let mut next_item_incarnation_id = self.next_item_incarnation_id;
+                let before_program = match current.playback_program() {
+                    Ok(program) => program,
+                    Err(error) => return execute_error_response(error),
+                };
+                let now = request.now();
+                let replaces_live_items = matches!(
+                    &request,
+                    AppStateRequest::RestoreBackup { .. }
+                        | AppStateRequest::DiscardBackup { .. }
+                        | AppStateRequest::BeginSession { .. }
+                        | AppStateRequest::ResolveNativeSession {
+                            continue_previous: false,
+                            ..
+                        }
+                        | AppStateRequest::ResetRuntime { .. }
+                );
+                let mutation = match apply_mutation(
+                    &mut next,
+                    request,
+                    self.next_cache_attempt_token,
+                    &namespace,
+                    &mut next_item_incarnation_id,
+                ) {
+                    Ok(mutation) => mutation,
+                    Err(error) => return execute_error_response(error),
+                };
+                if mutation.changed {
+                    next.sync_user_ids(&namespace);
+                    if current.session_generation != next.session_generation {
+                        next.remote_identities.clear();
+                    } else {
+                        next.remote_identities
+                            .retain(|_, name| next.session_users.contains(name));
+                    }
+                    let after_program = match next.playback_program() {
+                        Ok(program) => program,
+                        Err(error) => return execute_error_response(error),
+                    };
+                    if replaces_live_items {
+                        next.active_cache_attempts.clear();
+                    } else {
+                        let live_item_ids: HashSet<String> = next
+                            .current_item
+                            .iter()
+                            .chain(next.playlist.iter())
+                            .map(|item| item.id.clone())
+                            .collect();
+                        next.active_cache_attempts
+                            .retain(|item_id, _| live_item_ids.contains(item_id));
+                    }
+                    let Some(revision) = current.revision.checked_add(1) else {
+                        return internal_error_response("AppState revision overflow");
+                    };
+                    next.revision = revision;
+                    if before_program != after_program || mutation.force_program_lifetime {
+                        let Some(generation) = current
+                            .playback_generation
+                            .checked_add(1)
+                            .filter(|generation| *generation <= MAX_SAFE_JSON_INTEGER)
+                        else {
+                            return internal_error_response(
+                                "AppState playback generation overflow",
+                            );
+                        };
+                        next.playback_generation = generation;
+                    }
+                    if let Some(now) = now {
+                        next.updated_at = now;
+                    }
+                    let mut effects = mutation.effects;
+                    // A boost belongs to this song, not to the next item's playback.
+                    // Incarnations also distinguish replacements that reuse an item ID.
+                    let song_changed = current
+                        .current_item
+                        .as_ref()
+                        .map(|item| &item.item_incarnation_id)
+                        != next
+                            .current_item
+                            .as_ref()
+                            .map(|item| &item.item_incarnation_id);
+                    next.automatic_transition(current, song_changed);
+                    if song_changed && next.player_settings.volume_percent > 100 {
+                        next.player_settings.volume_percent = 100;
+                        effects.write_core = true;
+                    }
+                    if effects.write_backup {
+                        update_backup_from_state(&mut next);
+                        if next.backup.is_none() {
+                            effects.write_backup = false;
+                            effects.delete_backup = true;
+                        }
+                    }
+                    let live_ids: HashSet<_> = next
+                        .current_item
+                        .iter()
+                        .chain(next.playlist.iter())
+                        .chain(next.backup.iter().flat_map(|backup| {
+                            backup.current_item.iter().chain(backup.playlist.iter())
+                        }))
+                        .map(|item| item.id.clone())
+                        .collect();
+                    next.requester_user_ids
+                        .retain(|id, _| live_ids.contains(id));
+                    let snapshot = next.snapshot_with_playback_program(after_program);
+                    let persistence = next.persistence_snapshot();
+                    let clears_controls = current.playback_generation != next.playback_generation;
+                    let previous_user_ids = current.session_user_ids.clone();
+                    let session_changed = current.session_generation != next.session_generation;
+                    if let Err(error) = self.persist_native(&next) {
+                        return storage_error_response(error);
+                    }
+                    // Revoke retired LAN singer bindings at the shared commit
+                    // boundary, after persistence succeeds. A later same-name
+                    // user must not restore an old device's registration.
+                    #[cfg(feature = "native-host")]
+                    self.native_session.reconcile_identities(
+                        &previous_user_ids,
+                        &next.session_user_ids,
+                        next.session_generation,
+                    );
+                    self.internet_remote_peers.reconcile_identities(
+                        &previous_user_ids,
+                        &next.session_user_ids,
+                        session_changed,
+                    );
+                    if clears_controls {
+                        self.player_controls.clear();
+                    }
+                    self.data = Some(next);
+                    #[cfg(feature = "native-host")]
+                    self.notify_analysis(clears_controls);
+                    self.next_item_incarnation_id = next_item_incarnation_id;
+                    #[cfg(feature = "native-host")]
+                    native_session::state_changes().notify_waiters();
+                    AppStateResponse::Success(Box::new(AppStateSuccess {
+                        schema_version: SCHEMA_VERSION,
+                        status: "completed",
+                        committed: true,
+                        snapshot: Some(snapshot),
+                        persistence: Some(persistence),
+                        effects,
+                        result: mutation.result,
+                    }))
+                } else {
+                    let snapshot = current.snapshot_with_playback_program(before_program);
+                    let persistence = current.persistence_snapshot();
+                    if mutation.operational_changed {
+                        self.data = Some(next);
+                    }
+                    AppStateResponse::Success(Box::new(AppStateSuccess {
+                        schema_version: SCHEMA_VERSION,
+                        status: "completed",
+                        committed: false,
+                        snapshot: Some(snapshot),
+                        persistence: Some(persistence),
+                        effects: PersistenceEffects::default(),
+                        result: mutation.result,
+                    }))
+                }
+            }
+        }
+    }
+}
+
+fn internet_remote_payload(
+    request_id: &str,
+    sequence: u64,
+    accepted: bool,
+    stale: bool,
+    revision: u64,
+    data: Value,
+    host_effect: Option<Value>,
+) -> Value {
+    let mut payload = json!({
+        "request_id": request_id,
+        "sequence": sequence,
+        "accepted": accepted,
+        "stale": stale,
+        "revision": revision,
+        "data": data,
+    });
+    if let Some(effect) = host_effect {
+        payload
+            .as_object_mut()
+            .expect("Internet Remote reply must be an object")
+            .insert("_host_effect".to_owned(), effect);
+    }
+    payload
+}
+
+fn internet_remote_reply(
+    data: &AppStateData,
+    validation: &InternetRemoteValidation,
+    payload: Value,
+    host_effect: Option<Value>,
+    stale: bool,
+) -> AppStateResponse {
+    internet_remote_completion_reply(
+        data,
+        &validation.request_id,
+        validation.sequence,
+        payload,
+        host_effect,
+        stale,
+    )
+}
+
+fn internet_remote_completion_reply(
+    data: &AppStateData,
+    request_id: &str,
+    sequence: u64,
+    payload: Value,
+    host_effect: Option<Value>,
+    stale: bool,
+) -> AppStateResponse {
+    let snapshot = match data.snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => return execute_error_response(error),
+    };
+    let persistence = data.persistence_snapshot();
+    AppStateResponse::Success(Box::new(AppStateSuccess {
+        schema_version: SCHEMA_VERSION,
+        status: "completed",
+        committed: false,
+        result: internet_remote_payload(
+            request_id,
+            sequence,
+            !stale,
+            stale,
+            snapshot.revision,
+            payload,
+            host_effect,
+        ),
+        snapshot: Some(snapshot),
+        persistence: Some(persistence),
+        effects: PersistenceEffects::default(),
+    }))
+}
+
+fn wrap_internet_remote_mutation(
+    response: AppStateResponse,
+    validation: &InternetRemoteValidation,
+    host_effect: Option<Value>,
+    identity_reply: Option<String>,
+) -> AppStateResponse {
+    match response {
+        AppStateResponse::Success(mut success) => {
+            let Some(snapshot) = success.snapshot.as_ref() else {
+                return internal_error_response(
+                    "Internet Remote mutation omitted AppState snapshot",
+                );
+            };
+            let remote_state = project_remote_state(snapshot);
+            let payload = if let Some(name) = identity_reply {
+                json!({"name": name, "state": remote_state})
+            } else {
+                json!(remote_state)
+            };
+            success.result = internet_remote_payload(
+                &validation.request_id,
+                validation.sequence,
+                true,
+                false,
+                snapshot.revision,
+                payload,
+                host_effect,
+            );
+            AppStateResponse::Success(success)
+        }
+        failure => failure,
+    }
+}
+
+fn wrap_internet_remote_completion(
+    response: AppStateResponse,
+    request_id: &str,
+    sequence: u64,
+    host_effect: Option<Value>,
+) -> AppStateResponse {
+    match response {
+        AppStateResponse::Success(mut success) => {
+            let Some(snapshot) = success.snapshot.as_ref() else {
+                return internal_error_response(
+                    "Internet Remote completion omitted AppState snapshot",
+                );
+            };
+            success.result = internet_remote_payload(
+                request_id,
+                sequence,
+                true,
+                false,
+                snapshot.revision,
+                json!(project_remote_state(snapshot)),
+                host_effect,
+            );
+            AppStateResponse::Success(success)
+        }
+        failure => failure,
+    }
+}
+
+fn invalid_request_response(kind: &str, message: &str) -> AppStateResponse {
+    AppStateResponse::Failure(AppStateFailure {
+        schema_version: SCHEMA_VERSION,
+        status: "invalid_request",
+        error: AppStateError {
+            kind: kind.to_owned(),
+            message: message.to_owned(),
+            details: None,
+        },
+    })
+}
+
+fn internet_remote_error_response(error: InternetRemoteError) -> AppStateResponse {
+    AppStateResponse::Failure(AppStateFailure {
+        schema_version: SCHEMA_VERSION,
+        status: "rejected",
+        error: AppStateError {
+            kind: error.kind().to_owned(),
+            message: error.message().to_owned(),
+            details: None,
+        },
+    })
+}
+
+fn uninitialized_response() -> AppStateResponse {
+    AppStateResponse::Failure(AppStateFailure {
+        schema_version: SCHEMA_VERSION,
+        status: "uninitialized",
+        error: AppStateError {
+            kind: "app_state_uninitialized".to_owned(),
+            message: "Rust AppState has not been initialized".to_owned(),
+            details: None,
+        },
+    })
+}
+
+fn internal_error_response(message: &str) -> AppStateResponse {
+    AppStateResponse::Failure(AppStateFailure {
+        schema_version: SCHEMA_VERSION,
+        status: "internal_error",
+        error: AppStateError {
+            kind: "internal_error".to_owned(),
+            message: message.to_owned(),
+            details: None,
+        },
+    })
+}
+
+fn execute_error_response(error: ExecuteError) -> AppStateResponse {
+    match error {
+        ExecuteError::Rejected(error) => AppStateResponse::Failure(AppStateFailure {
+            schema_version: SCHEMA_VERSION,
+            status: "rejected",
+            error,
+        }),
+        ExecuteError::Internal(message) => internal_error_response(&message),
+    }
+}
+
+/// Cache event application holds only AppState's existing serialized authority.
+pub(crate) fn with_cache_application<T>(
+    action: impl FnOnce(&mut AppState) -> T,
+) -> Result<T, AppStateError> {
+    let mut app = APP_STATE
+        .get_or_init(|| Mutex::new(AppState::default()))
+        .lock()
+        .map_err(|_| AppStateError {
+            kind: "internal_error".into(),
+            message: "Rust AppState lock is poisoned".into(),
+            details: None,
+        })?;
+    Ok(action(&mut app))
+}
+
+impl AppState {
+    pub(crate) fn current_cache_item_id(&self) -> Option<&str> {
+        self.data
+            .as_ref()?
+            .current_item
+            .as_ref()
+            .map(|item| item.id.as_str())
+    }
+
+    pub(crate) fn cache_items(&self) -> Result<Vec<PlaylistItem>, AppStateError> {
+        let data = self.data.as_ref().ok_or_else(|| AppStateError {
+            kind: "uninitialized".into(),
+            message: "AppState is not initialized".into(),
+            details: None,
+        })?;
+        Ok(data
+            .current_item
+            .iter()
+            .chain(data.playlist.iter())
+            .cloned()
+            .collect())
+    }
+
+    pub(crate) fn reserve_runtime_attempt(
+        &mut self,
+        item_id: &str,
+        incarnation: &str,
+    ) -> Result<CacheAttemptReservation, AppStateError> {
+        match self.execute(AppStateRequest::BeginCacheAttempt {
+            schema_version: SCHEMA_VERSION,
+            item_id: item_id.into(),
+            expected_item_incarnation_id: incarnation.into(),
+        }) {
+            AppStateResponse::Failure(failure) => Err(failure.error),
+            AppStateResponse::Success(_) => Ok(self
+                .data
+                .as_ref()
+                .expect("initialized")
+                .active_cache_attempts[item_id]
+                .reservation
+                .clone()),
+        }
+    }
+
+    pub(crate) fn cache_runtime_item(
+        &self,
+        item_id: &str,
+        token: u64,
+    ) -> Result<PlaylistItem, AppStateError> {
+        let Some(data) = &self.data else {
+            return Err(AppStateError {
+                kind: "uninitialized".into(),
+                message: "AppState is not initialized".into(),
+                details: None,
+            });
+        };
+        validate_cache_attempt_ownership(data, item_id, token, self.next_cache_attempt_token)
+            .map_err(|error| match error {
+                ExecuteError::Rejected(error) => error,
+                ExecuteError::Internal(message) => AppStateError {
+                    kind: "internal_error".into(),
+                    message,
+                    details: None,
+                },
+            })?;
+        Ok(data
+            .find_item(item_id)
+            .expect("validated live item")
+            .clone())
+    }
+
+    pub(crate) fn cache_observation(
+        &mut self,
+        committed: bool,
+        effects: PersistenceEffects,
+    ) -> AppStateResponse {
+        let mut observation = self.execute(AppStateRequest::Snapshot { schema_version: 1 });
+        if let AppStateResponse::Success(ref mut out) = observation {
+            out.committed = committed;
+            out.effects = effects;
+        }
+        observation
+    }
+}
+
+impl AppStateResponse {
+    pub(crate) fn accumulate_cache_effects(&self, effects: &mut PersistenceEffects) -> bool {
+        let Self::Success(response) = self else {
+            return false;
+        };
+        effects.write_core |= response.effects.write_core;
+        effects.write_session_played |= response.effects.write_session_played;
+        effects.write_backup |= response.effects.write_backup;
+        effects.delete_backup |= response.effects.delete_backup;
+        effects.delete_runtime_files |= response.effects.delete_runtime_files;
+        response.committed
+    }
+}
+
+pub fn execute_app_state(request: AppStateRequest) -> AppStateResponse {
+    let shutdown = matches!(request, AppStateRequest::Shutdown { .. });
+    let state = APP_STATE.get_or_init(|| Mutex::new(AppState::default()));
+    let Ok(mut state) = state.lock() else {
+        return internal_error_response("Rust AppState lock is poisoned");
+    };
+    let response = state.execute(request);
+    drop(state);
+    if shutdown {
+        let _ = artifact_lifetime::collect_artifacts(None);
+    }
+    response
+}
+
+/// Bootstrap an in-process Host without replacing already initialized AppState.
+/// The caller owns seed loading and persistence of the returned effects. This is
+/// additive: the existing explicit Initialize command retains its reset semantics.
+pub fn initialize_app_state_once(seed: AppStateSeed) -> AppStateResponse {
+    let state = APP_STATE.get_or_init(|| Mutex::new(AppState::default()));
+    let Ok(mut state) = state.lock() else {
+        return internal_error_response("Rust AppState lock is poisoned");
+    };
+    state.initialize_once(seed)
+}
+
+/// Bootstrap a native Host using a private, versioned checkpoint. Every durable
+/// mutation (including runtime-originated cache updates) is saved under the same
+/// AppState lock before it is published. The desktop adapter remains opt-out.
+pub fn initialize_native_host(directory: &Path, initial: AppStateSeed) -> AppStateResponse {
+    let state = APP_STATE.get_or_init(|| Mutex::new(AppState::default()));
+    let Ok(mut state) = state.lock() else {
+        return internal_error_response("Rust AppState lock is poisoned");
+    };
+    state.initialize_native(directory, initial)
+}
+
+pub(crate) fn begin_cache_attempt_for_runtime(
+    item_id: &str,
+    expected_item_incarnation_id: &str,
+) -> Result<CacheAttemptReservation, AppStateError> {
+    match execute_app_state(AppStateRequest::BeginCacheAttempt {
+        schema_version: SCHEMA_VERSION,
+        item_id: item_id.to_owned(),
+        expected_item_incarnation_id: expected_item_incarnation_id.to_owned(),
+    }) {
+        AppStateResponse::Success(success) => serde_json::from_value(success.result.clone())
+            .ok()
+            .filter(|reservation: &CacheAttemptReservation| {
+                reservation.cache_attempt_token > 0
+                    && reservation.item_id == item_id
+                    && reservation.item_incarnation_id == expected_item_incarnation_id
+                    && valid_authoritative_identity(&reservation.item_incarnation_id, 'i')
+                    && valid_authoritative_identity(&reservation.artifact_set_id, 'a')
+                    && valid_artifact_relative_directory(
+                        &reservation.artifact_relative_directory,
+                        &reservation.item_incarnation_id,
+                        &reservation.artifact_set_id,
+                    )
+            })
+            .ok_or_else(|| AppStateError {
+                kind: "invalid_cache_attempt_response".to_owned(),
+                message: "AppState returned an invalid cache attempt reservation".to_owned(),
+                details: None,
+            }),
+        AppStateResponse::Failure(failure) => Err(failure.error),
+    }
+}
+
+pub(crate) fn authorize_cache_publication_for_runtime(
+    item_id: &str,
+    reservation: &CacheAttemptReservation,
+) -> Result<(), AppStateError> {
+    match execute_app_state(AppStateRequest::AuthorizeCachePublication {
+        schema_version: SCHEMA_VERSION,
+        item_id: item_id.to_owned(),
+        cache_attempt_token: reservation.cache_attempt_token,
+        item_incarnation_id: reservation.item_incarnation_id.clone(),
+        artifact_set_id: reservation.artifact_set_id.clone(),
+        artifact_relative_directory: reservation.artifact_relative_directory.clone(),
+    }) {
+        AppStateResponse::Success(success) if success.result["authorized"] == json!(true) => Ok(()),
+        AppStateResponse::Success(_) => Err(AppStateError {
+            kind: "invalid_cache_publication_authorization".to_owned(),
+            message: "AppState returned an invalid publication authorization".to_owned(),
+            details: None,
+        }),
+        AppStateResponse::Failure(failure) => Err(failure.error),
+    }
+}
+
+pub fn execute_app_state_json(request_json: &str) -> String {
+    let response = match serde_json::from_str::<AppStateRequest>(request_json) {
+        Ok(request) => execute_app_state(request),
+        Err(error) => invalid_request_response(
+            "invalid_json_request",
+            &format!("invalid AppState request: {error}"),
+        ),
+    };
+    serde_json::to_string(&response).unwrap_or_else(|_| {
+        "{\"schema_version\":1,\"status\":\"internal_error\",\"error\":{\"kind\":\"serialization_failed\",\"message\":\"failed to serialize AppState response\"}}".to_owned()
+    })
+}
+
+/// Catalog cache bookkeeping only. All HTTP, JSON interpretation and parsing
+/// happen after this closure has released the process-wide AppState mutex.
+pub(crate) fn with_catalog<T>(
+    action: impl FnOnce(
+        &mut crate::shared_catalog::CatalogState,
+    ) -> Result<T, crate::shared_catalog::CatalogError>,
+) -> Result<T, crate::shared_catalog::CatalogError> {
+    let mut app = APP_STATE
+        .get_or_init(|| Mutex::new(AppState::default()))
+        .lock()
+        .map_err(|_| {
+            crate::shared_catalog::CatalogError::new(
+                503,
+                "state_unavailable",
+                "Rust state lock unavailable",
+            )
+        })?;
+    action(&mut app.catalog)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    fn item(id: &str, bvid: &str, requester_name: &str) -> PlaylistItem {
+        PlaylistItem {
+            media_source: Default::default(),
+            id: id.to_owned(),
+            original_url: format!("https://example.test/{id}"),
+            resolved_url: format!("https://example.test/{id}?p=1"),
+            bvid: bvid.to_owned(),
+            aid: 1,
+            cid: 2,
+            page: 1,
+            title: format!("title-{id}"),
+            part_title: "P1".to_owned(),
+            display_title: format!("title-{id} - P1"),
+            cover_url: String::new(),
+            embed_url: String::new(),
+            selected_pages: vec![1],
+            selected_cids: vec![2],
+            selected_durations: vec![120],
+            selected_parts: vec!["P1".to_owned()],
+            available_pages: vec![1],
+            available_cids: vec![2],
+            available_durations: vec![120],
+            available_parts: vec!["P1".to_owned()],
+            audio_variants: Vec::new(),
+            selected_audio_variant_id: String::new(),
+            video_page: 1,
+            manual_selection: false,
+            owner_mid: 0,
+            owner_name: String::new(),
+            owner_url: String::new(),
+            requester_name: requester_name.to_owned(),
+            queue_slot_type: "cycle".to_owned(),
+            cache_status: "pending".to_owned(),
+            cache_progress: 0.0,
+            cache_activity_at: 0.0,
+            cache_download_current_bytes: 0,
+            cache_download_total_bytes: 0,
+            cache_download_tracks: Vec::new(),
+            cache_message: "等待缓存".to_owned(),
+            video_relative_path: String::new(),
+            video_media_url: String::new(),
+            item_incarnation_id: String::new(),
+            artifact_set_id: String::new(),
+            artifact_relative_directory: String::new(),
+        }
+    }
+
+    fn history(key: &str, requester: &str) -> HistoryEntry {
+        HistoryEntry {
+            key: key.to_owned(),
+            display_title: key.to_owned(),
+            original_url: format!("https://example.test/{key}"),
+            resolved_url: format!("https://example.test/{key}"),
+            requested_at: 10.0,
+            title: key.to_owned(),
+            part_title: "P1".to_owned(),
+            owner_mid: 0,
+            owner_name: String::new(),
+            owner_url: String::new(),
+            requester_name: requester.to_owned(),
+            request_count: 1,
+        }
+    }
+
+    fn played(id: &str, requester: &str) -> SessionPlayedEntry {
+        SessionPlayedEntry {
+            key: format!("BV-{id}:p1:a1"),
+            item_id: id.to_owned(),
+            display_title: id.to_owned(),
+            title: id.to_owned(),
+            part_title: "P1".to_owned(),
+            original_url: format!("https://example.test/{id}"),
+            resolved_url: format!("https://example.test/{id}"),
+            bvid: format!("BV-{id}"),
+            aid: 1,
+            cid: 2,
+            page: 1,
+            played_at: 10.0,
+            ended_at: None,
+            owner_mid: 0,
+            owner_name: String::new(),
+            owner_url: String::new(),
+            requester_name: requester.to_owned(),
+            cover_url: String::new(),
+            threshold_reached: false,
+        }
+    }
+
+    fn seed() -> AppStateSeed {
+        AppStateSeed {
+            automatic_volume: Default::default(),
+            session_user_ids: std::collections::HashMap::new(),
+            requester_user_ids: std::collections::HashMap::new(),
+
+            playback_mode: "local".to_owned(),
+            player_settings: PlayerSettingsSeed::default(),
+            current_item: None,
+            current_item_started: false,
+            playlist: Vec::new(),
+            history: Vec::new(),
+            session_history: Vec::new(),
+            session_users: vec!["Alice".to_owned(), "Bob".to_owned()],
+            remote_identities: HashMap::new(),
+            gatcha_pool_preferences: HashMap::new(),
+            session_started_at: 10.0,
+            session_played_file: "played-current.json".to_owned(),
+            session_played: Vec::new(),
+            session_archives: Vec::new(),
+            previous_session: None,
+            backup: None,
+            updated_at: 10.0,
+        }
+    }
+
+    fn initialize(state: &mut AppState, seed: AppStateSeed) -> AppSnapshot {
+        success(state.execute(AppStateRequest::Initialize {
+            schema_version: 1,
+            state: Box::new(seed),
+        }))
+        .snapshot
+        .expect("initialize snapshot")
+    }
+
+    #[test]
+    fn defer_current_preserves_every_item_and_explicit_position() {
+        for index in 0..3 {
+            let mut state = AppState::default();
+            let mut initial = seed();
+            initial.current_item = Some(item("a", "BV-a", "Alice"));
+            initial.current_item_started = true;
+            initial.session_played = vec![played("a", "Alice")];
+            initial.playlist = vec![
+                item("b", "BV-b", "Bob"),
+                item("c", "BV-c", "Alice"),
+                item("d", "BV-d", "Bob"),
+            ];
+            initial.player_settings.key_shift = 3;
+            initial.player_settings.volume_percent = 150;
+            let before = initialize(&mut state, initial);
+            let original = before.current_item.as_ref().unwrap();
+            let command = AppStateRequest::DeferCurrentItem {
+                schema_version: 1,
+                item_id: original.id.clone(),
+                expected_item_incarnation_id: original.item_incarnation_id.clone(),
+                expected_playback_generation: before.playback_generation,
+                expected_playlist_item_ids: vec!["b".into(), "c".into(), "d".into()],
+                target_index: index,
+                reset_av_delay: true,
+                now: 20.0,
+            };
+            // Unrelated settings/progress revisions must not invalidate a drag.
+            success(state.execute(AppStateRequest::ApplyAvDelay {
+                schema_version: 1,
+                action: AvDelayCommand::Adjust { delta_ms: 150 },
+                now: 19.0,
+            }));
+            let after = success(state.execute(command.clone())).snapshot.unwrap();
+            assert_eq!(after.current_item.as_ref().unwrap().id, "b");
+            assert_eq!(after.current_item.as_ref().unwrap(), &before.playlist[0]);
+            let mut expected = vec!["c", "d"];
+            expected.insert(index, "a");
+            assert_eq!(
+                after
+                    .playlist
+                    .iter()
+                    .map(|item| item.id.as_str())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            let mut retained = original.clone();
+            retained.queue_slot_type = "manual".into();
+            assert_eq!(after.playlist[index], retained);
+            assert!(!after.current_item_started);
+            assert_eq!(after.playback_generation, before.playback_generation + 1);
+            assert_eq!(after.player_settings.key_shift, 0);
+            assert_eq!(after.player_settings.volume_percent, 100);
+            assert_eq!(after.player_settings.av_offset_ms, 0);
+            assert!(after.history.is_empty());
+            assert!(after.session_history.is_empty());
+            assert_eq!(after.session_played[0].ended_at, Some(20.0));
+            assert_eq!(after.session_played[1].item_id, "b");
+            let committed = state.data.clone();
+            assert_eq!(
+                failure(state.execute(command)).error.kind,
+                "defer_current_conflict"
+            );
+            assert_eq!(
+                state.data, committed,
+                "duplicate drop must not advance twice"
+            );
+            let mut snapshot = after;
+            for _ in 0..=index {
+                snapshot = success(state.execute(AppStateRequest::AdvanceToNext {
+                    schema_version: 1,
+                    expected_playback_generation: snapshot.playback_generation,
+                    reset_av_delay: false,
+                    now: 21.0,
+                }))
+                .snapshot
+                .unwrap();
+            }
+            assert_eq!(snapshot.current_item.as_ref().unwrap(), &retained);
+            assert!(!snapshot.current_item_started);
+            success(state.execute(AppStateRequest::MarkCurrentItemStarted {
+                schema_version: 1,
+                item_id: "a".into(),
+                now: 22.0,
+            }));
+            let ended = success(state.execute(AppStateRequest::AdvanceToNext {
+                schema_version: 1,
+                expected_playback_generation: snapshot.playback_generation,
+                reset_av_delay: false,
+                now: 23.0,
+            }))
+            .snapshot
+            .unwrap();
+            assert_eq!(ended.history.len(), 1);
+            assert_eq!(ended.history[0].request_count, 1);
+        }
+    }
+
+    #[test]
+    fn defer_current_rejects_stale_or_invalid_drops_without_any_mutation() {
+        for scenario in [
+            "current",
+            "incarnation",
+            "generation",
+            "order",
+            "target",
+            "empty",
+            "missing-current",
+        ] {
+            let mut state = AppState::default();
+            let mut initial = seed();
+            initial.current_item =
+                (scenario != "missing-current").then(|| item("a", "BV-a", "Alice"));
+            initial.playlist = vec![item("b", "BV-b", "Bob"), item("c", "BV-c", "Alice")];
+            if scenario == "empty" {
+                initial.playlist.clear();
+            }
+            let before = initialize(&mut state, initial);
+            let command = AppStateRequest::DeferCurrentItem {
+                schema_version: 1,
+                item_id: if scenario == "current" { "wrong" } else { "a" }.into(),
+                expected_item_incarnation_id: if scenario == "incarnation" {
+                    "wrong".into()
+                } else {
+                    before
+                        .current_item
+                        .as_ref()
+                        .map(|item| item.item_incarnation_id.clone())
+                        .unwrap_or_default()
+                },
+                expected_playback_generation: before.playback_generation
+                    + u64::from(scenario == "generation"),
+                expected_playlist_item_ids: if scenario == "order" {
+                    vec!["c".into(), "b".into()]
+                } else {
+                    before.playlist.iter().map(|item| item.id.clone()).collect()
+                },
+                target_index: if scenario == "target" { 2 } else { 0 },
+                reset_av_delay: false,
+                now: 20.0,
+            };
+            let data = state.data.clone();
+            assert!(state.execute(command).error().is_some(), "{scenario}");
+            assert_eq!(state.data, data, "{scenario}");
+        }
+    }
+
+    #[test]
+    fn native_bootstrap_preserves_existing_state_and_does_not_request_rewrites() {
+        let mut state = AppState::default();
+        let mut initial = seed();
+        initial.playlist = vec![item("retained", "BV1z84y1p7oS", "Alice")];
+        let first = state.initialize_once(initial);
+        let first_snapshot = first.snapshot().expect("initialized").clone();
+        assert_eq!(first_snapshot.playlist.len(), 1);
+        assert!(first.error().is_none());
+
+        let mut replacement = seed();
+        replacement.session_users = vec!["Must not replace".to_owned()];
+        replacement.updated_at = 100.0;
+        let second = state.initialize_once(replacement);
+        assert_eq!(second.snapshot(), Some(&first_snapshot));
+        let second = success(second);
+        assert!(!second.committed);
+        assert_eq!(second.effects, PersistenceEffects::default());
+    }
+
+    #[test]
+    fn native_bootstrap_rejects_invalid_seed_without_poisoning_retry() {
+        let mut state = AppState::default();
+        let mut invalid = seed();
+        invalid.session_started_at = f64::NAN;
+        let failure = state.initialize_once(invalid);
+        assert!(failure.snapshot().is_none());
+        assert!(failure.error().is_some());
+        assert!(state.data.is_none());
+        assert!(state.initialize_once(seed()).snapshot().is_some());
+    }
+
+    fn success(response: AppStateResponse) -> AppStateSuccess {
+        match response {
+            AppStateResponse::Success(success) => *success,
+            AppStateResponse::Failure(failure) => panic!("unexpected failure: {failure:?}"),
+        }
+    }
+
+    fn failure(response: AppStateResponse) -> AppStateFailure {
+        match response {
+            AppStateResponse::Failure(failure) => failure,
+            AppStateResponse::Success(success) => panic!("unexpected success: {success:?}"),
+        }
+    }
+
+    #[test]
+    fn internet_remote_sessions_live_inside_app_state_and_reset_with_it() {
+        let mut state = AppState::default();
+        let snapshot = initialize(&mut state, seed());
+        let peer_id = "peer-one".to_owned();
+        let epoch = "abcdefghijklmnopqrstuv".to_owned();
+        let opened = success(state.execute(AppStateRequest::OpenInternetRemotePeer {
+            schema_version: 1,
+            peer_id: peer_id.clone(),
+            epoch: epoch.clone(),
+            profile: RemoteProfile::Controller,
+        }));
+        assert!(!opened.committed);
+        assert_eq!(opened.result["opened"], json!(true));
+
+        let message = json!({
+            "v": 1,
+            "lane": "control",
+            "epoch": epoch,
+            "seq": 1,
+            "id": "123e4567-e89b-42d3-a456-426614174000",
+            "kind": "state.get",
+            "body": {"since_revision": snapshot.revision},
+        })
+        .to_string();
+        let validation = success(
+            state.execute(AppStateRequest::DispatchInternetRemoteMessage {
+                schema_version: 1,
+                peer_id: peer_id.clone(),
+                lane: RemoteLane::Control,
+                message: message.clone(),
+                reset_av_delay: true,
+                now: 10.0,
+            }),
+        );
+        assert_eq!(validation.result["accepted"], json!(true));
+        assert_eq!(
+            validation.result["data"]["revision"],
+            json!(snapshot.revision)
+        );
+
+        let replay = failure(
+            state.execute(AppStateRequest::DispatchInternetRemoteMessage {
+                schema_version: 1,
+                peer_id: peer_id.clone(),
+                lane: RemoteLane::Control,
+                message,
+                reset_av_delay: true,
+                now: 10.0,
+            }),
+        );
+        assert_eq!(replay.error.kind, "replayed_internet_remote_sequence");
+
+        initialize(&mut state, seed());
+        let cleared = failure(
+            state.execute(AppStateRequest::DispatchInternetRemoteMessage {
+                schema_version: 1,
+                peer_id,
+                lane: RemoteLane::Control,
+                message: json!({
+                    "v": 1,
+                    "lane": "control",
+                    "epoch": "abcdefghijklmnopqrstuv",
+                    "seq": 2,
+                    "id": "123e4567-e89b-42d3-a456-426614174001",
+                    "kind": "connection.health",
+                    "body": {},
+                })
+                .to_string(),
+                reset_av_delay: true,
+                now: 10.0,
+            }),
+        );
+        assert_eq!(cleared.error.kind, "unknown_internet_remote_peer");
+    }
+
+    fn remote_message(
+        state: &mut AppState,
+        peer_id: &str,
+        epoch: &str,
+        seq: u64,
+        kind: &str,
+        body: Value,
+        now: f64,
+    ) -> AppStateSuccess {
+        success(
+            state.execute(AppStateRequest::DispatchInternetRemoteMessage {
+                schema_version: 1,
+                peer_id: peer_id.to_owned(),
+                lane: RemoteLane::Control,
+                message: json!({
+                    "v": 1,
+                    "lane": "control",
+                    "epoch": epoch,
+                    "seq": seq,
+                    "id": format!("123e4567-e89b-42d3-a456-{seq:012}"),
+                    "kind": kind,
+                    "body": body,
+                })
+                .to_string(),
+                reset_av_delay: true,
+                now,
+            }),
+        )
+    }
+
+    #[test]
+    fn internet_remote_av_delay_actions_use_latest_state_and_preserve_global_lock() {
+        let mut state = AppState::default();
+        initialize(&mut state, seed());
+        let peer_id = "peer-one";
+        let epoch = "abcdefghijklmnopqrstuv";
+        success(state.execute(AppStateRequest::OpenInternetRemotePeer {
+            schema_version: 1,
+            peer_id: peer_id.into(),
+            epoch: epoch.into(),
+            profile: RemoteProfile::Controller,
+        }));
+        success(state.execute(AppStateRequest::ApplyAvDelay {
+            schema_version: 1,
+            action: AvDelayCommand::Adjust { delta_ms: 50 },
+            now: 11.0,
+        }));
+        let adjusted = remote_message(
+            &mut state,
+            peer_id,
+            epoch,
+            1,
+            "player.av_delay_action",
+            json!({"type":"adjust","delta_ms":50}),
+            12.0,
+        );
+        assert_eq!(
+            adjusted.result["data"]["player_settings"]["effective_av_delay_ms"],
+            100
+        );
+        let locked = remote_message(
+            &mut state,
+            peer_id,
+            epoch,
+            2,
+            "player.av_delay_action",
+            json!({"type":"toggle_lock"}),
+            13.0,
+        );
+        assert_eq!(
+            locked.result["data"]["player_settings"]["av_delay_locked"],
+            true
+        );
+        remote_message(
+            &mut state,
+            peer_id,
+            epoch,
+            3,
+            "player.av_delay_action",
+            json!({"type":"adjust","delta_ms":50}),
+            14.0,
+        );
+        let reset = remote_message(
+            &mut state,
+            peer_id,
+            epoch,
+            4,
+            "player.av_delay_action",
+            json!({"type":"reset_local"}),
+            15.0,
+        );
+        assert_eq!(
+            reset.result["data"]["player_settings"]["effective_av_delay_ms"],
+            100
+        );
+        assert_eq!(
+            reset.result["data"]["player_settings"]["av_delay_locked"],
+            true
+        );
+        let absolute = remote_message(
+            &mut state,
+            peer_id,
+            epoch,
+            5,
+            "player.set_av_delay",
+            json!({"effective_delay_ms":-200}),
+            16.0,
+        );
+        assert_eq!(
+            absolute.result["data"]["player_settings"]["effective_av_delay_ms"],
+            -200
+        );
+    }
+
+    #[test]
+    fn youtube_remote_add_mixed_queue_history_and_controls_use_shared_state() {
+        let mut state = AppState::default();
+        initialize(&mut state, seed());
+        let peer_id = "peer-youtube";
+        let epoch = "abcdefghijklmnopqrstuv";
+        success(state.execute(AppStateRequest::OpenInternetRemotePeer {
+            schema_version: 1,
+            peer_id: peer_id.into(),
+            epoch: epoch.into(),
+            profile: RemoteProfile::Controller,
+        }));
+        remote_message(
+            &mut state,
+            peer_id,
+            epoch,
+            1,
+            "session.set_identity",
+            json!({"name":"Alice"}),
+            10.0,
+        );
+        let revision = state.data.as_ref().unwrap().revision;
+        let pending = remote_message(
+            &mut state,
+            peer_id,
+            epoch,
+            2,
+            "playlist.add",
+            json!({
+                "catalog_item_id":"youtube:YE7VzlLtp-4","position":"tail","expected_revision":revision
+            }),
+            11.0,
+        );
+        let source = bilikara_rust::media_source::MediaSource::YouTube {
+            video_id: "YE7VzlLtp-4".into(),
+        };
+        let mut youtube = item("youtube", "", "");
+        youtube.media_source = source.clone();
+        youtube.original_url = source.canonical_url().unwrap();
+        youtube.resolved_url = youtube.original_url.clone();
+        youtube.aid = 0;
+        youtube.cid = 0;
+        youtube.selected_cids = vec![0];
+        youtube.available_cids = vec![0];
+        let completion = success(state.execute(
+            AppStateRequest::CompleteInternetRemotePlaylistAdd {
+                schema_version: 1,
+                peer_id: peer_id.into(),
+                request_id: pending.result["request_id"].as_str().unwrap().into(),
+                item: youtube.clone(),
+                reset_av_delay: false,
+                now: 12.0,
+            },
+        ));
+        assert!(completion.committed);
+        assert_eq!(
+            completion.result["data"]["current_item"]["media_source"]["provider"],
+            "youtube"
+        );
+        youtube.id = "duplicate-youtube".into();
+        let duplicate = failure(state.execute(AppStateRequest::AddItem {
+            requester_user_id: None,
+
+            schema_version: 1,
+            item: youtube,
+            position: "tail".into(),
+            requester_name: "Alice".into(),
+            reset_av_delay: false,
+            allow_repeat: false,
+            now: 13.0,
+        }));
+        assert_eq!(duplicate.error.kind, "duplicate_session_request");
+        success(state.execute(AppStateRequest::AddItem {
+            requester_user_id: None,
+
+            schema_version: 1,
+            item: item("bilibili", "BV1ab411c7mD", ""),
+            position: "tail".into(),
+            requester_name: "Bob".into(),
+            reset_av_delay: false,
+            allow_repeat: false,
+            now: 14.0,
+        }));
+        success(state.execute(AppStateRequest::ApplyAvDelay {
+            schema_version: 1,
+            action: AvDelayCommand::Adjust { delta_ms: 150 },
+            now: 15.0,
+        }));
+        success(state.execute(AppStateRequest::SetKeyShift {
+            schema_version: 1,
+            key_shift: 2,
+            now: 16.0,
+        }));
+        let tuned = success(state.execute(AppStateRequest::MarkCurrentItemStarted {
+            schema_version: 1,
+            item_id: "youtube".into(),
+            now: 17.0,
+        }))
+        .snapshot
+        .unwrap();
+        assert_eq!(tuned.player_settings.key_shift, 2);
+        assert_eq!(tuned.player_settings.av_offset_ms, 150);
+        // Public ratings must stop before generating any host/cloud effect.
+        let rejected = state.execute(AppStateRequest::DispatchInternetRemoteMessage {
+            schema_version:1, peer_id:peer_id.into(), lane:RemoteLane::Control,reset_av_delay:false,
+            message:json!({"v":1,"lane":"control","epoch":epoch,"seq":3,"id":"123e4567-e89b-42d3-a456-000000000003","kind":"rating.submit","body":{"play_id":"youtube","score":5}}).to_string(),now:18.0,
+        });
+        assert!(rejected.error().is_some());
+        let after = success(state.execute(AppStateRequest::AdvanceToNext {
+            schema_version: 1,
+            expected_playback_generation: tuned.playback_generation,
+            reset_av_delay: false,
+            now: 19.0,
+        }))
+        .snapshot
+        .unwrap();
+        assert_eq!(after.current_item.as_ref().unwrap().id, "bilibili");
+        assert_eq!(after.history[0].key, "youtube:YE7VzlLtp-4");
+        let projected = project_remote_state(&after);
+        assert_eq!(projected.history[0].media_source, source);
+        assert!(projected.history[0].bvid.is_empty());
+        assert_eq!(after.session_played[0].key, "youtube:YE7VzlLtp-4");
+        assert_eq!(
+            after.session_played[0].resolved_url,
+            source.canonical_url().unwrap()
+        );
+        assert!(after.session_played[0].bvid.is_empty());
+        let persistence = state.data.as_ref().unwrap().persistence_snapshot();
+        assert!(
+            !serde_json::to_string(&persistence)
+                .unwrap()
+                .contains("googlevideo.com")
+        );
+    }
+
+    #[test]
+    fn internet_remote_dispatch_owns_mutations_and_emits_typed_host_effects() {
+        let mut state = AppState::default();
+        initialize(&mut state, seed());
+        let peer_id = "peer-one";
+        let epoch = "abcdefghijklmnopqrstuv";
+        success(state.execute(AppStateRequest::OpenInternetRemotePeer {
+            schema_version: 1,
+            peer_id: peer_id.to_owned(),
+            epoch: epoch.to_owned(),
+            profile: RemoteProfile::Controller,
+        }));
+
+        let identity = remote_message(
+            &mut state,
+            peer_id,
+            epoch,
+            1,
+            "session.set_identity",
+            json!({"name": "Carol"}),
+            10.0,
+        );
+        assert!(identity.committed);
+        assert_eq!(identity.result["data"]["name"], json!("Carol"));
+        assert_eq!(
+            identity.result["data"]["state"]["session_users"],
+            json!(["Alice", "Bob", "Carol"])
+        );
+
+        let revision = identity.result["revision"].as_u64().expect("revision");
+        let pending = remote_message(
+            &mut state,
+            peer_id,
+            epoch,
+            2,
+            "playlist.add",
+            json!({
+                "catalog_item_id": "BV1ab411c7mD",
+                "position": "next",
+                "allow_repeat": true,
+                "expected_revision": revision,
+            }),
+            11.0,
+        );
+        assert!(!pending.committed);
+        assert_eq!(
+            pending.result["_host_effect"]["kind"],
+            json!("fetch_playlist_item")
+        );
+        assert_eq!(
+            pending.result["_host_effect"]["selected_video_page"],
+            Value::Null
+        );
+        assert_eq!(
+            pending.result["_host_effect"]["selected_audio_pages"],
+            json!([])
+        );
+
+        let mut fetched = item("remote", "BV1ab411c7mD", "");
+        fetched.page = 2;
+        fetched.video_page = 2;
+        let completion = success(
+            state.execute(AppStateRequest::CompleteInternetRemotePlaylistAdd {
+                schema_version: 1,
+                peer_id: peer_id.to_owned(),
+                request_id: pending.result["request_id"]
+                    .as_str()
+                    .expect("request id")
+                    .to_owned(),
+                item: fetched,
+                reset_av_delay: true,
+                now: 12.0,
+            }),
+        );
+        assert!(completion.committed);
+        assert_eq!(
+            completion.result["_host_effect"]["kind"],
+            json!("sync_cache")
+        );
+        assert_eq!(
+            completion.result["data"]["current_item"]["requester_name"],
+            json!("Carol")
+        );
+
+        let playback = remote_message(
+            &mut state,
+            peer_id,
+            epoch,
+            3,
+            "playback.seek_relative",
+            json!({
+                "item_id": completion.result["data"]["current_item"]["id"],
+                "playback_generation": completion.result["data"]["playback_generation"],
+                "delta_seconds": 10,
+            }),
+            13.0,
+        );
+        assert!(!playback.committed);
+        assert_eq!(
+            playback.result["_host_effect"]["kind"],
+            json!("player_control")
+        );
+        assert_eq!(playback.result["_host_effect"]["delta_seconds"], json!(10));
+
+        let absolute_seek = remote_message(
+            &mut state,
+            peer_id,
+            epoch,
+            4,
+            "playback.seek_absolute",
+            json!({
+                "item_id": completion.result["data"]["current_item"]["id"],
+                "playback_generation": completion.result["data"]["playback_generation"],
+                "target_seconds": 42,
+            }),
+            14.0,
+        );
+        assert!(!absolute_seek.committed);
+        assert_eq!(
+            absolute_seek.result["_host_effect"]["action"],
+            json!("seek-absolute")
+        );
+        assert_eq!(
+            absolute_seek.result["_host_effect"]["target_seconds"],
+            json!(42)
+        );
+    }
+
+    #[test]
+    fn internet_remote_rejects_stale_playback_and_item_incarnation_targets() {
+        let mut state = AppState::default();
+        let mut initial = seed();
+        initial.current_item = Some(item("a", "BV-a", "Alice"));
+        initial.playlist = vec![item("b", "BV-b", "Bob")];
+        let program_a = initialize(&mut state, initial);
+        let peer_id = "peer-one";
+        let epoch = "abcdefghijklmnopqrstuv";
+        success(state.execute(AppStateRequest::OpenInternetRemotePeer {
+            schema_version: 1,
+            peer_id: peer_id.to_owned(),
+            epoch: epoch.to_owned(),
+            profile: RemoteProfile::Controller,
+        }));
+
+        let program_b = success(state.execute(AppStateRequest::MoveToFront {
+            schema_version: 1,
+            item_id: "b".to_owned(),
+            reset_av_delay: false,
+            now: 11.0,
+        }))
+        .snapshot
+        .expect("program B snapshot");
+        let before_stale_playback = state.data.clone();
+        let stale_playback = remote_message(
+            &mut state,
+            peer_id,
+            epoch,
+            1,
+            "playback.seek_relative",
+            json!({
+                "item_id": "a",
+                "playback_generation": program_a.playback_generation,
+                "delta_seconds": 15,
+            }),
+            12.0,
+        );
+        assert_eq!(stale_playback.result["accepted"], json!(false));
+        assert_eq!(stale_playback.result["stale"], json!(true));
+        assert!(stale_playback.result.get("_host_effect").is_none());
+        assert_eq!(state.data, before_stale_playback);
+        assert_eq!(
+            stale_playback.result["data"]["current_item"]["id"],
+            json!("b"),
+        );
+
+        let stale_absolute_seek = remote_message(
+            &mut state,
+            peer_id,
+            epoch,
+            2,
+            "playback.seek_absolute",
+            json!({
+                "item_id": "a",
+                "playback_generation": program_a.playback_generation,
+                "target_seconds": 42,
+            }),
+            12.5,
+        );
+        assert_eq!(stale_absolute_seek.result["accepted"], json!(false));
+        assert_eq!(stale_absolute_seek.result["stale"], json!(true));
+        assert!(stale_absolute_seek.result.get("_host_effect").is_none());
+        assert_eq!(state.data, before_stale_playback);
+
+        let stale_incarnation = program_b
+            .current_item
+            .as_ref()
+            .expect("program B item")
+            .item_incarnation_id
+            .clone();
+        success(state.execute(AppStateRequest::RemoveItem {
+            schema_version: 1,
+            item_id: "b".to_owned(),
+            now: 13.0,
+        }));
+        success(state.execute(AppStateRequest::AddItem {
+            requester_user_id: None,
+
+            schema_version: 1,
+            item: item("b", "BV-b-new", ""),
+            position: "tail".to_owned(),
+            requester_name: "Bob".to_owned(),
+            reset_av_delay: false,
+            allow_repeat: true,
+            now: 14.0,
+        }));
+        let live = success(state.execute(AppStateRequest::Snapshot { schema_version: 1 }))
+            .snapshot
+            .expect("live snapshot");
+        let live_incarnation = live
+            .playlist
+            .iter()
+            .find(|entry| entry.id == "b")
+            .or_else(|| live.current_item.as_ref().filter(|entry| entry.id == "b"))
+            .expect("replacement item")
+            .item_incarnation_id
+            .clone();
+        assert_ne!(live_incarnation, stale_incarnation);
+
+        for (seq, kind, body) in [
+            (
+                3,
+                "player.set_audio_variant",
+                json!({
+                    "item_id": "b",
+                    "variant_id": "p1_off_vocal",
+                    "expected_item_incarnation_id": stale_incarnation,
+                    "expected_revision": live.revision,
+                }),
+            ),
+            (
+                4,
+                "cache.retry",
+                json!({
+                    "item_id": "b",
+                    "expected_item_incarnation_id": stale_incarnation,
+                    "expected_revision": live.revision,
+                }),
+            ),
+        ] {
+            let data_before = state.data.clone();
+            let rejected = remote_message(
+                &mut state,
+                peer_id,
+                epoch,
+                seq,
+                kind,
+                body,
+                15.0 + seq as f64,
+            );
+            assert_eq!(rejected.result["accepted"], json!(false), "{kind}");
+            assert_eq!(rejected.result["stale"], json!(true), "{kind}");
+            assert!(rejected.result.get("_host_effect").is_none(), "{kind}");
+            assert_eq!(state.data, data_before, "{kind}");
+        }
+        for (seq, force) in [(5, false), (6, true)] {
+            let accepted = remote_message(
+                &mut state,
+                peer_id,
+                epoch,
+                seq,
+                "cache.retry",
+                json!({
+                    "item_id":"b", "expected_item_incarnation_id":live_incarnation,
+                    "expected_revision":live.revision, "force":force,
+                }),
+                25.0 + seq as f64,
+            );
+            assert_eq!(accepted.result["accepted"], true);
+            assert_eq!(accepted.result["_host_effect"]["force"], force);
+        }
+    }
+
+    #[test]
+    fn internet_remote_playlist_add_completion_rebases_after_unrelated_revision_change() {
+        let mut state = AppState::default();
+        initialize(&mut state, seed());
+        let peer_id = "peer-one";
+        let epoch = "abcdefghijklmnopqrstuv";
+        success(state.execute(AppStateRequest::OpenInternetRemotePeer {
+            schema_version: 1,
+            peer_id: peer_id.to_owned(),
+            epoch: epoch.to_owned(),
+            profile: RemoteProfile::Controller,
+        }));
+        let identity = remote_message(
+            &mut state,
+            peer_id,
+            epoch,
+            1,
+            "session.set_identity",
+            json!({"name": "Carol"}),
+            10.0,
+        );
+        let pending = remote_message(
+            &mut state,
+            peer_id,
+            epoch,
+            2,
+            "playlist.add",
+            json!({
+                "catalog_item_id": "BV1ab411c7mD",
+                "position": "tail",
+                "allow_repeat": false,
+                "expected_revision": identity.result["revision"],
+            }),
+            11.0,
+        );
+        success(state.execute(AppStateRequest::SetVolume {
+            schema_version: 1,
+            volume_percent: 50,
+            expected_item_incarnation_id: None,
+            now: 12.0,
+        }));
+
+        let completion = success(
+            state.execute(AppStateRequest::CompleteInternetRemotePlaylistAdd {
+                schema_version: 1,
+                peer_id: peer_id.to_owned(),
+                request_id: pending.result["request_id"]
+                    .as_str()
+                    .expect("request id")
+                    .to_owned(),
+                item: item("remote", "BV1ab411c7mD", ""),
+                reset_av_delay: true,
+                now: 13.0,
+            }),
+        );
+        assert!(completion.committed);
+        assert_eq!(completion.result["accepted"], json!(true));
+        assert_eq!(completion.result["stale"], json!(false));
+        assert_eq!(
+            state
+                .data
+                .as_ref()
+                .expect("state")
+                .current_item
+                .as_ref()
+                .map(|item| item.bvid.as_str()),
+            Some("BV1ab411c7mD")
+        );
+    }
+
+    #[test]
+    fn internet_remote_playlist_add_admission_rebases_a_stale_visible_revision() {
+        let mut state = AppState::default();
+        initialize(&mut state, seed());
+        let peer_id = "peer-one";
+        let epoch = "abcdefghijklmnopqrstuv";
+        success(state.execute(AppStateRequest::OpenInternetRemotePeer {
+            schema_version: 1,
+            peer_id: peer_id.to_owned(),
+            epoch: epoch.to_owned(),
+            profile: RemoteProfile::Controller,
+        }));
+        let identity = remote_message(
+            &mut state,
+            peer_id,
+            epoch,
+            1,
+            "session.set_identity",
+            json!({"name": "Carol"}),
+            10.0,
+        );
+        success(state.execute(AppStateRequest::SetVolume {
+            schema_version: 1,
+            volume_percent: 50,
+            expected_item_incarnation_id: None,
+            now: 11.0,
+        }));
+
+        let pending = remote_message(
+            &mut state,
+            peer_id,
+            epoch,
+            2,
+            "playlist.add",
+            json!({
+                "catalog_item_id": "BV1ab411c7mD",
+                "position": "tail",
+                "allow_repeat": false,
+                "expected_revision": identity.result["revision"],
+            }),
+            12.0,
+        );
+
+        assert_eq!(pending.result["accepted"], json!(true));
+        assert_eq!(pending.result["stale"], json!(false));
+        assert_eq!(
+            pending.result["_host_effect"]["kind"],
+            json!("fetch_playlist_item")
+        );
+    }
+
+    #[test]
+    fn internet_remote_playlist_add_completion_validates_manual_binding_selection() {
+        let mut state = AppState::default();
+        initialize(&mut state, seed());
+        let peer_id = "peer-one";
+        let epoch = "abcdefghijklmnopqrstuv";
+        success(state.execute(AppStateRequest::OpenInternetRemotePeer {
+            schema_version: 1,
+            peer_id: peer_id.to_owned(),
+            epoch: epoch.to_owned(),
+            profile: RemoteProfile::Controller,
+        }));
+        let identity = remote_message(
+            &mut state,
+            peer_id,
+            epoch,
+            1,
+            "session.set_identity",
+            json!({"name": "Carol"}),
+            10.0,
+        );
+        let pending = remote_message(
+            &mut state,
+            peer_id,
+            epoch,
+            2,
+            "playlist.add",
+            json!({
+                "catalog_item_id": "BV1ab411c7mD_p2",
+                "selected_video_page": 2,
+                "selected_audio_pages": [1, 3],
+                "expected_revision": identity.result["revision"],
+            }),
+            11.0,
+        );
+        assert_eq!(
+            pending.result["_host_effect"]["selected_video_page"],
+            json!(2)
+        );
+        assert_eq!(
+            pending.result["_host_effect"]["selected_audio_pages"],
+            json!([1, 3])
+        );
+        let mut fetched = item("remote", "BV1ab411c7mD", "");
+        fetched.page = 2;
+        fetched.video_page = 2;
+        fetched.manual_selection = true;
+
+        let rejected = failure(
+            state.execute(AppStateRequest::CompleteInternetRemotePlaylistAdd {
+                schema_version: 1,
+                peer_id: peer_id.to_owned(),
+                request_id: pending.result["request_id"]
+                    .as_str()
+                    .expect("request id")
+                    .to_owned(),
+                item: fetched,
+                reset_av_delay: true,
+                now: 12.0,
+            }),
+        );
+
+        assert_eq!(rejected.error.kind, "internet_remote_catalog_item_mismatch");
+        assert!(state.data.as_ref().expect("state").current_item.is_none());
+    }
+
+    #[test]
+    fn internet_remote_cancelled_playlist_adds_release_the_pending_capacity() {
+        let mut state = AppState::default();
+        initialize(&mut state, seed());
+        let peer_id = "peer-one";
+        let epoch = "abcdefghijklmnopqrstuv";
+        success(state.execute(AppStateRequest::OpenInternetRemotePeer {
+            schema_version: 1,
+            peer_id: peer_id.to_owned(),
+            epoch: epoch.to_owned(),
+            profile: RemoteProfile::Controller,
+        }));
+        let identity = remote_message(
+            &mut state,
+            peer_id,
+            epoch,
+            1,
+            "session.set_identity",
+            json!({"name": "Carol"}),
+            10.0,
+        );
+        let revision = identity.result["revision"].as_u64().expect("revision");
+
+        for sequence in 2..=18 {
+            let pending = remote_message(
+                &mut state,
+                peer_id,
+                epoch,
+                sequence,
+                "playlist.add",
+                json!({
+                    "catalog_item_id": "BV1ab411c7mD",
+                    "expected_revision": revision,
+                }),
+                10.0 + sequence as f64,
+            );
+            let request_id = pending.result["request_id"]
+                .as_str()
+                .expect("request id")
+                .to_owned();
+            let cancelled = success(state.execute(
+                AppStateRequest::CancelInternetRemotePlaylistAdd {
+                    schema_version: 1,
+                    peer_id: peer_id.to_owned(),
+                    request_id,
+                },
+            ));
+            assert_eq!(cancelled.result["cancelled"], json!(true));
+        }
+    }
+
+    #[test]
+    fn internet_remote_reconnect_can_claim_an_existing_session_identity() {
+        let mut state = AppState::default();
+        let initial = initialize(&mut state, seed());
+        let peer_id = "peer-one";
+        let epoch = "abcdefghijklmnopqrstuv";
+        success(state.execute(AppStateRequest::OpenInternetRemotePeer {
+            schema_version: 1,
+            peer_id: peer_id.to_owned(),
+            epoch: epoch.to_owned(),
+            profile: RemoteProfile::Controller,
+        }));
+
+        let identity = remote_message(
+            &mut state,
+            peer_id,
+            epoch,
+            1,
+            "session.set_identity",
+            json!({"name": "Alice"}),
+            10.0,
+        );
+
+        assert!(!identity.committed);
+        assert_eq!(identity.result["revision"], json!(initial.revision));
+        assert_eq!(identity.result["data"]["name"], json!("Alice"));
+        let repeated_identity = remote_message(
+            &mut state,
+            peer_id,
+            epoch,
+            2,
+            "session.set_identity",
+            json!({"name": "Alice"}),
+            10.5,
+        );
+        assert!(!repeated_identity.committed);
+        assert_eq!(repeated_identity.result["data"]["name"], json!("Alice"));
+        let search = remote_message(
+            &mut state,
+            peer_id,
+            epoch,
+            3,
+            "catalog.search",
+            json!({"query": "song", "limit": 10}),
+            11.0,
+        );
+        assert_eq!(
+            search.result["_host_effect"]["kind"],
+            json!("catalog_search")
+        );
+    }
+
+    #[test]
+    fn internet_remote_shared_browse_and_gatcha_emit_only_typed_host_effects() {
+        let mut state = AppState::default();
+        initialize(&mut state, seed());
+        let peer_id = "peer-one";
+        let epoch = "abcdefghijklmnopqrstuv";
+        success(state.execute(AppStateRequest::OpenInternetRemotePeer {
+            schema_version: 1,
+            peer_id: peer_id.to_owned(),
+            epoch: epoch.to_owned(),
+            profile: RemoteProfile::Controller,
+        }));
+        remote_message(
+            &mut state,
+            peer_id,
+            epoch,
+            1,
+            "session.set_identity",
+            json!({"name": "Carol"}),
+            10.0,
+        );
+
+        let browse = remote_message(
+            &mut state,
+            peer_id,
+            epoch,
+            2,
+            "catalog.browse",
+            json!({
+                "kind": "artist",
+                "letter": "A",
+                "query": "",
+                "tag": "",
+                "locale": "ja",
+                "limit": 100,
+            }),
+            11.0,
+        );
+        assert_eq!(
+            browse.result["_host_effect"]["kind"],
+            json!("catalog_browse")
+        );
+        assert_eq!(
+            browse.result["_host_effect"]["browse_kind"],
+            json!("artist")
+        );
+
+        let gatcha = remote_message(
+            &mut state,
+            peer_id,
+            epoch,
+            3,
+            "gatcha.uid_add",
+            json!({"uid": "123456"}),
+            12.0,
+        );
+        assert_eq!(
+            gatcha.result["_host_effect"],
+            json!({"kind": "gatcha_uid_add", "uid": "123456"})
+        );
+        let removal = remote_message(
+            &mut state,
+            peer_id,
+            epoch,
+            4,
+            "gatcha.source_remove",
+            json!({"source":"favlist","id":"42:10"}),
+            13.0,
+        );
+        assert_eq!(
+            removal.result["_host_effect"],
+            json!({"kind":"gatcha_source_remove","source":"favlist","id":"42:10"})
+        );
+    }
+
+    fn begin_cache_attempt(state: &mut AppState, item_id: &str) -> (u64, AppStateSuccess) {
+        let expected_item_incarnation_id = state
+            .data
+            .as_ref()
+            .and_then(|data| data.find_item(item_id))
+            .map(|item| item.item_incarnation_id.clone())
+            .expect("live item incarnation");
+        let response = success(state.execute(AppStateRequest::BeginCacheAttempt {
+            schema_version: 1,
+            item_id: item_id.to_owned(),
+            expected_item_incarnation_id,
+        }));
+        let token = response.result["cache_attempt_token"]
+            .as_u64()
+            .expect("positive cache attempt token");
+        (token, response)
+    }
+
+    fn item_incarnation(state: &AppState, item_id: &str) -> String {
+        state
+            .data
+            .as_ref()
+            .and_then(|data| data.find_item(item_id))
+            .map(|item| item.item_incarnation_id.clone())
+            .expect("live item incarnation")
+    }
+
+    fn cache_reservation(response: &AppStateSuccess) -> CacheAttemptReservation {
+        serde_json::from_value(response.result.clone()).expect("cache reservation")
+    }
+
+    fn apply_cache(
+        state: &mut AppState,
+        item_id: &str,
+        cache_attempt_token: u64,
+        event: CacheEvent,
+        now: f64,
+    ) -> AppStateResponse {
+        state.execute(AppStateRequest::ApplyCacheEvent {
+            schema_version: 1,
+            item_id: item_id.to_owned(),
+            cache_attempt_token,
+            event,
+            now,
+        })
+    }
+
+    fn apply_player_status_observation(
+        state: &mut AppState,
+        expected_playback_generation: u64,
+        item_id: &str,
+        is_paused: bool,
+        current_time: f64,
+        duration: f64,
+        now: f64,
+    ) -> AppStateResponse {
+        state.execute(AppStateRequest::ApplyPlayerStatusObservation {
+            schema_version: 1,
+            expected_playback_generation,
+            item_id: item_id.to_owned(),
+            is_paused,
+            current_time,
+            duration,
+            now,
+        })
+    }
+
+    fn ready_event(
+        state: &AppState,
+        item_id: &str,
+        cache_attempt_token: u64,
+        video_name: &str,
+        variants: &[(&str, &str)],
+        producer_selection: &str,
+    ) -> CacheEvent {
+        let reservation = &state
+            .data
+            .as_ref()
+            .expect("initialized state")
+            .active_cache_attempts[item_id]
+            .reservation;
+        assert_eq!(reservation.cache_attempt_token, cache_attempt_token);
+        let directory = reservation.artifact_relative_directory.clone();
+        CacheEvent::Ready {
+            progress: 100.0,
+            message: "ready".to_owned(),
+            video_relative_path: format!("{directory}/{video_name}"),
+            video_media_url: format!("/media/{directory}/{video_name}"),
+            audio_variants: variants
+                .iter()
+                .map(|(id, audio_name)| {
+                    Map::from_iter([
+                        ("id".to_owned(), json!(id)),
+                        (
+                            "audio_url".to_owned(),
+                            json!(format!("/media/{directory}/{audio_name}")),
+                        ),
+                    ])
+                })
+                .collect(),
+            selected_audio_variant_id: producer_selection.to_owned(),
+            item_incarnation_id: reservation.item_incarnation_id.clone(),
+            artifact_set_id: reservation.artifact_set_id.clone(),
+            artifact_relative_directory: directory,
+        }
+    }
+
+    #[test]
+    fn persisted_state_initializes_one_authoritative_snapshot() {
+        let mut state = AppState::default();
+        let mut initial = seed();
+        initial.current_item = Some(item("current", "BV-current", "Alice"));
+        initial.current_item_started = true;
+        initial.playlist = vec![item("queued", "BV-queued", "Bob")];
+        initial.history = vec![history("BV-old:p1:a1", "Alice")];
+        initial.session_history = vec![history("BV-session:p1:a1", "Bob")];
+        initial.session_played = vec![played("current", "Alice")];
+        initial.player_settings = PlayerSettingsSeed {
+            global_av_delay_ms: 120,
+            local_av_delay_ms: -20,
+            av_delay_locked: true,
+            volume_percent: 42,
+            is_muted: true,
+            song_advance_delay_seconds: 8,
+            key_shift: 3,
+        };
+        let snapshot = initialize(&mut state, initial.clone());
+        assert_eq!(snapshot.revision, 1);
+        assert_eq!(snapshot.session_generation, 1);
+        assert_eq!(snapshot.playback_generation, 1);
+        assert_eq!(
+            snapshot.current_item.as_ref().map(|item| item.id.as_str()),
+            Some("current")
+        );
+        assert_eq!(snapshot.playlist[0].id, "queued");
+        assert_eq!(snapshot.history, initial.history);
+        assert_eq!(snapshot.session_history, initial.session_history);
+        assert_eq!(snapshot.session_users, ["Alice", "Bob"]);
+        assert_eq!(snapshot.session_played, initial.session_played);
+        assert_eq!(snapshot.player_settings.volume_percent, 42);
+        assert_eq!(snapshot.player_settings.av_offset_ms, 100);
+
+        let read = success(state.execute(AppStateRequest::Snapshot { schema_version: 1 }));
+        assert!(!read.committed);
+        assert_eq!(read.snapshot.expect("snapshot"), snapshot);
+    }
+
+    #[test]
+    fn volume_boost_preserves_defaults_and_remote_state() {
+        let mut state = AppState::default();
+        let initial = initialize(&mut state, seed());
+        assert_eq!(initial.player_settings.volume_percent, 100);
+        for (requested, expected) in [(275, 275), (500, 500), (501, 500), (-1, 0)] {
+            let result = success(state.execute(AppStateRequest::SetVolume {
+                schema_version: 1,
+                volume_percent: requested,
+                expected_item_incarnation_id: None,
+                now: 11.0,
+            }));
+            let snapshot = result.snapshot.expect("volume snapshot");
+            assert_eq!(snapshot.player_settings.volume_percent, expected);
+            assert_eq!(
+                i32::from(
+                    project_remote_state(&snapshot)
+                        .player_settings
+                        .volume_percent
+                ),
+                expected
+            );
+        }
+        let peer = "volume-peer";
+        let epoch = "abcdefghijklmnopqrstuv";
+        success(state.execute(AppStateRequest::OpenInternetRemotePeer {
+            schema_version: 1,
+            peer_id: peer.to_owned(),
+            epoch: epoch.to_owned(),
+            profile: RemoteProfile::Controller,
+        }));
+        let result = remote_message(
+            &mut state,
+            peer,
+            epoch,
+            1,
+            "player.set_volume",
+            json!({"volume_percent": 500}),
+            12.0,
+        );
+        assert_eq!(
+            result.result["data"]["player_settings"]["volume_percent"],
+            500
+        );
+        let reset = success(state.execute(AppStateRequest::ResetPlayer {
+            schema_version: 1,
+            now: 13.0,
+        }));
+        assert_eq!(reset.snapshot.unwrap().player_settings.volume_percent, 100);
+        let mut restored = seed();
+        restored.player_settings.volume_percent = 500;
+        assert_eq!(
+            initialize(&mut state, restored)
+                .player_settings
+                .volume_percent,
+            500
+        );
+    }
+
+    #[test]
+    fn delayed_volume_write_cannot_restore_boost_after_song_change() {
+        let mut state = AppState::default();
+        let mut initial = seed();
+        initial.current_item = Some(item("a", "BV1", "Alice"));
+        initial.playlist = vec![item("b", "BV2", "Bob")];
+        let first = initialize(&mut state, initial);
+        let incarnation = first
+            .current_item
+            .as_ref()
+            .unwrap()
+            .item_incarnation_id
+            .clone();
+        success(state.execute(AppStateRequest::SetVolume {
+            schema_version: 1,
+            volume_percent: 375,
+            expected_item_incarnation_id: Some(incarnation.clone()),
+            now: 11.0,
+        }));
+        let next = success(state.execute(AppStateRequest::AdvanceToNext {
+            schema_version: 1,
+            expected_playback_generation: first.playback_generation,
+            reset_av_delay: false,
+            now: 12.0,
+        }))
+        .snapshot
+        .unwrap();
+        assert_eq!(next.player_settings.volume_percent, 100);
+        let late = failure(state.execute(AppStateRequest::SetVolume {
+            schema_version: 1,
+            volume_percent: 500,
+            expected_item_incarnation_id: Some(incarnation.clone()),
+            now: 13.0,
+        }));
+        assert_eq!(late.error.kind, "item_incarnation_mismatch");
+        let after = success(state.execute(AppStateRequest::Snapshot { schema_version: 1 }))
+            .snapshot
+            .unwrap();
+        assert_eq!(after, next);
+        success(state.execute(AppStateRequest::OpenInternetRemotePeer {
+            schema_version: 1,
+            peer_id: "volume-guard".into(),
+            epoch: "abcdefghijklmnopqrstuv".into(),
+            profile: RemoteProfile::Controller,
+        }));
+        let remote_late = failure(
+            state.execute(AppStateRequest::DispatchInternetRemoteMessage {
+                schema_version: 1,
+                peer_id: "volume-guard".into(),
+                lane: RemoteLane::Control,
+                message: json!({"v":1,"lane":"control","epoch":"abcdefghijklmnopqrstuv","seq":1,
+                "id":"123e4567-e89b-42d3-a456-000000000001","kind":"player.set_volume",
+                "body":{"volume_percent":500,"expected_item_incarnation_id":incarnation}})
+                .to_string(),
+                reset_av_delay: false,
+                now: 13.0,
+            }),
+        );
+        assert_eq!(remote_late.error.kind, "item_incarnation_mismatch");
+        let accepted = success(state.execute(AppStateRequest::SetVolume {
+            schema_version: 1,
+            volume_percent: 250,
+            expected_item_incarnation_id: Some(next.current_item.unwrap().item_incarnation_id),
+            now: 14.0,
+        }));
+        assert_eq!(
+            accepted.snapshot.unwrap().player_settings.volume_percent,
+            250
+        );
+    }
+
+    #[test]
+    fn song_change_caps_boost_preserves_mute_and_normal_volume() {
+        for volume in [45, 100, 375, 500] {
+            let mut state = AppState::default();
+            let mut initial = seed();
+            initial.current_item = Some(item("a", "BV1", "Alice"));
+            initial.playlist = vec![item("b", "BV2", "Bob")];
+            initial.player_settings.volume_percent = volume;
+            initial.player_settings.is_muted = true;
+            let snapshot = initialize(&mut state, initial);
+            let restarted = success(
+                state.execute(AppStateRequest::RestartPlaybackProgram { schema_version: 1 }),
+            )
+            .snapshot
+            .unwrap();
+            assert_eq!(restarted.player_settings.volume_percent, volume);
+            let rejected = failure(state.execute(AppStateRequest::AdvanceToNext {
+                schema_version: 1,
+                expected_playback_generation: snapshot.playback_generation,
+                reset_av_delay: false,
+                now: 12.0,
+            }));
+            assert_eq!(rejected.error.kind, "playback_generation_mismatch");
+            let advanced = success(state.execute(AppStateRequest::AdvanceToNext {
+                schema_version: 1,
+                expected_playback_generation: restarted.playback_generation,
+                reset_av_delay: false,
+                now: 13.0,
+            }));
+            assert!(advanced.effects.write_core);
+            let settings = advanced.snapshot.unwrap().player_settings;
+            assert_eq!(settings.volume_percent, volume.min(100));
+            assert!(settings.is_muted);
+            let unmuted = success(state.execute(AppStateRequest::SetMuted {
+                schema_version: 1,
+                is_muted: false,
+                now: 14.0,
+            }))
+            .snapshot
+            .unwrap();
+            assert_eq!(unmuted.player_settings.volume_percent, volume.min(100));
+            assert!(!unmuted.player_settings.is_muted);
+        }
+    }
+
+    #[test]
+    fn revisions_increment_once_and_rejections_or_reads_do_not_increment() {
+        let mut state = AppState::default();
+        initialize(&mut state, seed());
+        let changed = success(state.execute(AppStateRequest::SetVolume {
+            schema_version: 1,
+            volume_percent: 35,
+            expected_item_incarnation_id: None,
+            now: 11.0,
+        }));
+        assert!(changed.committed);
+        assert_eq!(changed.snapshot.as_ref().expect("snapshot").revision, 2);
+
+        let unchanged = success(state.execute(AppStateRequest::SetVolume {
+            schema_version: 1,
+            volume_percent: 35,
+            expected_item_incarnation_id: None,
+            now: 12.0,
+        }));
+        assert!(!unchanged.committed);
+        assert_eq!(unchanged.snapshot.as_ref().expect("snapshot").revision, 2);
+
+        let rejected = failure(state.execute(AppStateRequest::SetPlaybackMode {
+            schema_version: 1,
+            mode: String::new(),
+            now: 13.0,
+        }));
+        assert_eq!(rejected.status, "rejected");
+        let read = success(state.execute(AppStateRequest::Snapshot { schema_version: 1 }));
+        assert_eq!(read.snapshot.expect("snapshot").revision, 2);
+    }
+
+    #[test]
+    fn session_and_playback_generations_follow_identity_boundaries() {
+        let mut state = AppState::default();
+        let first = initialize(&mut state, seed());
+        let added = success(state.execute(AppStateRequest::AddItem {
+            requester_user_id: None,
+
+            schema_version: 1,
+            item: item("a", "BV-a", ""),
+            position: "tail".to_owned(),
+            requester_name: "Alice".to_owned(),
+            reset_av_delay: false,
+            allow_repeat: false,
+            now: 11.0,
+        }));
+        let added = added.snapshot.expect("added snapshot");
+        assert_eq!(added.session_generation, first.session_generation);
+        assert_eq!(added.playback_generation, first.playback_generation + 1);
+
+        let volume = success(state.execute(AppStateRequest::SetVolume {
+            schema_version: 1,
+            volume_percent: 50,
+            expected_item_incarnation_id: None,
+            now: 12.0,
+        }))
+        .snapshot
+        .expect("volume snapshot");
+        assert_eq!(volume.playback_generation, added.playback_generation);
+
+        let reset = success(state.execute(AppStateRequest::BeginSession {
+            schema_version: 1,
+            new_session: SessionArchiveSeed {
+                file_name: "played-next.json".to_owned(),
+                session_started_at: 13.0,
+                items: Vec::new(),
+            },
+            now: 13.0,
+        }))
+        .snapshot
+        .expect("reset snapshot");
+        assert_eq!(reset.session_generation, added.session_generation + 1);
+        assert_eq!(reset.playback_generation, added.playback_generation + 1);
+    }
+
+    #[test]
+    fn playback_program_shape_tracks_requested_and_mountable_current_identity() {
+        let mut state = AppState::default();
+        let empty = initialize(&mut state, seed());
+        let empty_value = serde_json::to_value(&empty).expect("empty snapshot JSON");
+        assert!(
+            empty_value
+                .as_object()
+                .expect("snapshot object")
+                .contains_key("playback_program")
+        );
+        assert_eq!(empty_value["playback_program"], Value::Null);
+
+        let pending = success(state.execute(AppStateRequest::AddItem {
+            requester_user_id: None,
+
+            schema_version: 1,
+            item: item("a", "BV-a", ""),
+            position: "tail".to_owned(),
+            requester_name: "Alice".to_owned(),
+            reset_av_delay: false,
+            allow_repeat: false,
+            now: 11.0,
+        }))
+        .snapshot
+        .expect("pending snapshot");
+        let pending_item = pending.current_item.as_ref().expect("pending current item");
+        let pending_value = serde_json::to_value(&pending).expect("pending snapshot JSON");
+        assert_eq!(pending_value["playback_program"]["item_id"], "a");
+        assert_eq!(
+            pending_value["playback_program"]["item_incarnation_id"],
+            pending_item.item_incarnation_id
+        );
+        assert_eq!(
+            pending_value["playback_program"]["selected_audio_variant_id"],
+            ""
+        );
+        assert_eq!(
+            pending_value["playback_program"]["artifact_set_id"],
+            Value::Null
+        );
+
+        let (token, reservation_response) = begin_cache_attempt(&mut state, "a");
+        let reservation = cache_reservation(&reservation_response);
+        let ready = ready_event(
+            &state,
+            "a",
+            token,
+            "video.mp4",
+            &[
+                ("original", "original.m4a"),
+                ("instrumental", "instrumental.m4a"),
+            ],
+            "instrumental",
+        );
+        let mounted = success(apply_cache(&mut state, "a", token, ready, 12.0))
+            .snapshot
+            .expect("mounted snapshot");
+        let mounted_value = serde_json::to_value(&mounted).expect("mounted snapshot JSON");
+        assert_eq!(mounted.playback_generation, pending.playback_generation + 1);
+        assert_eq!(mounted_value["playback_program"]["item_id"], "a");
+        assert_eq!(
+            mounted_value["playback_program"]["item_incarnation_id"],
+            reservation.item_incarnation_id
+        );
+        assert_eq!(
+            mounted_value["playback_program"]["selected_audio_variant_id"],
+            "instrumental"
+        );
+        assert_eq!(
+            mounted_value["playback_program"]["artifact_set_id"],
+            reservation.artifact_set_id
+        );
+
+        let (invalid_token, _) = begin_cache_attempt(&mut state, "a");
+        let mut invalid_ready = ready_event(
+            &state,
+            "a",
+            invalid_token,
+            "video-v2.mp4",
+            &[("original", "original-v2.m4a")],
+            "original",
+        );
+        if let CacheEvent::Ready {
+            video_media_url, ..
+        } = &mut invalid_ready
+        {
+            *video_media_url = "/media/outside/video-v2.mp4".to_owned();
+        }
+        let rejected = failure(apply_cache(
+            &mut state,
+            "a",
+            invalid_token,
+            invalid_ready,
+            13.0,
+        ));
+        assert_eq!(rejected.error.kind, "invalid_cache_ready");
+        let after_rejection =
+            success(state.execute(AppStateRequest::Snapshot { schema_version: 1 }))
+                .snapshot
+                .expect("snapshot after invalid Ready");
+        assert_eq!(after_rejection, mounted);
+    }
+
+    #[test]
+    fn playback_generation_tracks_refresh_selection_reset_and_republication() {
+        let mut state = AppState::default();
+        let initial = initialize(&mut state, seed());
+        let pending = success(state.execute(AppStateRequest::AddItem {
+            requester_user_id: None,
+
+            schema_version: 1,
+            item: item("a", "BV-a", ""),
+            position: "tail".to_owned(),
+            requester_name: "Alice".to_owned(),
+            reset_av_delay: false,
+            allow_repeat: false,
+            now: 11.0,
+        }))
+        .snapshot
+        .expect("pending snapshot");
+        assert_eq!(pending.playback_generation, initial.playback_generation + 1);
+
+        let (fill_token, _) = begin_cache_attempt(&mut state, "a");
+        for event in [
+            CacheEvent::Queued {
+                message: "queued".to_owned(),
+            },
+            CacheEvent::Started {
+                message: "started".to_owned(),
+            },
+            CacheEvent::Progress {
+                download: None,
+                progress: 50.0,
+                message: Some("progress".to_owned()),
+            },
+        ] {
+            let snapshot = success(apply_cache(&mut state, "a", fill_token, event, 11.5))
+                .snapshot
+                .expect("cache progress snapshot");
+            assert_eq!(snapshot.playback_generation, pending.playback_generation);
+        }
+
+        let first_ready = ready_event(
+            &state,
+            "a",
+            fill_token,
+            "video-v1.mp4",
+            &[
+                ("original", "original-v1.m4a"),
+                ("instrumental", "instrumental-v1.m4a"),
+            ],
+            "original",
+        );
+        let mounted = success(apply_cache(&mut state, "a", fill_token, first_ready, 12.0))
+            .snapshot
+            .expect("first Ready snapshot");
+        assert_eq!(mounted.playback_generation, pending.playback_generation + 1);
+
+        let a_incarnation = item_incarnation(&state, "a");
+        let selected = success(state.execute(AppStateRequest::SetAudioVariant {
+            schema_version: 1,
+            item_id: "a".to_owned(),
+            expected_item_incarnation_id: a_incarnation.clone(),
+            variant_id: "instrumental".to_owned(),
+            now: 12.5,
+        }))
+        .snapshot
+        .expect("selected variant snapshot");
+        assert_eq!(
+            selected.playback_generation,
+            mounted.playback_generation + 1
+        );
+        let no_op_selection = success(state.execute(AppStateRequest::SetAudioVariant {
+            schema_version: 1,
+            item_id: "a".to_owned(),
+            expected_item_incarnation_id: a_incarnation,
+            variant_id: "instrumental".to_owned(),
+            now: 12.6,
+        }));
+        assert!(!no_op_selection.committed);
+        assert_eq!(
+            no_op_selection
+                .snapshot
+                .expect("no-op selection snapshot")
+                .playback_generation,
+            selected.playback_generation
+        );
+
+        let (failed_refresh, _) = begin_cache_attempt(&mut state, "a");
+        for event in [
+            CacheEvent::Queued {
+                message: "refresh queued".to_owned(),
+            },
+            CacheEvent::Started {
+                message: "refresh started".to_owned(),
+            },
+            CacheEvent::Progress {
+                download: None,
+                progress: 75.0,
+                message: Some("refresh progress".to_owned()),
+            },
+        ] {
+            let snapshot = success(apply_cache(&mut state, "a", failed_refresh, event, 13.0))
+                .snapshot
+                .expect("refresh progress snapshot");
+            assert_eq!(snapshot.playback_generation, selected.playback_generation);
+        }
+        let failed_event = CacheEvent::Failed {
+            message: "refresh failed".to_owned(),
+        };
+        let failed = success(apply_cache(
+            &mut state,
+            "a",
+            failed_refresh,
+            failed_event.clone(),
+            13.5,
+        ))
+        .snapshot
+        .expect("failed refresh snapshot");
+        assert_eq!(failed.playback_generation, selected.playback_generation);
+        let replay = success(apply_cache(
+            &mut state,
+            "a",
+            failed_refresh,
+            failed_event,
+            13.6,
+        ));
+        assert!(!replay.committed);
+        assert_eq!(replay.result["replayed"], json!(true));
+        assert_eq!(
+            replay
+                .snapshot
+                .expect("terminal replay snapshot")
+                .playback_generation,
+            selected.playback_generation
+        );
+
+        let (cancelled_refresh, _) = begin_cache_attempt(&mut state, "a");
+        let cancelled = success(apply_cache(
+            &mut state,
+            "a",
+            cancelled_refresh,
+            CacheEvent::Cancelled {
+                message: "refresh cancelled".to_owned(),
+            },
+            14.0,
+        ))
+        .snapshot
+        .expect("cancelled refresh snapshot");
+        assert_eq!(cancelled.playback_generation, selected.playback_generation);
+
+        let (refresh_token, refresh_response) = begin_cache_attempt(&mut state, "a");
+        let refresh_reservation = cache_reservation(&refresh_response);
+        let refresh_ready = ready_event(
+            &state,
+            "a",
+            refresh_token,
+            "video-v2.mp4",
+            &[
+                ("original", "original-v2.m4a"),
+                ("instrumental", "instrumental-v2.m4a"),
+            ],
+            "original",
+        );
+        let refreshed = success(apply_cache(
+            &mut state,
+            "a",
+            refresh_token,
+            refresh_ready,
+            14.5,
+        ))
+        .snapshot
+        .expect("successful refresh snapshot");
+        assert_eq!(
+            refreshed.playback_generation,
+            selected.playback_generation + 1
+        );
+        assert_eq!(
+            refreshed
+                .playback_program
+                .as_ref()
+                .and_then(|program| program.artifact_set_id.as_deref()),
+            Some(refresh_reservation.artifact_set_id.as_str())
+        );
+
+        let (evict_token, _) = begin_cache_attempt(&mut state, "a");
+        let evicted = success(apply_cache(
+            &mut state,
+            "a",
+            evict_token,
+            CacheEvent::Evicted {
+                message: "evicted".to_owned(),
+            },
+            15.0,
+        ))
+        .snapshot
+        .expect("evicted snapshot");
+        assert_eq!(
+            evicted.playback_generation,
+            refreshed.playback_generation + 1
+        );
+        assert_eq!(
+            evicted
+                .playback_program
+                .as_ref()
+                .and_then(|program| program.artifact_set_id.as_ref()),
+            None
+        );
+
+        let (republish_token, _) = begin_cache_attempt(&mut state, "a");
+        let republish_ready = ready_event(
+            &state,
+            "a",
+            republish_token,
+            "video-v3.mp4",
+            &[
+                ("original", "original-v3.m4a"),
+                ("instrumental", "instrumental-v3.m4a"),
+            ],
+            "original",
+        );
+        let republished = success(apply_cache(
+            &mut state,
+            "a",
+            republish_token,
+            republish_ready,
+            15.5,
+        ))
+        .snapshot
+        .expect("republished snapshot");
+        assert_eq!(
+            republished.playback_generation,
+            evicted.playback_generation + 1
+        );
+    }
+
+    #[test]
+    fn playback_generation_ignores_settings_metadata_and_non_current_work() {
+        let mut state = AppState::default();
+        let mut initial = seed();
+        initial.current_item = Some(item("a", "BV-a", "Alice"));
+        initial.playlist = vec![item("b", "BV-b", "Bob"), item("c", "BV-c", "Alice")];
+        initial.session_played = vec![played("a", "Alice")];
+        let initialized = initialize(&mut state, initial);
+        let generation = initialized.playback_generation;
+
+        macro_rules! assert_no_program_bump {
+            ($request:expr) => {{
+                let response = success(state.execute($request));
+                assert_eq!(
+                    response
+                        .snapshot
+                        .as_ref()
+                        .expect("mutation snapshot")
+                        .playback_generation,
+                    generation
+                );
+                response
+            }};
+        }
+
+        assert_no_program_bump!(AppStateRequest::SetVolume {
+            schema_version: 1,
+            volume_percent: 50,
+            expected_item_incarnation_id: None,
+            now: 11.0,
+        });
+        assert_no_program_bump!(AppStateRequest::SetMuted {
+            schema_version: 1,
+            is_muted: true,
+            now: 11.1,
+        });
+        assert_no_program_bump!(AppStateRequest::ApplyAvDelay {
+            schema_version: 1,
+            action: AvDelayCommand::Adjust { delta_ms: 25 },
+            now: 11.2,
+        });
+        assert_no_program_bump!(AppStateRequest::SetKeyShift {
+            schema_version: 1,
+            key_shift: 2,
+            now: 11.3,
+        });
+        assert_no_program_bump!(AppStateRequest::SetSongAdvanceDelay {
+            schema_version: 1,
+            delay_seconds: 7,
+            now: 11.4,
+        });
+        assert_no_program_bump!(AppStateRequest::MarkCurrentItemStarted {
+            schema_version: 1,
+            item_id: "a".to_owned(),
+            now: 11.5,
+        });
+        assert_no_program_bump!(AppStateRequest::UpdateItem {
+            schema_version: 1,
+            item_id: "a".to_owned(),
+            changes: PlaylistItemPatch {
+                display_title: Some("metadata only".to_owned()),
+                ..PlaylistItemPatch::default()
+            },
+            persist_backup: false,
+            now: 11.6,
+        });
+        assert_no_program_bump!(AppStateRequest::AppendHistory {
+            schema_version: 1,
+            entry: history("BV-history:p1:a1", "Alice"),
+            now: 11.7,
+        });
+        assert_no_program_bump!(AppStateRequest::MarkSessionPlayedThreshold {
+            schema_version: 1,
+            item_id: "a".to_owned(),
+            now: 11.8,
+        });
+        assert_no_program_bump!(AppStateRequest::UpdateOwnerInfo {
+            schema_version: 1,
+            source_url: "https://example.test/a".to_owned(),
+            owner_mid: 42,
+            owner_name: "owner".to_owned(),
+            owner_url: "https://example.test/owner".to_owned(),
+            now: 11.9,
+        });
+        assert_no_program_bump!(AppStateRequest::SetPlaybackMode {
+            schema_version: 1,
+            mode: "online".to_owned(),
+            now: 12.0,
+        });
+        assert_no_program_bump!(AppStateRequest::MoveItem {
+            schema_version: 1,
+            item_id: "b".to_owned(),
+            direction: "down".to_owned(),
+            now: 12.1,
+        });
+        assert_no_program_bump!(AppStateRequest::RenameSessionUser {
+            schema_version: 1,
+            current_name: "Alice".to_owned(),
+            new_name: "Alicia".to_owned(),
+            expected_user_id: None,
+            expected_name: None,
+            now: 12.2,
+        });
+
+        let (queued_token, _) = begin_cache_attempt(&mut state, "b");
+        let queued_ready = ready_event(
+            &state,
+            "b",
+            queued_token,
+            "video-b.mp4",
+            &[
+                ("original", "original-b.m4a"),
+                ("instrumental", "instrumental-b.m4a"),
+            ],
+            "original",
+        );
+        let queued_publication = success(apply_cache(
+            &mut state,
+            "b",
+            queued_token,
+            queued_ready,
+            12.4,
+        ));
+        assert_eq!(
+            queued_publication
+                .snapshot
+                .expect("queued Ready snapshot")
+                .playback_generation,
+            generation
+        );
+        let b_incarnation = item_incarnation(&state, "b");
+        assert_no_program_bump!(AppStateRequest::SetAudioVariant {
+            schema_version: 1,
+            item_id: "b".to_owned(),
+            expected_item_incarnation_id: b_incarnation,
+            variant_id: "instrumental".to_owned(),
+            now: 12.5,
+        });
+        let (queued_refresh_token, _) = begin_cache_attempt(&mut state, "b");
+        for event in [
+            CacheEvent::Queued {
+                message: "queued refresh".to_owned(),
+            },
+            CacheEvent::Started {
+                message: "started refresh".to_owned(),
+            },
+            CacheEvent::Progress {
+                download: None,
+                progress: 80.0,
+                message: Some("refresh progress".to_owned()),
+            },
+            CacheEvent::Failed {
+                message: "refresh failed".to_owned(),
+            },
+        ] {
+            let queued_refresh = success(apply_cache(
+                &mut state,
+                "b",
+                queued_refresh_token,
+                event,
+                12.55,
+            ));
+            assert_eq!(
+                queued_refresh
+                    .snapshot
+                    .expect("queued refresh snapshot")
+                    .playback_generation,
+                generation
+            );
+        }
+        let (queued_recache_token, _) = begin_cache_attempt(&mut state, "b");
+        let queued_recache_ready = ready_event(
+            &state,
+            "b",
+            queued_recache_token,
+            "video-b-v2.mp4",
+            &[
+                ("original", "original-b-v2.m4a"),
+                ("instrumental", "instrumental-b-v2.m4a"),
+            ],
+            "original",
+        );
+        let queued_recache = success(apply_cache(
+            &mut state,
+            "b",
+            queued_recache_token,
+            queued_recache_ready,
+            12.58,
+        ));
+        assert_eq!(
+            queued_recache
+                .snapshot
+                .expect("queued recache snapshot")
+                .playback_generation,
+            generation
+        );
+        let (queued_reset_token, _) = begin_cache_attempt(&mut state, "b");
+        let queued_reset = success(apply_cache(
+            &mut state,
+            "b",
+            queued_reset_token,
+            CacheEvent::Reset {
+                message: "queued reset".to_owned(),
+                clear_selected_audio_variant: true,
+            },
+            12.6,
+        ));
+        assert_eq!(
+            queued_reset
+                .snapshot
+                .expect("queued reset snapshot")
+                .playback_generation,
+            generation
+        );
+
+        let no_op = assert_no_program_bump!(AppStateRequest::SetVolume {
+            schema_version: 1,
+            volume_percent: 50,
+            expected_item_incarnation_id: None,
+            now: 12.7,
+        });
+        assert!(!no_op.committed);
+    }
+
+    #[test]
+    fn reset_player_forces_exactly_one_current_program_lifetime() {
+        let mut state = AppState::default();
+        let mut initial = seed();
+        initial.current_item = Some(item("a", "BV-a", "Alice"));
+        let pending = initialize(&mut state, initial);
+        let pending_program = pending.playback_program.clone();
+
+        let pending_reset = success(state.execute(AppStateRequest::ResetPlayer {
+            schema_version: 1,
+            now: 13.0,
+        }));
+        assert!(pending_reset.committed);
+        let pending_reset_snapshot = pending_reset.snapshot.expect("pending reset snapshot");
+        assert_eq!(pending_reset_snapshot.playback_program, pending_program);
+        assert_eq!(
+            pending_reset_snapshot.playback_generation,
+            pending.playback_generation + 1
+        );
+        assert_eq!(pending_reset_snapshot.revision, pending.revision + 1);
+        assert_eq!(pending_reset.effects, PersistenceEffects::default());
+
+        let second_reset = success(state.execute(AppStateRequest::ResetPlayer {
+            schema_version: 1,
+            now: 13.1,
+        }));
+        assert!(second_reset.committed);
+        let second_reset_snapshot = second_reset.snapshot.expect("second reset snapshot");
+        assert_eq!(second_reset_snapshot.playback_program, pending_program);
+        assert_eq!(
+            second_reset_snapshot.playback_generation,
+            pending_reset_snapshot.playback_generation + 1
+        );
+        assert_eq!(
+            second_reset_snapshot.revision,
+            pending_reset_snapshot.revision + 1
+        );
+        assert_eq!(second_reset.effects, PersistenceEffects::default());
+
+        success(state.execute(AppStateRequest::SetVolume {
+            schema_version: 1,
+            volume_percent: 42,
+            expected_item_incarnation_id: None,
+            now: 13.2,
+        }));
+        success(state.execute(AppStateRequest::SetMuted {
+            schema_version: 1,
+            is_muted: true,
+            now: 13.3,
+        }));
+        success(state.execute(AppStateRequest::ApplyAvDelay {
+            schema_version: 1,
+            action: AvDelayCommand::Adjust { delta_ms: 50 },
+            now: 13.4,
+        }));
+        success(state.execute(AppStateRequest::SetKeyShift {
+            schema_version: 1,
+            key_shift: 3,
+            now: 13.5,
+        }));
+        success(state.execute(AppStateRequest::MarkCurrentItemStarted {
+            schema_version: 1,
+            item_id: "a".to_owned(),
+            now: 13.6,
+        }));
+        let before_settings_reset =
+            success(state.execute(AppStateRequest::Snapshot { schema_version: 1 }))
+                .snapshot
+                .expect("snapshot before settings reset");
+        let settings_reset = success(state.execute(AppStateRequest::ResetPlayer {
+            schema_version: 1,
+            now: 13.7,
+        }));
+        assert!(settings_reset.committed);
+        let settings_reset_snapshot = settings_reset.snapshot.expect("settings reset snapshot");
+        assert_eq!(settings_reset_snapshot.playback_program, pending_program);
+        assert_eq!(
+            settings_reset_snapshot.playback_generation,
+            before_settings_reset.playback_generation + 1
+        );
+        assert_eq!(settings_reset_snapshot.player_settings.av_offset_ms, 0);
+        assert_eq!(settings_reset_snapshot.player_settings.volume_percent, 100);
+        assert!(!settings_reset_snapshot.player_settings.is_muted);
+        assert_eq!(settings_reset_snapshot.player_settings.key_shift, 0);
+        assert!(!settings_reset_snapshot.current_item_started);
+        assert!(settings_reset.effects.write_core);
+        assert!(settings_reset.effects.write_session_played);
+
+        let (fill_token, _) = begin_cache_attempt(&mut state, "a");
+        let ready = ready_event(
+            &state,
+            "a",
+            fill_token,
+            "video.mp4",
+            &[("original", "original.m4a")],
+            "original",
+        );
+        let mounted = success(apply_cache(&mut state, "a", fill_token, ready, 14.0))
+            .snapshot
+            .expect("mounted snapshot");
+        let mounted_program = mounted.playback_program.clone();
+        let mounted_reset = success(state.execute(AppStateRequest::ResetPlayer {
+            schema_version: 1,
+            now: 14.1,
+        }));
+        assert!(mounted_reset.committed);
+        let mounted_reset_snapshot = mounted_reset.snapshot.expect("mounted reset snapshot");
+        assert_eq!(mounted_reset_snapshot.playback_program, mounted_program);
+        assert_eq!(
+            mounted_reset_snapshot.playback_generation,
+            mounted.playback_generation + 1
+        );
+        assert_eq!(mounted_reset.effects, PersistenceEffects::default());
+    }
+
+    #[test]
+    fn reset_player_without_a_program_never_creates_a_generation() {
+        let mut state = AppState::default();
+        let initial = initialize(&mut state, seed());
+
+        let no_op = success(state.execute(AppStateRequest::ResetPlayer {
+            schema_version: 1,
+            now: 11.0,
+        }));
+        assert!(!no_op.committed);
+        let no_op_snapshot = no_op.snapshot.expect("no-op reset snapshot");
+        assert_eq!(no_op_snapshot, initial);
+        assert_eq!(no_op.effects, PersistenceEffects::default());
+
+        success(state.execute(AppStateRequest::SetVolume {
+            schema_version: 1,
+            volume_percent: 42,
+            expected_item_incarnation_id: None,
+            now: 11.1,
+        }));
+        let before_settings_reset =
+            success(state.execute(AppStateRequest::Snapshot { schema_version: 1 }))
+                .snapshot
+                .expect("snapshot before no-program settings reset");
+        let settings_reset = success(state.execute(AppStateRequest::ResetPlayer {
+            schema_version: 1,
+            now: 11.2,
+        }));
+        assert!(settings_reset.committed);
+        let settings_reset_snapshot = settings_reset.snapshot.expect("settings reset snapshot");
+        assert_eq!(settings_reset_snapshot.playback_program, None);
+        assert_eq!(
+            settings_reset_snapshot.playback_generation,
+            before_settings_reset.playback_generation
+        );
+        assert!(settings_reset.effects.write_core);
+        assert!(settings_reset.effects.write_session_played);
+    }
+
+    #[test]
+    fn reset_player_generation_overflow_is_fully_atomic() {
+        let mut state = AppState::default();
+        let mut initial = seed();
+        initial.current_item = Some(item("a", "BV-a", "Alice"));
+        initial.player_settings.volume_percent = 42;
+        initial.current_item_started = true;
+        initialize(&mut state, initial);
+        state
+            .data
+            .as_mut()
+            .expect("initialized state")
+            .playback_generation = MAX_SAFE_JSON_INTEGER;
+        let before = state.data.clone();
+        let incarnation_counter_before = state.next_item_incarnation_id;
+
+        let overflow = failure(state.execute(AppStateRequest::ResetPlayer {
+            schema_version: 1,
+            now: 11.0,
+        }));
+        assert_eq!(overflow.status, "internal_error");
+        assert!(
+            overflow
+                .error
+                .message
+                .contains("playback generation overflow")
+        );
+        assert_eq!(state.data, before);
+        assert_eq!(state.next_item_incarnation_id, incarnation_counter_before);
+    }
+
+    #[test]
+    fn restart_playback_program_preserves_program_settings_and_persistence() {
+        let mut state = AppState::default();
+        let mut initial = seed();
+        initial.current_item = Some(item("a", "BV-a", "Alice"));
+        initial.playback_mode = "online".to_owned();
+        initial.player_settings = PlayerSettingsSeed {
+            global_av_delay_ms: 125,
+            local_av_delay_ms: -25,
+            av_delay_locked: true,
+            volume_percent: 42,
+            is_muted: true,
+            song_advance_delay_seconds: 8,
+            key_shift: 3,
+        };
+        initial.current_item_started = true;
+        let before = initialize(&mut state, initial);
+
+        let restarted =
+            success(state.execute(AppStateRequest::RestartPlaybackProgram { schema_version: 1 }));
+        assert!(restarted.committed);
+        assert_eq!(restarted.effects, PersistenceEffects::default());
+        assert_eq!(restarted.result, mutation_value(true));
+        let after = restarted.snapshot.expect("restart snapshot");
+        assert_eq!(after.revision, before.revision + 1);
+        assert_eq!(after.playback_generation, before.playback_generation + 1);
+        assert_eq!(after.playback_program, before.playback_program);
+        assert_eq!(after.playback_mode, before.playback_mode);
+        assert_eq!(after.player_settings, before.player_settings);
+        assert_eq!(after.current_item, before.current_item);
+        assert_eq!(after.current_item_started, before.current_item_started);
+        assert_eq!(after.updated_at, before.updated_at);
+    }
+
+    #[test]
+    fn restart_playback_program_without_current_program_is_a_no_op() {
+        let mut state = AppState::default();
+        let before = initialize(&mut state, seed());
+
+        let no_op =
+            success(state.execute(AppStateRequest::RestartPlaybackProgram { schema_version: 1 }));
+        assert!(!no_op.committed);
+        assert_eq!(no_op.effects, PersistenceEffects::default());
+        assert_eq!(no_op.result, mutation_value(false));
+        assert_eq!(no_op.snapshot.expect("no-op restart snapshot"), before);
+    }
+
+    #[test]
+    fn restart_playback_program_generation_overflow_is_fully_atomic() {
+        let mut state = AppState::default();
+        let mut initial = seed();
+        initial.current_item = Some(item("a", "BV-a", "Alice"));
+        initialize(&mut state, initial);
+        state
+            .data
+            .as_mut()
+            .expect("initialized state")
+            .playback_generation = MAX_SAFE_JSON_INTEGER;
+        let before = state.data.clone();
+        let incarnation_counter_before = state.next_item_incarnation_id;
+
+        let overflow =
+            failure(state.execute(AppStateRequest::RestartPlaybackProgram { schema_version: 1 }));
+        assert_eq!(overflow.status, "internal_error");
+        assert!(
+            overflow
+                .error
+                .message
+                .contains("playback generation overflow")
+        );
+        assert_eq!(state.data, before);
+        assert_eq!(state.next_item_incarnation_id, incarnation_counter_before);
+    }
+
+    #[test]
+    fn same_id_new_incarnation_and_invalid_or_overflowing_programs_are_atomic() {
+        let mut state = AppState::default();
+        let mut initial = seed();
+        initial.current_item = Some(item("a", "BV-live", "Alice"));
+        initial.backup = Some(BackupSeed {
+            current_item: Some(item("a", "BV-restored", "Alice")),
+            playlist: Vec::new(),
+            played_session: None,
+            updated_at: 9.0,
+        });
+        let initialized = initialize(&mut state, initial);
+        let initial_incarnation = initialized
+            .playback_program
+            .as_ref()
+            .expect("initial program")
+            .item_incarnation_id
+            .clone();
+        let (ready_token, _) = begin_cache_attempt(&mut state, "a");
+        let current_ready = ready_event(
+            &state,
+            "a",
+            ready_token,
+            "video.mp4",
+            &[("original", "original.m4a")],
+            "original",
+        );
+        let mounted = success(apply_cache(
+            &mut state,
+            "a",
+            ready_token,
+            current_ready,
+            11.0,
+        ))
+        .snapshot
+        .expect("mounted snapshot");
+        let restored = success(state.execute(AppStateRequest::RestoreBackup {
+            schema_version: 1,
+            reset_av_delay: false,
+            now: 12.0,
+        }))
+        .snapshot
+        .expect("restored snapshot");
+        let restored_program = restored
+            .playback_program
+            .as_ref()
+            .expect("restored program");
+        assert_eq!(restored_program.item_id, "a");
+        assert_ne!(restored_program.item_incarnation_id, initial_incarnation);
+        assert!(restored_program.artifact_set_id.is_none());
+        assert!(restored_program.selected_audio_variant_id.is_empty());
+        assert_eq!(
+            restored.playback_generation,
+            mounted.playback_generation + 1
+        );
+
+        let mut invalid_state = AppState::default();
+        let mut invalid_initial = seed();
+        invalid_initial.current_item = Some(item("spaced", "BV-spaced", "Alice"));
+        initialize(&mut invalid_state, invalid_initial);
+        let (invalid_token, _) = begin_cache_attempt(&mut invalid_state, "spaced");
+        let invalid_ready = ready_event(
+            &invalid_state,
+            "spaced",
+            invalid_token,
+            "video.mp4",
+            &[(" original ", "original.m4a")],
+            " original ",
+        );
+        success(apply_cache(
+            &mut invalid_state,
+            "spaced",
+            invalid_token,
+            invalid_ready,
+            11.0,
+        ));
+        let invalid_before = invalid_state.data.clone();
+        let invalid_incarnation = item_incarnation(&invalid_state, "spaced");
+        let rejected = failure(invalid_state.execute(AppStateRequest::SetAudioVariant {
+            schema_version: 1,
+            item_id: "spaced".to_owned(),
+            expected_item_incarnation_id: invalid_incarnation,
+            variant_id: "original".to_owned(),
+            now: 12.0,
+        }));
+        assert_eq!(rejected.error.kind, "invalid_playback_program");
+        assert_eq!(invalid_state.data, invalid_before);
+
+        let mut overflow_state = AppState::default();
+        let mut overflow_initial = seed();
+        overflow_initial.current_item = Some(item("overflow", "BV-overflow", "Alice"));
+        initialize(&mut overflow_state, overflow_initial);
+        overflow_state
+            .data
+            .as_mut()
+            .expect("overflow state data")
+            .playback_generation = MAX_SAFE_JSON_INTEGER;
+        let overflow_before = overflow_state.data.clone();
+        let incarnation_counter_before = overflow_state.next_item_incarnation_id;
+        let overflow_incarnation = item_incarnation(&overflow_state, "overflow");
+        let overflow = failure(overflow_state.execute(AppStateRequest::SetAudioVariant {
+            schema_version: 1,
+            item_id: "overflow".to_owned(),
+            expected_item_incarnation_id: overflow_incarnation,
+            variant_id: "p1_p1".to_owned(),
+            now: 13.0,
+        }));
+        assert_eq!(overflow.status, "internal_error");
+        assert!(
+            overflow
+                .error
+                .message
+                .contains("playback generation overflow")
+        );
+        assert_eq!(overflow_state.data, overflow_before);
+        assert_eq!(
+            overflow_state.next_item_incarnation_id,
+            incarnation_counter_before
+        );
+    }
+
+    #[test]
+    fn admissions_at_capacity_reject_both_positions_without_changing_state() {
+        for has_current in [false, true] {
+            let mut state = AppState::default();
+            let mut initial = seed();
+            if has_current {
+                initial.current_item = Some(item("playing", "BV-playing", "Alice"));
+            }
+            initial.playlist = (0..MAX_ITEMS - usize::from(has_current))
+                .map(|index| item(&format!("q{index}"), &format!("BV{index:010}"), "Alice"))
+                .collect();
+            initialize(&mut state, initial);
+            let before = state.data.clone();
+            let incarnation_counter = state.next_item_incarnation_id;
+            for position in ["tail", "next"] {
+                let rejected = failure(state.execute(AppStateRequest::AddItem {
+                    requester_user_id: None,
+
+                    schema_version: 1,
+                    item: item("extra", "BV-extra", "Bob"),
+                    position: position.to_owned(),
+                    requester_name: "Bob".to_owned(),
+                    reset_av_delay: true,
+                    allow_repeat: true,
+                    now: 11.0,
+                }));
+                assert_eq!(rejected.error.kind, "too_many_items");
+                assert_eq!(state.data, before);
+                assert_eq!(state.next_item_incarnation_id, incarnation_counter);
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_admissions_share_the_last_available_slot() {
+        let mut state = AppState::default();
+        let mut initial = seed();
+        initial.current_item = Some(item("playing", "BV-playing", "Alice"));
+        initial.playlist = (0..MAX_ITEMS - 2)
+            .map(|index| item(&format!("q{index}"), &format!("BV{index:010}"), "Alice"))
+            .collect();
+        initialize(&mut state, initial);
+        let before_revision = state.data.as_ref().unwrap().revision;
+        let before_counter = state.next_item_incarnation_id;
+        let state = Arc::new(Mutex::new(state));
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|index| {
+                let state = Arc::clone(&state);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    let response = state.lock().unwrap().execute(AppStateRequest::AddItem {
+                        requester_user_id: None,
+
+                        schema_version: 1,
+                        item: item(
+                            &format!("extra-{index}"),
+                            &format!("BV-extra-{index}"),
+                            "Bob",
+                        ),
+                        position: if index % 2 == 0 { "tail" } else { "next" }.to_owned(),
+                        requester_name: "Bob".to_owned(),
+                        reset_av_delay: false,
+                        allow_repeat: false,
+                        now: 11.0,
+                    });
+                    match response {
+                        AppStateResponse::Success(success) => {
+                            assert!(success.committed);
+                            true
+                        }
+                        AppStateResponse::Failure(failure) => {
+                            assert_eq!(failure.error.kind, "too_many_items");
+                            false
+                        }
+                    }
+                })
+            })
+            .collect();
+        let admitted = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .filter(|admitted| *admitted)
+            .count();
+        assert_eq!(admitted, 1);
+        let state = state.lock().unwrap();
+        let data = state.data.as_ref().unwrap();
+        assert_eq!(data.playlist.len() + 1, MAX_ITEMS);
+        assert_eq!(data.current_item.as_ref().unwrap().id, "playing");
+        assert_eq!(data.revision, before_revision + 1);
+        assert_eq!(state.next_item_incarnation_id, before_counter + 1);
+        assert_eq!(
+            data.playlist
+                .iter()
+                .filter(|item| item.id.starts_with("extra-"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn resort_clears_single_fixed_slot_before_future_cycle_admission() {
+        for slot in ["priority", "manual"] {
+            let mut state = AppState::default();
+            let mut initial = seed();
+            initial.current_item = Some(item("playing", "BV-playing", "Alice"));
+            let mut waiting = item("alice-next", "BV-alice", "Alice");
+            waiting.queue_slot_type = slot.to_owned();
+            initial.playlist = vec![waiting];
+            initialize(&mut state, initial);
+            let reordered = success(state.execute(AppStateRequest::ResortPlaylistByCycle {
+                schema_version: 1,
+                now: 11.0,
+            }));
+            assert!(reordered.committed);
+            let snapshot = reordered.snapshot.expect("snapshot");
+            assert_eq!(snapshot.playlist.len(), 1);
+            assert_eq!(snapshot.playlist[0].queue_slot_type, "cycle");
+            assert_eq!(snapshot.current_item.unwrap().id, "playing");
+            let added = success(state.execute(AppStateRequest::AddItem {
+                requester_user_id: None,
+
+                schema_version: 1,
+                item: item("bob-next", "BV-bob", "Bob"),
+                position: "tail".to_owned(),
+                requester_name: "Bob".to_owned(),
+                reset_av_delay: false,
+                allow_repeat: false,
+                now: 12.0,
+            }));
+            assert_eq!(
+                added
+                    .snapshot
+                    .unwrap()
+                    .playlist
+                    .iter()
+                    .map(|item| item.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["bob-next", "alice-next"]
+            );
+        }
+    }
+
+    #[test]
+    fn playlist_duplicate_order_advance_and_history_are_committed_in_rust() {
+        let mut state = AppState::default();
+        initialize(&mut state, seed());
+        for (id, bvid, requester) in [
+            ("a", "BV-a", "Alice"),
+            ("b", "BV-b", "Bob"),
+            ("c", "BV-c", "Alice"),
+        ] {
+            let response = state.execute(AppStateRequest::AddItem {
+                requester_user_id: None,
+
+                schema_version: 1,
+                item: item(id, bvid, ""),
+                position: "tail".to_owned(),
+                requester_name: requester.to_owned(),
+                reset_av_delay: false,
+                allow_repeat: false,
+                now: 11.0,
+            });
+            assert!(matches!(response, AppStateResponse::Success(_)));
+        }
+        let snapshot = success(state.execute(AppStateRequest::Snapshot { schema_version: 1 }))
+            .snapshot
+            .expect("snapshot");
+        assert_eq!(
+            snapshot
+                .current_item
+                .as_ref()
+                .map(|entry| entry.id.as_str()),
+            Some("a")
+        );
+        assert_eq!(
+            snapshot
+                .playlist
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            ["b", "c"]
+        );
+
+        let revision = snapshot.revision;
+        let duplicate = failure(state.execute(AppStateRequest::AddItem {
+            requester_user_id: None,
+
+            schema_version: 1,
+            item: item("duplicate-a", "BV-a", ""),
+            position: "tail".to_owned(),
+            requester_name: "Alice".to_owned(),
+            reset_av_delay: false,
+            allow_repeat: false,
+            now: 12.0,
+        }));
+        assert_eq!(duplicate.error.kind, "duplicate_session_request");
+        let after_rejection =
+            success(state.execute(AppStateRequest::Snapshot { schema_version: 1 }))
+                .snapshot
+                .expect("snapshot");
+        assert_eq!(after_rejection.revision, revision);
+
+        success(state.execute(AppStateRequest::MarkCurrentItemStarted {
+            schema_version: 1,
+            item_id: "a".to_owned(),
+            now: 13.0,
+        }));
+        let advanced = success(state.execute(AppStateRequest::AdvanceToNext {
+            schema_version: 1,
+            expected_playback_generation: snapshot.playback_generation,
+            reset_av_delay: false,
+            now: 14.0,
+        }))
+        .snapshot
+        .expect("advanced snapshot");
+        assert_eq!(
+            advanced
+                .current_item
+                .as_ref()
+                .map(|entry| entry.id.as_str()),
+            Some("b")
+        );
+        assert_eq!(advanced.history[0].requester_name, "Alice");
+        assert_eq!(advanced.session_history[0].requester_name, "Alice");
+        assert_eq!(advanced.session_played[0].ended_at, Some(14.0));
+    }
+
+    #[test]
+    fn advance_requires_the_exact_playback_generation_and_rejects_atomically() {
+        let mut state = AppState::default();
+        initialize(&mut state, seed());
+        for (id, bvid) in [("a", "BV-a"), ("b", "BV-b"), ("c", "BV-c")] {
+            success(state.execute(AppStateRequest::AddItem {
+                requester_user_id: None,
+
+                schema_version: 1,
+                item: item(id, bvid, ""),
+                position: "tail".to_owned(),
+                requester_name: "Alice".to_owned(),
+                reset_av_delay: false,
+                allow_repeat: false,
+                now: 11.0,
+            }));
+        }
+        let program_a = success(state.execute(AppStateRequest::Snapshot { schema_version: 1 }))
+            .snapshot
+            .expect("program A snapshot");
+        let program_b = success(state.execute(AppStateRequest::MoveToFront {
+            schema_version: 1,
+            item_id: "b".to_owned(),
+            reset_av_delay: false,
+            now: 12.0,
+        }))
+        .snapshot
+        .expect("program B snapshot");
+        assert_eq!(
+            program_b.current_item.as_ref().map(|item| item.id.as_str()),
+            Some("b")
+        );
+
+        let metadata_only = success(state.execute(AppStateRequest::SetVolume {
+            schema_version: 1,
+            volume_percent: 37,
+            expected_item_incarnation_id: None,
+            now: 13.0,
+        }))
+        .snapshot
+        .expect("metadata-only snapshot");
+        assert!(metadata_only.revision > program_b.revision);
+        assert_eq!(
+            metadata_only.playback_generation,
+            program_b.playback_generation
+        );
+
+        let before_stale = state.data.clone();
+        let stale = failure(state.execute(AppStateRequest::AdvanceToNext {
+            schema_version: 1,
+            expected_playback_generation: program_a.playback_generation,
+            reset_av_delay: false,
+            now: 14.0,
+        }));
+        assert_eq!(stale.error.kind, "playback_generation_mismatch");
+        assert_eq!(
+            stale.error.details,
+            Some(json!({
+                "expected_playback_generation": program_a.playback_generation,
+                "actual_playback_generation": program_b.playback_generation,
+            }))
+        );
+        assert_eq!(state.data, before_stale);
+
+        let advanced = success(state.execute(AppStateRequest::AdvanceToNext {
+            schema_version: 1,
+            expected_playback_generation: program_b.playback_generation,
+            reset_av_delay: false,
+            now: 15.0,
+        }))
+        .snapshot
+        .expect("exact-generation advance snapshot");
+        assert_eq!(
+            advanced.current_item.as_ref().map(|item| item.id.as_str()),
+            Some("c")
+        );
+        assert_eq!(
+            advanced.playback_generation,
+            program_b.playback_generation + 1
+        );
+    }
+
+    #[test]
+    fn zero_duration_status_does_not_start_history_or_rating_threshold() {
+        let mut state = AppState::default();
+        let mut initial = seed();
+        initial.current_item = Some(item("a", "BV-a", "Alice"));
+        initial.session_played = vec![played("a", "Alice")];
+        let mounted = initialize(&mut state, initial);
+        let zero = success(apply_player_status_observation(
+            &mut state,
+            mounted.playback_generation,
+            "a",
+            false,
+            50.0,
+            0.0,
+            11.0,
+        ));
+        assert_eq!(zero.result["started_changed"], false);
+        assert!(!state.data.as_ref().unwrap().current_item_started);
+        assert!(!state.data.as_ref().unwrap().session_played[0].threshold_reached);
+        let valid = success(apply_player_status_observation(
+            &mut state,
+            mounted.playback_generation,
+            "a",
+            false,
+            50.0,
+            100.0,
+            12.0,
+        ));
+        assert_eq!(valid.result["started_changed"], true);
+        assert_eq!(valid.result["threshold_changed"], true);
+    }
+
+    #[test]
+    fn exact_generation_player_status_applies_both_marks_without_program_bump() {
+        let mut state = AppState::default();
+        let mut initial = seed();
+        initial.current_item = Some(item("a", "BV-a", "Alice"));
+        initial.session_played = vec![played("a", "Alice")];
+        let mounted = initialize(&mut state, initial);
+
+        let applied = success(apply_player_status_observation(
+            &mut state,
+            mounted.playback_generation,
+            "a",
+            true,
+            50.0,
+            100.0,
+            11.0,
+        ));
+        assert!(applied.committed);
+        assert_eq!(
+            applied.result,
+            json!({
+                "changed": true,
+                "started_changed": true,
+                "threshold_changed": true,
+            })
+        );
+        let applied_snapshot = applied.snapshot.expect("applied status snapshot");
+        assert!(applied_snapshot.current_item_started);
+        assert!(applied_snapshot.session_played[0].threshold_reached);
+        assert_eq!(
+            applied_snapshot.playback_generation,
+            mounted.playback_generation
+        );
+
+        let replay = success(apply_player_status_observation(
+            &mut state,
+            mounted.playback_generation,
+            "a",
+            true,
+            50.0,
+            100.0,
+            12.0,
+        ));
+        assert!(!replay.committed);
+        assert_eq!(
+            replay.result,
+            json!({
+                "changed": false,
+                "started_changed": false,
+                "threshold_changed": false,
+            })
+        );
+        let replay_snapshot = replay.snapshot.expect("replayed status snapshot");
+        assert_eq!(replay_snapshot.revision, applied_snapshot.revision);
+        assert_eq!(
+            replay_snapshot.playback_generation,
+            mounted.playback_generation
+        );
+    }
+
+    #[test]
+    fn reset_player_rejects_old_generation_status_atomically() {
+        let mut state = AppState::default();
+        let mut initial = seed();
+        initial.current_item = Some(item("a", "BV-a", "Alice"));
+        initial.current_item_started = true;
+        initial.session_played = vec![played("a", "Alice")];
+        let mounted = initialize(&mut state, initial);
+        let reset = success(state.execute(AppStateRequest::ResetPlayer {
+            schema_version: 1,
+            now: 11.0,
+        }))
+        .snapshot
+        .expect("reset snapshot");
+        assert_eq!(reset.playback_generation, mounted.playback_generation + 1);
+        assert!(!reset.current_item_started);
+
+        let before_stale = state.data.clone();
+        let stale = failure(apply_player_status_observation(
+            &mut state,
+            mounted.playback_generation,
+            "a",
+            false,
+            75.0,
+            100.0,
+            12.0,
+        ));
+        assert_eq!(stale.error.kind, "playback_generation_mismatch");
+        assert_eq!(state.data, before_stale);
+
+        let current = success(apply_player_status_observation(
+            &mut state,
+            reset.playback_generation,
+            "a",
+            false,
+            0.0,
+            100.0,
+            13.0,
+        ));
+        let current_snapshot = current.snapshot.expect("current status snapshot");
+        assert!(current_snapshot.current_item_started);
+        assert!(!current_snapshot.session_played[0].threshold_reached);
+        assert_eq!(
+            current_snapshot.playback_generation,
+            reset.playback_generation
+        );
+    }
+
+    #[test]
+    fn same_id_new_incarnation_cannot_receive_old_generation_status_marks() {
+        let mut state = AppState::default();
+        let mut initial = seed();
+        initial.current_item = Some(item("a", "BV-old", "Alice"));
+        initial.session_played = vec![played("a", "Alice")];
+        let old = initialize(&mut state, initial);
+        let old_incarnation = old
+            .current_item
+            .expect("old current item")
+            .item_incarnation_id;
+
+        success(state.execute(AppStateRequest::RemoveItem {
+            schema_version: 1,
+            item_id: "a".to_owned(),
+            now: 11.0,
+        }));
+        let replacement = success(state.execute(AppStateRequest::AddItem {
+            requester_user_id: None,
+
+            schema_version: 1,
+            item: item("a", "BV-new", ""),
+            position: "tail".to_owned(),
+            requester_name: "Alice".to_owned(),
+            reset_av_delay: false,
+            allow_repeat: true,
+            now: 12.0,
+        }))
+        .snapshot
+        .expect("replacement snapshot");
+        assert_ne!(
+            replacement
+                .current_item
+                .as_ref()
+                .expect("replacement current item")
+                .item_incarnation_id,
+            old_incarnation
+        );
+
+        let before_stale = state.data.clone();
+        let stale = failure(apply_player_status_observation(
+            &mut state,
+            old.playback_generation,
+            "a",
+            false,
+            75.0,
+            100.0,
+            13.0,
+        ));
+        assert_eq!(stale.error.kind, "playback_generation_mismatch");
+        assert_eq!(state.data, before_stale);
+        let after = success(state.execute(AppStateRequest::Snapshot { schema_version: 1 }))
+            .snapshot
+            .expect("post-stale snapshot");
+        assert!(!after.current_item_started);
+        assert!(
+            after
+                .session_played
+                .iter()
+                .all(|entry| !entry.threshold_reached)
+        );
+    }
+
+    #[test]
+    fn previous_session_and_backup_restore_are_state_owned() {
+        let mut state = AppState::default();
+        let mut initial = seed();
+        initial.previous_session = Some(SessionArchiveSeed {
+            file_name: "played-previous.json".to_owned(),
+            session_started_at: 2.0,
+            items: vec![played("previous", "Alice")],
+        });
+        initial.backup = Some(BackupSeed {
+            current_item: Some(item("restored", "BV-restored", "Alice")),
+            playlist: vec![item("queued", "BV-queued", "Bob")],
+            played_session: Some(SessionArchiveSeed {
+                file_name: "played-backup.json".to_owned(),
+                session_started_at: 3.0,
+                items: vec![played("restored", "Alice")],
+            }),
+            updated_at: 9.0,
+        });
+        let initialized = initialize(&mut state, initial);
+        assert!(initialized.backup.available);
+        assert!(initialized.previous_session.available);
+
+        let restored = success(state.execute(AppStateRequest::RestoreBackup {
+            schema_version: 1,
+            reset_av_delay: false,
+            now: 11.0,
+        }))
+        .snapshot
+        .expect("restored snapshot");
+        assert_eq!(
+            restored
+                .current_item
+                .as_ref()
+                .map(|entry| entry.id.as_str()),
+            Some("restored")
+        );
+        assert_eq!(restored.playlist[0].id, "queued");
+        assert!(!restored.previous_session.available);
+        assert_eq!(restored.session_played[0].item_id, "restored");
+    }
+
+    #[test]
+    fn cache_attempt_reservation_is_unique_and_operational_only() {
+        let mut state = AppState::default();
+        let mut initial = seed();
+        initial.current_item = Some(item("a", "BV-a", "Alice"));
+        let before = initialize(&mut state, initial);
+
+        let (first, reserved) = begin_cache_attempt(&mut state, "a");
+        let first_reservation = cache_reservation(&reserved);
+        assert!(first > 0);
+        assert_eq!(first_reservation.item_id, "a");
+        assert!(!first_reservation.refresh);
+        assert!(valid_authoritative_identity(
+            &first_reservation.item_incarnation_id,
+            'i'
+        ));
+        assert!(valid_authoritative_identity(
+            &first_reservation.artifact_set_id,
+            'a'
+        ));
+        assert!(!reserved.committed);
+        assert_eq!(reserved.snapshot.as_ref(), Some(&before));
+        assert_eq!(
+            reserved.persistence,
+            Some(state.data.as_ref().expect("data").persistence_snapshot())
+        );
+        assert_eq!(reserved.effects, PersistenceEffects::default());
+        let (second, superseded) = begin_cache_attempt(&mut state, "a");
+        let second_reservation = cache_reservation(&superseded);
+        assert!(second > first);
+        assert_ne!(
+            first_reservation.artifact_set_id,
+            second_reservation.artifact_set_id
+        );
+        assert_eq!(
+            first_reservation.item_incarnation_id,
+            second_reservation.item_incarnation_id
+        );
+        assert!(!superseded.committed);
+        assert_eq!(superseded.snapshot.as_ref(), Some(&before));
+        assert_eq!(
+            state.data.as_ref().expect("data").active_cache_attempts["a"].token,
+            second
+        );
+    }
+
+    #[test]
+    fn cache_attempt_expected_incarnation_mismatch_is_fully_atomic() {
+        let mut state = AppState::default();
+        let mut initial = seed();
+        initial.current_item = Some(item("a", "BV-a", "Alice"));
+        initialize(&mut state, initial);
+        let data_before = state.data.clone();
+        let persistence_before = state.data.as_ref().expect("data").persistence_snapshot();
+        let token_before = state.next_cache_attempt_token;
+        let artifact_before = state.next_artifact_set_id;
+
+        let rejected = failure(state.execute(AppStateRequest::BeginCacheAttempt {
+            schema_version: 1,
+            item_id: "a".to_owned(),
+            expected_item_incarnation_id:
+                "i-00000000000000000000000000000000-0000000000000001".to_owned(),
+        }));
+
+        assert_eq!(rejected.error.kind, "item_incarnation_mismatch");
+        assert_eq!(state.next_cache_attempt_token, token_before);
+        assert_eq!(state.next_artifact_set_id, artifact_before);
+        assert_eq!(state.data, data_before);
+        assert_eq!(
+            state.data.as_ref().expect("data").persistence_snapshot(),
+            persistence_before
+        );
+        assert!(
+            state
+                .data
+                .as_ref()
+                .expect("data")
+                .active_cache_attempts
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn removed_and_readded_item_rejects_the_stale_expected_incarnation() {
+        let mut state = AppState::default();
+        let mut initial = seed();
+        initial.current_item = Some(item("a", "BV-old", "Alice"));
+        initialize(&mut state, initial);
+        let stale_item_incarnation_id = state
+            .data
+            .as_ref()
+            .and_then(|data| data.find_item("a"))
+            .expect("old item")
+            .item_incarnation_id
+            .clone();
+        success(state.execute(AppStateRequest::RemoveItem {
+            schema_version: 1,
+            item_id: "a".to_owned(),
+            now: 11.0,
+        }));
+        success(state.execute(AppStateRequest::AddItem {
+            requester_user_id: None,
+
+            schema_version: 1,
+            item: item("a", "BV-new", ""),
+            position: "tail".to_owned(),
+            requester_name: "Alice".to_owned(),
+            reset_av_delay: false,
+            allow_repeat: true,
+            now: 12.0,
+        }));
+        let data_before = state.data.clone();
+        let token_before = state.next_cache_attempt_token;
+        let artifact_before = state.next_artifact_set_id;
+
+        let rejected = failure(state.execute(AppStateRequest::BeginCacheAttempt {
+            schema_version: 1,
+            item_id: "a".to_owned(),
+            expected_item_incarnation_id: stale_item_incarnation_id,
+        }));
+
+        assert_eq!(rejected.error.kind, "item_incarnation_mismatch");
+        assert_eq!(state.next_cache_attempt_token, token_before);
+        assert_eq!(state.next_artifact_set_id, artifact_before);
+        assert_eq!(state.data, data_before);
+    }
+
+    #[test]
+    fn audio_variant_selection_rejects_reused_item_id_before_any_mutation() {
+        let mut state = AppState::default();
+        let mut initial = seed();
+        initial.current_item = Some(item("a", "BV-old", "Alice"));
+        let old = initialize(&mut state, initial);
+        let stale_incarnation = old
+            .current_item
+            .expect("old current item")
+            .item_incarnation_id;
+
+        success(state.execute(AppStateRequest::RemoveItem {
+            schema_version: 1,
+            item_id: "a".to_owned(),
+            now: 11.0,
+        }));
+        success(state.execute(AppStateRequest::AddItem {
+            requester_user_id: None,
+
+            schema_version: 1,
+            item: item("a", "BV-new", ""),
+            position: "tail".to_owned(),
+            requester_name: "Alice".to_owned(),
+            reset_av_delay: false,
+            allow_repeat: true,
+            now: 12.0,
+        }));
+        let live_incarnation = item_incarnation(&state, "a");
+        assert_ne!(live_incarnation, stale_incarnation);
+
+        let data_before = state.data.clone();
+        let persistence_before = state
+            .data
+            .as_ref()
+            .expect("state data")
+            .persistence_snapshot();
+        let item_counter_before = state.next_item_incarnation_id;
+        let artifact_counter_before = state.next_artifact_set_id;
+        let attempt_counter_before = state.next_cache_attempt_token;
+        let stale = failure(state.execute(AppStateRequest::SetAudioVariant {
+            schema_version: 1,
+            item_id: "a".to_owned(),
+            expected_item_incarnation_id: stale_incarnation,
+            variant_id: "p1_p1".to_owned(),
+            now: 13.0,
+        }));
+
+        assert_eq!(stale.error.kind, "item_incarnation_mismatch");
+        assert_eq!(state.data, data_before);
+        assert_eq!(
+            state
+                .data
+                .as_ref()
+                .expect("state data")
+                .persistence_snapshot(),
+            persistence_before
+        );
+        assert_eq!(state.next_item_incarnation_id, item_counter_before);
+        assert_eq!(state.next_artifact_set_id, artifact_counter_before);
+        assert_eq!(state.next_cache_attempt_token, attempt_counter_before);
+
+        let valid = success(state.execute(AppStateRequest::SetAudioVariant {
+            schema_version: 1,
+            item_id: "a".to_owned(),
+            expected_item_incarnation_id: live_incarnation,
+            variant_id: "p1_p1".to_owned(),
+            now: 14.0,
+        }));
+        assert!(valid.committed);
+        assert_eq!(
+            valid
+                .snapshot
+                .expect("valid selection snapshot")
+                .current_item
+                .expect("current item")
+                .selected_audio_variant_id,
+            "p1_p1"
+        );
+    }
+
+    #[test]
+    fn queued_audio_variant_preselection_uses_the_exact_item_incarnation() {
+        let mut state = AppState::default();
+        let mut initial = seed();
+        initial.current_item = Some(item("a", "BV-a", "Alice"));
+        initial.playlist = vec![item("b", "BV-b", "Bob")];
+        let initialized = initialize(&mut state, initial);
+        let generation = initialized.playback_generation;
+        let b_incarnation = item_incarnation(&state, "b");
+
+        let selected = success(state.execute(AppStateRequest::SetAudioVariant {
+            schema_version: 1,
+            item_id: "b".to_owned(),
+            expected_item_incarnation_id: b_incarnation,
+            variant_id: "p1_p1".to_owned(),
+            now: 11.0,
+        }));
+        let snapshot = selected.snapshot.expect("queued selection snapshot");
+        assert!(selected.committed);
+        assert_eq!(snapshot.playback_generation, generation);
+        assert_eq!(snapshot.current_item.expect("current").id, "a");
+        assert_eq!(snapshot.playlist[0].id, "b");
+        assert_eq!(snapshot.playlist[0].selected_audio_variant_id, "p1_p1");
+    }
+
+    #[test]
+    fn refresh_lifecycle_preserves_then_atomically_replaces_committed_artifacts() {
+        let mut state = AppState::default();
+        let mut initial = seed();
+        initial.current_item = Some(item("a", "BV-a", "Alice"));
+        initialize(&mut state, initial);
+
+        let (fill_token, fill_response) = begin_cache_attempt(&mut state, "a");
+        assert!(!cache_reservation(&fill_response).refresh);
+        let fill_ready = ready_event(
+            &state,
+            "a",
+            fill_token,
+            "video-v1.mp4",
+            &[("original", "audio-v1.m4a")],
+            "original",
+        );
+        success(apply_cache(&mut state, "a", fill_token, fill_ready, 10.5));
+        let committed_v1 = state
+            .data
+            .as_ref()
+            .expect("data")
+            .find_item("a")
+            .expect("item")
+            .clone();
+
+        let (failed_refresh, failed_response) = begin_cache_attempt(&mut state, "a");
+        assert!(cache_reservation(&failed_response).refresh);
+        for event in [
+            CacheEvent::Queued {
+                message: "refresh queued".to_owned(),
+            },
+            CacheEvent::Started {
+                message: "refresh started".to_owned(),
+            },
+            CacheEvent::Progress {
+                download: None,
+                progress: 64.0,
+                message: Some("refresh progress".to_owned()),
+            },
+        ] {
+            success(apply_cache(&mut state, "a", failed_refresh, event, 11.0));
+            let refreshing = state
+                .data
+                .as_ref()
+                .expect("data")
+                .find_item("a")
+                .expect("item");
+            assert_eq!(refreshing.cache_status, "ready");
+            assert_eq!(
+                (
+                    &refreshing.video_relative_path,
+                    &refreshing.video_media_url,
+                    &refreshing.audio_variants,
+                    &refreshing.selected_audio_variant_id,
+                    &refreshing.artifact_set_id,
+                    &refreshing.artifact_relative_directory,
+                ),
+                (
+                    &committed_v1.video_relative_path,
+                    &committed_v1.video_media_url,
+                    &committed_v1.audio_variants,
+                    &committed_v1.selected_audio_variant_id,
+                    &committed_v1.artifact_set_id,
+                    &committed_v1.artifact_relative_directory,
+                )
+            );
+        }
+        success(apply_cache(
+            &mut state,
+            "a",
+            failed_refresh,
+            CacheEvent::Failed {
+                message: "refresh failed".to_owned(),
+            },
+            12.0,
+        ));
+        let after_failure = state
+            .data
+            .as_ref()
+            .expect("data")
+            .find_item("a")
+            .expect("item");
+        assert_eq!(after_failure.cache_status, "ready");
+        assert_eq!(after_failure.artifact_set_id, committed_v1.artifact_set_id);
+
+        let (cancelled_refresh, _) = begin_cache_attempt(&mut state, "a");
+        success(apply_cache(
+            &mut state,
+            "a",
+            cancelled_refresh,
+            CacheEvent::Cancelled {
+                message: "refresh cancelled".to_owned(),
+            },
+            13.0,
+        ));
+        assert_eq!(
+            state
+                .data
+                .as_ref()
+                .expect("data")
+                .find_item("a")
+                .expect("item")
+                .artifact_set_id,
+            committed_v1.artifact_set_id
+        );
+
+        let (successful_refresh, refresh_response) = begin_cache_attempt(&mut state, "a");
+        let refresh_reservation = cache_reservation(&refresh_response);
+        assert!(refresh_reservation.refresh);
+        assert_ne!(
+            refresh_reservation.artifact_set_id,
+            committed_v1.artifact_set_id
+        );
+        let refresh_ready = ready_event(
+            &state,
+            "a",
+            successful_refresh,
+            "video-v2.mp4",
+            &[("original", "audio-v2.m4a")],
+            "original",
+        );
+        success(apply_cache(
+            &mut state,
+            "a",
+            successful_refresh,
+            refresh_ready,
+            14.0,
+        ));
+        let committed_v2 = state
+            .data
+            .as_ref()
+            .expect("data")
+            .find_item("a")
+            .expect("item");
+        assert_eq!(
+            committed_v2.artifact_set_id,
+            refresh_reservation.artifact_set_id
+        );
+        assert_ne!(committed_v2.video_media_url, committed_v1.video_media_url);
+
+        let (reset_token, _) = begin_cache_attempt(&mut state, "a");
+        success(apply_cache(
+            &mut state,
+            "a",
+            reset_token,
+            CacheEvent::Reset {
+                message: "explicit reset".to_owned(),
+                clear_selected_audio_variant: true,
+            },
+            15.0,
+        ));
+        let reset = state
+            .data
+            .as_ref()
+            .expect("data")
+            .find_item("a")
+            .expect("item");
+        assert_eq!(reset.cache_status, "pending");
+        assert!(reset.artifact_set_id.is_empty());
+        assert!(reset.video_media_url.is_empty());
+    }
+
+    #[test]
+    fn artifact_identity_exhaustion_is_atomic() {
+        let mut state = AppState::default();
+        let mut initial = seed();
+        initial.current_item = Some(item("a", "BV-a", "Alice"));
+        initialize(&mut state, initial);
+        state.next_artifact_set_id = u64::MAX;
+        let data_before = state.data.clone();
+        let token_before = state.next_cache_attempt_token;
+        let expected_item_incarnation_id = state
+            .data
+            .as_ref()
+            .and_then(|data| data.find_item("a"))
+            .expect("item")
+            .item_incarnation_id
+            .clone();
+        let rejected = failure(state.execute(AppStateRequest::BeginCacheAttempt {
+            schema_version: 1,
+            item_id: "a".to_owned(),
+            expected_item_incarnation_id,
+        }));
+        assert_eq!(rejected.error.kind, "artifact_set_id_exhausted");
+        assert_eq!(state.next_artifact_set_id, u64::MAX);
+        assert_eq!(state.next_cache_attempt_token, token_before);
+        assert_eq!(state.data, data_before);
+    }
+
+    #[test]
+    fn cache_attempt_acceptance_requires_exact_live_ownership() {
+        let mut state = AppState::default();
+        let mut initial = seed();
+        initial.current_item = Some(item("a", "BV-a", "Alice"));
+        initial.playlist = vec![item("b", "BV-b", "Bob")];
+        let before = initialize(&mut state, initial);
+        let (old, _) = begin_cache_attempt(&mut state, "a");
+        let (current, _) = begin_cache_attempt(&mut state, "a");
+        let (other, _) = begin_cache_attempt(&mut state, "b");
+        let allocator_before = state.next_cache_attempt_token;
+        let attempts_before = state
+            .data
+            .as_ref()
+            .expect("data")
+            .active_cache_attempts
+            .clone();
+
+        for (token, expected_kind) in [
+            (0, "invalid_cache_attempt_token"),
+            (allocator_before + 1, "unissued_cache_attempt_token"),
+            (old, "cache_attempt_superseded"),
+            (other, "cache_attempt_wrong_item"),
+        ] {
+            let rejected = failure(apply_cache(
+                &mut state,
+                "a",
+                token,
+                CacheEvent::Progress {
+                    download: None,
+                    progress: 50.0,
+                    message: Some("stale".to_owned()),
+                },
+                11.0,
+            ));
+            assert_eq!(rejected.error.kind, expected_kind);
+            assert_eq!(state.next_cache_attempt_token, allocator_before);
+            assert_eq!(
+                state.data.as_ref().expect("data").active_cache_attempts,
+                attempts_before
+            );
+            let snapshot = success(state.execute(AppStateRequest::Snapshot { schema_version: 1 }))
+                .snapshot
+                .expect("snapshot");
+            assert_eq!(snapshot, before);
+        }
+
+        let applied = success(apply_cache(
+            &mut state,
+            "a",
+            current,
+            CacheEvent::Progress {
+                download: None,
+                progress: 50.0,
+                message: Some("current".to_owned()),
+            },
+            12.0,
+        ));
+        assert!(applied.committed);
+    }
+
+    #[test]
+    fn removed_and_reused_item_ids_never_inherit_old_attempts() {
+        let mut state = AppState::default();
+        let mut initial = seed();
+        initial.current_item = Some(item("a", "BV-old", "Alice"));
+        initialize(&mut state, initial);
+        let (old, old_response) = begin_cache_attempt(&mut state, "a");
+        let old_reservation = cache_reservation(&old_response);
+        success(state.execute(AppStateRequest::RemoveItem {
+            schema_version: 1,
+            item_id: "a".to_owned(),
+            now: 11.0,
+        }));
+        assert!(
+            !state
+                .data
+                .as_ref()
+                .expect("data")
+                .active_cache_attempts
+                .contains_key("a")
+        );
+        let removed = failure(apply_cache(
+            &mut state,
+            "a",
+            old,
+            CacheEvent::Failed {
+                message: "removed failure".to_owned(),
+            },
+            11.5,
+        ));
+        assert_eq!(removed.error.kind, "cache_attempt_not_active");
+        success(state.execute(AppStateRequest::AddItem {
+            requester_user_id: None,
+
+            schema_version: 1,
+            item: item("a", "BV-new", ""),
+            position: "tail".to_owned(),
+            requester_name: "Alice".to_owned(),
+            reset_av_delay: false,
+            allow_repeat: true,
+            now: 12.0,
+        }));
+        let (_new, new_response) = begin_cache_attempt(&mut state, "a");
+        let new_reservation = cache_reservation(&new_response);
+        assert_ne!(
+            old_reservation.item_incarnation_id,
+            new_reservation.item_incarnation_id
+        );
+        assert_ne!(
+            old_reservation.artifact_set_id,
+            new_reservation.artifact_set_id
+        );
+        let rejected = failure(apply_cache(
+            &mut state,
+            "a",
+            old,
+            CacheEvent::Failed {
+                message: "old failure".to_owned(),
+            },
+            13.0,
+        ));
+        assert_eq!(rejected.error.kind, "cache_attempt_superseded");
+        assert_eq!(
+            state
+                .data
+                .as_ref()
+                .expect("data")
+                .find_item("a")
+                .expect("re-added item")
+                .bvid,
+            "BV-new"
+        );
+    }
+
+    #[test]
+    fn clearing_or_replacing_live_items_clears_their_attempt_bindings() {
+        let mut state = AppState::default();
+        let mut initial = seed();
+        initial.current_item = Some(item("a", "BV-a", "Alice"));
+        initial.playlist = vec![item("b", "BV-b", "Bob")];
+        initialize(&mut state, initial);
+        let (current_token, _) = begin_cache_attempt(&mut state, "a");
+        let (queued_token, _) = begin_cache_attempt(&mut state, "b");
+
+        success(state.execute(AppStateRequest::ClearPlaylist {
+            schema_version: 1,
+            now: 11.0,
+        }));
+        let queued_rejection = failure(apply_cache(
+            &mut state,
+            "b",
+            queued_token,
+            CacheEvent::Failed {
+                message: "cleared".to_owned(),
+            },
+            12.0,
+        ));
+        assert_eq!(queued_rejection.error.kind, "cache_attempt_not_active");
+        assert_eq!(
+            state.data.as_ref().expect("data").active_cache_attempts["a"].token,
+            current_token
+        );
+
+        success(state.execute(AppStateRequest::BeginSession {
+            schema_version: 1,
+            new_session: SessionArchiveSeed {
+                file_name: "next.json".to_owned(),
+                session_started_at: 13.0,
+                items: Vec::new(),
+            },
+            now: 13.0,
+        }));
+        assert!(
+            state
+                .data
+                .as_ref()
+                .expect("data")
+                .active_cache_attempts
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn cache_attempt_tokens_survive_shutdown_reinitialize_and_overflow_atomically() {
+        let mut state = AppState::default();
+        let mut initial = seed();
+        initial.current_item = Some(item("a", "BV-a", "Alice"));
+        let first_lifecycle = initialize(&mut state, initial.clone());
+        assert_eq!(first_lifecycle.playback_generation, 1);
+        let (first, first_response) = begin_cache_attempt(&mut state, "a");
+        let first_reservation = cache_reservation(&first_response);
+        let shutdown = success(state.execute(AppStateRequest::Shutdown { schema_version: 1 }));
+        assert!(shutdown.snapshot.is_none());
+        let second_lifecycle = initialize(&mut state, initial);
+        assert_eq!(second_lifecycle.playback_generation, 1);
+        let (second, second_response) = begin_cache_attempt(&mut state, "a");
+        let second_reservation = cache_reservation(&second_response);
+        assert!(second > first);
+        assert_ne!(
+            first_reservation.item_incarnation_id,
+            second_reservation.item_incarnation_id
+        );
+        let stale = failure(apply_cache(
+            &mut state,
+            "a",
+            first,
+            CacheEvent::Failed {
+                message: "previous lifetime".to_owned(),
+            },
+            11.0,
+        ));
+        assert_eq!(stale.error.kind, "cache_attempt_superseded");
+
+        state.next_cache_attempt_token = u64::MAX;
+        let data_before = state.data.clone();
+        let expected_item_incarnation_id = state
+            .data
+            .as_ref()
+            .and_then(|data| data.find_item("a"))
+            .expect("item")
+            .item_incarnation_id
+            .clone();
+        let rejected = failure(state.execute(AppStateRequest::BeginCacheAttempt {
+            schema_version: 1,
+            item_id: "a".to_owned(),
+            expected_item_incarnation_id,
+        }));
+        assert_eq!(rejected.error.kind, "cache_attempt_token_exhausted");
+        assert_eq!(state.next_cache_attempt_token, u64::MAX);
+        assert_eq!(state.data, data_before);
+    }
+
+    #[test]
+    fn terminal_cache_publications_settle_once_and_replay_exactly() {
+        let mut state = AppState::default();
+        let mut initial = seed();
+        initial.current_item = Some(item("a", "BV-a", "Alice"));
+        initialize(&mut state, initial);
+        let (token, _) = begin_cache_attempt(&mut state, "a");
+        let terminal = CacheEvent::Failed {
+            message: "network failed".to_owned(),
+        };
+        let accepted = success(apply_cache(&mut state, "a", token, terminal.clone(), 11.0));
+        assert!(accepted.committed);
+        let accepted_snapshot = accepted.snapshot.expect("accepted snapshot");
+
+        let replay = success(apply_cache(&mut state, "a", token, terminal, 12.0));
+        assert!(!replay.committed);
+        assert_eq!(replay.result["replayed"], json!(true));
+        assert_eq!(replay.effects, PersistenceEffects::default());
+        assert_eq!(replay.snapshot, Some(accepted_snapshot.clone()));
+
+        for (event, expected_kind) in [
+            (
+                CacheEvent::Failed {
+                    message: "different failure".to_owned(),
+                },
+                "cache_terminal_conflict",
+            ),
+            (
+                CacheEvent::Cancelled {
+                    message: "different terminal".to_owned(),
+                },
+                "cache_terminal_conflict",
+            ),
+            (
+                CacheEvent::Progress {
+                    download: None,
+                    progress: 60.0,
+                    message: None,
+                },
+                "cache_attempt_already_terminal",
+            ),
+        ] {
+            let rejected = failure(apply_cache(&mut state, "a", token, event, 13.0));
+            assert_eq!(rejected.error.kind, expected_kind);
+            let snapshot = success(state.execute(AppStateRequest::Snapshot { schema_version: 1 }))
+                .snapshot
+                .expect("snapshot");
+            assert_eq!(snapshot, accepted_snapshot);
+        }
+    }
+
+    #[test]
+    fn generic_update_item_is_metadata_only_and_preserves_committed_descriptor() {
+        let mut state = AppState::default();
+        let mut initial = seed();
+        initial.current_item = Some(item("a", "BV-a", "Alice"));
+        initialize(&mut state, initial);
+        let (token, _) = begin_cache_attempt(&mut state, "a");
+        let ready = ready_event(
+            &state,
+            "a",
+            token,
+            "committed.mp4",
+            &[("original", "committed.m4a")],
+            "original",
+        );
+        success(apply_cache(&mut state, "a", token, ready, 11.0));
+        let before = state
+            .data
+            .as_ref()
+            .expect("data")
+            .find_item("a")
+            .expect("item")
+            .clone();
+
+        success(state.execute(AppStateRequest::UpdateItem {
+            schema_version: 1,
+            item_id: "a".to_owned(),
+            changes: PlaylistItemPatch {
+                title: Some("enriched title".to_owned()),
+                part_title: Some("enriched part".to_owned()),
+                display_title: Some("enriched display".to_owned()),
+                cover_url: Some("https://example.test/cover.jpg".to_owned()),
+                embed_url: Some("https://example.test/embed".to_owned()),
+                owner_mid: Some(42),
+                owner_name: Some("enriched owner".to_owned()),
+                owner_url: Some("https://example.test/owner".to_owned()),
+            },
+            persist_backup: false,
+            now: 12.0,
+        }));
+        let after = state
+            .data
+            .as_ref()
+            .expect("data")
+            .find_item("a")
+            .expect("item");
+        assert_eq!(after.title, "enriched title");
+        assert_eq!(after.owner_name, "enriched owner");
+
+        let before_value = serde_json::to_value(&before).expect("serialize before item");
+        let after_value = serde_json::to_value(after).expect("serialize after item");
+        let protected_fields = [
+            "original_url",
+            "resolved_url",
+            "bvid",
+            "aid",
+            "cid",
+            "page",
+            "selected_pages",
+            "selected_cids",
+            "selected_durations",
+            "selected_parts",
+            "available_pages",
+            "available_cids",
+            "available_durations",
+            "available_parts",
+            "video_page",
+            "manual_selection",
+            "audio_variants",
+            "selected_audio_variant_id",
+            "cache_status",
+            "cache_progress",
+            "cache_activity_at",
+            "cache_download_current_bytes",
+            "cache_download_total_bytes",
+            "cache_download_tracks",
+            "cache_message",
+            "video_relative_path",
+            "video_media_url",
+            "item_incarnation_id",
+            "artifact_set_id",
+            "artifact_relative_directory",
+        ];
+        for field in protected_fields {
+            assert_eq!(before_value[field], after_value[field], "changed {field}");
+            let mut changes = Map::new();
+            changes.insert(field.to_owned(), before_value[field].clone());
+            let request = json!({
+                "command": "update_item",
+                "schema_version": 1,
+                "item_id": "a",
+                "changes": changes,
+                "persist_backup": false,
+                "now": 13.0,
+            });
+            assert!(
+                serde_json::from_value::<AppStateRequest>(request).is_err(),
+                "UpdateItem accepted protected field {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn added_audio_preselection_survives_admission_and_cache_publication() {
+        for (video_page, parts, ids) in [
+            (
+                2,
+                ["Off Vocal", "On Vocal"],
+                ["p1_off_vocal", "p2_on_vocal"],
+            ),
+            (
+                1,
+                ["on vocal", "off vocal"],
+                ["p1_on_vocal", "p2_off_vocal"],
+            ),
+            (2, ["伴奏", "原唱"], ["p1_track_1", "p2_track_2"]),
+        ] {
+            let mut state = AppState::default();
+            initialize(&mut state, seed());
+            for (id, bvid) in [("current", "BV-current"), ("queued", "BV-queued")] {
+                let mut requested = item(id, bvid, "");
+                requested.page = video_page;
+                requested.video_page = video_page;
+                requested.selected_pages = vec![1, 2];
+                requested.selected_parts = parts.map(str::to_owned).to_vec();
+                requested.selected_cids = vec![10, 20];
+                requested.selected_durations = vec![120, 120];
+                requested.available_pages = requested.selected_pages.clone();
+                requested.available_parts = requested.selected_parts.clone();
+                requested.available_cids = requested.selected_cids.clone();
+                requested.available_durations = requested.selected_durations.clone();
+                let selected_id = ids[video_page as usize - 1];
+                requested.selected_audio_variant_id = selected_id.to_owned();
+                // Admission must still discard caller-supplied cached media.
+                let caller_incarnation = "i-00000000000000000000000000000001-0000000000000001";
+                requested.item_incarnation_id = caller_incarnation.to_owned();
+                requested.video_relative_path = "old-video.mp4".to_owned();
+                requested.video_media_url = "/media/old-video.mp4".to_owned();
+                success(state.execute(AppStateRequest::AddItem {
+                    requester_user_id: None,
+
+                    schema_version: 1,
+                    item: requested,
+                    position: "tail".to_owned(),
+                    requester_name: "Alice".to_owned(),
+                    reset_av_delay: false,
+                    allow_repeat: false,
+                    now: 11.0,
+                }));
+                let admitted = state.data.as_ref().unwrap().find_item(id).unwrap();
+                assert_eq!(admitted.selected_audio_variant_id, selected_id);
+                assert!(valid_authoritative_identity(
+                    &admitted.item_incarnation_id,
+                    'i'
+                ));
+                assert_ne!(admitted.item_incarnation_id, caller_incarnation);
+                assert_eq!(admitted.cache_status, "pending");
+                assert!(admitted.video_relative_path.is_empty());
+                assert!(admitted.video_media_url.is_empty());
+                assert!(admitted.audio_variants.is_empty());
+                assert!(admitted.artifact_set_id.is_empty());
+                let (token, _) = begin_cache_attempt(&mut state, id);
+                success(apply_cache(
+                    &mut state,
+                    id,
+                    token,
+                    CacheEvent::Started {
+                        message: "downloading".to_owned(),
+                    },
+                    12.0,
+                ));
+                let ready = ready_event(
+                    &state,
+                    id,
+                    token,
+                    "video.mp4",
+                    &[(ids[0], "first.m4a"), (ids[1], "second.m4a")],
+                    ids[0],
+                );
+                success(apply_cache(&mut state, id, token, ready, 13.0));
+                let cached = state.data.as_ref().unwrap().find_item(id).unwrap();
+                assert_eq!(cached.cache_status, "ready");
+                assert_eq!(cached.selected_audio_variant_id, selected_id);
+            }
+        }
+    }
+
+    #[test]
+    fn ready_preserves_newer_selection_then_uses_proposal_then_first_variant() {
+        let mut state = AppState::default();
+        let mut initial = seed();
+        initial.current_item = Some(item("a", "BV-a", "Alice"));
+        initialize(&mut state, initial);
+
+        let (initial_fill, _) = begin_cache_attempt(&mut state, "a");
+        let initial_ready = ready_event(
+            &state,
+            "a",
+            initial_fill,
+            "initial.mp4",
+            &[
+                ("original", "initial-original.m4a"),
+                ("accompaniment", "initial-accompaniment.m4a"),
+            ],
+            "original",
+        );
+        success(apply_cache(
+            &mut state,
+            "a",
+            initial_fill,
+            initial_ready,
+            10.5,
+        ));
+        let a_incarnation = item_incarnation(&state, "a");
+        success(state.execute(AppStateRequest::SetAudioVariant {
+            schema_version: 1,
+            item_id: "a".to_owned(),
+            expected_item_incarnation_id: a_incarnation,
+            variant_id: "accompaniment".to_owned(),
+            now: 11.0,
+        }));
+        let (first, _) = begin_cache_attempt(&mut state, "a");
+        let first_ready = ready_event(
+            &state,
+            "a",
+            first,
+            "first.mp4",
+            &[
+                ("original", "first-original.m4a"),
+                ("accompaniment", "first-accompaniment.m4a"),
+            ],
+            "original",
+        );
+        let preserved = success(apply_cache(&mut state, "a", first, first_ready, 12.0));
+        assert_eq!(
+            preserved
+                .snapshot
+                .as_ref()
+                .expect("snapshot")
+                .current_item
+                .as_ref()
+                .expect("current")
+                .selected_audio_variant_id,
+            "accompaniment"
+        );
+
+        let (second, _) = begin_cache_attempt(&mut state, "a");
+        let second_ready = ready_event(
+            &state,
+            "a",
+            second,
+            "second.mp4",
+            &[("first", "second-first.m4a"), ("proposal", "proposal.m4a")],
+            "proposal",
+        );
+        let proposed = success(apply_cache(&mut state, "a", second, second_ready, 14.0));
+        assert_eq!(
+            proposed
+                .snapshot
+                .as_ref()
+                .expect("snapshot")
+                .current_item
+                .as_ref()
+                .expect("current")
+                .selected_audio_variant_id,
+            "proposal"
+        );
+
+        let (third, _) = begin_cache_attempt(&mut state, "a");
+        let third_ready = ready_event(
+            &state,
+            "a",
+            third,
+            "third.mp4",
+            &[
+                ("deterministic-first", "first.m4a"),
+                ("second", "second.m4a"),
+            ],
+            "missing-proposal",
+        );
+        let fallback = success(apply_cache(&mut state, "a", third, third_ready, 16.0));
+        assert_eq!(
+            fallback
+                .snapshot
+                .as_ref()
+                .expect("snapshot")
+                .current_item
+                .as_ref()
+                .expect("current")
+                .selected_audio_variant_id,
+            "deterministic-first"
+        );
+    }
+
+    #[test]
+    fn invalid_ready_payloads_leave_projection_and_attempt_unsettled() {
+        let mut state = AppState::default();
+        let mut initial = seed();
+        initial.current_item = Some(item("a", "BV-a", "Alice"));
+        let initial_snapshot = initialize(&mut state, initial);
+        let (token, _) = begin_cache_attempt(&mut state, "a");
+        let allocator = state.next_cache_attempt_token;
+
+        let duplicate = ready_event(
+            &state,
+            "a",
+            token,
+            "duplicate.mp4",
+            &[("same", "one.m4a"), ("same", "two.m4a")],
+            "same",
+        );
+        let mut empty_path = ready_event(&state, "a", token, "video.mp4", &[("a", "a.m4a")], "a");
+        let mut empty_video_url = empty_path.clone();
+        let mut empty_variant_id = empty_path.clone();
+        let mut empty_audio_url = empty_path.clone();
+        let mut encoded_traversal = empty_path.clone();
+        let mut malformed_proposal = empty_path.clone();
+        let mut missing_identity = empty_path.clone();
+        let mut duplicate_artifact_path = empty_path.clone();
+        let mut contradictory_directory = empty_path.clone();
+        if let CacheEvent::Ready {
+            video_relative_path,
+            ..
+        } = &mut empty_path
+        {
+            video_relative_path.clear();
+        }
+        if let CacheEvent::Ready {
+            video_media_url, ..
+        } = &mut empty_video_url
+        {
+            video_media_url.clear();
+        }
+        if let CacheEvent::Ready { audio_variants, .. } = &mut empty_variant_id {
+            audio_variants[0].insert("id".to_owned(), json!(""));
+        }
+        if let CacheEvent::Ready { audio_variants, .. } = &mut empty_audio_url {
+            audio_variants[0].insert("audio_url".to_owned(), json!(""));
+        }
+        if let CacheEvent::Ready {
+            video_media_url, ..
+        } = &mut encoded_traversal
+        {
+            *video_media_url = "/media/a/%2e%2e/outside.mp4".to_owned();
+        }
+        if let CacheEvent::Ready {
+            selected_audio_variant_id,
+            ..
+        } = &mut malformed_proposal
+        {
+            *selected_audio_variant_id = "bad\0proposal".to_owned();
+        }
+        if let CacheEvent::Ready {
+            artifact_set_id, ..
+        } = &mut missing_identity
+        {
+            artifact_set_id.clear();
+        }
+        if let CacheEvent::Ready {
+            video_media_url,
+            audio_variants,
+            ..
+        } = &mut duplicate_artifact_path
+        {
+            audio_variants[0].insert("audio_url".to_owned(), json!(video_media_url));
+        }
+        if let CacheEvent::Ready {
+            artifact_relative_directory,
+            ..
+        } = &mut contradictory_directory
+        {
+            artifact_relative_directory.push_str("/different");
+        }
+
+        for event in [
+            duplicate,
+            empty_path,
+            empty_video_url,
+            empty_variant_id,
+            empty_audio_url,
+            encoded_traversal,
+            malformed_proposal,
+            missing_identity,
+            duplicate_artifact_path,
+            contradictory_directory,
+        ] {
+            let rejected = failure(apply_cache(&mut state, "a", token, event, 11.0));
+            assert!(matches!(
+                rejected.error.kind.as_str(),
+                "invalid_cache_ready"
+                    | "duplicate_audio_variant_id"
+                    | "duplicate_artifact_path"
+                    | "cache_publication_identity_mismatch"
+            ));
+            assert_eq!(state.next_cache_attempt_token, allocator);
+            let data = state.data.as_ref().expect("data");
+            assert_eq!(data.snapshot().expect("valid snapshot"), initial_snapshot);
+            assert!(data.active_cache_attempts["a"].terminal_event.is_none());
+        }
+    }
+
+    #[test]
+    fn concurrent_callers_share_one_serial_authority() {
+        let state = Arc::new(Mutex::new(AppState::default()));
+        initialize(&mut state.lock().expect("lock"), seed());
+        let mut workers = Vec::new();
+        for value in 1..=8 {
+            let state = Arc::clone(&state);
+            workers.push(thread::spawn(move || {
+                state
+                    .lock()
+                    .expect("lock")
+                    .execute(AppStateRequest::SetVolume {
+                        schema_version: 1,
+                        volume_percent: value,
+                        expected_item_incarnation_id: None,
+                        now: 10.0 + f64::from(value),
+                    })
+            }));
+        }
+        for worker in workers {
+            assert!(matches!(
+                worker.join().expect("worker"),
+                AppStateResponse::Success(_)
+            ));
+        }
+        let snapshot = success(
+            state
+                .lock()
+                .expect("lock")
+                .execute(AppStateRequest::Snapshot { schema_version: 1 }),
+        )
+        .snapshot
+        .expect("snapshot");
+        assert_eq!(snapshot.revision, 9);
+    }
+
+    #[test]
+    fn request_contract_distinguishes_invalid_uninitialized_and_shutdown() {
+        let invalid: Value =
+            serde_json::from_str(&execute_app_state_json("{}")).expect("invalid response JSON");
+        assert_eq!(invalid["status"], "invalid_request");
+        let legacy_generation: Value = serde_json::from_str(&execute_app_state_json(
+            r#"{"command":"apply_cache_event","schema_version":1,"item_id":"a","generation":0,"event":{"kind":"queued","message":"legacy"},"now":1.0}"#,
+        ))
+        .expect("legacy generation response JSON");
+        assert_eq!(legacy_generation["status"], "invalid_request");
+
+        let mut state = AppState::default();
+        let uninitialized = failure(state.execute(AppStateRequest::Snapshot { schema_version: 1 }));
+        assert_eq!(uninitialized.status, "uninitialized");
+        initialize(&mut state, seed());
+        let shutdown = success(state.execute(AppStateRequest::Shutdown { schema_version: 1 }));
+        assert!(shutdown.committed);
+        let after = failure(state.execute(AppStateRequest::Snapshot { schema_version: 1 }));
+        assert_eq!(after.status, "uninitialized");
+    }
+}

@@ -5,10 +5,29 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from bilikara import config
+from bilikara import config, launcher, media_cli
 
 
 class ConfigPathTest(unittest.TestCase):
+    def test_no_cli_frozen_paths_and_logging_keep_product_home(self):
+        with TemporaryDirectory() as directory, patch.dict(os.environ, {"HOME": "/Users/fake", "USERPROFILE": "C:\\Users\\fake"}, clear=True), \
+             patch.object(config.sys, "frozen", True, create=True), \
+             patch.object(config.sys, "executable", str(Path(directory) / "bilikara")), \
+             patch.object(media_cli, "DISABLED", True):
+            for platform in ("win32", "darwin", "linux"):
+                with self.subTest(platform=platform), patch.object(config.sys, "platform", platform):
+                    # Frozen executable lookup resolves macOS directory aliases
+                    # and Windows short names before choosing the runtime home.
+                    expected = (Path("~/Library/Application Support/bilikara").expanduser()
+                                if platform == "darwin" else Path(directory).resolve() / "runtime")
+                    self.assertEqual(config._default_app_home(), expected)
+                    self.assertEqual(launcher._fallback_app_home(), expected)
+                    override = Path(directory) / "explicit-home"
+                    with patch.dict(os.environ, {"BILIKARA_HOME": str(override)}):
+                        self.assertEqual(config._default_app_home(), override)
+                        self.assertEqual(launcher._fallback_app_home(), override)
+                        self.assertEqual(launcher.startup_log_path(), override / "data/logs/startup.log")
+
     def test_frozen_build_defaults_to_runtime_within_app_folder(self):
         with TemporaryDirectory() as temp_dir:
             fake_executable = Path(temp_dir) / "bilikara.exe"
@@ -91,33 +110,32 @@ class ConfigPathTest(unittest.TestCase):
                         with patch("bilikara.config.subprocess.run", side_effect=AssertionError("git should not run")):
                             self.assertEqual(config._detect_app_version(), "v0.4.0")
 
-    def test_pick_windows_physical_host_prefers_non_virtual_adapter_with_gateway(self):
-        payload = [
-            {
-                "InterfaceAlias": "vEthernet (WSL)",
-                "InterfaceDescription": "Hyper-V Virtual Ethernet Adapter",
-                "IPv4Address": [{"IPAddress": "172.18.0.1"}],
-                "IPv4DefaultGateway": [],
-            },
-            {
-                "InterfaceAlias": "Wi-Fi",
-                "InterfaceDescription": "Intel Wi-Fi Adapter",
-                "IPv4Address": [{"IPAddress": "192.168.31.8"}],
-                "IPv4DefaultGateway": [{"NextHop": "192.168.31.1"}],
-            },
-        ]
-        self.assertEqual(config._pick_windows_physical_host(payload), "192.168.31.8")
+    def test_detect_windows_host_uses_first_rust_result_including_virtual_address(self):
+        for addresses in (["192.168.31.8", "192.168.31.9"], ["172.28.32.1", "192.168.31.8"]):
+            with self.subTest(addresses=addresses):
+                with patch("bilikara.rust_runtime.detect_lan_ipv4_addresses", return_value=addresses) as detect:
+                    self.assertEqual(config._detect_windows_physical_host(), addresses[0])
+                detect.assert_called_once_with(platform_name="win32")
 
-    def test_pick_windows_physical_host_returns_none_for_virtual_only_candidates(self):
-        payload = [
-            {
-                "InterfaceAlias": "vEthernet (Default Switch)",
-                "InterfaceDescription": "Hyper-V Virtual Ethernet Adapter",
-                "IPv4Address": [{"IPAddress": "172.28.32.1"}],
-                "IPv4DefaultGateway": [{"NextHop": "172.28.32.254"}],
-            }
-        ]
-        self.assertIsNone(config._pick_windows_physical_host(payload))
+    def test_detect_windows_host_returns_none_for_empty_rust_result(self):
+        with patch("bilikara.rust_runtime.detect_lan_ipv4_addresses", return_value=[]) as detect:
+            self.assertIsNone(config._detect_windows_physical_host())
+        detect.assert_called_once_with(platform_name="win32")
+
+    def test_detect_windows_host_returns_none_on_detection_exception(self):
+        with patch("bilikara.rust_runtime.detect_lan_ipv4_addresses", side_effect=RuntimeError("unavailable")) as detect:
+            self.assertIsNone(config._detect_windows_physical_host())
+        detect.assert_called_once_with(platform_name="win32")
+
+    def test_windows_frozen_uses_rust_virtual_last_resort(self):
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(config.sys, "frozen", True, create=True),
+            patch.object(config.os, "name", "nt"),
+            patch("bilikara.rust_runtime.detect_lan_ipv4_addresses", return_value=["172.28.32.1"]) as detect,
+        ):
+            self.assertEqual(config._default_host(), "172.28.32.1")
+        detect.assert_called_once_with(platform_name="win32")
 
 
 if __name__ == "__main__":

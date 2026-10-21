@@ -46,6 +46,7 @@ pub struct PlaylistOrderPlan {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlaylistIdentity {
+    pub media_source: crate::media_source::MediaSource,
     pub bvid: String,
     pub aid: u64,
     pub video_page: usize,
@@ -284,7 +285,8 @@ pub fn plan_playlist_order(
 }
 
 fn validate_identity(identity: &PlaylistIdentity) -> Result<(), PlaylistPlanError> {
-    if !valid_string(&identity.bvid, MAX_STRING_BYTES, true)
+    if !identity.media_source.is_valid()
+        || !valid_string(&identity.bvid, MAX_STRING_BYTES, true)
         || identity.video_page == 0
         || identity.selected_audio_pages.len() > MAX_AUDIO_PAGES
     {
@@ -295,6 +297,16 @@ fn validate_identity(identity: &PlaylistIdentity) -> Result<(), PlaylistPlanErro
 
 fn playlist_identity_key(identity: &PlaylistIdentity) -> Result<String, PlaylistPlanError> {
     validate_identity(identity)?;
+    if let crate::media_source::MediaSource::YouTube { video_id } = &identity.media_source {
+        if !identity.bvid.is_empty()
+            || identity.aid != 0
+            || identity.video_page != 1
+            || identity.selected_audio_pages.iter().any(|page| *page != 1)
+        {
+            return Err(PlaylistPlanError::InvalidIdentity);
+        }
+        return Ok(format!("youtube:{video_id}"));
+    }
     let mut key = if identity.bvid.is_empty() {
         format!("aid:{}:p{}", identity.aid, identity.video_page)
     } else {
@@ -457,6 +469,8 @@ pub(crate) fn plan_playlist_order_json(request_json: &str) -> Option<String> {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PlaylistIdentityWire {
+    #[serde(default)]
+    media_source: crate::media_source::MediaSource,
     bvid: String,
     aid: u64,
     video_page: usize,
@@ -499,6 +513,7 @@ struct PlaylistDuplicateResponseWire {
 impl From<PlaylistIdentityWire> for PlaylistIdentity {
     fn from(value: PlaylistIdentityWire) -> Self {
         Self {
+            media_source: value.media_source,
             bvid: value.bvid,
             aid: value.aid,
             video_page: value.video_page,
@@ -549,6 +564,14 @@ pub(crate) fn decide_playlist_duplicate_json(request_json: &str) -> Option<Strin
 mod tests {
     use super::*;
 
+    #[test]
+    fn youtube_duplicate_identity_is_source_scoped() {
+        let request = r#"{"schema_version":1,"candidate":{"media_source":{"provider":"youtube","video_id":"YE7VzlLtp-4"},"bvid":"","aid":0,"video_page":1,"selected_audio_pages":[1]},"current_item":null,"queued_items":[],"history_entries":[]}"#;
+        let result = decide_playlist_duplicate_json(request).expect("YouTube identity");
+        let value: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(value["identity_key"], "youtube:YE7VzlLtp-4");
+    }
+
     fn item(index: usize, id: &str, requester: &str, slot: PlaylistSlotType) -> PlaylistOrderItem {
         PlaylistOrderItem {
             original_index: index,
@@ -570,10 +593,80 @@ mod tests {
 
     fn identity(bvid: &str, aid: u64, page: usize, audio: &[i64]) -> PlaylistIdentity {
         PlaylistIdentity {
+            media_source: Default::default(),
             bvid: bvid.into(),
             aid,
             video_page: page,
             selected_audio_pages: audio.to_vec(),
+        }
+    }
+
+    #[test]
+    fn ordering_golden_cases_preserve_empty_rotation_uneven_rounds_and_insertion() {
+        let mut empty = rebuild(vec![]);
+        empty.session_users.clear();
+        assert!(
+            plan_playlist_order(empty.clone())
+                .unwrap()
+                .ordered_ids
+                .is_empty()
+        );
+        empty.items = vec![
+            item(0, "a", "A", PlaylistSlotType::Cycle),
+            item(1, "fixed", "", PlaylistSlotType::Manual),
+        ];
+        assert_eq!(
+            plan_playlist_order(empty).unwrap().ordered_ids,
+            ["a", "fixed"]
+        );
+
+        let mut rotated = rebuild(vec![
+            item(0, "a", "A", PlaylistSlotType::Cycle),
+            item(1, "b", "B", PlaylistSlotType::Cycle),
+            item(2, "c", "C", PlaylistSlotType::Cycle),
+            item(3, "d", "D", PlaylistSlotType::Cycle),
+        ]);
+        rotated.session_users.push("D".into());
+        for (current, expected) in [
+            (Some("B"), ["c", "d", "a", "b"]),
+            (None, ["a", "b", "c", "d"]),
+            (Some(""), ["a", "b", "c", "d"]),
+            (Some("X"), ["a", "b", "c", "d"]),
+        ] {
+            rotated.current_requester = current.map(str::to_owned);
+            assert_eq!(
+                plan_playlist_order(rotated.clone()).unwrap().ordered_ids,
+                expected
+            );
+        }
+        let mut uneven = rebuild(vec![
+            item(0, "a2", "A", PlaylistSlotType::Cycle),
+            item(1, "b2", "B", PlaylistSlotType::Cycle),
+            item(2, "a1", "A", PlaylistSlotType::Cycle),
+            item(3, "c1", "C", PlaylistSlotType::Cycle),
+            item(4, "b1", "B", PlaylistSlotType::Cycle),
+            item(5, "a3", "A", PlaylistSlotType::Cycle),
+        ]);
+        uneven.session_users = vec!["A".into(), "C".into(), "B".into()];
+        for _ in 0..100 {
+            assert_eq!(
+                plan_playlist_order(uneven.clone()).unwrap().ordered_ids,
+                ["c1", "b2", "a2", "b1", "a1", "a3"]
+            );
+        }
+        let mut inserted = rebuild(vec![
+            item(0, "priority", "A", PlaylistSlotType::Priority),
+            item(1, "b1", "B", PlaylistSlotType::Cycle),
+            item(2, "c1", "C", PlaylistSlotType::Cycle),
+            item(3, "a1", "A", PlaylistSlotType::Cycle),
+        ]);
+        inserted.operation = PlaylistOrderOperation::InsertCycle;
+        for (requester, id) in [("B", "b2"), ("X", "x")] {
+            inserted.candidate = Some(item(4, id, requester, PlaylistSlotType::Cycle));
+            assert_eq!(
+                plan_playlist_order(inserted.clone()).unwrap().ordered_ids,
+                ["priority", "b1", "c1", "a1", id]
+            );
         }
     }
 
@@ -843,6 +936,7 @@ mod tests {
 
         let oversized_identity = PlaylistDuplicateRequest {
             candidate: PlaylistIdentity {
+                media_source: Default::default(),
                 bvid: "x".repeat(MAX_STRING_BYTES + 1),
                 aid: 1,
                 video_page: 1,

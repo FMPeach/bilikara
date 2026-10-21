@@ -98,6 +98,24 @@
     );
   }
 
+  function renderOwnerLabel(container, item, name, owners = []) {
+    container.classList.add("song-detail-owner");
+    const avatarUrl = ownerAvatarFromCachedOwners(item, owners);
+    const mark = document.createElement(avatarUrl ? "img" : "span");
+    if (avatarUrl) {
+      mark.className = "song-detail-owner-avatar";
+      mark.alt = "";
+      mark.referrerPolicy = "no-referrer";
+      mark.src = avatarUrl;
+    } else {
+      mark.className = "song-detail-up-mark owner-badge";
+      mark.textContent = "UP";
+    }
+    const label = document.createElement("strong");
+    label.textContent = name;
+    container.replaceChildren(mark, label);
+  }
+
   function ownerAvatarFromCachedOwners(item, owners) {
     const directAvatar = normalizedAvatarUrl(item);
     if (directAvatar) {
@@ -167,6 +185,10 @@
     const translate = typeof options?.t === "function" ? options.t : (key) => key;
     const onRequest = typeof options?.onRequest === "function" ? options.onRequest : async () => false;
     const onOpenExternal = typeof options?.onOpenExternal === "function" ? options.onOpenExternal : null;
+    const resolveReturnFocus = typeof options?.resolveReturnFocus === "function"
+      ? options.resolveReturnFocus
+      : null;
+    const onClose = typeof options?.onClose === "function" ? options.onClose : null;
     const requestButtonClass = stringValue(options?.requestButtonClass);
     const nextButtonClass = stringValue(options?.nextButtonClass);
     if (!container) {
@@ -177,21 +199,18 @@
     root.className = "song-detail-view hidden";
     root.setAttribute("aria-hidden", "true");
     root.innerHTML = `
+      <div class="song-detail-backdrop"></div>
       <div class="song-detail-surface">
         <article class="song-detail-card" role="document">
-          <button type="button" class="song-detail-close" data-song-detail-close aria-label="${translate("common.close")}">×</button>
+          <button type="button" class="song-detail-close" data-song-detail-close aria-label="${translate("common.close")}"><svg class="close-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m6 6 12 12M18 6 6 18" /></svg></button>
+          <h3 class="song-detail-title" data-song-detail-title></h3>
           <div class="song-detail-hero">
             <div class="song-detail-cover" data-song-detail-cover>
               <span class="song-detail-cover-fallback">Bili</span>
               <span class="song-detail-duration hidden" data-song-detail-duration></span>
             </div>
             <div class="song-detail-facts">
-              <h3 class="song-detail-title" data-song-detail-title></h3>
-              <div class="song-detail-owner" data-song-detail-owner>
-                <img class="song-detail-owner-avatar hidden" data-song-detail-owner-avatar alt="" referrerpolicy="no-referrer">
-                <span class="song-detail-up-mark owner-badge" data-song-detail-up-mark>UP</span>
-                <strong data-song-detail-owner-name>—</strong>
-              </div>
+              <div class="song-detail-owner" data-song-detail-owner></div>
               <div class="song-detail-bvid hidden" data-song-detail-bvid></div>
               <a class="song-detail-bilibili-link hidden" data-song-detail-bilibili-link target="_blank" rel="noopener noreferrer"></a>
               <div class="song-detail-metrics">
@@ -219,9 +238,6 @@
       cover: root.querySelector("[data-song-detail-cover]"),
       duration: root.querySelector("[data-song-detail-duration]"),
       owner: root.querySelector("[data-song-detail-owner]"),
-      ownerAvatar: root.querySelector("[data-song-detail-owner-avatar]"),
-      upMark: root.querySelector("[data-song-detail-up-mark]"),
-      ownerName: root.querySelector("[data-song-detail-owner-name]"),
       bvid: root.querySelector("[data-song-detail-bvid]"),
       bilibiliLink: root.querySelector("[data-song-detail-bilibili-link]"),
       playsLabel: root.querySelector("[data-song-detail-plays-label]"),
@@ -235,6 +251,10 @@
     requestButtonClass.split(/\s+/).filter(Boolean).forEach((className) => elements.request.classList.add(className));
     nextButtonClass.split(/\s+/).filter(Boolean).forEach((className) => elements.next.classList.add(className));
 
+    elements.close.dataset.i18nAriaLabel = "common.close";
+    elements.playsLabel.dataset.i18n = "search.playCountLabel";
+    elements.ratingLabel.dataset.i18n = "search.detailRating";
+    elements.bilibiliLink.dataset.i18n = "search.openOnBilibili";
     let activeItem = null;
     let activeUrl = "";
     let activeBilibiliUrl = "";
@@ -251,9 +271,12 @@
           button.removeAttribute("aria-busy");
         }
       });
+      elements.request.dataset.i18n = "request.submit";
+      elements.next.dataset.i18n = "request.moveNext";
       elements.request.textContent = translate("request.submit");
       elements.next.textContent = translate("request.moveNext");
       if (busy && activeButton) {
+        activeButton.dataset.i18n = "search.adding";
         activeButton.textContent = translate("search.adding");
       }
     }
@@ -267,9 +290,9 @@
       elements.cover.classList.toggle("is-empty", !coverUrl);
       if (coverUrl) {
         const image = document.createElement("img");
-        image.src = coverUrl;
         image.alt = "";
         image.referrerPolicy = "no-referrer";
+        image.src = coverUrl;
         image.decoding = "async";
         elements.cover.prepend(image);
       }
@@ -278,16 +301,8 @@
       elements.duration.textContent = duration;
       elements.duration.classList.toggle("hidden", !duration);
       elements.title.textContent = stringValue(item?.title) || stringValue(item?.bvid) || "Bilibili";
-      elements.ownerName.textContent = firstValue(item, ["owner_name", "author"]) || translate("search.detailOwnerUnknown");
+      renderOwnerLabel(elements.owner, item, firstValue(item, ["owner_name", "author"]) || translate("search.detailOwnerUnknown"));
       activeBilibiliUrl = renderBilibiliMetadata(elements, item, translate);
-      const avatarUrl = normalizedAvatarUrl(item);
-      elements.ownerAvatar.classList.toggle("hidden", !avatarUrl);
-      elements.upMark.classList.toggle("hidden", Boolean(avatarUrl));
-      if (avatarUrl) {
-        elements.ownerAvatar.src = avatarUrl;
-      } else {
-        elements.ownerAvatar.removeAttribute("src");
-      }
       elements.plays.textContent = formatCompactCount(firstValue(item, ["played_count", "play_count", "play", "view", "views"]));
       const rating = ratingValue(item);
       elements.rating.textContent = rating == null ? "—" : `${Number(rating.toFixed(1))} / 5`;
@@ -307,16 +322,18 @@
       root.classList.remove("hidden", "closing");
       root.setAttribute("aria-hidden", "false");
       render(activeItem);
-      global.requestAnimationFrame(() => elements.close?.focus());
+      global.requestAnimationFrame(() => elements.close?.focus({ preventScroll: true }));
       return true;
     }
 
-    function close({ immediate = false } = {}) {
+    function close({ immediate = false, restoreFocus = true, reason = "dismiss" } = {}) {
       if (root.classList.contains("hidden")) {
         return;
       }
       generation += 1;
       const closeGeneration = generation;
+      const closingItem = activeItem;
+      const closingFocus = previouslyFocused;
       const finish = () => {
         if (closeGeneration !== generation) {
           return;
@@ -328,10 +345,16 @@
         activeUrl = "";
         activeBilibiliUrl = "";
         renderBilibiliMetadata(elements, null, translate);
-        if (previouslyFocused?.isConnected) {
-          previouslyFocused.focus();
+        if (restoreFocus) {
+          const focusTarget = closingFocus?.isConnected
+            ? closingFocus
+            : resolveReturnFocus?.(closingFocus, closingItem);
+          if (focusTarget?.isConnected && typeof focusTarget.focus === "function") {
+            focusTarget.focus({ preventScroll: true });
+          }
         }
         previouslyFocused = null;
+        onClose?.({ item: closingItem, reason, restoredFocus: restoreFocus });
       };
       if (immediate) {
         finish();
@@ -361,6 +384,11 @@
     }
 
     elements.close.addEventListener("click", () => close());
+    root.addEventListener("click", (event) => {
+      if (!event.target.closest(".song-detail-card")) {
+        close();
+      }
+    });
     elements.bilibiliLink.addEventListener("click", (event) => {
       if (!activeBilibiliUrl) {
         event.preventDefault();
@@ -395,5 +423,6 @@
     normalizeBilibiliImageUrl,
     normalizedBvid,
     ownerAvatarFromCachedOwners,
+    renderOwnerLabel,
   };
 })(window);

@@ -1,18 +1,12 @@
-.selection-modal-card.search-modal-card,
-.remote-search-modal-card {
-  position: relative;
-  overflow: hidden;
-}
-
 .song-detail-view {
   position: absolute;
   inset: 0;
   z-index: 40;
   overflow: auto;
   padding: clamp(26px, 4vw, 42px);
-  background: color-mix(in srgb, var(--panel, #fff) 96%, transparent);
-  backdrop-filter: blur(14px);
-  -webkit-backdrop-filter: blur(14px);
+  background: var(--modal-backdrop-bg);
+  backdrop-filter: blur(var(--modal-backdrop-blur));
+  -webkit-backdrop-filter: blur(var(--modal-backdrop-blur));
   animation: song-detail-backdrop-in 0.2s ease-out;
 }
 
@@ -22,27 +16,6 @@
 
 .song-detail-view.closing {
   pointer-events: none;
-  animation: song-detail-backdrop-out 0.2s ease-out forwards;
-}
-
-#search-modal:not(.hidden):not(.closing) > .selection-modal-card.search-modal-card,
-#search-modal:not(.hidden):not(.closing) > .remote-search-modal-card {
-  transform-origin: center;
-  animation: song-detail-card-in 0.2s cubic-bezier(0.16, 1, 0.3, 1);
-}
-
-#search-modal.closing > .selection-modal-card.search-modal-card,
-#search-modal.closing > .remote-search-modal-card {
-  animation: song-detail-card-out 0.2s cubic-bezier(0.16, 1, 0.3, 1) forwards;
-}
-
-#search-modal:not(.hidden):not(.closing) > .selection-modal-backdrop,
-#search-modal:not(.hidden):not(.closing) > .remote-search-modal-backdrop {
-  animation: song-detail-backdrop-in 0.2s ease-out;
-}
-
-#search-modal.closing > .selection-modal-backdrop,
-#search-modal.closing > .remote-search-modal-backdrop {
   animation: song-detail-backdrop-out 0.2s ease-out forwards;
 }
 
@@ -73,55 +46,74 @@
 .song-detail-close {
   position: absolute;
   z-index: 4;
-  top: -14px;
-  right: -14px;
+  top: 10px;
+  right: 10px;
 }
 
-.selection-modal .search-modal-close,
+/* Shared SVG close mark: no font metrics or optical padding compensation. */
+:is(.banner-close, .binding-sheet-close, .rating-close, .song-detail-close):is(:has(> .close-icon), :where([data-legacy-has~="r22"])) {
+  display: inline-grid;
+  place-items: center;
+}
+.close-icon {
+  display: block;
+  width: 20px;
+  height: 20px;
+  margin: 0;
+  padding: 0;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  pointer-events: none;
+}
+
+.request-workspace .song-detail-close,
 .selection-modal .song-detail-close,
-.remote-search-modal .remote-search-modal-close,
-.remote-search-modal .song-detail-close {
+.remote-shell > .song-detail-view .song-detail-close {
   width: 32px;
   height: 32px;
   min-height: 32px;
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 0 0 2px 1px;
+  padding: 0;
   border: 0;
   border-radius: 50%;
-  background: var(--rating-close-bg);
+  background: var(--btn-secondary-bg);
   color: var(--ink);
   box-shadow: none;
   font: 400 20px/0 sans-serif;
   cursor: pointer;
   touch-action: manipulation;
-  transition: background 0.2s ease;
-}
-
-.selection-modal .search-modal-close {
-  top: 26px;
-}
-
-.selection-modal #search-modal-content-placeholder .search-head-actions {
-  margin-right: 54px;
+  transition:
+    background 180ms ease,
+    color 180ms ease,
+    box-shadow 180ms ease;
 }
 
 @media (hover: hover) and (pointer: fine) {
-  .selection-modal .search-modal-close:hover,
-  .selection-modal .search-modal-close:focus-visible,
+  .request-workspace .song-detail-close:hover,
+  .request-workspace .song-detail-close:focus-visible,
   .selection-modal .song-detail-close:hover,
-  .selection-modal .song-detail-close:focus-visible,
-  .remote-search-modal .remote-search-modal-close:hover,
-  .remote-search-modal .song-detail-close:hover {
-    background: var(--rating-close-hover-bg);
+  .selection-modal .song-detail-close:focus-visible {
+    background: var(--btn-secondary-bg);
   }
 }
 
-@media (hover: none), (pointer: coarse) {
-  .remote-search-modal .remote-search-modal-close:active:not(:disabled):not([aria-disabled="true"]):not([aria-busy="true"]),
-  .remote-search-modal .song-detail-close:active:not(:disabled):not([aria-disabled="true"]):not([aria-busy="true"]) {
-    transform: scale(0.97);
+.request-workspace .song-detail-close:focus-visible,
+.selection-modal .song-detail-close:focus-visible,
+.remote-shell > .song-detail-view .song-detail-close:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+@supports (color: color-mix(in srgb, black, white)) {
+  .request-workspace .song-detail-close:focus-visible,
+  .selection-modal .song-detail-close:focus-visible,
+  .remote-shell > .song-detail-view .song-detail-close:focus-visible {
+    outline: 2px solid color-mix(in srgb, var(--accent) 58%, transparent);
   }
 }
 
@@ -190,6 +182,7 @@
 }
 
 .song-detail-title {
+  padding-right: 28px;
   margin: 0;
   overflow: hidden;
   display: -webkit-box;
@@ -209,6 +202,36 @@
   gap: 8px;
   color: var(--muted, #766d66);
   font-size: 14px;
+}
+
+.owner-badge-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4em;
+  max-width: 100%;
+  vertical-align: middle;
+}
+
+.owner-badge {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  padding-block: 0.12em;
+  padding-inline: 0.12em 0.14em;
+  border: 1.3px solid currentColor;
+  border-radius: 0.22em;
+  font-size: 0.8em;
+  font-weight: 500;
+  line-height: 1;
+  letter-spacing: normal;
+}
+
+.owner-badge-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .song-detail-owner-avatar {
@@ -295,7 +318,7 @@
 
 .song-detail-actions {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 1fr) auto;
   gap: 10px;
 }
 
@@ -307,7 +330,7 @@
 @keyframes song-detail-card-in {
   from {
     opacity: 0;
-    transform: scale(0.75);
+    transform: scale(0.96);
   }
   to {
     opacity: 1;
@@ -322,7 +345,7 @@
   }
   to {
     opacity: 0;
-    transform: scale(0.75);
+    transform: scale(0.96);
   }
 }
 
@@ -349,20 +372,14 @@
   }
 
   .song-detail-close {
-    top: -10px;
-    right: -8px;
+    top: 10px;
+    right: 10px;
     width: 32px;
     height: 32px;
-    font-size: 23px;
   }
 
-  .remote-search-modal .song-detail-close {
-    padding-bottom: 3px;
-  }
-
-  .selection-modal .search-modal-close {
-    top: 18px;
-    right: 14px;
+  .remote-shell > .song-detail-view .song-detail-close {
+    padding: 0;
   }
 
   .song-detail-hero {
@@ -380,6 +397,7 @@
   }
 
   .song-detail-title {
+    padding-right: 0;
     -webkit-line-clamp: 4;
     line-clamp: 4;
     font-size: 15px;
@@ -410,7 +428,6 @@
     z-index: 3;
     gap: 8px;
     padding-top: 2px;
-    background: var(--panel, #fff);
   }
 }
 
@@ -422,3 +439,137 @@
     animation-duration: 1ms;
   }
 }
+
+/* Centered Host and Remote dialogs share 200ms motion and backdrop treatment.
+   Drawer motion remains directional. */
+@keyframes fade-in-backdrop {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes fade-out-backdrop {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+@keyframes scale-from-center-card {
+  from { opacity: 0; transform: scale(0.96); }
+  to { opacity: 1; transform: scale(1); }
+}
+@keyframes scale-to-center-card {
+  from { opacity: 1; transform: scale(1); }
+  to { opacity: 0; transform: scale(0.96); }
+}
+.rating-card { animation: scale-from-center-card 200ms cubic-bezier(0.16, 1, 0.3, 1); }
+.rating-modal-backdrop { animation: fade-in-backdrop 200ms ease-out; }
+.rating-modal.closing .rating-card { animation: scale-to-center-card 200ms cubic-bezier(0.16, 1, 0.3, 1) forwards; }
+.rating-modal.closing .rating-modal-backdrop { animation: fade-out-backdrop 200ms ease-out forwards; }
+.history-export-dialog::backdrop,
+.playback-sheet-backdrop {
+  backdrop-filter: blur(var(--modal-backdrop-blur));
+  -webkit-backdrop-filter: blur(var(--modal-backdrop-blur));
+}
+
+/* Discrete display transitions preserve the existing synchronous hidden state. */
+.selection-modal,
+.internet-remote-join-overlay {
+  opacity: 1;
+  transition: opacity 200ms ease-out, display 200ms allow-discrete;
+}
+.selection-modal.hidden,
+.internet-remote-join-overlay.hidden {
+  opacity: 0;
+  pointer-events: none;
+}
+.selection-modal-card,
+.internet-remote-join-card {
+  transform: scale(1);
+  transition: transform 200ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+.selection-modal.hidden .selection-modal-card,
+.internet-remote-join-overlay.hidden .internet-remote-join-card { transform: scale(0.96); }
+@starting-style {
+  .selection-modal, .internet-remote-join-overlay { opacity: 0; }
+  .selection-modal-card, .internet-remote-join-card { transform: scale(0.96); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .rating-card, .rating-modal-backdrop,
+  .rating-modal.closing .rating-card, .rating-modal.closing .rating-modal-backdrop {
+    animation-duration: 1ms;
+  }
+  .selection-modal, .selection-modal-card,
+  .internet-remote-join-overlay, .internet-remote-join-card { transition-duration: 1ms; }
+}
+
+/* Rating uses the same cover/facts geometry as song details. */
+.rating-card {
+  width: min(780px, 100%);
+}
+
+.rating-body {
+  padding: 20px;
+}
+
+.rating-card > .rating-close {
+  top: 10px;
+  right: 10px;
+}
+
+.rating-title {
+  padding-right: 24px;
+  font-size: 22px;
+}
+
+.rating-score {
+  margin-top: auto;
+}
+
+.rating-score .rating-stars {
+  justify-content: flex-start;
+  gap: 2px;
+  margin: 0;
+}
+
+.rating-score .rating-stars button {
+  flex: 0 1 36px;
+  justify-content: flex-start;
+  text-align: left;
+  width: 36px;
+  min-width: 0;
+  padding: 0;
+}
+
+.rating-actions {
+  --rating-actions-gap: 10px;
+  display: grid;
+  grid-template-columns:
+    minmax(calc((100% - var(--rating-actions-gap)) / 2), max-content)
+    minmax(min-content, 1fr);
+  gap: var(--rating-actions-gap);
+  margin-top: 16px;
+}
+
+.rating-actions > [data-rating-add-up] {
+  white-space: normal;
+}
+
+.rating-actions > button[data-rating-add-up],
+.rating-actions > button[data-rating-close],
+.song-detail-actions > button[data-song-detail-request],
+.song-detail-actions > button[data-song-detail-next] {
+  min-width: 0;
+  min-height: 44px;
+  height: auto;
+  padding-inline: 18px;
+}
+
+.rating-actions > [data-rating-close],
+.song-detail-actions > [data-song-detail-next] {
+  width: auto;
+  white-space: nowrap;
+}
+
+@media (max-width: 680px) {
+  .rating-body { padding: 14px; }
+  .rating-card > .rating-close { top: 10px; right: 10px; }
+}
+
+.request-workspace .song-detail-title { padding-right: 0; }

@@ -1,117 +1,52 @@
 # Version roadmap
 
-This document separates established architectural direction from candidate
-scope. Tentative entries are planning inputs, not release promises. No dates
-are assigned.
+This roadmap records current product direction and ownership. It is not a build receipt or a release announcement. Releases require their own artifact and device acceptance; no dates are assigned. User instructions belong in [quick start](quick-start.md) and [upgrading](upgrading.md); implementation commands belong in [native desktop](native-desktop.md).
 
-## Confirmed direction
+## v0.8 — convergence and release stabilization
 
-### v0.7.0 — Rust business-rule migration and release stabilization
+**Preview 2 has shipped. Stable v0.8.0 is in preparation.** Preserve approved Preview 1 behavior and subsequent fixes. A source commit or an Actions development artifact is not a public release.
 
-- Phase 2 is complete at 8/8.
-- The typed Rust business-rule core remains behind the current compatibility
-  boundary, with native Rust/Tauri build and bundle validation.
-- Stabilization includes the global AV-delay lock, split-playback reliability,
-  exports, and desktop integration.
-- Node.js 24 is a build and CI baseline. It is not an end-user runtime
-  requirement.
-- Python continues to own v0.7 operational I/O and mutable runtime state.
-- That Python ownership is retained release orchestration, not a destination
-  for new backend features. New backend/business policy is Rust-authoritative,
-  without new equivalent Python semantic fallbacks.
-- The AV-delay state machine is an additional typed Rust policy introduced
-  during stabilization. It is not a ninth Phase-2 domain.
-- Preview stabilization also includes Rust-authoritative playback-selector mode
-  policy and BBDown prepare routing. These focused policies are not a new
-  "Phase 3" and do not begin the full stateful-core migration.
-- v0.7 is not the final Rust runtime architecture.
+### Delivered ownership
 
-### v0.8.0 — Rust Core Convergence / Preview
+- Native desktop products use the Rust HTTP/SSE Host, shared services and one authoritative `AppState`. No Python interpreter, PyInstaller payload or Python FFI library is shipped. The runtime migration is complete.
+- Independent `xtask` owns development preparation, Host/updater release construction, Tauri assembly, compliance and macOS nested signing. Normal entries are `prepare:desktop`, `npm run build`, and CI's split `build-backend` / `assemble-desktop`.
+- Libav prerequisites, C-only verified caches, actual-library probes, C companion construction and dependency collection use Rust plus pinned shell/MSVC recipes. Pinned BBDown build preparation uses `prepare-bbdown`. Replaced Python producers and construction references are deleted.
+- Extracted-package qualification uses `verify-native-desktop` and actual installed Host execution. Construction, media, frontend and native business/HTTP/browser regressions use existing Rust/Node entries; replaced Python drivers and unused policy copies are deleted. Real-library checks run after their required prefix is prepared.
+- Windows/macOS bundle jobs retain native architecture, signing, extraction/round-trip, Host and updater checks. Linux local/native fixtures do not substitute for foreign platform execution, physical displays, Android devices or user acceptance.
 
-The confirmed objective is to make the Rust runtime the normal execution path,
-instead of using Rust only as a library of deterministic rules.
+### Stable release experience and acceptance
 
-- Introduce Rust runtime/application services and Rust `AppState` ownership for
-  stateful store, session, playlist, and cache behavior.
-- Make the Rust server/runtime the normal path. Retain Python only as a desktop
-  compatibility/startup fallback during the transition.
-- Select one stateful core mode at startup: Rust Core mode for the process, or
-  Python compatibility mode only when Rust initialization or migration fails.
-- Do not use per-operation Rust-to-Python fallback for stateful operations and
-  do not permit split-brain state.
-- Reduce repeated JSON FFI transport and duplicate Python recomputation in
-  normal Rust mode.
-- Retain transactional fallback only where temporary output can be cleaned up
-  and final publication is atomic.
-- Split `src-tauri/src/main.rs` into focused modules before adding substantial
-  runtime responsibilities.
-- Begin replacing external command-line dependencies.
+- Current additions include native YouTube single-video quick requests and stable-ID session-user editing, with synchronized device names and immutable historical request labels. Shared components serve Host, local Remote and public Remote.
+- Preserve queue rotation, priority/manual placement, stale command rejection, archived-session export, authentication and data recovery. Stabilize playback recovery, fullscreen and audience-video geometry against the released desktop baseline; shared user editors retain keyboard focus, bounded geometry and entry/exit motion across navigation and window resizing.
+- Updates include the external updater's readiness acknowledgement, recovery and restart-failure reporting. Validate actual installed packages; describe the one-time full-package transition from published older versions honestly.
+- Desktop first initialization offers confirmed import from known bilikara data locations, with manual folder selection. Failed confirmed legacy sources are isolated into recoverable backups; declining or failed import allows normal startup without repeated offers, and native reopening bypasses discovery. The separate offline tool remains usable after first launch, converting legacy records or copying validated native data with complete backups, explicit replacement consent, active-Host locking and recovery. Successful GUI import moves source data into a recoverable backup. Storage defaults remain unchanged; native platform/package acceptance still applies.
+- Host source management combines persistent ordering and batch removal with selection. Pull completion waits for captured gestures; real edit conflicts still cancel stale work. Remote gains Restart and touch playback-sheet gestures, with native inputs and scrolling retaining priority.
+- Startup update/channel preferences persist across native restarts and port changes; a busy update operation defers rather than loses the startup check. Quality and HiRes changes apply to newly created downloads, while cancellation closes an old transfer before replacement.
+- Internet Remote reports transport, authentication and synchronization stages. Trusted optional TURN configuration is application-ready; the independent signaling service still needs its companion issuance contract before relay activation. Local relay tests do not establish public deployment or venue reachability.
+- Stable v0.8.0 remains unpublished until the release artifacts are tested and publication is explicitly approved. Passing CI does not establish venue audio/video, physical dual-screen behavior or every network/provider condition.
 
-External-tool direction:
+### Remaining Python and retirement
 
-- BBDown: port only the behavior bilikara needs. Use the final known/current
-  BBDown behavior as a golden compatibility oracle, do not recreate unrelated
-  features, and retain explicit fallback for unsupported or special cases
-  during transition.
-- Downloader: implement an independent Rust downloader without porting or
-  linking aria2 source. Initial scope is HTTP/HTTPS, headers and cookies, URL
-  fallback, progress, cancellation, timeout/retry, temporary files,
-  response-length validation, and atomic publication. Range requests,
-  segmentation, resume, validators, proxy support, and crash recovery may
-  follow incrementally. Keep aria2c as an explicit transition fallback until
-  the Rust path is proven.
-- Media backend: introduce a `MediaBackend` abstraction. Prefer direct FFmpeg
-  libraries, primarily the required `libavformat`/`libavutil` functionality;
-  remove ffprobe CLI use where the library backend covers current metadata
-  inspection. Keep FFmpeg CLI only as a desktop transition fallback. Mobile
-  production must not depend on CLI executables.
+Supported Source development uses the single `python -m bilikara` entry for HTTP/FFI transport, yt-dlp orchestration and explicit media-CLI compatibility; the duplicate root Python launchers are retired. Source smoke/failure tests remain active. These are concrete consumers, not native product dependencies; redirecting Source to the native Host would lose supported behavior. Keep their dependencies and regression gates until a faithful replacement exists.
 
-Casting foundation:
+Third-party rebuild toolchains and AWS CLI publication may have Python dependencies. Do not hide them inside Actions/containers or claim all CI is Python-free. Continue retirement only when a concrete duplicate or obsolete maintenance path disappears without slower normal feedback, harder diagnosis or lost coverage. Simple Python adapters and tests may remain. Test-language/file counts alone do not establish completeness; a zero-Python test repository is **not** a stable v0.8 release gate.
 
-- Produce or remux the selected audio and serve it over HTTP with Range support
-  and stable local media URLs.
-- Introduce `CastSession`, `CastTarget`, and `CastController` abstractions.
-- Build an SSDP/DLNA discovery proof of concept and prove this flow:
+### Stable v0.8 requirements
 
-  ```text
-  current song
-  -> selected audio
-  -> Rust media output
-  -> local HTTP URL
-  -> DLNA renderer
-  ```
+Reliable desktop behavior, preserved data and layouts, recoverable upgrades and accurate platform limits determine readiness. Keep state/new business functionality Rust-owned. Avoid new UI/default/storage/codec changes during final stabilization unless a concrete defect requires them. Android remains a preview and does not redefine desktop acceptance.
 
-DLNA media casting is not operating-system screen mirroring.
+## Downloading and media
 
-### v1.0.0 milestone
+Rust Native remains the default downloader; shared Rust services own scheduling, retries, cancellation, validation and atomic publication. BBDown and DownKyi/aria2c remain explicit alternatives with accepted pins. Packaged media uses in-process libav, without FFmpeg/ffprobe programs; external test oracles remain test dependencies. Resume/proxy/crash-recovery work follows validated needs rather than a new engine or source-policy rewrite.
 
-v1.0.0 is a product-maturity milestone, not a deadline tied to a small number
-of intermediate releases. It requires a nearly complete intended feature set,
-a coherent and unified UI, stable desktop and mobile Host behavior, mature
-casting, acceptable migration and compatibility behavior, and release-quality
-reliability. Versions such as v0.10.0, v0.11.0, and later before v1.0 are
-explicitly acceptable.
+## Shared UI, mobile and casting
 
-## Tentative plans subject to revision
+Host, local/public Remote and Android share components, actions and layout definitions, with narrow platform/role adapters. Compact desktop retains desktop navigation; Android phone navigation is platform-specific. Refine component roles, typography, geometry, surfaces, focus, motion and asynchronous guards while preserving media nodes and drafts. Reference Apple HIG, Microsoft Fluent, then Google Material where they fit the existing product; record approved component rules in `AGENTS.md`.
 
-### v0.9.0 candidate direction
+The longer-term mobile direction remains standalone Android and iOS Hosts with GitHub-distributed APK/IPA artifacts; Remote remains a Host-served webpage. Mobile backends use shared Rust services in process, with Swift/Kotlin limited to platform adapters and no Python, sidecar or media-CLI requirement. This direction does not add a mobile release gate to stable v0.8.
 
-- Android Host Alpha capable of complete Host operation without a computer.
-- Local playback, Remote serving, download/cache operation, a foreground
-  service, notification and MediaSession integration, and Android local-network
-  permissions.
-- No Python and no sidecar CLI dependencies.
-- Production-grade DLNA discovery/control, including seek, volume, media
-  switching, session recovery, renderer profiles, and device testing.
+Continue Android lifecycle, background playback, local-network and external-display device validation. Future casting uses stable Rust-served HTTP media and shared session/target/controller abstractions, with actual receiver checks. DLNA playback, system mirroring and an independent audience display are separate capabilities; none is certified by an emulator or a desktop screenshot.
 
-The exact v0.9 scope must be re-evaluated from actual v0.8 results and must not
-be artificially constrained to a small release.
+## v1.0 milestone
 
-### v0.10.0 candidate direction
-
-- Android Host stabilization and Google Cast.
-- iOS Host Alpha, AirPlay integration, and iOS lifecycle/background-server
-  investigation.
-
-This allocation is provisional and may move across v0.9, v0.10, v0.11, or
-later releases.
+v1.0 requires a nearly complete intended feature set, coherent UI, stable desktop and mobile Host behavior, mature casting, acceptable migration/compatibility and release-quality reliability. Intermediate releases follow actual progress; these requirements are not lowered by engineering retirement.

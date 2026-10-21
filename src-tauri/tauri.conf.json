@@ -1,21 +1,27 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "bilikara",
-  "version": "0.7.2",
+  "version": "0.8.0",
   "identifier": "com.bilikara.app",
   "build": {
-    "beforeDevCommand": "",
+    "beforeDevCommand": {
+      "script": "cargo run --manifest-path xtask/Cargo.toml --locked --target host-tuple -- prepare-desktop",
+      "wait": true
+    },
     "beforeBuildCommand": "",
-    "devUrl": "http://127.0.0.1:8080",
     "frontendDist": "../static"
   },
   "app": {
     "withGlobalTauri": true,
+    "macOSPrivateApi": true,
     "windows": [
       {
         "label": "main",
+        "url": "desktop-startup.html",
         "fullscreen": false,
-        "height": 768,
+        "height": 700,
+        "minWidth": 700,
+        "minHeight": 600,
         "resizable": true,
         "title": "bilikara",
         "width": 1024,
@@ -26,7 +32,8 @@
     "security": {
       "csp": null,
       "capabilities": [
-        "main"
+        "main",
+        "controller"
       ]
     }
   },

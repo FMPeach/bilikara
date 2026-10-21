@@ -1,6 +1,6 @@
-# AGENTS.md - Bilikara Agent Development Guide
+# AGENTS.md - bilikara Agent Development Guide
 
-This document provides operational guidance, architectural rules, and validation standards for automated coding agents working on the Bilikara codebase.
+This document provides operational guidance, architectural rules, and validation standards for automated coding agents working on the bilikara codebase.
 
 ## 1. Scope and Precedence
 
@@ -11,15 +11,18 @@ This document provides operational guidance, architectural rules, and validation
 
 ## 2. Current Architecture
 
-Bilikara is a Bilibili-based Karaoke system consisting of a Host (PC display & desktop application) and a Remote (Mobile controller).
+bilikara is a karaoke system supporting Bilibili and YouTube, consisting of a Host (PC display & desktop application) and a Remote (Mobile controller).
 
 The architecture consists of the following primary layers:
 
 - `static/`: Frontend Host and Remote user interfaces built with vanilla JavaScript, HTML5, and CSS3. UI components use state-driven re-rendering and subscribe to real-time state updates via Server-Sent Events (SSE) at `/api/events`. Bundled and served by the Host server or packaged into the Tauri desktop shell.
-- `bilikara/`: Python Host application engine. Handles the current v0.7 HTTP routing (`http.server.ThreadingHTTPServer`), state management (`AppContext`), persistence (`PlaylistStore`), download management (`BBDown`, `FFmpeg`), version checks/updates, and frozen Python compatibility references created during earlier migration work.
-- `rust/`: Shared typed Rust domain core crate (`bilikara_rust`), compiled as both `cdylib` (for CFFI loading in Python) and `rlib` (for native Rust crate callers). Implements pure, deterministic business logic domains.
+- `bilikara/`: Retained Python source Host transport and compatibility adapter, used by development workflows and tests, not native desktop products or their build imports. Handles legacy HTTP/SSE routing (`http.server.ThreadingHTTPServer`), persistence I/O derived from Rust snapshots, trusted tool configuration, BBDown preparation and retained yt-dlp orchestration/source-mode media CLI compatibility, version checks/updates, and frozen Python compatibility references. `PlaylistStore` is an AppState/persistence adapter, not a mutable state authority.
+- `rust/`: Shared typed Rust domain core crate (`bilikara_rust`). Native products link its `rlib`; the `cdylib` and C ABI remain for Python compatibility/integration tests and source workflows. Implements pure, deterministic business logic domains.
+- `rust-runtime/`: Typed Rust runtime and application-services crate (`bilikara_runtime`), compiled as both `cdylib` and `rlib`. Owns the process-wide authoritative `AppState`, production native HTTP/SSE Host, Rust Native cache/runtime services and operational I/O such as the independent HTTP media downloader. Its C ABI remains for the legacy Python adapter and tests; native products link Rust directly.
+- `scripts/`, `media-libav/`: Platform recipes, independent verification and retained compatibility tooling. Replaced Python desktop/libav construction references and their dedicated tests are retired; normal native desktop construction uses `xtask` and must not execute Python or import `bilikara` application modules. Shared package validation belongs in the tooling layer.
+- `xtask/`: Independent Rust build and package-verification tool for adjacent desktop development preparation, ordinary release construction/assembly, libav prerequisites/cache and pinned build-time BBDown acquisition (`prepare-bbdown`). `prepare:desktop`, Tauri's development hook and `npm run build` use it; CI uses its shared backend/assembly entries around the existing Tauri build and native checks. Libav shell/MSVC recipes use its C-only cache, library probe, companion and dependency/metadata stages. It must not invoke Python or link the application Runtime. The extracted native package gate uses `verify-native-desktop` with isolated actual Host execution; remaining Python verification drivers stay separate. Native business tests use `npm run test:native-host` with test-only Node transport and actual isolated Rust processes; foreign-platform fixtures do not qualify native Windows/macOS products.
 - `src-tauri/`: Tauri 2 desktop shell providing native windowing, system tray integration, and cross-platform desktop application packaging.
-- `tests/`: Project test suite using standard Python `unittest`. Includes direct unit tests, integration tests enforcing native library loading (`BILIKARA_REQUIRE_RUST_LIB=1`), and tests that launch Node.js scripts to evaluate frontend JavaScript behavior.
+- `tests/`: Node desktop construction contracts and entry checks run via `npm run test:desktop-build`, using actual xtask and compiled native fixtures with independent expectations. `test:libav-wrapper` checks the real shell helper; required `test:libav-prerequisites` checks actual prepared libraries, shim/sanitizers, collection and cache after CI exports the native prefix. Frontend behavior/source contracts use `test:frontend`; Remote asset-copy checks use `test:remote-sync`, and auxiliary asset/metadata/workflow contracts use `test:auxiliary`. Native HTTP/catalog/SSE orchestration uses Node; `test:native-smoke` covers compiled process fixtures and separate macOS Tauri acceptance. Its locked manifest checks follow native Cargo graph preparation; required GUI checks use isolated extracted native apps. Remaining Python `unittest` covers source Host/legacy/FFI and operational consumers, including native library loading (`BILIKARA_REQUIRE_RUST_LIB=1`). Native package/GUI qualification remains a separate artifact gate.
 
 ## 3. Backend Ownership After Phase 2
 
@@ -33,15 +36,15 @@ For all **new backend or business functionality** from this point forward:
 - Rust is the authoritative implementation.
 - Do not add an equivalent Python business-rule implementation or a new
   `_py_*` mirror of a new Rust capability.
-- Python may adapt objects, transport FFI payloads, validate native results,
-  and perform the current v0.7 I/O/orchestration listed in Section 4. That glue
-  must not independently recompute the new policy.
+- The retained source Host may adapt objects, transport FFI payloads, validate
+  native results, and perform the legacy I/O/orchestration listed in Section 4.
+  That glue must not independently recompute the new policy.
 - A new Rust-only capability must fail explicitly or report itself unavailable
   when Rust cannot execute it. Do not silently add a Python semantic fallback.
-- New stateful backend features must either move the required ownership to Rust
-  first or wait for the relevant Rust Core ownership migration.
-- This boundary is not a new "Phase 3." The next architectural milestone is
-  **v0.8 Rust Core Convergence / Preview**.
+- New stateful backend features must extend the authoritative Rust `AppState`;
+  they must not create Python-owned state or a parallel authority.
+- This boundary is not a new "Phase 3." The current architectural milestone is
+  **v0.8 Preview 2 stabilization after Rust Core Convergence**.
 
 Pure deterministic policy remains a good small Rust-domain boundary when all
 of the following criteria are met:
@@ -59,51 +62,301 @@ When adding such a Rust-authoritative rule:
 - **Separation of Concerns**: Keep pure typed domain logic separate from `serde`, JSON adapters, and FFI wire exports.
 - **ABI Compatibility**: Keep additive FFI exports ABI-compatible unless a deliberate FFI ABI migration is requested.
 
-## 4. Temporary v0.7 Host Responsibilities and UI Ownership
+## 4. Rust AppState Authority and Retained Host/UI Responsibilities
 
-Keep the following operations in their respective Host (Python / Tauri) or UI (JavaScript) layers:
+The process-wide Rust `AppState` is the only authoritative mutable application
+state. Playlist, session, current-item, player-setting, history, and playlist
+item cache projections are committed under its single serialized lock. Python
+may cache defensive read-only projections and persist Rust snapshots, but it
+must not independently mutate or recompute this state.
+
+Rust AppState availability and initialization are startup requirements. There
+is no whole-application Python Core fallback. The default desktop launcher uses
+one supervised `bilikara-desktop-host` Rust process. Native desktop bundles ship
+no Python runtime, PyInstaller payload or temporary Python FFI libraries.
+Windows desktop builds keep application data in `runtime/data/`, media cache in
+`runtime/data/cache/`, and shell logs, window preferences and WebView storage
+inside the installation's `runtime/` by default. Do not rename these user-facing
+directories merely to reflect the backend implementation language. Reopening
+native data must not scan or automatically reopen unrelated AppData records.
+Before the first Host initialization, the shell may inspect only known bilikara
+AppData/application-home locations and offer legacy conversion with explicit
+source confirmation. No candidate means no dialog. Use native checkpoints, not
+the existence of runtime/WebView/log directories, to identify initialized data.
+The explicit desktop import tool also works after first launch, with separate
+consent and a complete current-data backup before replacement; it never merges
+two libraries. It converts legacy records or copies validated native data without
+rewriting their format. A failed/declined first-start legacy import must preserve
+old records and prepare usable fresh data without repeated import offers; never
+bypass corrupt native checkpoint protection. Offer manual runtime/data folder
+selection. Failed confirmed legacy sources are isolated as raw data in the new
+application home's `legacy-backup`; in-place data uses its transaction backup.
+If safe relocation fails, retain the source, report the limitation and continue
+with fresh native records. Successful GUI import moves only the source data directory into a
+recoverable backup after installation, never deletes an AppData/installation
+root. Direct offline CLI keeps sources unless cleanup is explicitly requested.
+Keep native validation, active-Host locking, interruption recovery
+and malformed-data protection; inspection/conversion must not launch the Host
+or download media. Explicit data overrides bypass automatic source discovery.
+Explicit data/import overrides remain
+available for isolated tests or a deliberate import.
+`BILIKARA_NATIVE_DATA_DIR` (and the earlier preview-directory alias) overrides
+the native data root; it does not select a different backend. See
+`docs/native-desktop.md` for layouts, builds, storage and explicit legacy import.
+Packaged Windows/macOS update installation uses the shared Rust installer and
+private shell lifecycle boundary. **v0.8.0-preview.2 has been released** with
+this Rust desktop runtime. Current work stabilizes that baseline and scopes
+remaining Python to tooling, testing, compatibility or development workflows;
+it is not another desktop migration. Per-platform validation is still required
+for each subsequent change.
+
+The retained legacy Python Host has the following adapter responsibilities.
+They are not dependencies of normal native desktop launch or packaging; the
+native product uses the shared Rust services and native Host adapters. Keep UI
+and shell responsibilities in their existing layers:
 
 - DOM event handling, button states, modal behavior, toast notifications, and UI rendering (`static/`).
 - HTTP request/response routing, SSE connection lifecycle, cookies, URL fetching, and API endpoints (`bilikara/`).
-- Filesystem I/O, archive extraction, font discovery, and system paths.
-- Subprocess execution and management for `BBDown`, `yt-dlp`, `aria2c`, `FFmpeg`, or `ffprobe`.
+- Retained Host filesystem I/O, archive extraction, and system paths. Export font discovery/rendering and archive assembly belong to Rust Runtime.
+- Retained subprocess execution and management for `yt-dlp` and existing source-mode media CLI compatibility. BBDown and DownKyi/aria2c download execution is shared Rust-owned. Python retains BBDown preparation and trusted configuration/login/status transport; aria2c preparation also belongs to Rust. Packaged FFmpeg/ffprobe executables remain retired.
 - Host runtime capability detection and environment variable evaluation.
 - Real-time clock acquisition and timestamping.
-- Existing mutable `PlaylistStore` state mutations, disk persistence, locks, queue ordering, cache scheduling, retries, and cancellation logic while the v0.7 Python Host remains in service.
+- Atomic state-file reads/writes, legacy-shape loading, backup/archive file handling, and persistence-error reporting. All semantic data written by Python is derived from Rust snapshots.
+- Retained cache scheduling, retries, cancellation, and execution for explicit yt-dlp and its existing media CLI compatibility. Its projections are committed through Rust AppState. Native, BBDown and DownKyi admissions, execution and publication are owned by shared `rust-runtime` services.
 - Tauri application lifecycle, native menus, and OS shell integrations (`src-tauri/`).
 
-These are temporary retained responsibilities, not targets for new Python
-feature ownership. Existing operational code may be maintained for release
-safety, but new stateful backend capabilities belong under Rust ownership or
-must wait for Rust Core convergence.
+These are retained adapter and I/O responsibilities, not Python application-core
+ownership. Existing operational code may be maintained for release safety, but
+new stateful backend capabilities belong in Rust AppState.
 
-`bilikara/playlist_export.py` is an explicit frozen legacy exception for v0.7.
-Its Pillow renderer and `prewarm_playlist_export_fonts()` must remain together:
-a Rust prewarm would not warm Pillow's caches. A future migration should move
-the complete export/render pipeline instead of adding a parallel Rust prewarm.
+P03 releases only the former `bilikara/playlist_export.py` subsystem freeze.
+CSV/image interpretation, layout, font discovery/fallback/cache/prewarm, PNG and
+multi-page ZIP encoding now belong to Rust. Python retains the public entry
+signatures, configured asset-root transport, native output validation and HTTP
+responses. The renderer and prewarm share Rust font resources; there is no
+Pillow renderer or Python semantic fallback. All other frozen references and
+public-interface retention decisions remain unchanged.
 
-## 5. UI Asynchronous-Action Policy
+## 5. UI Rules
 
-For UI actions that trigger asynchronous operations or backend side-effects:
+### 5.1 Behavior baseline and shared ownership
 
-1. **Immediate Feedback**: Disable the clicked button immediately.
-2. **Accessibility**: Set `aria-busy="true"` on the active element.
-3. **Loading Label**: Show an existing translated loading label where appropriate (e.g., `t("gatcha.adding")`, `t("search.adding")`).
-4. **Duplicate Protection**: Reject repeated clicks or activations while the Promise is in flight.
-5. **Clean Restoration**: In a `finally` block, restore the original disabled state, remove `aria-busy`, and restore original button text.
-6. **No Fixed Timers**: Do **not** use short `setTimeout` timers to prematurely re-enable controls while the backend request is still active.
+- Use the released **v0.8.0-preview.2 native desktop Host**, plus subsequently approved changes, as the current desktop behavior baseline. Preserve all approved Preview 1 behavior and later changes; Android previews do not redefine desktop behavior.
+- Reuse shared components, actions, tokens and layout definitions across Host, local Remote and public Remote. Keep platform adaptations narrow; do not copy whole screens.
+- Mobile Host should reuse Remote's shared component/action/layout definitions whenever the same workflow fits, beginning with Request. Keep the source UID field, add/fetch and manual-refresh actions on one shared row; the input yields width instead of stacking ordinary phone controls. Native Host's bounded page frame remains distinct from Remote's document scrolling.
+- Treat viewport size, input method and platform capabilities separately. Narrow desktop windows retain desktop navigation, tool rail, playback controls and mouse/keyboard operations. Width alone must not select Android workflows or hide supported desktop features.
+- Do not expose manual screen-direction selectors in Host settings. Desktop adapts to window dimensions; ordinary Android windows follow the system auto-rotation setting, ignoring former manual direction preferences. Retain the player's temporary native fullscreen direction and restore system mode on exit.
+- Native player fullscreen must hide the Host toolbar, tool rail and workspace at every desktop width, release narrow-layout stacking isolation, and restore them on exit without recreating media nodes. Test the native fullscreen path separately from browser DOM fullscreen, including high-DPI-sized logical viewports.
+- Windows native fullscreen must cover the monitor rather than its taskbar-excluding work area. Keep the fullscreen client area equal to the monitor bounds even when maximized, without an intermediate restore/maximize step. Preserve the original window placement for exit; serialize transitions on the native window thread, suppress system transition animations during the operation and exclude intermediate geometry from saved preferences. Validate both normal-window and maximized entry on Windows; browser layout tests do not verify the system taskbar.
+- Ordinary Host/Remote controls share a 44px height. Only Android's phone layout adopts Remote's two-row delay layout (four adjustment buttons, then reset/value/lock). Touch targets must not overflow native window chrome.
+- Android phone bottom navigation reuses desktop workspace icons, including their selected variants; Playback and My use matching outline/filled variants. The selected target uses the theme accent background and its contrasting on-accent icon/text color. Keep all five targets visible on one row, retain focus and pressed feedback, and respect reduced motion. Android uses native overlay scrollbars rather than desktop custom tracks; idle scrollbars should not remain visible. Login guidance follows the desktop surface instead of adding persistent mobile-only prose.
+- Android My gives Bilibili login and playback/download controls separate outlined 14px rounded cards. Align the compact login status with its heading at the right edge. The Settings entry uses the same 16px bold subheading style, while retaining its full touch target.
+- Android dock accent surfaces cap at 68px without reducing the five full-slot touch targets. My retains a 14px frame on all four edges around its inner scroller. My/Settings motion preserves measured page bounds and My's scroll offset. Android result lists reuse Remote's shared pager and horizontal swipe. Source selection keeps paging available; a subsequent long press captures the gesture for dragging, while a short swipe still changes pages.
+- Android phone Request contextual tabs replace the primary tab row above the card; release the former header grid track. Keep Playback’s stage fixed and scroll its controls independently. My/Settings navigation slides horizontally and respects reduced motion. The soft keyboard overlays the stationary bottom dock; only content and transient messages avoid its inset. Keep equal card outer gutters and 14px top/side content insets. Do not retain a former heading/list margin above the first visible control. Quick Request and Gatcha share their inner heading axis. Android audience output hides its own corner controls and follows the Host phone-access menu when showing or hiding its corner QR panel.
+- Validate desktop first, including the native 700px minimum width and mixed mouse/touch input, then Android. Adopt an Android improvement only when it preserves desktop workflows and demonstrates a benefit; record intentional behavior changes.
+- Presentation changes must preserve media nodes, playback state, pitch graphs, selections, rating drafts and in-flight guards. Do not recreate/reparent media or attach duplicate handlers.
+- Ordinary native Host windows use a 700px logical minimum width and 600px logical minimum height. Restore shorter saved heights at the current floor while retaining other preferences; cap the height floor to the selected monitor's usable area, including frame/DPI, so small displays remain usable. This is a native window constraint, not a CSS minimum that adds scrolling or an Android screen requirement.
 
-*Exemption*: Do **not** apply busy guards to immediate UI actions such as modal open/close, accordion expand/collapse, tab switching, fullscreen toggle, mute, or local-only view toggles.
+### 5.2 Asynchronous actions and rendering
+
+For actions that start asynchronous operations or backend side effects:
+
+1. Disable the activated button immediately and set `aria-busy="true"`.
+2. Use the existing translated loading label where appropriate (for example, `t("gatcha.adding")` or `t("search.adding")`).
+3. Reject duplicate activation while its Promise is pending.
+4. In `finally`, restore the original disabled state and text, and remove `aria-busy`.
+5. Never re-enable controls with a fixed short timer before the request completes.
+
+Immediate UI actions (open/close, expand/collapse, tabs, fullscreen, mute and local view switches) are exempt from busy guards.
+
+- Preserve snapshot-order validation and immediate playback/terminal-state updates. Revision/timestamp changes alone must not invalidate workspace rendering.
+- Preserve unchanged-content guards, node identity, open menus and pending actions when enhancing queues or other live lists.
+- Coalesce progress-only paints to once per second; do not delay terminal states or playback controls.
+- Measure layout on content, size and font changes, not on timers or playback ticks. Keep observers scoped and coalesce their work.
+- Localize dynamic labels in place without resetting form state or busy guards.
+- Session-user edits use stable user IDs and a roster version. Preserve selections and tag nodes across unrelated snapshots; new users start unselected. Reject stale batch edits atomically and cancel interrupted drags without committing them. A rename changes future requests only: existing song/history/export labels remain request-time records, while device bindings, queue rotation and rating guards follow the stable ID.
+
+### 5.3 Component geometry and control roles
+
+Choose a component by role, then reuse its shared definition. This table describes approved styles; it does not require every control to have one shape or every secondary action to acquire an outline.
+
+| Role | Height / typography | Shape / surface |
+| :--- | :--- | :--- |
+| Ordinary Host/Remote controls and single-line form fields | 44px; 16px | 14px rounded rectangle |
+| Dialog header text actions | 32px; 14px | Pill |
+| Dialog icon close | 32px; shared SVG mark | Circle; ordinary secondary fill |
+| Compact settings tools | 30px; 12px, weight 700; 12px inline padding | Pill |
+| Stacked export selects, both clients | 44px; 16px | 14px corners; visible theme-aware outline |
+| Runtime settings selects | 34px; 13px, weight 700 | Pill; Preview 2 native dropdown treatment |
+| Request segmented navigation, both clients | 48px track, including 4px vertical space at each edge; 16px | Shared segmented surface and active fill |
+| Pagination editor, both clients | 44px track; 32px input centered inside it | Input 8px corners; retain compact pagination geometry |
+| Initial-letter buttons, both clients | 40px; 16px, weight 700; 6px gaps | 12px corners; lightly accented selection |
+| Remote seek / next and play / pause | 44px and 48px respectively | Fixed circles on one center line |
+| Floating panels | 18px/24px title; 20px content inset | 18px corners |
+| Compact request entries | 72px; title 14px/16px; metadata 12px/16px | 16px corners |
+| Settings group cards | Single-language 16px subheading | 14px corners and outline |
+| Info bubbles | 13px, weight 400; line height 1.45; maximum width 320px | 12px corners |
+| Session-user editing tools | 44px circular icon targets; select-all uses the 30px compact tool definition | Reserve a 52px trash slot, including its 1.15 drag-over enlargement |
+
+- Action order follows the component role. Dialog footer groups place secondary/cancel actions before the primary completion action (left-to-right; preserve DOM and keyboard order). Export uses CSV on the left and image export on the right in both clients. Inline task forms retain their established workflow order (for example, request then queue-next); do not reverse every primary/secondary pair. Matching components share order across Host/local/public Remote. Secondary and cancel actions retain the shared neutral fill.
+- Pills use a fully rounded radius (currently 999px). Circles constrain width, height and min/max-width equally so inherited button minima cannot stretch them.
+- Compact tools include Check for updates and its Cancel action, Copy link, Identify display, Announcements and the Host current-song rating/next actions. Reuse the complete pill definition, not just its radius; a tool hidden by attribute stays hidden.
+- Domain actions such as room create/rebuild/close are ordinary controls, not compact tools or dismiss icons: 44px height, 16px text, weight 400, 14px corners and inline padding. Use the primary palette for create/rebuild and secondary for close, with an 8px gap and aligned text centers. Create/rebuild may fill the remaining row; close keeps its content width.
+- Volume and delay step/reset controls share the ordinary 16px font, theme-aware 1px outline and interaction states. Inline and floating playback controls retain the same typography and feedback; floating-panel prose does not change their inherited font. Their numeric wrappers retain the shared pill shape (999px), including Android phone layout, and share focus-within treatment.
+- Browse back actions share secondary fill, 16px normal text, 14px corners and inline padding, a theme-aware outline and no shadow. Use the client's ordinary height for category, name, artist, UP, favorites and advanced-catalog back actions; contextual navigation remains a separate role.
+- Select/input shape follows its control group: runtime selects beside pills/switches retain pills; stacked forms use rounded rectangles. Do not impose a single shape on every field.
+- Radio/checkbox controls use explicit native appearance, consistent sizing and visible focus. Never inherit text-field height or padding.
+- Refresh/regenerate icon actions are circular. Setting help icons sit beside their headings on both clients.
+
+### 5.4 Interaction, focus and motion
+
+- **Remote:** no hover-only styling or pointer-hover help, even with a mouse. Retain click/tap help, keyboard focus and pressed/busy/disabled feedback. Scope shared Host hover rules away from Remote.
+- **Host input capabilities:** hover-only appearances and previews require `(hover: hover) and (pointer: fine)`. Keep focus, selected/expanded and pressed rules outside that condition. Touch-generated compatibility mouse events must not trigger hover help or pause banner countdowns; explicit focus still retains its existing behavior.
+- **Host ordinary controls:** preserve the component's border/lift feedback on hover-capable fine pointers. Volume, delay, initial-letter and browse-back buttons share 120ms feedback, a 1px hover lift, the shared hover surface and accent outline; pressing restores their position and uses the shared darker surface and focus-border color. Numeric wrappers retain shared focus-within treatment.
+- **Top management/menu triggers, Host and Remote:** keep the normal surface and text colors when expanded, strengthen the theme-aware accent outline, and use the shared darker surface when pressed. Retain 120ms color transitions, visible keyboard focus and reduced-motion handling. Keep size, position and shadow fixed so anchored menus do not move. Host alone strengthens the outline on hover; Remote has no hover-only feedback. Full menus open by click/Enter/Space, with the Host phone QR hover preview remaining a separate annotation.
+- **Host dismiss icons:** blend 12% ink into the secondary background and use the existing danger icon color. Transition colors over 120ms; never translate or scale on hover or activation. This rule does not apply to labeled domain actions such as Close room.
+- **Inline search icons:** white magnifiers and search-collapse X controls have no shadow, including focus/hover. Host may lift them 2px, including the submit inside an expanded input; Remote has no hover effect. A real outline may mark focus/input state. Search-collapse controls are distinct from dialog dismiss icons.
+- Retain visible keyboard focus. Keep panel entry/exit motion separate from button feedback; motion is consistent within each component role and respects reduced motion.
+- Host tool-tab transitions change content opacity only. Retain the outgoing panel's grid/flex layout, border-box dimensions and position through exit, including rapid switches and remembered scroll positions; do not stretch it into the incoming panel's layout.
+- Retain popup nodes, anchors and geometry until exit motion finishes, and guard rapid reopening. Opening the full phone-access menu replaces its compact hover preview immediately; closing the full menu is instantaneous and must not flash the preview. A later genuine hover may show the preview again.
+
+### 5.5 Surfaces, themes and layering
+
+- Floating surfaces share `static/ui-surfaces.css`: 18px corners, theme-aware translucent fill, shadow and panel-confined backdrop blur. Keep opacity in shared tokens; no per-dialog/client overrides.
+- Blur only the outer floating panel, never its header, groups or controls. The collapsed Remote playback dock also blurs once, preserving its fill/progress tint. Removing nested blur must preserve theme colors and opacity.
+- A narrow desktop tool sheet is a floating panel and uses that same outer blur/fill. Its workspace content is transparent; resident wide-screen workspace cards retain their normal surface.
+- Verify visible blur, not only computed CSS; distinguish screenshot-renderer limitations from real-device behavior.
+- Host dialogs do not dim or blur the surrounding page or source card.
+- Remote large modals (entry gates, details, ratings, selection/export and playback sheet) use a theme-aware page-wide dimmed backdrop with opacity entry/exit, without page blur. Small anchored menus, help and volume editors use shadow without a second backdrop.
+- Remote modals and playback sheet lock background scrolling, including anchoring caused by background updates; the top menu is exempt. Prevent clicks reaching content behind open modals, preserve focus and Escape/close behavior, and retain non-dismissible entry gates.
+- The Remote top menu sits above the playback dock and below modals, including short landscape viewports. Help bubbles and compact hover QR previews are annotations in the higher browser top layer and may coexist with menus/dialogs.
+- Settings group fill is white in the light theme and slightly brighter than the enclosing surface in dark/blue themes, using the unaccented settings-group token. Language/theme segmented controls use the shared segmented background, visibly distinct from that fill.
+
+### 5.6 Panel geometry, positioning and spacing
+
+- The panel container owns outer padding; first/last content blocks add no redundant padding/margins. Hidden status, actions and content must not reserve layout tracks or gaps.
+- Dialog titles use 18px/24px typography and at least a 32px title row. Retain 20px title/side insets; header actions align with the first-line center, not the center of a wrapped title block.
+- A dismissible dialog has one close icon inside its upper-right corner. Close and neighboring header actions share the ordinary secondary background token, not a separate palette.
+- Compare rendered top/right action bounds, including border and title-centering offset. The current 20px inset and -4px offset put action backgrounds 16px from both inner edges. Move adjacent actions as one group and preserve their gaps/touch areas; the rule also applies to absolute close icons.
+- Host confirmations cap their border-box width at 440px and the viewport. Host export keeps its 420px exception, stacked fields and two actions on one row with compact inline padding. Verify Chinese, English and Japanese at 320px. Avoid fixed aspect ratios for translated prose.
+- Host top management menus and hover QR annotations right-align to their trigger, then clamp to a 12px viewport inset. Measure border-box layout size independently of animated transforms and retain coordinates during exit motion.
+- Host phone access, dual-screen and runtime-settings menus are mutually exclusive and dismiss on outside click/Escape. Phone access has no close button or reserved close-button clearance.
+- Opening the dual-screen menu may refresh display discovery, but numbered identifier windows appear only after an explicit Identify display action. Keep its button disabled and busy until the native invocation finishes closing those windows; do not restore it with a separate frontend timer.
+- Info bubbles choose above/below from measured space and stay inside the viewport. Their transition is 120ms opacity plus 3px slide in both directions; retain the anchor/node through exit. Break long translated clauses deliberately, never split URLs or numbers mechanically. Hidden help must not enlarge panels or cause horizontal scrolling on focus.
+- Remote top-menu connection and collapsed-section rows have equal occupied height. Balance visible edge insets around text, icons and corners; do not use negative margins or overlap targets. Expanded sections retain ordinary bottom padding.
+- Remote playback sheet slides up. Landscape is a complete 18px rounded card inset beyond safe areas on every side. Narrow portrait extends the background into the bottom safe area, with controls above it; retain rounded bottom corners there, or square corners when meeting a screen edge with no bottom inset. Two-column sheets give each column its own vertical scroll and gesture ownership. A fitting song/transport column stays fixed and supports drag-to-collapse; actual overflow retains native scrolling, including at the top edge. Never clip content merely to force a fit.
+- Desktop tool rail is 80px wide with 64px square targets and 14px corners. Labels use 12px/14px typography and their actual one/two-line height, fitting four Chinese characters per line. Center the 24px icon and label as a group with a 4px gap and a 1px upward optical bias; selected icons use accent-colored filled silhouettes with transparent cutouts, and the square target uses the shared theme-aware accent-soft fill without an additional outline. Selected fills retain the original outer stroke footprint. The selected queue retains its accent-colored outline and normal stroke weight with a slightly longer first line and shorter second line for staggered ends. History keeps the same 4:00 hands in both states; selection rotates only its outer arrow 30 degrees counterclockwise around the center. Session-user icons align each body apex with its head center in both outline and filled states. Filled silhouettes keep both heads as complete circles; only overlapping bodies use a transparent gap matching the outline width. Keep glyph visual weight balanced, theme contrast and visible keyboard focus.
+
+### 5.7 Dividers, headings and messages
+
+- Dividers separate visible groups/rows only. Hidden platform-specific rows must not leave a rule before the first visible row.
+- Semantic title/content separators remain visible and align with the heading's actual responsive text inset. They do not depend on scroll position. Do not add scroll-edge rules to headers/footers.
+- Playback-settings dividers align with the content inset, never the enclosing card edge. Remote's settings card owns 14px inline padding; sections add no second inline padding. Preserve control geometry and vertical spacing.
+- Bilingual pairs describe the same feature. Chinese/Japanese use its full English title as eyebrow; English uses the corresponding Chinese title. Host/Remote and dynamic headings remain equivalent. Compact navigation labels do not supply full section headings; playback status and individual control labels are not bilingual pairs.
+- Settings groups use single-language 16px subheadings.
+- Browse loading, selection hints and empty results use one plain centered muted 13px/1.5 status block with 8px vertical padding and no filled card. Place it directly below relevant controls/content, at the start of the list region, never at the bottom of a tall Host panel or duplicated in a footer. Remote may naturally end below it because its panel shrinks to content.
+- Put explanatory guidance in the shared heading-adjacent info button by default. Keep essential prerequisites, actionable status/errors and short text that does not affect layout visible. Android page titles retain the shared bilingual heading outside and above their content cards/tabs; Queue, History, Users and My share one axis and type scale. Header actions sit at the top-right of the complete title pair. Phone Settings uses a back action with an SVG chevron, without a duplicate large title. Audit controls by role: compact tools and login status actions must not inherit the 44px ordinary-action size.
+- Session-user guidance appears only in the empty list state; populated lists do not keep an instructional message or help button. The empty-session prerequisite uses the same bold accent as Request, with regular muted editing guidance directly below.
+- Preserve actionable errors through their existing error/toast owner. Empty display-list guidance uses bold accent text without a message-card background.
+- If an action's busy label already expresses checking/channel changes, do not duplicate that status in a message. Retain failures and completed outcomes.
+
+### 5.8 Request navigation, search and list layout
+
+- Host/Remote request navigation shares `static/request-tabs.css` typography, states, spacing and colors. Wide Host can keep primary/secondary rows; portrait uses the approved compact contextual row and back action.
+- Host Quick, Search, Discover and Sources share Quick's responsive panel axis throughout landscape widths. Align the first control below equally sized title/tab tracks; do not stack header bottom padding and content top padding.
+- Host rail hover uses the selected icon's theme color. Random-song covers keep a stable 16:9 geometry independent of title length and artwork dimensions.
+- Primary searches use the shared magnifier, busy spinner and translated accessible label. Host submits use the Host control height.
+- Contextual search keeps its right-hand toggle stationary: magnifier collapsed, X expanded. Keep a separate submit magnifier inside the input's right edge and support Enter. The input clear action edits the draft; close exits contextual search and restores unfiltered results when necessary. Preserve focus-on-open, guards and accessible labels across Host/local/public Remote.
+- A search action beside a horizontal card strip centers on the card track, excluding padding and scrollbar from the center calculation.
+- Host song-result grids (search/category/name/artist) and large category covers share `--request-song-card-min-inline-size: 200px`, including narrow overrides. Add columns before cards become oversized; scale category-cover titles to the card. Name/artist entry cards instead reuse compact UP/favorites widths, surface, typography and feedback.
+- Remote queue order badges own a 44px square drag/tap target without a separate grip column. A tap opens the shared localized help bubble; movement of at least 6px begins dragging, with no long-press delay. Keep small pointer jitter as a tap, suppress post-drag help clicks, and cancel interrupted gestures without committing a reorder.
+- Session-user lists retain their tag sizes and vertical scrolling in normal, selection and rename modes. Keep rename, multi-select and trash tools outside the scroll track; rename and multi-select are mutually exclusive. Selection replaces only number badges with native checkboxes. Batch dragging preserves roster order within the selection; normal-mode touch dragging uses the numbered handle so names and list space remain scrollable; in selection mode the checkbox only selects and the rest of the tag drags the selected group. The fixed trash slot owns drag hit-testing; its enlarged icon and snapshots must not interrupt drag feedback. Anchored rename editors use shared floating-panel geometry, ordinary fields/actions and keyboard focus management.
+- Reserve space inside the user-list scroll region for selection outlines and before/after insertion marks, including the first item. Desktop and touch drag previews retain the source tag's dimensions and editing-mode styles; touch previews follow the pointer with translucent fill. Source/session selection retains Tab/Enter/Space access without Alt-arrow reorder shortcuts. Trash help uses the shared animated tooltip and remains keyboard-accessible when deletion is disabled.
+- Scroll regions reserve scrollbar space only when actually scrolling. Native scrollbar width participates in layout; never apply unconditional `scrollbar-gutter: stable`. Use the queue's conditional overflow handling as the pattern.
+- Bounded name/artist, history and source lists add a 4px content gap only while scrolling. Name/artist grids retain 2px vertical paint room so first-row Host hover lift is not clipped. Remote request lists use document scrolling; bounded Remote queue/history lists use the same conditional gap. Observe content/size changes, not playback ticks.
+- Ordinary song/source lists keep bottom and side insets equal. Host result totals appear only in administrator mode, with a reserved footer track and at least 16px bottom clearance.
+- Search/entry pagination uses 4px above and below footer controls; do not stack list bottom padding onto it. Remote UP/favorites/category entries have up to 12 cards per page with responsive columns. Preserve the page across unrelated updates.
+- Host pagination belongs to the panel frame: keep it at the bottom, outside the internally scrolling content, with no overlap from editing tools. Fit page capacity to complete rows at the actual available width/height, minimizing scrolling while retaining it for a row that cannot fit or temporary editing overlays. Observe content/size/font changes and coalesce layout work; resizing preserves the previous visible anchor and selections. Do not apply native panel pagination to Remote's document flow.
+
+### 5.9 Request-card geometry and text overflow
+
+- Request source/name/artist, category and song cards share 16px inner corners across clients; ordinary form controls use their separate 14px rule. Preserve outer panel radii and spacing. Align nested/peer corner centers along a horizontal or vertical axis when practical; exact shared centers must not make approved shapes nearly square or reduce text clearance. Edge-flush covers use card clipping; circles, pills and detached controls retain their own shapes.
+- Text entries share a 72px height, 10px padding, 32px two-line title area (14px/16px, weight 700), 2px title-to-metadata gap and 16px metadata line (12px/16px).
+- Avatars are 24px, inset 10px from inner bottom/right edges. The first title line uses full width; the second line and metadata reserve 32px with an avatar, keeping at least 8px clear. Do not shrink the first line to enforce concentric corners.
+- Metadata stays on one line and ellipsizes when needed, preserving complete DOM text for accessibility.
+- UP text badges use the shared song-detail stylesheet across Host/Remote search, details and playback. Center their boxes without client-specific transforms or margins; wrapped owner names keep the badge aligned with the first line.
+- Leave vertical ink room for emoji/diacritics without changing the 16px baseline rhythm, card height or metadata position. Keep horizontal clipping.
+- Text longer than two lines scrolls within the second line. Short titles stay still; offscreen/hidden-page titles pause. Measure content/size/font changes, not timers. Reduced motion uses manual horizontal scrolling.
+- Scrolling titles with overflow greater than one visible line width loop continuously to the left; smaller overflow retains back-and-forth motion. Reuse the shared motion helper across playback and request cards, hide the visual repeat from accessibility, and keep unchanged measurements from restarting the loop.
+- Song covers keep 16:9 media, 10px text insets and a 40px two-line title (14px/20px). Equal-width peers align title heights/positions. Remote category labels may wrap to two lines within the fixed 16:9 cover. Preserve source-card widths/pagination; floating-panel radius is not an inline-card rule.
+- Queued sources absent from the library appear first as equal-sized dashed placeholders, showing “等待拉取” or the fetching spinner until refreshed data replaces them. Confirmation says “已加入拉取队列”, not “增量拉取”.
+- Queued favorites use the confirmed folder name from the authoritative shared queue on all clients. Numeric ID is only a fallback when no title exists; browser-local memory is insufficient.
+
+### 5.10 Playback and selection
+
+- Single-screen fullscreen enters without native video controls and ignores incidental focus/hover from layout changes; deliberate pointer movement, touch/click or keyboard interaction can reveal the seekbar afterward. Keep controls and cursor available while scrubbing. The single-screen cursor hides after 1.8 seconds idle and restores on input/exit, independently of dual-screen listeners. Audience playback remains free of native video controls. Fullscreen QR/exit hover expansion requires actual pointer movement over the control and resets on exit, pointer leave, window blur and resize; touch retains explicit tap pinning.
+- Right-center fullscreen/audience feedback uses compact vertical cards with an icon above a fully localized label/value, shared 18px floating surfaces and one outer blur per card. Use 32px icons and equal top/bottom content insets; keep icons and labels in the ordinary text color, accenting only the information value. Show confirmed volume/mute, effective audio/video delay/lock, key shift and explicit playback/seek/next operations; no user-edit cards (Host toasts own those). Ignore initial loads, song/session defaults, reorder and progress-only snapshots. Keep at most two recent visible categories in entry order, newer entries below earlier ones; same-category updates retain their slot and refresh expiry, while a new third category evicts the least recently updated category without a waiting queue. Each card expires independently. After the upper card finishes fading, move the lower card into its slot; a single card stays in that first slot. Passive cards retain the shared fill, outline and blur without external shadows that darken a neighboring card. Retain nodes/positions through 120ms opacity/3px entry/exit and movement, cancel exits on rapid reopening, expire two seconds after the latest actual adjustment and respect reduced motion. Keep cards inside the player/audience root, noninteractive and focus-neutral. Audience delivery uses the existing role/generation-checked master-state relay; replay/localization must not extend expiry or remount media.
+- Remote transport fills its available column and stays next to the song summary without stretch space. Resizing between one/two columns preserves control nodes and keeps progress inside its column.
+- Remote retains preview.1's 44px seek/next and 48px play/pause circles on one center line. Part/setting controls are 44px; header actions are 32px.
+- Playback-sheet collapse is an unfilled icon, centered when space permits and moving left only to avoid adjacent actions.
+- Rating entry remains openable without pending/submitted labels so users can revisit drafts; enforce eligibility and async submission guards inside the dialog.
+- Saving a rating before its submission trigger updates the waiting score; Host and Remote keep it editable until sending/acceptance. Preserve unsaved edits across unrelated snapshots, bind them to the stable user/session/play identity, and show the saved score when submission becomes read-only.
+- Remote progress thumbs appear on interaction or keyboard focus, keep their 44px input target, and restore range focus after a seek only while the user is still interacting there. Cancellation and closing must release scrubbing.
+- Part pills keep their existing shapes. Overflow adds an expand action; expanded lists wrap natural-width pills, never force two columns. Labels wider than a row scroll, manually under reduced motion. Preserve expand nodes across progress-only updates and popup geometry through exit.
+- Song titles fit fully within two lines; longer titles use one scrolling line (manual under reduced motion). Reserve vertical glyph paint room for descenders and exclude that padding when measuring wrapped line count. Cache progress replaces the uploader in its 20px line and restores it when ready; failure/retry affordances must not grow that line.
+- Host console and audience transition lists reuse the Remote queue badge surface from `ui-surfaces.css`: gray for pending/downloading, green for ready, and a red SVG X for failure. Cache state belongs to each song's badge, without dashed/warning card or canvas outlines; cache-only updates retain row/media nodes and geometry. The transition primary uses the queue's SVG play glyph. The console uses one localized “Following requests” heading at the shared 24px Host title size, numbers all pending songs from 1 (including its primary row), hides the redundant subtitle and uses 16px outer card padding. Song titles, requester metadata and numbering retain their original container-responsive scale; retain the audience screen's separate viewing-distance scale.
+- Selection dialogs use “选择分 P”, “视频画面（选一个）” and “音频轨道（至少选一个）”. Verify Chinese, English and Japanese at 360px; shorten/remove parentheses only if needed, retaining the full constraint in accessible help.
+
+### 5.11 Access sharing and audience windows
+
+- The Host sends every audience `master-state` envelope through `publish_presentation_output_state` (main window only); a loaded audience requests replay through `request_presentation_output_state` (controller only). Publish displayed changes even while idle. BroadcastChannel/localStorage are optional fast paths, never requirements for QR, room, theme or language delivery between WebViews.
+- All desktop windows share one data store. Tauri ignores a configured window's `dataDirectory`: create Windows `main` in code (`"create": false`) with the same `runtime/webview` directory set on audience/identifier windows. Share `WINDOWS_WEBVIEW_BROWSER_ARGS` (wry defaults plus `--disable-direct-composition-video-overlays`) so hardware video overlays cannot cover audience exit/QR controls.
+- Identifier windows initialize theme/language via a native-CSP-compatible external script and follow Host preferences while open.
+- New-request notices derive from accepted queue additions and appear on both single-screen fullscreen and audience windows. Audience notices use the native master-state relay, retain an expiry time and deduplicate replay; progress-only updates, initial loads and song transitions must not announce a new request.
+- All access QR cards share one 3px white frame; do not add a second SVG frame.
+- Show the applied public-room password even while an unsaved replacement is edited. Full management menus alone use bold Local/Public scan instructions; their password label stays normal and muted.
+- Compact dual-entry Host/fullscreen/audience cards and all Remote share cards omit scan/network/expansion help below QR codes. Local shows the complete clickable URL including protocol with the shared underline on every surface. Public shows muted normal “Room password” and bold accent password on one 12px line. Long passwords scroll horizontally without growing/clipping the panel. Preserve help in the full menu and Host local-only preview.
+- Connection counts represent connected Remote devices, merge multiple tabs and exclude Host/audience windows. Full menus use translated labels, compact cards a people icon/count. The full menu's Local count aligns with the Public disclosure chevron's right edge, without reserving a nonexistent Local chevron. Compact counts align with each column's right content edge. Fullscreen headers must not inherit management-menu close-button clearance.
+
+### 5.12 Export, announcements and updates
+
+- Stacked export selects have a visible shared theme-aware outline on both clients. Use one column at narrow widths; two only when translated labels/values fit. Export footer actions stay on one row at 320px; Remote uses equal columns, an 8px gap and 6px inline button padding. If the field already identifies image pagination, use compact options such as `200 per page` / `1ページ 200 曲`.
+- Announcements sit immediately before the update action in its action group, using the 30px light/accent-text tool pill (recache palette), including narrow wrapping.
+- Update confirmation uses the shared 18px title, 13px body and 12px gap. Include a translated manual-download fallback with an actual GitHub Releases link opened through the Host external-browser boundary.
+- Announcement windows separate the 18px window title from the article with an inset rule and 12px on either side. Article title is 16px; secondary type/date/version/deadline metadata is 12px, with 6px title-to-metadata and 12px before body. Do not stack body margins onto these gaps.
+- Retain supplied deadlines independently of body text. Publication dates omit seconds; deadlines include minutes/timezone. Refresh/cache status follows article content in small accent text; empty status reserves no space. Keep multi-entry separation inside content, without extra padding after the last entry.
 
 ## 6. Change Discipline
 
 - **Context Inspection**: Inspect the latest branch HEAD and `git status` before editing files.
 - **Minimal Changes**: Make the smallest coherent change necessary to accomplish the user request.
+- **Repository Documentation**: Commit development guidelines, user instructions, and necessary established architecture, interface, behavior and maintenance contracts. Keep exploratory plans, investigation notes, implementation diaries, one-off validation results, screenshots, traces and engineering receipts in ignored `.tmp/` or another noncommitted evidence location. Extract durable decisions into the relevant guideline or usage document instead of committing the development narrative; retain reproducible verification instructions, but report run-specific outcomes separately.
+- **Product Name**: Use lowercase `bilikara` in user-facing text, window titles and documentation. Preserve established protocol headers, environment variables, public symbols and historical compatibility fixtures when their spelling is part of a contract.
 - **Domain Boundaries**: Do not begin work on an unrelated business domain or migration area.
 - **Behavior Preservation**: Preserve existing fallback behaviors and user-visible functionality unless explicitly directed to alter them.
 - **Test Quality**: Never weaken, disable, or delete assertions to force a passing build.
+- **Python Retirement**: Identify repository, CI, release-script and test consumers before removing legacy code. Keep useful source entry points, frozen references and compatibility coverage. Native build tooling must run without importing the Python application package; keep package layout, provenance/metadata validation and artifact verification unchanged.
+- **Explicit UTF-8 for Repository Text**: Python code and tests reading repository JavaScript (especially files containing Chinese text), HTML, CSS, JSON, Markdown, or other UTF-8 source/assets must explicitly pass `encoding="utf-8"` to `Path.read_text()`, `Path.write_text()`, and text-mode `open()`. Text subprocess pipes carrying this content, including Node.js test harnesses, must also specify `encoding="utf-8"` in `subprocess.run()` / `Popen()`; `text=True` alone is insufficient. Never rely on the OS locale, Linux defaults, `PYTHONUTF8`, or a CI environment switch to make these operations portable: Windows may default to CP1252/GBK. Apply this rule to new and modified scripts/tests; do not fix decode failures by ignoring/replacing invalid bytes or weakening assertions.
 - **Reviewability**: Each business-rule domain change should remain independently reviewable and revertible.
 - **Git Hygiene**: Do not create unexpected branches, worktrees, tags, release builds, or remote pushes unless requested. Never rewrite published history without an explicit request and backup.
+
+### 6.1 Cross-platform construction and distribution
+
+- **Native Paths and Manifest Keys**: Keep native filesystem paths separate from portable slash-separated manifest keys. Encode enumerated paths by validated components; do not reject legitimate Windows separators or reinterpret a literal POSIX backslash as a separator. Validate untrusted keys before joining: reject traversal, absolute/rooted paths, drive/UNC/device prefixes, alternate-stream syntax, disallowed roots and excluded payloads. Never sanitize an unsafe key into an accepted path. Apply containment and relative-link checks at copy/restore boundaries. Windows `canonicalize()` produces extended `\\?\` paths that external tools may reject: retain them for filesystem validation, and use relative generated include/output arguments under a validated owned cwd where supported, as the MSVC companion does. Do not globally strip prefixes or weaken containment to repair a tool invocation.
+- **Argument Boundaries and Legal Fixtures**: Use native path APIs and subprocess argument arrays. Shell quoting is required at an existing shell boundary; JSON serialization is not shell escaping. Cover spaces, CJK and literal metacharacters without shell evaluation. Windows fixtures must use legal Windows filenames; keep POSIX-only quote/backslash filenames in separate tests. A simulated platform value on Linux is not Windows filesystem evidence.
+- **Windows Batch Invocation**: `cmd.exe` uses different quoting from ordinary CRT programs. For a trusted, quoted batch command in Node tests, opt into `windowsVerbatimArguments` only for that invocation; retain default argument encoding for native binaries. Exercise the real batch file with Unicode, spaces and metacharacters from an unrelated cwd, keeping deadlines and owned-process cleanup. Do not fix escaped-quote failures with `shell: true` or by removing special-path coverage.
+- **Filesystem Identity in Tests**: Compare existing paths through independent native filesystem canonicalization (for example, Node's `fs.realpathSync.native`). Windows short names such as `RUNNER~1` and extended long paths can identify the same directory; Node's JavaScript `realpathSync` can retain the short spelling. Before passing an existing DLL path from Bash to a Win32 loader, resolve it through native filesystem APIs: `LoadLibraryExW` requires backslashes even when filesystem existence checks accept mixed separators. Do not strip prefixes or lowercase strings to hide a wrong destination. Keep exact file contents, containment and unrelated-directory protection assertions.
+- **Text, Binary Data and Newlines**: Use explicit UTF-8 for repository text, JSON, subprocess text and GitHub environment/output files; preserve binary payload bytes. Decode platform-defined streams in their actual encoding (for example, `cmd /u` emits UTF-16). Normalize CRLF/CR only at a documented text boundary, retaining exact expected content and missing/duplicate-marker rejection. Pin LF checkout for shell startup files where required. Do not use replacement decoding, locale overrides or relaxed assertions to conceal corruption.
+- **Windows Compiler Selection**: Initialize the requested native MSVC host/target environment before the first Cargo or C build. Git Bash can prepend its GNU `link.exe` after inheriting Visual Studio's PATH; exporting PATH once through `GITHUB_ENV` is insufficient. Preserve `setup_msvc.ps1` and its `BASH_ENV` initializer so each noninteractive Bash process selects the corresponding MSVC tools. Verify actual tool resolution; do not substitute MinGW, change `/MD`, add unrelated flags or use a recording fixture as native-linker acceptance. Windows environment-variable names are case-insensitive even when enumeration preserves `Path` or `PathExt`; snapshots must retain that native lookup rule. POSIX names remain case-sensitive. After publishing a prepared tool through `GITHUB_PATH`, check discovery and execution in a fresh native consumer before expensive downstream builds.
+- **Cargo and Rustup Context**: Invoke build/verification tools from the checkout or copied rebuild-kit root. `--manifest-path` does not select the working-directory hierarchy for Cargo configuration or rustup overrides. Shared recipe helpers must use a subshell so the caller retains its source cwd and EXIT-trap access to logs. Preserve explicit `RUSTUP_TOOLCHAIN`, `--locked`, host-native tool targets and product target/profile/feature distinctions. Select current binaries through Cargo metadata/compiler-artifact output, including `CARGO_TARGET_DIR`; do not glob for stale artifacts.
+- **Output Ownership and Publication**: Validate generated cleanup destinations and source/cache/output overlap before recursive deletion. Never clean an installation, real `runtime/`, unrelated artifacts, the checkout or the entire Cargo target tree. Stage in small owned directories, invalidate stale completion markers after failed builds and publish metadata only after its binary/dependencies are valid. Preserve an existing valid output on preparation failure where the established contract supports it.
+- **Archives, Links and Modes**: Verify pinned downloads before extraction or execution. Bound transfers/extraction and reject missing, ambiguous, linked or unsafe executable entries. Preserve accepted relative symlinks, executable modes and archive roots; a development copy that dereferences links is unsuitable for a signed final bundle. Compare extracted and round-trip inventories, link targets, permissions and static bytes, not just filenames.
+- **Dependency Closure and Layout**: Inspect actual machine type, imports/delay imports and loader paths. Keep system/API-set dependencies distinct from declared private libraries and permitted selected-toolchain redistributables; do not collect arbitrary DLLs/libraries from PATH. Preserve executable naming/case, the single vendor tree, Host/updater locations, manifests and source/license/rebuild materials. Exclude user data, Python runtime/FFI payloads and private test executables from native products.
+- **macOS Sealing**: Preserve framework loader paths, resource/code separation, plist fields, relative vendor links and the accepted nested-code signing order. Honor existing identity, entitlement, requirement and flag handling; verify signatures and archive round trips natively. Make no bundle mutation after its final seal. Ad-hoc signing is not notarization, and foreign-platform fixtures do not qualify macOS signing.
+- **Processes and Error Propagation**: Bound child output and deadlines, preserve nonzero exits and clean owned process trees. Large Node programs should use files/stdin rather than exceed platform command-line limits with `-e`. Shell recipes must propagate configure/compiler/collector failures through pipelines and keep machine-readable `GITHUB_OUTPUT` values separate from logs. Diagnose races, watcher limits and filesystem execution errors with controlled reproductions; do not hide them with blanket retries or longer timeouts.
+- **Cache Semantics and Timing**: Inspect the actual key, hit/miss, restore/save timestamps and save result before explaining a slow run. OS/architecture, compiler/SDK, flags, recipe and profile/feature distinctions legitimately separate caches; concurrent cold runs may both start before the first successful save. History-only SHA changes must not invalidate the C-library cache. Keep that cache upstream-only and independent of application/Runtime/companion edits; rebuild downstream outputs after restore. Validate hashes, modes, links, schema, target and key before mutating a restore destination. Do not rotate keys or broaden cache contents merely to obtain a hit.
+- **CI Inputs and Evidence**: Install pinned host tools and native compiler prerequisites before their first consumer; place required real-library checks after the prefix is prepared/exported. Explicitly required missing or invalid inputs must fail, while an optional local skip must state its reason. Keep strict Source/native gates and supported platform matrices. Separate fixture, local native, remote CI, extracted-package/signature and physical GUI/device evidence; none substitutes for the others, and a pushed commit is not release acceptance.
+- **Dependency Updates**: Prefer recent stable dependencies and commit reproducible lockfiles. Validate changed development, browser and packaging paths with their matching tools; reinstall Playwright browsers after updating its test client. Diagnose automation-client defects separately from product WebViews. Keep media/tool integrity pins until an explicitly validated update; do not use unbounded `latest` acquisition in product preparation.
 
 ## 7. Validation Standards
 
@@ -120,13 +373,35 @@ cargo test --locked
 cargo build --release --locked
 cd ..
 
+# 1b. Rust Runtime Infrastructure Checks
+cd rust-runtime
+cargo fmt --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
+cargo build --release --locked
+cd ..
+
+# 1c. Desktop Construction Contracts (Node 24, pinned host-native xtask)
+npm run test:desktop-build
+# Shell wrapper checks; recording commands, not library qualification
+npm run test:libav-wrapper
+# Required real native prefix; Linux CI invokes this after its prerequisite
+BILIKARA_TEST_LIBAV_COMPANION=/absolute/prefix/bin/libbilikara_media_libav.so npm run test:libav-prerequisites
+npm run test:frontend
+# Rendered Host/Remote interactions, including shared layout and audience relay
+npm run test:host-experience
+npm run test:remote-sync
+npm run test:auxiliary
+npm run test:native-qr
+npm run test:native-images
+npm run test:native-login
+
 # 2. Python Test Suite (forcing native library verification)
 BILIKARA_REQUIRE_RUST_LIB=1 \
 python -m unittest discover -s tests -v
 
 # 3. Python Compilation Checks
 python -m compileall -q bilikara
-python -m py_compile start_bilikara.py build_bundle.py
 
 # 4. Tauri Shell Checks
 cd src-tauri
@@ -159,13 +434,25 @@ When completing a task, agents must report:
 
 ## 9. Directory and Module Map
 
-### Python Host Layer (`bilikara/`)
+### Retained Python Source Host and Compatibility Layer (`bilikara/`)
+
+This layer supports source development and compatibility/equivalence tests. It
+is not shipped or imported by the native desktop build. `ffmpeg_vendor.py`
+retains its legacy import surface by forwarding to `scripts/libav_manifest.py`;
+legacy diagnostics use that tooling verifier; native construction validates the
+same manifest contract in xtask.
+
+Source startup uses `python -m bilikara` from the repository root. The
+`start_bilikara.sh` convenience wrapper uses that same module entry. Root-level
+Python launcher aliases are retired; the `bilikara/server.py` transport remains
+active.
+
 | File | Purpose |
 | :--- | :--- |
 | `server.py` | HTTP Server, API endpoints, SSE event hub (`AppContext`). |
-| `store.py` | `PlaylistStore` managing JSON state persistence (`data/state.json`). |
-| `bilibili.py` | Bilibili API querying, metadata parsing, media-page selection wrapper. |
-| `cache.py` | Orchestration of `BBDown` downloads and `FFmpeg` audio extraction. |
+| `store.py` | `PlaylistStore` AppState/FFI adapter, defensive read-only projection, and atomic JSON persistence derived from Rust snapshots. |
+| `bilibili.py` | Bilibili API querying, metadata parsing, media-page selection wrapper; DASH is a thin adapter to the Rust Bilibili service for DownKyi too. Shared Gatcha/maintenance WBI helpers remain. |
+| `cache.py` | Rust CacheRuntime configuration/state projection plus BBDown preparation/login adapters, retained yt-dlp orchestration and existing source-mode media CLI compatibility. |
 | `rust_backend.py` | Native FFI loader, JSON payload validation, frozen compatibility fallbacks for older domains, and fail-closed adapters for new Rust-authoritative capabilities. |
 | `updater.py` | GitHub release checking, semver comparison, update asset resolution. |
 | `config.py` | Global settings, path resolution, runtime tool discovery. |
@@ -187,11 +474,27 @@ When completing a task, agents must report:
 | `src/cache_planning.rs` | Pure cache-window desired, pending, retention, and preemption planning policy. |
 | `src/playlist_planning.rs` | Pure playlist ordering and duplicate-identity planning policy. |
 | `src/av_delay.rs` | Pure global/local AV-delay transition, clamping, and lock-button state policy. |
-| `src/playback_selector_policy.rs` | Rust-authoritative selector-mode validation and persisted-mode normalization from explicit capability availability. |
 | `src/tool_prepare_policy.rs` | Rust-authoritative deterministic tool prepare routing from immutable host-gathered facts. |
 | `src/release_selection.rs` | Semantic version sorting and release filtering rules. |
 | `src/asset_selection.rs` | Update package scoring by platform and architecture. |
 | `src/ffi.rs` | FFI wrapper utilities, memory safety helpers, panic containment. |
+
+### Rust Runtime Infrastructure (`rust-runtime/`)
+| File / Module | Purpose |
+| :--- | :--- |
+| `src/app_state.rs` | Process-wide authoritative mutable application state, strict commands, revision/generation tracking, snapshots, and persistence effects. |
+| `src/http_downloader.rs` | Typed HTTP transfer, URL fallback, progress, cancellation, response validation, and atomic publication. |
+| `src/cache_runtime.rs` | Rust Native cache queues, primary/urgent workers, retries, cancellation, multi-track validation, and atomic cache-group publication. |
+| `src/media_backend.rs` | Native media probing and MP4/FLAC normalization for Rust Native playback artifacts. |
+| `src/bilibili_service.rs` | Bilibili WBI signing, DASH resolution, and redirect handling. |
+| `src/gatcha_repository.rs` | Gacha configuration, persistence, browsing, candidate selection, and Bilibili refresh operations. |
+| `src/cloudflare_service.rs` | Cloudflare API execution, pool-entry normalization, and bounded background append scheduling. |
+| `src/status_service.rs` | Bilibili login state and Gacha refresh lease/status ownership. |
+| `src/update_installer.rs` and `src/update_installer/` | Update extraction, native package validation and preparation, retained published-era helper launch, and the external `bilikara-updater` (`apply.rs`, `src/bin/bilikara-updater.rs`) that replaces and reopens a desktop installation. |
+| `src/diagnostics.rs` | Diagnostic sanitization and artifact assembly. |
+| `src/playlist_export.rs` and `src/playlist_export/` | Complete CSV/image export service, local-time formatting, reusable fonts, text layout/rasterization, PNG/ZIP and coarse wire adaptation; no AppState lock during rendering. |
+| `src/networking.rs` and `src/networking/` | Native LAN interface and routing facts per platform, plus the pure address classification and ranking policy. |
+| `src/ffi.rs` | Temporary C ABI, including the additive schema-v1 AppState request entry used by the Python Host adapter. |
 
 ### Tauri Shell Layer (`src-tauri/`)
 | File / Module | Purpose |

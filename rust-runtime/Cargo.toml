@@ -1,0 +1,66 @@
+[package]
+name = "bilikara_runtime"
+version = "0.8.0"
+edition = "2024"
+rust-version = "1.88"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[example]]
+name = "native_host_alpha"
+required-features = ["native-host"]
+
+[[example]]
+name = "validate_announcements"
+required-features = ["native-host"]
+
+[[bin]]
+name = "bilikara-desktop-host"
+required-features = ["native-host"]
+
+[[bin]]
+name = "bilikara-updater"
+
+[features]
+native-host = ["dep:axum", "dep:tokio-util", "qrcode/svg", "dep:time"]
+
+[dependencies]
+base64 = "0.22"
+axum = { version = "0.8", optional = true, default-features = false, features = ["http1", "json", "tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "fs", "io-util"] }
+tokio-util = { version = "0.7", optional = true, features = ["io"] }
+time = { version = "0.3", optional = true }
+bilikara_rust = { path = "../rust" }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+cosmic-text = { version = "0.17", default-features = false, features = ["std", "swash", "fontconfig"] }
+csv = "1.4"
+ebur128 = { version = "=0.1.10", default-features = false }
+fs2 = "0.4"
+flate2 = "1"
+tar = { version = "0.4", default-features = false }
+sha2 = "0.10"
+getrandom = "0.3"
+libc = "0.2"
+md5 = "0.8"
+mp4 = "0.14"
+png = { version = "0.18.1", default-features = false }
+qrcode = { version = "0.14.1", default-features = false }
+regex = "1"
+rquickjs = { version = "=0.14.0", default-features = false, features = ["std"] }
+reqwest = { version = "0.13", features = ["blocking", "json", "cookies"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = "2"
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+webpki-root-certs = "1"
+rquickjs = { version = "=0.14.0", default-features = false, features = ["std", "bindgen"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock", "Win32_Storage_FileSystem", "Win32_System_LibraryLoader", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading", "Win32_System_Pipes", "Win32_System_JobObjects", "Win32_Security", "Win32_System_WindowsProgramming"] }
+
+[dev-dependencies]
+claxon = "0.4"
+quircs = "=0.10.3"

@@ -19,6 +19,9 @@ def startup_logging_enabled() -> bool:
 
 
 def _fallback_app_home() -> Path:
+    override = os.getenv("BILIKARA_HOME", "").strip()
+    if override:
+        return Path(override).expanduser()
     if getattr(sys, "frozen", False):
         if sys.platform == "darwin":
             return Path("~/Library/Application Support/bilikara").expanduser()
@@ -149,12 +152,16 @@ def run_with_startup_logging() -> None:
     parser.add_argument("--https-smoke", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--tool-smoke",
-        choices=("bbdown", "aria2c"),
+        choices=("native", "bbdown", "aria2c", "ffmpeg", "media-routing", "no-media-cli"),
         help=argparse.SUPPRESS,
     )
     args = parser.parse_args()
 
     _ensure_std_streams()
+    if args.tool_smoke and hasattr(sys.stdout, "reconfigure"):
+        # Machine-readable smoke JSON must survive non-ASCII package paths
+        # even when a Windows redirected stream defaults to an ANSI code page.
+        sys.stdout.reconfigure(encoding="utf-8")
     _install_debug_log_streams()
     _install_startup_exception_hooks()
     if startup_logging_enabled():
@@ -188,6 +195,9 @@ def run_with_startup_logging() -> None:
         append_startup_log(
             "Import or HTTPS initialization failure:\n" + traceback.format_exc().rstrip()
         )
+        if args.tool_smoke:
+            # Automated smoke failures must exit, not open a frozen GUI error dialog.
+            raise SystemExit(1) from None
         raise
 
     if startup_logging_enabled():

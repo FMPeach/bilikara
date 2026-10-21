@@ -1,0 +1,165 @@
+# Android Host preview
+
+The launcher name is **bilikara beta** and uses the desktop artwork. The test APK retains
+`com.bilikara.app.alpha`. Updating an existing installation requires the same
+signing certificate and a non-decreasing versionCode. It is **not** a production
+signed release. The technical bootstrap names `android-alpha.html` and
+`android_alpha_status` remain compatible implementation identifiers.
+
+## Runtime and UI boundaries
+
+- One adaptive Android Host layout follows the WebView window width and system
+  auto-rotation, without manual layout/direction selectors. Player fullscreen
+  temporarily requests landscape and restores system orientation on exit.
+  See [adaptive layout](android-layout.md).
+- Compact landscape upcoming-song panel, with scrollable following songs.
+- Queue move requests accept the shared Host's `index` field. Cache usage counts
+  actual private media bytes (including partial downloads); cached-song counts
+  come from committed, ready current/queued artifacts rather than directory names.
+- Choosing **new session** atomically archives the previous session's played
+  records, clears current singers/queue/session records, and retains global
+  history, login and settings. Export's source selector includes every archived
+  session, grouped by date, as well as current-session and all-history records.
+  Archives remain in the authoritative Rust checkpoint, not a parallel store.
+  There is a 1,000 archive / existing checkpoint-size safety limit; reaching it
+  reports an error and preserves records, never silently deletes an old session.
+- Diagnostic Markdown supplies UTC generation time, Android/API/device/ABI,
+  actual package version, WebView package/version and browser facts. Python is
+  explicitly not applicable. Connectivity checks target Bilibili, GitHub and the
+  release mirror with bounded timeouts, not D1 scans. Existing sanitizers remain.
+- Internet Remote uses the **same frontend, room lifecycle and Rust protocol**
+  as desktop. The native adapter connects already-validated commands to native
+  queue/player/catalog/Gacha/rating services. Peer identity, replay/generation
+  guards and bounded public metadata projections remain mandatory. Room admin,
+  old-session export and updater admin remain Host-only. Local and Internet QR
+  images are generated locally; credentials are not sent to a QR service.
+- Successfully accepted new songs enqueue the existing bounded Cloudflare
+  metadata append operation, matching desktop. No new SQL or table write path,
+  bulk import upload, full scan or schema migration was introduced.
+- Android update checks select **Android ARM64 APKs**, not desktop archives,
+  using the shared Rust release/channel policy. Download URLs are reconstructed
+  from fixed GitHub/R2 origins. Release metadata must include a SHA-256 digest
+  and bounded size. Android independently checks downloaded size/hash, package
+  ID, increasing versionCode, non-debug build and exact signer before offering
+  the **system installer**; installing is never silent. Unknown-source permission
+  is requested through Android settings and requires another explicit attempt.
+  Test builds can check versions but cannot install formal signed APKs.
+
+Room lifetimes follow the shared 1–24-hour UI (default 12) and the expiration
+returned by the deployed signaling Worker. This work does not deploy a Worker.
+The catalog Worker must support the documented cursor-pagination contract.
+
+## Android System WebView compatibility
+
+Android's `minSdk = 24` describes the native OS API floor, not the installed
+WebView's JavaScript, rendering or native-bridge support. The default standard
+mode UI capability baseline is **Chromium 111**, derived from the unguarded capabilities
+listed in [WebView support and compatibility checks](android-webview-support.md). The former
+93-era JavaScript baseline alone does not cover the current UI. This is a
+capability floor, not certification of every provider/device at that version.
+It does not require users to replace the system provider.
+
+Open **My → Settings → Diagnostics → WebView compatibility check** to see the
+actual provider/package/version, native message bridge and webpage capabilities.
+The startup document also has this action. A native dialog opens automatically
+for an old/unknown provider or missing message bridge, even if the shared
+frontend cannot parse. It offers **Copy diagnostics** and **Close**. On the
+startup page it also offers **Enter compatibility mode** (进入兼容模式) when the
+actual provider is at least Chromium **83**, the native bridge works, and the
+required compatibility primitives are present. This is an explicit choice;
+a supported provider uses standard mode automatically. Compatibility mode reuses
+the same UI and Rust Host with missing-capability adapters. WebView 83–90 uses
+generated CSS syntax adapters and simplified CSS motion; compatibility mode on
+91 keeps its existing path. The displayed mode names are 标准模式 (standard mode)
+and 兼容模式 (compatibility mode); their internal `latest` / `legacy` identifiers
+remain unchanged.
+It does not open a store or ask users to install another WebView; availability
+of component updates varies by ROM/vendor. Actual engine capabilities are
+checked at startup. APK `minSdk` cannot constrain the independently installed
+WebView's version, so the native OS floor remains 24.
+
+State loading and public-room creation use `AbortController` with bounded timers;
+they do not require the newer `AbortSignal.timeout`. The LAN entry and its QR
+arrive in Host state and do not require a public signaling room. Public-room
+creation is a separate network operation, with its QR generated by the local Host.
+
+If the interface still does not respond, copy the native diagnostic report and
+include OS/MIUI and bilikara versions. It contains environment/capability facts,
+not room tokens or application records. Android's OS version alone does not
+establish [`WEB_MESSAGE_LISTENER`](https://developer.android.com/reference/androidx/webkit/WebViewFeature#WEB_MESSAGE_LISTENER)
+availability. Linux Chromium checks cannot certify Android bridges, rendering
+or a particular MIUI build.
+
+## Deferred by the user
+
+General external-link integration, developer mode and diagnostic ZIP packages.
+Independent Android audience output depends on a device exposing a separate
+presentation display; system WiFi/HDMI mirroring is a different capability. Neither real hardware display latency nor long-session
+reliability is claimed by desktop browser or emulator tests.
+
+## APK workflow and signing
+
+`CI And Bundles` now builds an Android ARM64 APK after its existing test jobs.
+PR/manual builds produce clearly named **debug test artifacts**; they do not
+upload APKs to a Release or R2. Manual Actions builds restore the independent
+beta key from `ANDROID_BETA_KEYSTORE_BASE64` (PKCS12, alias `androiddebugkey`,
+standard debug passwords `android`). Both the restored certificate and final
+APK must match the public pin in `scripts/android_release.mjs`; missing or
+mismatched signing material fails the manual build. Keep the private key backed
+up outside Git and build caches; do not regenerate it between runs or branches.
+
+PR artifacts have `ephemeral-debug` in their names and receive no persistent
+signing key. Local builds retain the developer's debug signer unless an explicit
+`ANDROID_BETA_KEYSTORE_PATH` is supplied. These packages, and older CI packages
+signed with a runner's temporary debug key, are not necessarily upgrade-compatible
+with manual beta builds. Changing to a fixed key cannot repair an existing
+signature mismatch without the old key; preserve data before planning migration.
+This does not introduce an automatic uninstall or data reset.
+
+Tags require all four separate release signing secrets,
+with no fallback to publishing a debug package:
+
+| Secret | Value |
+| --- | --- |
+| `ANDROID_KEYSTORE_BASE64` | Base64-encoded release keystore |
+| `ANDROID_KEYSTORE_PASSWORD` | Keystore password |
+| `ANDROID_KEY_ALIAS` | Signing entry alias |
+| `ANDROID_KEY_PASSWORD` | Signing entry password |
+
+If release signing is not configured, the tag Android job fails explicitly and
+the combined R2 mirror waits rather than advertising an incomplete bundle.
+No new Cloudflare secret is required: R2 continues using `R2_ACCOUNT_ID`,
+`R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` and `R2_BUCKET`.
+
+Signed tag assets are `bilikara-vX.Y.Z[-preview.N]-android-arm64.apk`. The mirror
+waits for desktop and Android jobs, uploads all assets, and publishes the release
+list plus per-tag/stable metadata. Metadata retains GitHub's SHA-256 digest.
+Android's versionCode mapping preserves preview-to-stable upgrades; downgrading
+to an older stable base is rejected by Android even if desktop offers that
+channel switch. Debug and release package IDs/signers differ: do not uninstall a
+test installation expecting its local data to transfer into a new release app.
+
+## Device acceptance
+
+1. Install a newer beta APK over a beta signed with the same certificate,
+   without uninstalling. Confirm icon/name and
+   that login/settings survive. Continue an existing session once, then restart
+   and choose new; export both the old session and the new empty/current session.
+2. Queue several songs; move to top/bottom and verify ordering. Download, retry,
+   clear and change cache size; compare ready counts and storage usage after the
+   two-second metadata refresh. Partial downloads correctly occupy space.
+3. In landscape, verify countdown, current title and following-song list are
+   reachable. Portrait pages, background pause/foreground resume remain intact.
+4. Create a public room, scan from a separate network/device, register a singer,
+   browse/search, add a real intended song, seek, switch tracks and reconnect.
+   Close the room. Validate expiration against the deployed Worker's response.
+5. Copy diagnostic Markdown: generation time, Android/device/build/WebView and
+   connectivity results should be populated; failed networks report failure,
+   not blank success. Do not share an unsanitized native checkpoint.
+6. Check app updates. The test build must never offer to overwrite itself with a
+   differently signed formal APK. Release installation and R2 publication need
+   a future signed tag and remain unverified until that run exists.
+
+Implementation and acceptance here make no production D1 queries or fabricated
+song/rating submissions. Hardware and real release-pipeline results must be
+recorded separately from local regression results.

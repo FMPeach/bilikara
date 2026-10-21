@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import base64
+from . import media_cli
+
 from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 import ctypes
 from dataclasses import dataclass
 from datetime import datetime
 import hashlib
-import http.cookiejar
 import json
 import math
 import os
@@ -57,13 +57,11 @@ from .config import (
 )
 from .bilibili import (
     BilibiliError,
-    cookie_from_bbdown_data,
     effective_bilibili_cookie,
     fetch_dash_playurl,
 )
-from . import rust_backend
-from .playback_selector import PlaybackCapabilityError, PlaybackSelector
-from .store import PlaylistStore
+from . import rust_backend, rust_runtime
+from .store import PlaylistStore, PlaylistStoreCommandError
 
 MEDIA_EXTENSIONS = {".mp4", ".mkv", ".webm", ".flv", ".m4v"}
 AUDIO_EXTENSIONS = {".m4a", ".aac", ".mp3", ".flac", ".ogg", ".opus", ".wav"}
@@ -80,14 +78,6 @@ CACHE_RETENTION_BUFFER_ITEMS = 3
 MAX_PARALLEL_TRACK_DOWNLOADS = 4
 DOWNKYI_TRACK_MAX_ATTEMPTS = 10
 DOWNKYI_TRACK_RETRY_WAIT_SECONDS = 3.0
-BILIBILI_QR_GENERATE_URL = (
-    "https://passport.bilibili.com/x/passport-login/web/qrcode/generate"
-    "?source=main-fe-header"
-)
-BILIBILI_QR_POLL_URL = "https://passport.bilibili.com/x/passport-login/web/qrcode/poll"
-BILIBILI_QR_WAITING_SCAN = 86101
-BILIBILI_QR_WAITING_CONFIRMATION = 86090
-BILIBILI_QR_EXPIRED = 86038
 BILIBILI_LOGIN_LOG_NAME = "bilibili-login.log"
 DESKTOP_STARTUP_LOG_NAME = "desktop-startup.log"
 PERSISTENT_DIAGNOSTIC_LOG_NAMES = frozenset(
@@ -99,16 +89,6 @@ BILIBILI_LOGIN_SENSITIVE_FIELD_RE = re.compile(
     r"authorization|cookie|shutdown_token|secret|token)[\"']?\s*[:=]\s*[\"']?)"
     r"([^\"'&;,\s<>]+)"
 )
-BILIBILI_LOGIN_COOKIE_ORDER = (
-    "SESSDATA",
-    "bili_jct",
-    "DedeUserID",
-    "DedeUserID__ckMd5",
-    "sid",
-    "buvid3",
-    "buvid4",
-    "b_nut",
-)
 ARIA2_MACOS_VERSION = "1.37.0"
 ARIA2_MACOS_SOURCE_URL = (
     "https://github.com/aria2/aria2/releases/download/release-1.37.0/"
@@ -118,13 +98,16 @@ ARIA2_MACOS_SOURCE_SHA256 = (
     "60a420ad7085eb616cb6e2bdf0a7206d68ff3d37fb5a956dc44242eb2f79b66b"
 )
 SOURCE_AUDIO_DURATION_TOLERANCE_SECONDS = 2.0
-try:
-    ARIA2_CONNECTIONS_PER_TRACK = max(
-        1,
-        min(16, int(os.getenv("BILIKARA_ARIA2_CONNECTIONS_PER_TRACK", "16"))),
-    )
-except ValueError:
-    ARIA2_CONNECTIONS_PER_TRACK = 16
+RUST_MEDIA_PROBE_CONTAINER_SUFFIXES = frozenset({".m4a", ".mp4"})
+# Native media failures a different backend may be offered instead. These are
+# the kinds that describe a limit of the Rust MediaBackend, never a property of
+# the media the operation has to reject, and they mirror
+# MediaErrorKind::allows_backend_fallback on the Rust side. Contract violations
+# and genuinely invalid media are deliberately absent: a more permissive
+# backend must not be allowed to accept what the native one correctly refused.
+RUST_MEDIA_PROBE_FALLBACK_ERROR_KINDS = frozenset(
+    {"unsupported_codec", "unsupported_container_layout"}
+)
 CREATE_NO_WINDOW = 0x08000000
 STARTF_USESHOWWINDOW = 0x00000001
 SW_HIDE = 0
@@ -148,8 +131,14 @@ DEFAULT_AUDIO_HIRES = True
 DOWNLOAD_SOURCE_BBDOWN = "bbdown"
 DOWNLOAD_SOURCE_YTDLP = "ytdlp"
 DOWNLOAD_SOURCE_DOWNKYI = "downkyi"
-DOWNLOAD_SOURCE_CHOICES = (DOWNLOAD_SOURCE_BBDOWN, DOWNLOAD_SOURCE_YTDLP, DOWNLOAD_SOURCE_DOWNKYI)
-DEFAULT_DOWNLOAD_SOURCE = DOWNLOAD_SOURCE_BBDOWN
+DOWNLOAD_SOURCE_NATIVE = "native"
+DOWNLOAD_SOURCE_CHOICES = (
+    DOWNLOAD_SOURCE_NATIVE,
+    DOWNLOAD_SOURCE_BBDOWN,
+    DOWNLOAD_SOURCE_DOWNKYI,
+    DOWNLOAD_SOURCE_YTDLP,
+)
+DEFAULT_DOWNLOAD_SOURCE = DOWNLOAD_SOURCE_NATIVE
 
 
 class CacheCancelledError(RuntimeError):
@@ -310,6 +299,9 @@ class CacheManager:
         self.ordered_desired_ids: list[str] = []
         self.stop_event = threading.Event()
         self.lock = threading.RLock()
+        self._artifact_owner = rust_runtime.artifact_lifetime_request(
+            "open", cache_root=str(CACHE_DIR)
+        )["owner"]
         self.binary_state = "idle"
         self.binary_version = ""
         self.binary_message = "等待任务"
@@ -325,21 +317,360 @@ class CacheManager:
         self.item_activity_at: dict[str, float] = {}
         self.item_stage_progress_signatures: dict[str, str] = {}
         self.item_download_progress: dict[str, dict[str, dict[str, object]]] = {}
+        self.item_download_attempt_tokens: dict[str, int] = {}
+        self.python_worker_download_sources: dict[str, str] = {}
+        self.python_cache_attempt_tokens: dict[str, int] = {}
         self.retry_requested_ids: set[str] = set()
+        self.settling_cache_attempt_tokens: set[int] = set()
+        self.worker_attempt_scope = threading.local()
         self.cache_interrupted_messages: dict[str, str] = {}
         self.log_dir = LOG_DIR
-        self.bbdown_login_cancel_event: threading.Event | None = None
-        self.bbdown_login_state = "idle"
-        self.bbdown_login_message = "未登录"
-        # self.bbdown_login_qr_text = ""
-        self.bbdown_login_qr_image = ""
+        self.native_cache_started = False
+        self.native_cache_event_stop = threading.Event()
+        self.native_cache_event_worker: threading.Thread | None = None
+        self.native_cache_snapshot: dict[str, Any] = {}
+        self.native_cache_error = ""
+        self.native_cache_call_lock = threading.Lock()
+        self.native_cache_observation_lock = threading.Lock()
+        self.aria2_configuration = None
+        self.aria2_install_attempted = False
+        self.aria2_configuration_lock = threading.Lock()
+        self.bbdown_configuration_lock = threading.Lock()
+        self.bbdown_configuration: dict[str, Any] | None = None
+        rust_runtime.reset_bilibili_login_status()
         self._load_cache_policy()
         self.worker = threading.Thread(target=self._worker_loop, daemon=True)
         self.worker.start()
 
+    def _native_cache_request(self, command: str, **fields: Any) -> dict[str, Any]:
+        with self.native_cache_call_lock:
+            return rust_runtime.cache_runtime_request(command, **fields)
+
+    def _project_cache_event(
+        self,
+        item_id: str,
+        kind: str,
+        *,
+        cache_attempt_token: int,
+        **fields: Any,
+    ) -> bool:
+        token = self._require_cache_attempt_token(cache_attempt_token)
+        terminal = str(kind) in {"ready", "failed", "cancelled", "evicted", "reset"}
+        try:
+            return self.store.apply_cache_event(
+                item_id,
+                cache_attempt_token=token,
+                event={"kind": str(kind), **fields},
+            )
+        finally:
+            if terminal:
+                self.collect_retired_artifacts()
+
+    @staticmethod
+    def _require_cache_attempt_token(token: object) -> int:
+        if isinstance(token, bool) or not isinstance(token, int) or token <= 0:
+            raise ValueError("cache attempt token must be a positive integer")
+        return token
+
+    @staticmethod
+    def _path_is_within(candidate: Path, root: Path) -> bool:
+        try:
+            candidate.relative_to(root)
+        except ValueError:
+            return False
+        return True
+
+    def _artifact_request(self, command: str, **fields: Any) -> dict[str, Any]:
+        return rust_runtime.artifact_lifetime_request(
+            command, owner=self._artifact_owner, **fields
+        )
+
+    def claim_host_playback_program(self, **identity: Any) -> bool:
+        return self._artifact_request("claim", **identity)["accepted"]
+
+    def retire_host_playback_program(self, **identity: Any) -> bool:
+        released = self._artifact_request("retire", **identity)["accepted"]
+        self.collect_retired_artifacts()
+        return released
+
+    def acquire_media_reader(self, relative_path: str) -> str | None:
+        return self._artifact_request("acquire", relative_path=relative_path)["handle"]
+
+    def release_media_reader(self, lease: object) -> bool:
+        if not isinstance(lease, str):
+            return False
+        released = self._artifact_request("release", handle=lease)["accepted"]
+        self.collect_retired_artifacts()
+        return released
+
+    def collect_retired_artifacts(self) -> int:
+        return self._artifact_request("collect")["collected"]
+
+    def _finish_artifact_attempts(self, item_id: str, tokens: set[int]) -> None:
+        self._artifact_request(
+            "finish_attempts", item_id=item_id, cache_attempt_tokens=sorted(tokens)
+        )
+        self.collect_retired_artifacts()
+
+    def _begin_cache_attempt(
+        self,
+        item_id: str,
+        expected_item_incarnation_id: str,
+    ) -> int:
+        token = self._require_cache_attempt_token(
+            self.store.begin_cache_attempt(
+                str(item_id),
+                expected_item_incarnation_id,
+            )
+        )
+        return token
+
+    def _begin_cache_attempt_for_item(self, item: PlaylistItem) -> int:
+        return self._begin_cache_attempt(item.id, item.item_incarnation_id)
+
+    def _cache_attempt_reservation_for_item(
+        self,
+        item: PlaylistItem,
+        cache_attempt_token: int,
+    ) -> dict[str, Any]:
+        token = self._require_cache_attempt_token(cache_attempt_token)
+        reservation = self.store.cache_attempt_reservation(token)
+        if (
+            reservation.get("item_id") != item.id
+            or reservation.get("item_incarnation_id")
+            != item.item_incarnation_id
+        ):
+            raise RuntimeError(
+                "cache item incarnation changed before downloader preparation"
+            )
+        return reservation
+
+    def _cache_attempt_paths(
+        self,
+        cache_attempt_token: int,
+    ) -> tuple[dict[str, Any], Path, Path]:
+        token = self._require_cache_attempt_token(cache_attempt_token)
+        reservation = self.store.cache_attempt_reservation(token)
+        if reservation.get("cache_attempt_token") != token:
+            raise ValueError("cache attempt reservation token mismatch")
+        relative_directory = str(
+            reservation.get("artifact_relative_directory") or ""
+        )
+        relative_path = Path(relative_directory)
+        if (
+            not relative_directory
+            or relative_path.is_absolute()
+            or ".." in relative_path.parts
+        ):
+            raise ValueError("Rust artifact directory is invalid")
+        # Resolve only for containment checks. Returning canonical paths here
+        # breaks later relative_to(CACHE_DIR) calls when the configured root is
+        # an equivalent alias such as macOS /var or a Windows 8.3 short path.
+        committed_dir = CACHE_DIR / relative_path
+        staging_dir = CACHE_DIR / ".staging" / f"attempt-{token}"
+        cache_root = CACHE_DIR.resolve()
+        resolved_committed_dir = committed_dir.resolve()
+        resolved_staging_dir = staging_dir.resolve()
+        if (
+            not self._path_is_within(resolved_committed_dir, cache_root)
+            or not self._path_is_within(resolved_staging_dir, cache_root)
+        ):
+            raise ValueError("Rust artifact directory escapes the cache root")
+        return reservation, staging_dir, committed_dir
+
+    def _begin_live_cache_attempts(
+        self, items: Iterable[PlaylistItem]
+    ) -> dict[str, int]:
+        tokens: dict[str, int] = {}
+        for item in items:
+            try:
+                tokens[item.id] = self._begin_cache_attempt_for_item(item)
+            except PlaylistStoreCommandError as exc:
+                if exc.kind != "item_not_found":
+                    raise
+        return tokens
+
+    def _project_cache_progress(
+        self,
+        item_id: str,
+        *,
+        cache_attempt_token: int,
+        progress: object | None = None,
+        message: object | None = None,
+    ) -> bool:
+        if progress is None:
+            item = self.store.get_item(item_id)
+            progress = item.cache_progress if item is not None else 0.0
+        event: dict[str, Any] = {
+            "progress": float(progress),
+        }
+        if message is not None:
+            event["message"] = str(message)
+        return self._project_cache_event(
+            item_id,
+            "progress",
+            cache_attempt_token=cache_attempt_token,
+            **event,
+        )
+
+    def _ensure_native_cache_runtime(self) -> None:
+        with self.lock:
+            if self.native_cache_started or self.stop_event.is_set():
+                return
+            snapshot = self._native_cache_request("start")
+            self.native_cache_started = True
+            self.native_cache_error = ""
+            self.native_cache_snapshot = dict(snapshot)
+            self.native_cache_event_stop.clear()
+            worker = threading.Thread(
+                target=self._native_cache_event_loop,
+                name="bilikara-rust-cache-events",
+                daemon=True,
+            )
+            self.native_cache_event_worker = worker
+            worker.start()
+
+    def _native_cache_event_loop(self) -> None:
+        while not self.native_cache_event_stop.wait(0.1):
+            try:
+                if self._drain_native_cache_events():
+                    self._native_orchestration("wake")
+            except Exception as exc:  # noqa: BLE001
+                with self.lock:
+                    self.native_cache_error = str(exc)
+                if self.native_cache_event_stop.wait(1.0):
+                    return
+
+    def _drain_native_cache_events(self) -> bool:
+        # Keep synchronous callers and the poller in delivery order too.
+        with self.native_cache_observation_lock:
+            if self.stop_event.is_set():
+                return False
+            # Rust drains, recovers and commits the batch. This poller only delivers
+            # existing persistence/observer and artifact-lifetime effects.
+            result = self.store.process_runtime_cache_events(
+                self._native_cache_request,
+                max_cache_items=self.max_cache_items,
+            )
+            effects = result["effects"]
+            self._apply_native_cache_snapshot(result["snapshot"])
+            for item_id in effects["activity_item_ids"]:
+                self._record_item_activity(item_id)
+            if effects["settlements"]:
+                self.collect_retired_artifacts()
+            for error in effects["errors"]:
+                _debug_print(f"[bilikara-cache] rejected Rust cache publication: {error['kind']}")
+            with self.lock:
+                self.native_cache_error = ""
+            return bool(effects["settlements"])
+
+    def _apply_native_cache_snapshot(self, snapshot: dict[str, Any]) -> None:
+        # A read-only diagnostic/ownership view. Legacy queues below are never
+        # populated from the Native queue.
+        with self.lock:
+            if snapshot.get("last_event_sequence", 0) >= self.native_cache_snapshot.get("last_event_sequence", 0):
+                self.native_cache_snapshot = dict(snapshot)
+
+    def _native_orchestration(self, command: str = "reconcile", *, captured_source: str | None = None, **fields: Any) -> dict[str, Any]:
+        if self.stop_event.is_set():
+            return {}
+        self._ensure_native_cache_runtime()
+        cookie = effective_bilibili_cookie()
+        with self.lock:
+            configuration = {
+                "download_source": captured_source or self.download_source,
+                "video_quality": self.video_quality,
+                "audio_hires": self.audio_hires,
+                "hevc_supported": self.hevc_supported,
+                "avc_quality_cap": self.avc_quality_cap,
+            }
+        if (command in {"reconcile", "wake", "retry"}
+            and configuration["download_source"] == DOWNLOAD_SOURCE_BBDOWN
+            and not self._download_login_error(DOWNLOAD_SOURCE_BBDOWN, cookie=cookie)):
+            self._configure_bbdown_executor()
+        if (command in {"reconcile", "wake", "retry"}
+            and configuration["download_source"] == DOWNLOAD_SOURCE_DOWNKYI
+            and not self._download_login_error(DOWNLOAD_SOURCE_DOWNKYI, cookie=cookie)):
+            self._configure_aria2_executor(install=True)
+        with self.lock:
+            if self.stop_event.is_set() and command != "stop":
+                return {}
+            # Capture facts and deliver external-worker handoffs against the same
+            # retry-window lock. Rust performs no waits, callbacks or network I/O.
+            facts = {
+                "cache_root": str(CACHE_DIR.resolve()),
+                "log_dir": str(self.log_dir.resolve()),
+                "max_cache_items": self.max_cache_items,
+                **configuration,
+                "cookie": cookie,
+                "user_agent": str(BILIBILI_HEADERS.get("User-Agent") or ""),
+                "referer": str(BILIBILI_HEADERS.get("Referer") or ""),
+                "external_attempts": [
+                    {"item_id": item_id, "cache_attempt_token": token,
+                     "retry_open": self._python_retry_window_open_locked(item_id),
+                     "primary": self.active_item_id == item_id,
+                     "urgent": item_id in self.urgent_cache_ids}
+                    for item_id, token in self.python_cache_attempt_tokens.items()
+                    if item_id in self.python_worker_download_sources
+                ],
+            }
+            result = rust_runtime.native_cache_request(
+                command, owner=self._artifact_owner, facts=facts, **fields
+            )
+            self._apply_native_cache_snapshot(result["snapshot"])
+            # These are decided views used by retained external workers and UI.
+            if self.download_source in (DOWNLOAD_SOURCE_NATIVE, DOWNLOAD_SOURCE_BBDOWN, DOWNLOAD_SOURCE_DOWNKYI):
+                self.desired_ids = set(result["desired_ids"])
+                self.ordered_desired_ids = list(result["ordered_ids"])
+            processes = []
+            for handoff in result["external_retries"]:
+                if handoff.get("handoff"):
+                    self.cache_interrupted_messages[handoff["item_id"]] = "等待共享 Rust 缓存"
+                else:
+                    self.retry_requested_ids.add(handoff["item_id"])
+                processes.extend(self._active_processes_locked(handoff["item_id"]))
+            self.native_cache_error = ""
+        self._terminate_processes(processes)
+        return result
+
+    def _configure_bbdown_executor(self) -> dict[str, Any]:
+        # Preparation/probing must precede the configuration/worker handoff lock.
+        # Cache even unavailability; observing progress never repeats tool I/O.
+        with self.bbdown_configuration_lock:
+            if self.bbdown_configuration is None:
+                try:
+                    prepared = self._ensure_bbdown()
+                except Exception:  # Preparation status is kept by the existing service.
+                    prepared = None
+                self.bbdown_configuration = rust_runtime.configure_bbdown(
+                    owner=self._artifact_owner, prepared_path=prepared,
+                )
+            result = dict(self.bbdown_configuration)
+        with self.lock:
+            if self.download_source == DOWNLOAD_SOURCE_BBDOWN:
+                self.binary_state = "ready" if result["ready"] else "failed"
+                self.binary_message = result["message"]
+        return result
+
+    def _sync_native_with_playlist(self, *, wake: bool = False) -> None:
+        try:
+            result = self._native_orchestration("wake" if wake else "reconcile")
+            self._drain_native_cache_events()
+            self.collect_retired_artifacts()
+            if result:
+                current_ids = set(result["current_ids"])
+                for source in (DOWNLOAD_SOURCE_NATIVE, DOWNLOAD_SOURCE_BBDOWN, DOWNLOAD_SOURCE_DOWNKYI):
+                    for log_file in (self.log_dir / source).glob("*.log"):
+                        if log_file.stem not in current_ids:
+                            self._safe_unlink(log_file)
+        except Exception as exc:  # noqa: BLE001
+            with self.lock:
+                self.native_cache_error = str(exc)
+
     def status(self, metrics: dict[str, Any] | None = None) -> dict:
         cache_metrics = metrics or self.cache_metrics()
         login_status = self.bbdown_login_status()
+        native_runtime_ready = bool(rust_runtime.runtime_status()["loaded"])
         with self.lock:
             return {
                 "state": self.binary_state,
@@ -349,12 +680,15 @@ class CacheManager:
                 "max_cache_items": self.max_cache_items,
                 "cache_bytes": cache_metrics["total_bytes"],
                 "cached_items": cache_metrics["item_count"],
+                "native_runtime_ready": native_runtime_ready,
                 "logged_in": login_status["logged_in"],
                 "login": login_status,
                 "media_capabilities": self.media_capabilities_snapshot(),
             }
 
     def ffmpeg_status(self) -> dict[str, Any]:
+        if media_cli.DISABLED:
+            return {"state": "disabled", "version": "", "message": media_cli.MESSAGE, "path": ""}
         with self.lock:
             return {
                 "state": self.ffmpeg_state,
@@ -365,21 +699,55 @@ class CacheManager:
 
     def diagnostic_snapshot(self) -> dict[str, Any]:
         with self.lock:
-            active_item_id = self.active_item_id or ""
-            urgent_item_ids = list(self.urgent_cache_ids)
-            pending_ids = list(self.pending_ids)
+            active_item_id = self.active_item_id or self.native_cache_snapshot.get("primary_active_item_id") or ""
+            urgent_item_ids = list(self.urgent_cache_ids | set(self.native_cache_snapshot.get("urgent_item_ids", [])))
+            pending_ids = list(self.pending_ids | set(self.native_cache_snapshot.get("pending_ids", [])))
             desired_ids = list(self.ordered_desired_ids)
             binary_state = self.binary_state
             binary_version = self.binary_version
             ffmpeg_state = self.ffmpeg_state
             ffmpeg_version = self.ffmpeg_version
             download_source = self.download_source
+            native_cache_error = str(getattr(self, "native_cache_error", "") or "")
+            native_cache_snapshot = dict(
+                getattr(self, "native_cache_snapshot", {}) or {}
+            )
 
-        bbdown_path = Path(BB_DOWN_PATH_OVERRIDE).expanduser() if BB_DOWN_PATH_OVERRIDE else self._local_binary_path()
-        ytdlp_path = Path(YTDLP_PATH_OVERRIDE).expanduser() if YTDLP_PATH_OVERRIDE else self._local_ytdlp_binary_path()
-        aria2c_path = Path(ARIA2C_PATH_OVERRIDE).expanduser() if ARIA2C_PATH_OVERRIDE else self._local_aria2c_binary_path()
-        ffmpeg_path = Path(FFMPEG_PATH_OVERRIDE).expanduser() if FFMPEG_PATH_OVERRIDE else FFMPEG_RUNTIME_PATH
-
+        runtime = rust_runtime.runtime_status()
+        runtime_load_state = "ready" if runtime["loaded"] else "failed"
+        runtime_state = (
+            "ready"
+            if runtime["loaded"]
+            and not (download_source == DOWNLOAD_SOURCE_NATIVE and native_cache_error)
+            else "failed"
+        )
+        runtime_version = (
+            f"Rust ABI {runtime.get('abi_version')}"
+            if runtime["loaded"]
+            else ""
+        )
+        bbdown_path = (
+            Path(BB_DOWN_PATH_OVERRIDE).expanduser()
+            if BB_DOWN_PATH_OVERRIDE
+            else self._local_binary_path()
+        )
+        ytdlp_path = (
+            Path(YTDLP_PATH_OVERRIDE).expanduser()
+            if YTDLP_PATH_OVERRIDE
+            else self._local_ytdlp_binary_path()
+        )
+        with self.aria2_configuration_lock:
+            aria2_configuration = dict(self.aria2_configuration or {})
+        aria2c_path = Path(aria2_configuration["path"]) if aria2_configuration else (
+            Path(ARIA2C_PATH_OVERRIDE).expanduser()
+            if ARIA2C_PATH_OVERRIDE
+            else self._local_aria2c_binary_path()
+        )
+        ffmpeg_path = (
+            Path(FFMPEG_PATH_OVERRIDE).expanduser()
+            if FFMPEG_PATH_OVERRIDE
+            else FFMPEG_RUNTIME_PATH
+        )
         bbdown_version = ""
         if BB_DOWN_VERSION_FILE.exists():
             try:
@@ -393,7 +761,9 @@ class CacheManager:
 
         return {
             "tools": {
-                "BBDown": self._diagnostic_tool_entry(bbdown_path, bbdown_version, binary_state),
+                "BBDown": self._diagnostic_tool_entry(
+                    bbdown_path, bbdown_version, binary_state
+                ),
                 "yt-dlp": self._diagnostic_tool_entry(
                     ytdlp_path,
                     self._read_ytdlp_version(ytdlp_path),
@@ -401,7 +771,7 @@ class CacheManager:
                 ),
                 "aria2c": self._diagnostic_tool_entry(
                     aria2c_path,
-                    self._read_aria2c_version(aria2c_path) if aria2c_path.exists() else "",
+                    str(aria2_configuration.get("version") or ""),
                     binary_state if download_source == DOWNLOAD_SOURCE_DOWNKYI else "",
                 ),
                 "FFmpeg": self._diagnostic_tool_entry(
@@ -409,6 +779,42 @@ class CacheManager:
                     ffmpeg_version or self._read_ffmpeg_version(ffmpeg_path),
                     ffmpeg_state,
                 ),
+                "Rust Native": {
+                    "installed": bool(runtime["loaded"]),
+                    "version": runtime_version,
+                    "state": runtime_state,
+                    "path": str(runtime.get("path") or ""),
+                    "capabilities": dict(runtime.get("capabilities") or {}),
+                    "message": str(
+                        runtime.get("error")
+                        or native_cache_error
+                        or "Rust Native ready"
+                    ),
+                    "runtime_state": runtime_state,
+                    "runtime_error": str(runtime.get("error") or ""),
+                    "load_diagnostics": dict(runtime.get("load_diagnostics") or {}),
+                },
+                "Rust MediaBackend": {
+                    "installed": bool(runtime["loaded"]),
+                    "version": runtime_version,
+                    "state": runtime_load_state,
+                    "path": str(runtime.get("path") or ""),
+                    "message": str(runtime.get("error") or "Rust MediaBackend ready"),
+                    "runtime_state": runtime_load_state,
+                    "runtime_error": str(runtime.get("error") or ""),
+                },
+                "Rust CacheRuntime": {
+                    "installed": bool(runtime["loaded"]),
+                    "version": runtime_version,
+                    "state": runtime_state,
+                    "path": str(runtime.get("path") or ""),
+                    "message": str(
+                        runtime.get("error")
+                        or native_cache_error
+                        or "Rust CacheRuntime ready"
+                    ),
+                    "snapshot": native_cache_snapshot,
+                },
             },
             "tasks": {
                 "active_item_id": active_item_id,
@@ -429,78 +835,31 @@ class CacheManager:
         }
 
     def bbdown_login_status(self) -> dict[str, Any]:
-        data_path = self._bbdown_data_path()
-        data_exists = data_path.exists()
-        logged_in = bool(cookie_from_bbdown_data(data_path))
-        with self.lock:
-            if self.bbdown_login_state == "failed":
-                logged_in = False
-                state = "failed"
-                message = self.bbdown_login_message
-            elif logged_in:
-                state = "logged_in"
-                message = "BBDown 已登录"
-            elif data_exists and self.bbdown_login_state not in {"starting", "waiting"}:
-                state = "failed"
-                message = "BBDown 登录完成，但 BBDown.data 中未检测到有效的 SESSDATA 和 bili_jct"
-            else:
-                state = self.bbdown_login_state
-                message = self.bbdown_login_message
-            return {
-                "logged_in": logged_in,
-                "state": state,
-                "message": message,
-                "data_path": str(self._bbdown_data_path()),
-                # "qr_text": "" if logged_in else self.bbdown_login_qr_text,
-                "qr_image": "" if logged_in else self.bbdown_login_qr_image,
-            }
+        return rust_runtime.desktop_login("snapshot", data_path=str(self._bbdown_data_path()))
 
     def start_bbdown_login(self, *, force_refresh_qr: bool = False) -> dict[str, Any]:
-        if cookie_from_bbdown_data(self._bbdown_data_path()):
-            return self.bbdown_login_status()
         with self.lock:
-            active_login = (
-                self.bbdown_login_cancel_event is not None
-                and not self.bbdown_login_cancel_event.is_set()
-                and self.bbdown_login_state in {"starting", "waiting"}
-            )
-            if active_login and not force_refresh_qr:
+            if self.stop_event.is_set():
                 return self.bbdown_login_status()
-            if self.bbdown_login_cancel_event is not None:
-                self.bbdown_login_cancel_event.set()
-            cancel_event = threading.Event()
-            self.bbdown_login_cancel_event = cancel_event
-            self.bbdown_login_state = "starting"
-            self.bbdown_login_message = "正在启动 BBDown 登录"
-            # self.bbdown_login_qr_text = ""
-            self.bbdown_login_qr_image = ""
-        self._remove_bbdown_qr_image()
-        threading.Thread(
-            target=self._bbdown_login_worker,
-            args=(cancel_event,),
-            daemon=True,
-        ).start()
-        return self.bbdown_login_status()
+            result = rust_runtime.desktop_login(
+                "start", data_path=str(self._bbdown_data_path()), force=force_refresh_qr
+            )
+            generation = result["generation"]
+            if generation is not None:
+                try:
+                    threading.Thread(
+                        target=self._bbdown_login_worker, args=(generation,), daemon=True
+                    ).start()
+                except RuntimeError:
+                    rust_runtime.set_bilibili_login_status(
+                        "failed", message="无法启动登录线程", generation=generation
+                    )
+            return self.bbdown_login_status()
 
     def logout_bbdown(self) -> dict[str, Any]:
         with self.lock:
-            if self.bbdown_login_cancel_event is not None:
-                self.bbdown_login_cancel_event.set()
-            self.bbdown_login_cancel_event = None
-        self._remove_bbdown_qr_image()
-        try:
-            self._bbdown_data_path().unlink(missing_ok=True)
-        except OSError as exc:
-            with self.lock:
-                self.bbdown_login_state = "failed"
-                self.bbdown_login_message = f"退出登录失败: {exc}"
+            rust_runtime.desktop_login("logout", data_path=str(self._bbdown_data_path()))
             return self.bbdown_login_status()
-        with self.lock:
-            self.bbdown_login_state = "idle"
-            self.bbdown_login_message = "未登录"
-            # self.bbdown_login_qr_text = ""
-            self.bbdown_login_qr_image = ""
-        return self.bbdown_login_status()
 
     def policy_snapshot(self, metrics: dict[str, Any] | None = None) -> dict[str, Any]:
         cache_metrics = metrics or self.cache_metrics()
@@ -518,13 +877,13 @@ class CacheManager:
                 "reset_offset_on_next": self.reset_offset_on_next,
                 "download_source_choices": [
                     {
+                        "value": DOWNLOAD_SOURCE_NATIVE,
+                        "label": "Rust Native",
+                    },
+                    {
                         "value": DOWNLOAD_SOURCE_BBDOWN,
                         "label": "BBDown",
                     },
-                    # {
-                    #     "value": DOWNLOAD_SOURCE_YTDLP,
-                    #     "label": "yt-dlp",
-                    # },
                     {
                         "value": DOWNLOAD_SOURCE_DOWNKYI,
                         "label": "Downkyi (aria2c)",
@@ -543,7 +902,6 @@ class CacheManager:
             return dict(self.client_media_capabilities)
 
     def set_client_media_capabilities(self, payload: dict[str, Any]) -> dict[str, Any]:
-        playback_selector = self.store.capture_playback_selector()
         hevc_supported = payload.get("hevc_supported")
         if not isinstance(hevc_supported, bool):
             raise ValueError("hevc_supported must be a boolean")
@@ -559,10 +917,8 @@ class CacheManager:
             avc_supported = False
         max_avc_quality = self._quality_from_choice_index(
             payload.get("max_avc_quality_index"),
-            playback_selector=playback_selector,
         ) or self._optional_video_quality(
             payload.get("max_avc_quality"),
-            playback_selector=playback_selector,
         )
         if not hevc_supported and not max_avc_quality:
             max_avc_quality = VIDEO_QUALITY_CHOICES[-1]
@@ -610,58 +966,35 @@ class CacheManager:
                 )
             )
 
-        if should_recache:
+        if self._current_download_source() in (DOWNLOAD_SOURCE_NATIVE, DOWNLOAD_SOURCE_BBDOWN, DOWNLOAD_SOURCE_DOWNKYI):
+            self._sync_native_with_playlist()
+        elif should_recache:
             self._request_desired_recaching("HEVC unsupported; switching video cache to AVC")
 
         return self.media_capabilities_snapshot()
-
-    @staticmethod
-    def _py_quality_from_choice_index(index: object) -> str | None:
-        try:
-            normalized_index = int(index)
-        except (TypeError, ValueError):
-            return None
-        if 0 <= normalized_index < len(VIDEO_QUALITY_CHOICES):
-            return VIDEO_QUALITY_CHOICES[normalized_index]
-        return None
-
-    @staticmethod
-    def _py_optional_video_quality(video_quality: object) -> str | None:
-        value = str(video_quality or "").strip()
-        if value in VIDEO_QUALITY_CHOICES:
-            return value
-        return None
 
     @staticmethod
     def _native_quality_policy(
         video_quality: object,
         quality_cap: object = "",
         choice_index: int | None = None,
-        *,
-        playback_selector: PlaybackSelector | None = None,
-    ) -> dict[str, Any] | None:
+    ) -> dict[str, Any]:
         request = {
             "schema_version": 1,
             "raw_quality": str(video_quality or ""),
             "raw_cap": str(quality_cap or ""),
             "choice_index": choice_index,
         }
-        if playback_selector is not None:
-            return playback_selector.dispatch(
-                "decide_quality_policy",
-                python=lambda: None,
-                rust=lambda: rust_backend.try_decide_quality_policy(
-                    request, allow_python_reference=False
-                ),
-            )
-        completed, response = rust_backend.try_decide_quality_policy(request)
-        return response if completed else None
+        return rust_backend.require_playback_capability(
+            "decide_quality_policy",
+            lambda: rust_backend.try_decide_quality_policy(
+                request, allow_python_reference=False
+            ),
+        )
 
     @staticmethod
     def _quality_from_choice_index(
         index: object,
-        *,
-        playback_selector: PlaybackSelector | None = None,
     ) -> str | None:
         try:
             normalized_index = int(index)
@@ -670,30 +1003,15 @@ class CacheManager:
         response = CacheManager._native_quality_policy(
             "",
             choice_index=normalized_index,
-            playback_selector=playback_selector,
         )
-        if response is not None:
-            return response["indexed_quality"]
-        return rust_backend.python_fallback(
-            "decide_quality_policy",
-            lambda: CacheManager._py_quality_from_choice_index(index),
-        )
+        return response["indexed_quality"]
 
     @staticmethod
     def _optional_video_quality(
         video_quality: object,
-        *,
-        playback_selector: PlaybackSelector | None = None,
     ) -> str | None:
-        response = CacheManager._native_quality_policy(
-            video_quality, playback_selector=playback_selector
-        )
-        if response is not None:
-            return response["optional_quality"]
-        return rust_backend.python_fallback(
-            "decide_quality_policy",
-            lambda: CacheManager._py_optional_video_quality(video_quality),
-        )
+        response = CacheManager._native_quality_policy(video_quality)
+        return response["optional_quality"]
 
     def enrich_snapshot(
         self,
@@ -773,20 +1091,20 @@ class CacheManager:
         items = self.store.list_items()
         if not items:
             return
+        if self._current_download_source() in (DOWNLOAD_SOURCE_NATIVE, DOWNLOAD_SOURCE_BBDOWN, DOWNLOAD_SOURCE_DOWNKYI):
+            self.sync_with_playlist()
+            return
         invalidated_ids: list[str] = []
 
         for item in items:
             if item.cache_status != "ready" or self._item_cache_ready(item):
                 continue
-            self.store.update_item(
+            cache_attempt_token = self._begin_cache_attempt_for_item(item)
+            self._project_cache_event(
                 item.id,
-                cache_status="pending",
-                cache_progress=0.0,
-                cache_message="缓存文件已清空，等待重新缓存",
-                video_relative_path="",
-                video_media_url="",
-                audio_variants=[],
-                persist_backup=False,
+                "evicted",
+                cache_attempt_token=cache_attempt_token,
+                message="缓存文件已清空，等待重新缓存",
             )
             self._record_item_activity(item.id)
             invalidated_ids.append(item.id)
@@ -828,11 +1146,6 @@ class CacheManager:
         download_source: str | None = None,
         reset_offset_on_next: bool | None = None,
     ) -> dict[str, Any]:
-        playback_selector = (
-            self.store.capture_playback_selector()
-            if video_quality is not None
-            else None
-        )
         changed = False
         cache_limit_changed = False
         with self.lock:
@@ -843,9 +1156,7 @@ class CacheManager:
                     changed = True
                     cache_limit_changed = True
             if video_quality is not None:
-                normalized_quality = self._normalize_video_quality(
-                    video_quality, playback_selector=playback_selector
-                )
+                normalized_quality = self._normalize_video_quality(video_quality)
                 if self.video_quality != normalized_quality:
                     self.video_quality = normalized_quality
                     changed = True
@@ -920,24 +1231,11 @@ class CacheManager:
         return bounded
 
     @staticmethod
-    def _py_normalize_video_quality(video_quality: object) -> str:
-        value = str(video_quality or "").strip()
-        if value in VIDEO_QUALITY_CHOICES:
-            return value
-        return DEFAULT_VIDEO_QUALITY
-
-    @staticmethod
     def _normalize_video_quality(
         video_quality: object,
-        *,
-        playback_selector: PlaybackSelector | None = None,
     ) -> str:
-        response = CacheManager._native_quality_policy(
-            video_quality, playback_selector=playback_selector
-        )
-        if response is not None:
-            return str(response["normalized_quality"])
-        return CacheManager._py_normalize_video_quality(video_quality)
+        response = CacheManager._native_quality_policy(video_quality)
+        return str(response["normalized_quality"])
 
     @staticmethod
     def _normalize_download_source(download_source: object) -> str:
@@ -950,127 +1248,159 @@ class CacheManager:
         normalized_source = self._normalize_download_source(download_source)
         if normalized_source == DOWNLOAD_SOURCE_DOWNKYI:
             return self._aria2c_status()
+        if normalized_source == DOWNLOAD_SOURCE_BBDOWN:
+            self._ensure_native_cache_runtime()
+            return {"download_source": normalized_source, "tool": "BBDown",
+                    "requires_prepare": False, **self._configure_bbdown_executor()}
+        if normalized_source != DOWNLOAD_SOURCE_NATIVE:
+            return {
+                "download_source": normalized_source,
+                "tool": self._download_source_label(normalized_source),
+                "ready": True,
+                "requires_prepare": False,
+            }
+        status = rust_runtime.runtime_status()
         return {
             "download_source": normalized_source,
             "tool": self._download_source_label(normalized_source),
-            "ready": True,
+            "ready": bool(status["loaded"]),
             "requires_prepare": False,
+            "message": str(status.get("error") or "Rust Native ready"),
         }
 
     def prepare_downloader(self, download_source: object) -> dict[str, Any]:
         normalized_source = self._normalize_download_source(download_source)
-        if normalized_source != DOWNLOAD_SOURCE_DOWNKYI:
+        if normalized_source == DOWNLOAD_SOURCE_BBDOWN:
+            with self.bbdown_configuration_lock:
+                if self.bbdown_configuration and not self.bbdown_configuration["ready"]:
+                    self.bbdown_configuration = None
             return self.downloader_status(normalized_source)
-        status = self._aria2c_status()
-        if status.get("ready"):
-            return status
-        if not status.get("auto_prepare_supported"):
-            raise RuntimeError(str(status.get("message") or "aria2c requires manual installation"))
-
-        restore_binary_state = normalized_source != self._current_download_source()
-        with self.lock:
-            previous_binary = (self.binary_state, self.binary_version, self.binary_message)
-        try:
-            self._ensure_aria2c()
-        except urllib.error.HTTPError as exc:
-            if restore_binary_state:
-                self._restore_binary_status(previous_binary)
-            if exc.code == 404:
+        if normalized_source == DOWNLOAD_SOURCE_DOWNKYI:
+            with self.aria2_configuration_lock:
+                if self.aria2_configuration and not self.aria2_configuration["ready"]:
+                    self.aria2_configuration = None
+                    self.aria2_install_attempted = False
+            status = self._aria2c_status()
+            if status.get("ready"):
+                return status
+            if not status.get("auto_prepare_supported"):
                 raise RuntimeError(
-                    f"未找到可用的 aria2c 自动下载包。请安装 aria2c，"
-                    f"或将可执行文件放入 {self._local_aria2c_binary_path()} 后再切换。"
-                ) from exc
-            raise
-        except Exception:
-            if restore_binary_state:
-                self._restore_binary_status(previous_binary)
-            raise
-        status = self._aria2c_status()
-        status["prepared"] = True
-        return status
+                    str(status.get("message") or "aria2c requires manual installation")
+                )
+            restore_binary_state = DOWNLOAD_SOURCE_DOWNKYI != self._current_download_source()
+            with self.lock:
+                previous_binary = (self.binary_state, self.binary_version, self.binary_message)
+            try:
+                self._ensure_aria2c()
+            except urllib.error.HTTPError as exc:
+                if restore_binary_state:
+                    self._restore_binary_status(previous_binary)
+                if exc.code == 404:
+                    raise RuntimeError(
+                        f"未找到可用的 aria2c 自动下载包。请安装 aria2c，"
+                        f"或将可执行文件放入 {self._local_aria2c_binary_path()} 后再切换。"
+                    ) from exc
+                raise
+            except Exception:
+                if restore_binary_state:
+                    self._restore_binary_status(previous_binary)
+                raise
+            status = self._aria2c_status()
+            status["prepared"] = True
+            return status
+        return self.downloader_status(normalized_source)
 
     def _restore_binary_status(self, status: tuple[str, str, str]) -> None:
         with self.lock:
             self.binary_state, self.binary_version, self.binary_message = status
 
-    def _aria2c_status(self) -> dict[str, Any]:
-        override = Path(ARIA2C_PATH_OVERRIDE).expanduser() if ARIA2C_PATH_OVERRIDE else None
-        manual_path = self._local_aria2c_binary_path()
-        system_path = None if override else self._system_aria2c_path()
+    def _configure_aria2_executor(self, *, install: bool = False) -> dict[str, Any]:
+        self._ensure_native_cache_runtime()
+        with self.aria2_configuration_lock:
+            if self.aria2_configuration is None or (
+                install and not self.aria2_configuration["ready"] and not self.aria2_install_attempted
+            ):
+                self.aria2_configuration = rust_runtime.configure_aria2(
+                    owner=self._artifact_owner, directory=ARIA2C_DIR,
+                    override_path=Path(ARIA2C_PATH_OVERRIDE).expanduser() if ARIA2C_PATH_OVERRIDE else None,
+                    vendor_roots=[VENDOR_DIR, INTERNAL_VENDOR_DIR], install=install,
+                )
+                self.aria2_install_attempted = install
+            result = dict(self.aria2_configuration)
+        with self.lock:
+            if self.download_source == DOWNLOAD_SOURCE_DOWNKYI:
+                self.binary_state = "ready" if result["ready"] else "failed"
+                self.binary_version = result["version"]
+                self.binary_message = result["message"]
+        return result
 
-        if override and override.exists():
-            binary_path = override
-        elif system_path:
-            binary_path = system_path
-        else:
-            binary_path = manual_path
-        exists = binary_path.exists()
-        version = self._read_aria2c_version(binary_path) if exists else ""
-        system, arch = self._current_platform_tokens()
-        ready = bool(version)
-        auto_prepare_supported = not ready and self._aria2_auto_prepare_supported(system, arch)
-        if ready:
-            if override and binary_path == override:
-                message = f"使用外部 aria2c: {override}"
-            elif system_path and binary_path == system_path:
-                message = f"使用系统 aria2c: {system_path}"
-            else:
-                message = f"aria2c {version} 已就绪"
-        elif exists and auto_prepare_supported:
-            message = f"aria2c 不可执行，将在确认后自动修复: {binary_path}"
-        elif exists:
-            message = f"aria2c 不可执行: {binary_path}"
-        elif auto_prepare_supported:
-            message = f"需要下载 aria2c 到 {manual_path}"
-        else:
-            message = f"当前平台需要手动安装 aria2c，或将 aria2c 放入 {manual_path}"
-        return {
-            "download_source": DOWNLOAD_SOURCE_DOWNKYI,
-            "tool": "aria2c",
-            "ready": ready,
-            "requires_prepare": not ready,
-            "auto_prepare_supported": auto_prepare_supported,
-            "path": str(binary_path),
-            "manual_path": str(manual_path),
-            "version": version,
-            "platform": system,
-            "arch": arch,
-            "install_url": "https://github.com/aria2/aria2/releases",
-            "message": message,
-        }
+    def _aria2c_status(self) -> dict[str, Any]:
+        result = self._configure_aria2_executor()
+        return {"download_source": DOWNLOAD_SOURCE_DOWNKYI, "tool": "aria2c",
+                "requires_prepare": not result["ready"],
+                "auto_prepare_supported": result["auto_prepare_supported"],
+                "manual_path": str(self._local_aria2c_binary_path()), **result}
+
     def cache_metrics(self) -> dict[str, Any]:
         item_bytes: dict[str, int] = {}
-        total_bytes = 0
+        logical_total_bytes = 0
         item_count = 0
         if not CACHE_DIR.exists():
             return {
                 "item_bytes": item_bytes,
-                "total_bytes": total_bytes,
+                "total_bytes": logical_total_bytes,
                 "item_count": item_count,
+                "physical_total_bytes": 0,
+                "retained_bytes": 0,
+                "staging_bytes": 0,
             }
 
-        for child in CACHE_DIR.iterdir():
-            if not child.is_dir():
+        for item in self.store.list_items():
+            relative_directory = str(
+                getattr(item, "artifact_relative_directory", "") or ""
+            )
+            committed_dir = self._cache_path_from_relative_path(relative_directory)
+            if committed_dir is None:
                 continue
-            size = self._path_size(child)
-            item_bytes[child.name] = size
-            total_bytes += size
+            size = self._path_size(committed_dir)
+            item_bytes[item.id] = size
+            logical_total_bytes += size
             if size > 0:
                 item_count += 1
 
+        physical_total_bytes = self._path_size(CACHE_DIR)
+        staging_bytes = self._path_size(CACHE_DIR / ".staging")
         return {
             "item_bytes": item_bytes,
-            "total_bytes": total_bytes,
+            "total_bytes": logical_total_bytes,
             "item_count": item_count,
+            "physical_total_bytes": physical_total_bytes,
+            "retained_bytes": max(
+                0,
+                physical_total_bytes - logical_total_bytes - staging_bytes,
+            ),
+            "staging_bytes": staging_bytes,
         }
 
     def prepare_session(self) -> None:
-        self._clear_cache_root()
+        native = self._current_download_source() in (DOWNLOAD_SOURCE_NATIVE, DOWNLOAD_SOURCE_BBDOWN, DOWNLOAD_SOURCE_DOWNKYI)
+        items = [] if native else self.store.list_items()
+        cache_attempt_tokens = self._begin_live_cache_attempts(items)
+        if native:
+            self._native_orchestration("prepare")
+            self._drain_native_cache_events()
+            self._clear_log_root()
+        else:
+            self._clear_cache_root()
         with self.lock:
             self.item_activity_at.clear()
             self.item_stage_progress_signatures.clear()
             self.item_download_progress.clear()
+            self.item_download_attempt_tokens.clear()
+            self.python_worker_download_sources.clear()
+            self.python_cache_attempt_tokens.clear()
             self.retry_requested_ids.clear()
+            self.settling_cache_attempt_tokens.clear()
             self.cache_interrupted_messages.clear()
             self.pending_ids.clear()
             self.requeued_active_ids.clear()
@@ -1078,16 +1408,15 @@ class CacheManager:
             self.urgent_workers.clear()
             self.desired_ids.clear()
             self.ordered_desired_ids.clear()
-        for item in self.store.list_items():
-            self.store.update_item(
+        for item in items:
+            cache_attempt_token = cache_attempt_tokens.get(item.id)
+            if cache_attempt_token is None:
+                continue
+            self._project_cache_event(
                 item.id,
-                cache_status="pending",
-                cache_progress=0.0,
-                cache_message=self._waiting_message(),
-                video_relative_path="",
-                video_media_url="",
-                audio_variants=[],
-                persist_backup=False,
+                "reset",
+                cache_attempt_token=cache_attempt_token,
+                message=self._waiting_message(),
             )
             self._record_item_activity(item.id)
         self.sync_with_playlist()
@@ -1099,42 +1428,86 @@ class CacheManager:
         with self.lock:
             if self.stop_event.is_set():
                 return
+            if not self._artifact_request("is_current")["accepted"]:
+                self.stop_event.set()
+                self.native_cache_event_stop.set()
+                self._terminate_processes(self._active_processes_locked(), wait=True)
+                return
+            if self.native_cache_started:
+                self._native_orchestration("stop")
+                items = []
+            else:
+                items = self.store.list_items()
+            cache_attempt_tokens = self._begin_live_cache_attempts(items)
             self.stop_event.set()
             processes = self._active_processes_locked()
             urgent_workers = list(self.urgent_workers.values())
-            if self.bbdown_login_cancel_event is not None:
-                self.bbdown_login_cancel_event.set()
-                self.bbdown_login_cancel_event = None
+            rust_runtime.desktop_login("cancel", data_path=str(self._bbdown_data_path()))
+            native_cache_started = self.native_cache_started
+            self.native_cache_event_stop.set()
+            native_cache_event_worker = self.native_cache_event_worker
         self._terminate_processes(processes, wait=True)
         current_thread = threading.current_thread()
         for worker in urgent_workers:
             if worker is current_thread:
                 continue
             worker.join(timeout=5.0)
-        self._clear_cache_root()
+        if native_cache_event_worker is not None and native_cache_event_worker is not current_thread:
+            native_cache_event_worker.join(timeout=5.0)
+        if native_cache_started:
+            try:
+                self.store.process_runtime_cache_events(
+                    self._native_cache_request, max_cache_items=self.max_cache_items
+                )
+            except Exception as exc:  # noqa: BLE001
+                _debug_print(f"[bilikara-cache] Rust cache clear during shutdown failed: {exc}")
+            try:
+                self._native_cache_request("shutdown")
+            except Exception as exc:  # noqa: BLE001
+                _debug_print(f"[bilikara-cache] Rust cache shutdown failed: {exc}")
+            self._clear_log_root()
+        else:
+            self._clear_cache_root()
         with self.lock:
             self.item_activity_at.clear()
             self.item_stage_progress_signatures.clear()
             self.item_download_progress.clear()
+            self.item_download_attempt_tokens.clear()
+            self.python_worker_download_sources.clear()
+            self.python_cache_attempt_tokens.clear()
             self.retry_requested_ids.clear()
+            self.settling_cache_attempt_tokens.clear()
             self.cache_interrupted_messages.clear()
             self.urgent_cache_ids.clear()
             self.urgent_workers.clear()
             self.active_process_item_ids.clear()
-        for item in self.store.list_items():
-            self.store.update_item(
+            self.native_cache_started = False
+            self.native_cache_event_worker = None
+            self.native_cache_snapshot.clear()
+        for item in items:
+            cache_attempt_token = cache_attempt_tokens.get(item.id)
+            if cache_attempt_token is None:
+                continue
+            self._project_cache_event(
                 item.id,
-                cache_status="pending",
-                cache_progress=0.0,
-                cache_message="缓存已在退出时清空",
-                video_relative_path="",
-                video_media_url="",
-                audio_variants=[],
-                persist_backup=False,
+                "reset",
+                cache_attempt_token=cache_attempt_token,
+                message="缓存已在退出时清空",
             )
             self._record_item_activity(item.id)
+        self._artifact_request("close")
+        self.collect_retired_artifacts()
 
     def clear_runtime_cache(self) -> None:
+        native_cache = (
+            self._current_download_source() in (DOWNLOAD_SOURCE_NATIVE, DOWNLOAD_SOURCE_BBDOWN, DOWNLOAD_SOURCE_DOWNKYI)
+            or self.native_cache_started
+        )
+        items = [] if native_cache else self.store.list_items()
+        cache_attempt_tokens = self._begin_live_cache_attempts(items)
+        if native_cache:
+            self._native_orchestration("clear")
+            self._drain_native_cache_events()
         with self.lock:
             processes = self._active_processes_locked()
             urgent_workers = list(self.urgent_workers.values())
@@ -1145,14 +1518,19 @@ class CacheManager:
             self.desired_ids.clear()
             self.ordered_desired_ids.clear()
             self.retry_requested_ids.clear()
+            self.settling_cache_attempt_tokens.clear()
             self.cache_interrupted_messages.clear()
             self.item_activity_at.clear()
             self.item_stage_progress_signatures.clear()
             self.item_download_progress.clear()
+            self.item_download_attempt_tokens.clear()
+            self.python_worker_download_sources.clear()
+            self.python_cache_attempt_tokens.clear()
             self.active_process = None
             self.active_processes.clear()
             self.active_process_item_ids.clear()
             self.active_item_id = None
+            self.native_cache_snapshot.clear()
             while True:
                 try:
                     self.tasks.get_nowait()
@@ -1164,12 +1542,63 @@ class CacheManager:
             if worker is current_thread:
                 continue
             worker.join(timeout=5.0)
-        self._clear_cache_root()
+        for item in items:
+            token = cache_attempt_tokens.get(item.id)
+            if token is None:
+                continue
+            self._project_cache_event(
+                item.id,
+                "evicted",
+                cache_attempt_token=token,
+                message="缓存已清空",
+            )
+            self._record_item_activity(item.id)
 
-    def retry_item(self, item_id: str, *, force: bool = False) -> None:
+    def retry_item(
+        self,
+        item_id: str,
+        *,
+        expected_item_incarnation_id: str,
+        force: bool = False,
+    ) -> None:
+        if (
+            not isinstance(expected_item_incarnation_id, str)
+            or not expected_item_incarnation_id
+        ):
+            raise ValueError(
+                "expected item incarnation must be a non-empty Rust identity"
+            )
+        download_source = self._current_download_source()
+        if download_source in (DOWNLOAD_SOURCE_NATIVE, DOWNLOAD_SOURCE_BBDOWN, DOWNLOAD_SOURCE_DOWNKYI):
+            try:
+                self._native_orchestration(
+                    "retry", item_id=item_id,
+                    captured_source=download_source,
+                    expected_item_incarnation_id=expected_item_incarnation_id,
+                    force=bool(force),
+                )
+            except rust_runtime.RustRuntimeServiceError as exc:
+                if exc.kind in {"item_not_found", "item_incarnation_mismatch"}:
+                    raise PlaylistStoreCommandError(exc) from exc
+                if exc.kind == "retry_not_allowed":
+                    raise ValueError(str(exc)) from exc
+                raise
+            self._drain_native_cache_events()
+            self._append_log_line(self._item_log_path(item_id),
+                                  f"[{self._log_timestamp()}] manual retry requested")
+            return
         item = self.store.get_item(item_id)
-        if not item:
-            raise ValueError("没有找到要重新下载的歌曲")
+        if (
+            not item
+            or item.item_incarnation_id != expected_item_incarnation_id
+        ):
+            self._begin_cache_attempt(
+                item_id,
+                expected_item_incarnation_id,
+            )
+            raise RuntimeError(
+                "Rust AppState accepted an inconsistent cache retry target"
+            )
         if item.cache_status == "ready" and not force:
             raise ValueError("这首歌已经缓存完成，无需重新下载")
         if item.cache_status not in {"downloading", "failed", "ready", "pending", "queued"}:
@@ -1177,12 +1606,23 @@ class CacheManager:
         if not self._is_in_cache_window(item_id):
             raise ValueError("当前不在自动缓存窗口中")
 
-        download_source = self._current_download_source()
+        if login_error := self._download_login_error(download_source, item_id):
+            raise ValueError(login_error)
         log_path = self._item_log_path(item_id, download_source)
-        self._append_log_line(log_path, f"[{self._log_timestamp()}] manual retry requested")
 
         is_current_item = self.store.is_current_item(item_id)
+        self._append_log_line(
+            log_path,
+            f"[{self._log_timestamp()}] manual retry requested",
+        )
         with self.lock:
+            if self.native_cache_started:
+                result = rust_runtime.native_cache_request(
+                    "handoff", owner=self._artifact_owner, item_id=item_id,
+                    expected_item_incarnation_id=expected_item_incarnation_id,
+                )
+                self.native_cache_snapshot = dict(result["snapshot"])
+            refresh_token = self._begin_cache_attempt(item_id, expected_item_incarnation_id)
             active_processes = self._active_processes_locked(item_id)
             target_is_primary_active = self.active_item_id == item_id
             target_is_urgent_active = item_id in self.urgent_cache_ids
@@ -1209,18 +1649,16 @@ class CacheManager:
             )
             if in_flight:
                 self.retry_requested_ids.add(item_id)
+            self.python_worker_download_sources[item_id] = download_source
+            self.python_cache_attempt_tokens[item_id] = refresh_token
             if preempted_item_id:
                 self.cache_interrupted_messages[preempted_item_id] = "等待当前歌曲重新下载"
 
-        self.store.update_item(
+        self._project_cache_event(
             item_id,
-            cache_status="pending",
-            cache_progress=0.0,
-            cache_message="准备重新下载",
-            video_relative_path="",
-            video_media_url="",
-            audio_variants=[],
-            persist_backup=False,
+            "queued",
+            cache_attempt_token=refresh_token,
+            message="准备重新下载",
         )
         self._record_item_activity(item_id)
 
@@ -1228,7 +1666,6 @@ class CacheManager:
             self._terminate_processes(active_processes)
             return
 
-        self._remove_cache_dir(item_id)
         if start_concurrent_current_retry:
             self._append_log_line(
                 log_path,
@@ -1360,6 +1797,13 @@ class CacheManager:
         return retained_ids
 
     def sync_with_playlist(self) -> None:
+        if self.stop_event.is_set():
+            return
+        if self._current_download_source() in (DOWNLOAD_SOURCE_NATIVE, DOWNLOAD_SOURCE_BBDOWN, DOWNLOAD_SOURCE_DOWNKYI):
+            self._sync_native_with_playlist()
+            return
+        if self.native_cache_started:
+            self._sync_native_with_playlist()
         items = self.store.list_items()
         plan, priority_state = self._stable_cache_plan_snapshot(items)
         desired_ids = set(plan.desired_ids)
@@ -1385,14 +1829,43 @@ class CacheManager:
         self._apply_cache_plan_priority(items, priority_plan)
 
     def enqueue(self, item_id: str) -> None:
+        item = self.store.get_item(item_id)
+        if not item:
+            return
+        missing_download_login = False
         with self.lock:
-            if (
-                item_id in self.pending_ids
-                or item_id in self.urgent_cache_ids
-                or self.stop_event.is_set()
-            ):
-                return
-            self.pending_ids.add(item_id)
+            download_source = self.python_worker_download_sources.get(item_id, self.download_source)
+            if download_source not in (DOWNLOAD_SOURCE_NATIVE, DOWNLOAD_SOURCE_BBDOWN, DOWNLOAD_SOURCE_DOWNKYI):
+                if (
+                    item_id in self.pending_ids
+                    or item_id in self.native_cache_snapshot.get("active_item_ids", [])
+                    or item_id in self.native_cache_snapshot.get("pending_ids", [])
+                    or item_id in self.urgent_cache_ids
+                    or self.stop_event.is_set()
+                ):
+                    return
+                missing_download_login = bool(
+                    (login_error := self._download_login_error(download_source, item_id))
+                )
+                cache_attempt_token = self.python_cache_attempt_tokens.get(item_id)
+                if cache_attempt_token is None:
+                    cache_attempt_token = self._begin_cache_attempt_for_item(item)
+                if not missing_download_login:
+                    self.pending_ids.add(item_id)
+                    self.python_worker_download_sources[item_id] = download_source
+                    self.python_cache_attempt_tokens[item_id] = cache_attempt_token
+        if download_source in (DOWNLOAD_SOURCE_NATIVE, DOWNLOAD_SOURCE_BBDOWN, DOWNLOAD_SOURCE_DOWNKYI):
+            self._sync_native_with_playlist()
+            return
+        if missing_download_login:
+            self._project_cache_event(
+                item_id,
+                "failed",
+                cache_attempt_token=cache_attempt_token,
+                message=f"缓存失败: {login_error}",
+            )
+            self._record_item_activity(item_id)
+            return
         self.tasks.put(item_id)
 
     def _remove_queued_item(self, item_id: str) -> None:
@@ -1410,25 +1883,60 @@ class CacheManager:
                 self.tasks.put(queued_id)
 
     def _start_urgent_cache(self, item_id: str) -> None:
-        self._remove_queued_item(item_id)
+        with self.lock:
+            download_source = self.python_worker_download_sources.get(item_id, self.download_source)
+        if download_source in (DOWNLOAD_SOURCE_NATIVE, DOWNLOAD_SOURCE_BBDOWN, DOWNLOAD_SOURCE_DOWNKYI):
+            item = self.store.get_item(item_id)
+            if item is not None:
+                self.retry_item(item_id, expected_item_incarnation_id=item.item_incarnation_id, force=True)
+            return
+        item = self.store.get_item(item_id)
+        if item is None:
+            return
         with self.lock:
             if self.stop_event.is_set() or item_id in self.urgent_cache_ids:
                 return
-            self.urgent_cache_ids.add(item_id)
-            self.pending_ids.add(item_id)
-            worker = threading.Thread(
-                target=self._urgent_cache_worker,
-                args=(item_id,),
-                name=f"bilikara-current-cache-{item_id}",
-                daemon=True,
+            download_source = self.python_worker_download_sources.setdefault(
+                item_id, download_source
             )
-            self.urgent_workers[item_id] = worker
+            if login_error := self._download_login_error(download_source, item_id):
+                cache_attempt_token = self._begin_cache_attempt_for_item(item)
+                missing_download_login = True
+            else:
+                cache_attempt_token = self.python_cache_attempt_tokens.get(item_id)
+                if cache_attempt_token is None:
+                    cache_attempt_token = self._begin_cache_attempt_for_item(item)
+                    self.python_cache_attempt_tokens[item_id] = cache_attempt_token
+                missing_download_login = False
+            if missing_download_login:
+                worker = None
+            else:
+                self._remove_queued_item(item_id)
+                self.urgent_cache_ids.add(item_id)
+                self.pending_ids.add(item_id)
+                worker = threading.Thread(
+                    target=self._urgent_cache_worker,
+                    args=(item_id, cache_attempt_token),
+                    name=f"bilikara-current-cache-{item_id}",
+                    daemon=True,
+                )
+                self.urgent_workers[item_id] = worker
+        if missing_download_login:
+            self._project_cache_event(
+                item_id,
+                "failed",
+                cache_attempt_token=cache_attempt_token,
+                message=f"缓存失败: {login_error}",
+            )
+            return
+        assert worker is not None
         worker.start()
 
-    def _urgent_cache_worker(self, item_id: str) -> None:
+    def _urgent_cache_worker(self, item_id: str, cache_attempt_token: int) -> None:
         should_resync = False
         try:
-            should_resync = self._cache_item(item_id)
+            self._begin_worker_attempt_scope(cache_attempt_token)
+            should_resync = self._cache_item(item_id, cache_attempt_token)
         except Exception as exc:  # noqa: BLE001
             _debug_print(f"[bilikara-cache] Unexpected urgent-cache error for item {item_id}: {exc}")
             try:
@@ -1438,26 +1946,70 @@ class CacheManager:
                     log_path,
                     f"[{self._log_timestamp()}] Unexpected urgent-cache error: {exc}",
                 )
-                self.store.update_item(
+                self._project_cache_event(
                     item_id,
-                    cache_status="failed",
-                    cache_message=f"缓存发生意外错误: {exc}",
-                    persist_backup=False,
+                    "failed",
+                    cache_attempt_token=cache_attempt_token,
+                    message=f"缓存发生意外错误: {exc}",
                 )
             except Exception:
                 pass
         finally:
+            owned_attempt_tokens = self._end_worker_attempt_scope()
+            self._finish_artifact_attempts(item_id, owned_attempt_tokens)
             with self.lock:
                 self.urgent_cache_ids.discard(item_id)
                 self.urgent_workers.pop(item_id, None)
-                self.pending_ids.discard(item_id)
-        if should_resync and not self.stop_event.is_set():
+                self._release_worker_attempt_bookkeeping_locked(
+                    item_id,
+                    owned_attempt_tokens,
+                    release_ownership=True,
+                )
+        self._after_external_cache_attempt(should_resync)
+
+    def _after_external_cache_attempt(self, should_resync: bool) -> None:
+        if self.stop_event.is_set():
+            return
+        if self._current_download_source() in (DOWNLOAD_SOURCE_NATIVE, DOWNLOAD_SOURCE_BBDOWN, DOWNLOAD_SOURCE_DOWNKYI):
+            # A closed retry window may have deferred a Native replacement, even
+            # when the external attempt failed. Wake Rust after ownership drains;
+            # a clear/stop operation remains closed to these background wakeups.
+            self._sync_native_with_playlist(wake=True)
+        elif should_resync:
             self.sync_with_playlist()
 
     def _enqueue_front(self, item_id: str, *, requeue_after: str | None = None) -> None:
+        item = self.store.get_item(item_id)
+        if item is None:
+            return
+        requeue_item = self.store.get_item(requeue_after) if requeue_after else None
         with self.lock:
             if self.stop_event.is_set():
                 return
+            # A stale retained-source priority plan cannot create a shared job
+            # in the Python queue after configuration changed.
+            if self.python_worker_download_sources.get(item_id, self.download_source) in (
+                DOWNLOAD_SOURCE_NATIVE, DOWNLOAD_SOURCE_BBDOWN, DOWNLOAD_SOURCE_DOWNKYI
+            ):
+                return
+            download_source = self.python_worker_download_sources.setdefault(
+                item_id, self.download_source
+            )
+            if login_error := self._download_login_error(download_source, item_id):
+                raise ValueError(login_error)
+            if item_id not in self.python_cache_attempt_tokens:
+                self.python_cache_attempt_tokens[item_id] = (
+                    self._begin_cache_attempt_for_item(item)
+                )
+            if (
+                requeue_after
+                and requeue_item is not None
+                and requeue_after == self.active_item_id
+                and requeue_after in self.desired_ids
+            ):
+                self.python_cache_attempt_tokens[requeue_after] = (
+                    self._begin_cache_attempt_for_item(requeue_item)
+                )
             drained: list[str] = []
             skip_ids = {item_id}
             if requeue_after:
@@ -1482,6 +2034,20 @@ class CacheManager:
                 self.tasks.put(queued_id)
 
     def _enqueue_retry_front(self, item_id: str, *, requeue_after: str | None = None) -> None:
+        item = self.store.get_item(item_id)
+        if item is None:
+            return
+        with self.lock:
+            download_source = self.python_worker_download_sources.get(item_id, self.download_source)
+            if download_source in (DOWNLOAD_SOURCE_NATIVE, DOWNLOAD_SOURCE_BBDOWN, DOWNLOAD_SOURCE_DOWNKYI):
+                return
+            if login_error := self._download_login_error(download_source, item_id):
+                raise ValueError(login_error)
+            self.python_worker_download_sources[item_id] = download_source
+            if item_id not in self.python_cache_attempt_tokens:
+                self.python_cache_attempt_tokens[item_id] = (
+                    self._begin_cache_attempt_for_item(item)
+                )
         self._enqueue_front(item_id, requeue_after=requeue_after)
 
     def _reorder_pending_cache_queue(self, ordered_ids: list[str]) -> None:
@@ -1501,6 +2067,8 @@ class CacheManager:
                     drained.append(queued_id)
                 else:
                     self.pending_ids.discard(queued_id)
+                    self.python_worker_download_sources.pop(queued_id, None)
+                    self.python_cache_attempt_tokens.pop(queued_id, None)
                 self.tasks.task_done()
 
             drained_set = set(drained)
@@ -1564,7 +2132,16 @@ class CacheManager:
                 try:
                     with self.lock:
                         self.active_item_id = item_id
-                    should_resync = self._cache_item(item_id)
+                        cache_attempt_token = self.python_cache_attempt_tokens.get(
+                            item_id
+                        )
+                    if cache_attempt_token is None:
+                        raise RuntimeError("queued cache item has no reserved attempt token")
+                    self._begin_worker_attempt_scope(cache_attempt_token)
+                    should_resync = self._cache_item(
+                        item_id,
+                        cache_attempt_token,
+                    )
                 except Exception as exc:  # noqa: BLE001
                     _debug_print(f"[bilikara-cache] Unexpected error caching item {item_id}: {exc}")
                     try:
@@ -1577,15 +2154,17 @@ class CacheManager:
                     except Exception:
                         pass
                     try:
-                        self.store.update_item(
+                        self._project_cache_event(
                             item_id,
-                            cache_status="failed",
-                            cache_message=f"缓存发生意外错误: {exc}",
-                            persist_backup=False,
+                            "failed",
+                            cache_attempt_token=cache_attempt_token,
+                            message=f"缓存发生意外错误: {exc}",
                         )
                     except Exception:
                         pass
             finally:
+                owned_attempt_tokens = self._end_worker_attempt_scope()
+                self._finish_artifact_attempts(item_id, owned_attempt_tokens)
                 with self.lock:
                     if self.active_item_id == item_id:
                         self.active_item_id = None
@@ -1598,31 +2177,89 @@ class CacheManager:
                         self.active_processes.discard(process)
                         self.active_process_item_ids.pop(process, None)
                     self.active_process = next(iter(self.active_processes), None)
-                    if item_id in self.requeued_active_ids:
+                    requeued = item_id in self.requeued_active_ids
+                    if requeued:
                         self.requeued_active_ids.discard(item_id)
-                    else:
-                        self.pending_ids.discard(item_id)
+                    self._release_worker_attempt_bookkeeping_locked(
+                        item_id,
+                        owned_attempt_tokens,
+                        release_ownership=not requeued,
+                    )
                 self.tasks.task_done()
-            if should_resync and not self.stop_event.is_set():
-                self.sync_with_playlist()
+            self._after_external_cache_attempt(should_resync)
 
-    def _cache_item(self, item_id: str, allow_refresh_retry: bool = True) -> bool:
-        playback_selector = self.store.capture_playback_selector()
+    def _cache_item(
+        self,
+        item_id: str,
+        cache_attempt_token: int,
+    ) -> bool:
+        cache_attempt_token = self._require_cache_attempt_token(
+            cache_attempt_token
+        )
         if self.stop_event.is_set() or not self._should_cache(item_id):
             return False
-        if self._take_retry_request(item_id):
-            self._remove_cache_dir(item_id)
         item = self.store.get_item(item_id)
         if not item:
-            self._remove_cache_dir(item_id)
+            self._remove_cache_dir(
+                item_id,
+                cache_attempt_token=cache_attempt_token,
+            )
             return False
+        self._cache_attempt_reservation_for_item(item, cache_attempt_token)
+        if self._take_retry_request(item_id):
+            cache_attempt_token = self._replacement_cache_attempt_token(
+                item, cache_attempt_token
+            )
         # Current cache flow keeps video and audio tracks separate so the host
         # can switch audio variants without remuxing a single output file.
         return self._cache_item_multi(
             item_id,
             item,
-            allow_refresh_retry=allow_refresh_retry,
-            playback_selector=playback_selector,
+            cache_attempt_token=cache_attempt_token,
+        )
+
+    def _replacement_cache_attempt_token(
+        self,
+        item: PlaylistItem,
+        previous_token: int,
+    ) -> int:
+        item_id = item.id
+        with self.lock:
+            replacement_token = self.python_cache_attempt_tokens.get(item_id)
+        if replacement_token is None or replacement_token == previous_token:
+            replacement_token = self._begin_cache_attempt_for_item(item)
+            with self.lock:
+                self.python_cache_attempt_tokens[item_id] = replacement_token
+        self._record_worker_attempt(replacement_token)
+        self._cache_attempt_reservation_for_item(item, replacement_token)
+        return replacement_token
+
+    def _restart_cache_after_retry_request(
+        self,
+        item_id: str,
+        previous_token: int,
+        *,
+        item_dir: Path | None = None,
+        log_path: Path | None = None,
+    ) -> bool:
+        """Restart an attempt after its already-consumed replacement request."""
+        fresh_item = self.store.get_item(item_id)
+        if not fresh_item or not self._should_cache(item_id):
+            return False
+        retry_token = self._replacement_cache_attempt_token(
+            fresh_item, previous_token
+        )
+        if log_path is not None:
+            self._append_log_line(
+                log_path,
+                f"[{self._log_timestamp()}] restarting cache by manual request",
+            )
+        if item_dir is not None:
+            self._safe_rmtree(item_dir)
+        return self._cache_item_multi(
+            item_id,
+            fresh_item,
+            cache_attempt_token=retry_token,
         )
 
     def _cache_item_multi(
@@ -1630,60 +2267,144 @@ class CacheManager:
         item_id: str,
         item,
         *,
-        allow_refresh_retry: bool,
-        playback_selector: PlaybackSelector | None = None,
+        cache_attempt_token: int | None = None,
     ) -> bool:
-        self._clear_item_download_progress(item_id)
-        self.store.update_item(
+        if item.id != item_id:
+            raise RuntimeError("cache item owner changed before downloader preparation")
+        if cache_attempt_token is not None:
+            self._cache_attempt_reservation_for_item(item, cache_attempt_token)
+        with self.lock:
+            download_source = self.python_worker_download_sources[item_id]
+        if download_source == DOWNLOAD_SOURCE_BBDOWN:
+            raise RuntimeError("BBDown is owned by the shared Rust runtime")
+        if login_error := self._download_login_error(download_source, item_id):
+            token = (
+                self._begin_cache_attempt_for_item(item)
+                if cache_attempt_token is None
+                else self._require_cache_attempt_token(cache_attempt_token)
+            )
+            self._record_worker_attempt(token)
+            if self._close_python_retry_window(item_id, token):
+                return self._restart_cache_after_retry_request(
+                    item_id,
+                    token,
+                )
+            self._clear_item_download_progress(
+                item_id,
+                cache_attempt_token=token,
+            )
+            self._project_cache_event(
+                item_id,
+                "failed",
+                cache_attempt_token=token,
+                message=f"缓存失败: {login_error}",
+            )
+            self._record_item_activity(item_id)
+            return False
+
+        token = (
+            self._begin_cache_attempt_for_item(item)
+            if cache_attempt_token is None
+            else self._require_cache_attempt_token(cache_attempt_token)
+        )
+        self._record_worker_attempt(token)
+        self._cache_attempt_reservation_for_item(item, token)
+
+        self._clear_item_download_progress(
             item_id,
-            cache_status="queued",
-            cache_progress=0.0,
-            cache_message="等待缓存队列",
-            persist_backup=False,
+            cache_attempt_token=token,
+        )
+        self._project_cache_event(
+            item_id,
+            "queued",
+            cache_attempt_token=token,
+            message="等待缓存队列",
         )
         self._record_item_activity(item_id)
 
-        item_dir = CACHE_DIR / item_id
-        item_dir.mkdir(parents=True, exist_ok=True)
-        download_source = self._current_download_source()
-        if download_source == DOWNLOAD_SOURCE_DOWNKYI:
-            self._cleanup_attempt_dirs(item_dir)
+        reservation, item_dir, _committed_dir = self._cache_attempt_paths(token)
+        item_dir.parent.mkdir(parents=True, exist_ok=True)
+        item_dir.mkdir(parents=False, exist_ok=False)
         log_path = self._item_log_path(item_id, download_source)
         self._append_log_line(log_path, "")
         self._append_log_line(log_path, f"[{self._log_timestamp()}] start cache: {item.display_title}")
 
-        try:
-            binary_path = self._ensure_downloader(download_source)
-        except Exception as exc:  # noqa: BLE001
-            label = self._download_source_label(download_source)
-            self.store.update_item(
-                item_id,
-                cache_status="failed",
-                cache_message=f"{label} 不可用: {exc}",
-                persist_backup=False,
-            )
-            return False
-
-        try:
-            ffmpeg_path = self._ensure_ffmpeg(force_refresh=False)
-        except Exception as exc:  # noqa: BLE001
-            self._append_log_line(log_path, f"[{self._log_timestamp()}] ffmpeg unavailable: {exc}")
-            self.store.update_item(
-                item_id,
-                cache_status="failed",
-                cache_message=f"FFmpeg 不可用: {exc}",
-                persist_backup=False,
-            )
-            return False
+        if download_source == DOWNLOAD_SOURCE_NATIVE:
+            if not rust_runtime.http_download_available() or not rust_runtime.media_backend_available():
+                status = rust_runtime.runtime_status()
+                message = str(status.get("error") or "Rust runtime is unavailable")
+                self._append_log_line(
+                    log_path,
+                    f"[{self._log_timestamp()}] Rust runtime unavailable: {message}",
+                )
+                if self._close_python_retry_window(item_id, token):
+                    return self._restart_cache_after_retry_request(
+                        item_id,
+                        token,
+                        item_dir=item_dir,
+                        log_path=log_path,
+                    )
+                self._project_cache_event(
+                    item_id,
+                    "failed",
+                    cache_attempt_token=token,
+                    message=f"Rust Native 不可用: {message}",
+                )
+                return False
+            binary_path = Path()
+            ffmpeg_path = Path()
+        else:
+            try:
+                binary_path = self._ensure_downloader(download_source)
+            except Exception as exc:  # noqa: BLE001
+                label = self._download_source_label(download_source)
+                if self._close_python_retry_window(item_id, token):
+                    return self._restart_cache_after_retry_request(
+                        item_id,
+                        token,
+                        item_dir=item_dir,
+                        log_path=log_path,
+                    )
+                self._project_cache_event(
+                    item_id,
+                    "failed",
+                    cache_attempt_token=token,
+                    message=f"{label} 不可用: {exc}",
+                )
+                self._safe_rmtree(item_dir)
+                return False
+            try:
+                ffmpeg_path = Path() if media_cli.DISABLED else self._ensure_ffmpeg(force_refresh=False)
+            except Exception as exc:  # noqa: BLE001
+                self._append_log_line(
+                    log_path,
+                    f"[{self._log_timestamp()}] ffmpeg unavailable: {exc}",
+                )
+                if self._close_python_retry_window(item_id, token):
+                    return self._restart_cache_after_retry_request(
+                        item_id,
+                        token,
+                        item_dir=item_dir,
+                        log_path=log_path,
+                    )
+                self._project_cache_event(
+                    item_id,
+                    "failed",
+                    cache_attempt_token=token,
+                    message=f"FFmpeg 不可用: {exc}",
+                )
+                self._safe_rmtree(item_dir)
+                return False
 
         if not self._should_cache(item_id):
+            self._safe_rmtree(item_dir)
             return False
 
-        self.store.update_item(
+        self._project_cache_event(
             item_id,
-            cache_status="downloading",
-            cache_message=self._cache_start_message(item),
-            persist_backup=False,
+            "started",
+            cache_attempt_token=token,
+            message=self._cache_start_message(item),
         )
         self._record_item_activity(item_id)
 
@@ -1694,112 +2415,132 @@ class CacheManager:
                 ffmpeg_path,
                 item_dir,
                 log_path,
+                cache_attempt_token=token,
                 download_source=download_source,
-                playback_selector=playback_selector,
             )
             self._raise_if_retry_requested(item_id)
             self._raise_if_priority_shift(item_id)
-            downkyi_tracks_prevalidated = bool(cache_result.get("downkyi_tracks_prevalidated"))
-            if download_source == DOWNLOAD_SOURCE_DOWNKYI and not downkyi_tracks_prevalidated:
-                self._normalize_downkyi_cache_result(cache_result, ffmpeg_path, log_path)
-            if not downkyi_tracks_prevalidated:
-                self._validate_cache_result(item.id, cache_result, ffmpeg_path, log_path)
-            self._raise_if_retry_requested(item_id)
+            native_tracks_prevalidated = bool(
+                cache_result.get("native_tracks_prevalidated")
+            )
+            if not native_tracks_prevalidated:
+                self._validate_cache_result(
+                    item.id,
+                    cache_result,
+                    ffmpeg_path,
+                    log_path,
+                    cache_attempt_token=token,
+                )
+            # Last point at which this attempt can still accept a replacement
+            # request; after it the worker publishes and settles.
+            if self._close_python_retry_window(item_id, token):
+                raise CacheCancelledError(RETRY_REQUESTED_MESSAGE)
             self._raise_if_priority_shift(item_id)
-            if download_source == DOWNLOAD_SOURCE_DOWNKYI:
-                self._publish_validated_cache_result(cache_result, log_path)
+            self._publish_validated_cache_result(
+                item_id,
+                token,
+                reservation,
+                item_dir,
+                cache_result,
+                log_path,
+            )
         except CacheCancelledError as exc:
             if str(exc) == RETRY_REQUESTED_MESSAGE:
                 self._take_retry_request(item_id)
-                self._append_log_line(log_path, f"[{self._log_timestamp()}] restarting cache by manual request")
-                self._remove_cache_dir(item_id)
-                fresh_item = self.store.get_item(item_id)
-                if fresh_item and self._should_cache(item_id):
-                    return self._cache_item_multi(item_id, fresh_item, allow_refresh_retry=allow_refresh_retry)
-                return False
+                return self._restart_cache_after_retry_request(
+                    item_id,
+                    token,
+                    item_dir=item_dir,
+                    log_path=log_path,
+                )
             self._take_cache_interrupt_message(item_id)
             self._append_log_line(log_path, f"[{self._log_timestamp()}] cancelled: {exc}")
-            self._drop_item_cache(item_id, str(exc))
+            self._safe_rmtree(item_dir)
+            self._clear_item_download_progress(
+                item_id,
+                cache_attempt_token=token,
+            )
+            self._project_cache_event(
+                item_id,
+                "cancelled",
+                cache_attempt_token=token,
+                message=str(exc),
+            )
+            self._record_item_activity(item_id)
             return False
         except DownloadCommandError as exc:
-            self._cleanup_attempt_dirs(item_dir)
+            self._safe_rmtree(item_dir)
             if self._take_retry_request(item_id):
-                self._append_log_line(log_path, f"[{self._log_timestamp()}] restarting cache by manual request")
-                self._remove_cache_dir(item_id)
-                fresh_item = self.store.get_item(item_id)
-                if fresh_item and self._should_cache(item_id):
-                    return self._cache_item_multi(item_id, fresh_item, allow_refresh_retry=allow_refresh_retry)
-                return False
+                return self._restart_cache_after_retry_request(
+                    item_id,
+                    token,
+                    log_path=log_path,
+                )
             last_message = str(exc)
-            if (
-                download_source == DOWNLOAD_SOURCE_BBDOWN
-                and allow_refresh_retry
-                and self._should_force_refresh_bbdown(last_message)
-            ):
-                self._append_log_line(
-                    log_path,
-                    f"[{self._log_timestamp()}] detected stale BBDown hint, forcing refresh and retry",
+            if self._close_python_retry_window(item_id, token):
+                return self._restart_cache_after_retry_request(
+                    item_id,
+                    token,
+                    log_path=log_path,
                 )
-                self._append_log_line(
-                    log_path,
-                    f"[{self._log_timestamp()}] detected stale BBDown hint, forcing refresh and retry",
-                )
-                try:
-                    self._ensure_bbdown(force_refresh=True)
-                    self._clear_item_download_progress(item_id)
-                    self._safe_rmtree(item_dir)
-                    item_dir.mkdir(parents=True, exist_ok=True)
-                    return self._cache_item_multi(item_id, item, allow_refresh_retry=False)
-                except Exception as refresh_exc:  # noqa: BLE001
-                    self._append_log_line(
-                        log_path,
-                        f"[{self._log_timestamp()}] forced BBDown refresh failed: {refresh_exc}",
-                    )
-            self._clear_item_download_progress(item_id)
+            self._clear_item_download_progress(
+                item_id,
+                cache_attempt_token=token,
+            )
             _debug_print(f"[bilikara-cache] item={item_id} download_source={download_source} FAILED: {last_message}")
             self._append_log_line(log_path, f"[{self._log_timestamp()}] failed: {last_message}")
-            self.store.update_item(
+            self._project_cache_event(
                 item_id,
-                cache_status="failed",
-                cache_message=f"缓存失败: {last_message}",
-                persist_backup=False,
+                "failed",
+                cache_attempt_token=token,
+                message=f"缓存失败: {last_message}",
             )
             self._record_item_activity(item_id)
             return False
         except Exception as exc:  # noqa: BLE001
-            self._cleanup_attempt_dirs(item_dir)
-            if self._take_retry_request(item_id):
-                self._append_log_line(log_path, f"[{self._log_timestamp()}] restarting cache by manual request")
-                self._remove_cache_dir(item_id)
-                fresh_item = self.store.get_item(item_id)
-                if fresh_item and self._should_cache(item_id):
-                    return self._cache_item_multi(item_id, fresh_item, allow_refresh_retry=allow_refresh_retry)
-                return False
+            self._safe_rmtree(item_dir)
+            if self._close_python_retry_window(item_id, token):
+                return self._restart_cache_after_retry_request(
+                    item_id,
+                    token,
+                    log_path=log_path,
+                )
             last_message = str(exc)
-            self._clear_item_download_progress(item_id)
+            self._clear_item_download_progress(
+                item_id,
+                cache_attempt_token=token,
+            )
             _debug_print(f"[bilikara-cache] item={item_id} download_source={download_source} FAILED: {last_message}")
             self._append_log_line(log_path, f"[{self._log_timestamp()}] failed: {last_message}")
-            self.store.update_item(
+            self._project_cache_event(
                 item_id,
-                cache_status="failed",
-                cache_message=f"缓存失败: {last_message}",
-                persist_backup=False,
+                "failed",
+                cache_attempt_token=token,
+                message=f"缓存失败: {last_message}",
             )
             self._record_item_activity(item_id)
             return False
 
         video_file = cache_result["video_file"]
-        self._clear_item_download_progress(item_id)
-        self.store.update_item(
+        self._clear_item_download_progress(
             item_id,
-            cache_status="ready",
-            cache_progress=100.0,
-            cache_message=self._ready_message(item),
+            cache_attempt_token=token,
+        )
+        self._project_cache_event(
+            item_id,
+            "ready",
+            cache_attempt_token=token,
+            progress=100.0,
+            message=self._ready_message(item),
             video_relative_path=cache_result["video_relative_path"],
             video_media_url=cache_result["video_media_url"],
             audio_variants=cache_result["audio_variants"],
             selected_audio_variant_id=cache_result["selected_audio_variant_id"],
-            persist_backup=False,
+            item_incarnation_id=cache_result["item_incarnation_id"],
+            artifact_set_id=cache_result["artifact_set_id"],
+            artifact_relative_directory=cache_result[
+                "artifact_relative_directory"
+            ],
         )
         self._record_item_activity(item_id)
         self._append_log_line(log_path, f"[{self._log_timestamp()}] ready: {video_file.name}")
@@ -2000,9 +2741,12 @@ class CacheManager:
         item_dir: Path,
         log_path: Path,
         *,
+        cache_attempt_token: int,
         download_source: str,
-        playback_selector: PlaybackSelector | None = None,
     ) -> dict[str, object]:
+        cache_attempt_token = self._require_cache_attempt_token(
+            cache_attempt_token
+        )
         self._raise_if_priority_shift(item.id)
         selected_pages = self._selected_pages_for_item(item)
         video_page = item.video_page if item.video_page in selected_pages else selected_pages[0]
@@ -2024,7 +2768,11 @@ class CacheManager:
             for index, page in enumerate(selected_pages)
         ]
         download_tracks = [video_track, *audio_tracks]
-        self._begin_download_progress(item.id, download_tracks)
+        self._begin_download_progress(
+            item.id,
+            download_tracks,
+            cache_attempt_token=cache_attempt_token,
+        )
 
         if download_source == DOWNLOAD_SOURCE_YTDLP:
             ordered_tracks = [*audio_tracks, video_track]
@@ -2041,74 +2789,25 @@ class CacheManager:
                     page=int(track["page"]),
                     stream_kind=str(track["stream_kind"]),
                     track_key=str(track["key"]),
+                    cache_attempt_token=cache_attempt_token,
                     download_source=download_source,
-                    playback_selector=playback_selector,
                 )
-        elif download_source == DOWNLOAD_SOURCE_DOWNKYI:
-            dash_streams = self._resolve_dash_streams(item, playback_selector=playback_selector)
-            result_paths = self._download_dash_streams_with_aria2c(
+        elif download_source == DOWNLOAD_SOURCE_NATIVE:
+            dash_streams = self._resolve_dash_streams(
                 item,
-                binary_path,
-                ffmpeg_path,
+                native_media=True,
+            )
+            result_paths = self._download_dash_streams_native(
+                item,
                 item_dir,
                 log_path,
                 dash_streams=dash_streams,
                 video_track=video_track,
                 audio_tracks=audio_tracks,
-                validate_tracks=True,
-                playback_selector=playback_selector,
+                cache_attempt_token=cache_attempt_token,
             )
         else:
-            result_paths = {}
-            max_workers = max(1, min(len(download_tracks), MAX_PARALLEL_TRACK_DOWNLOADS))
-            executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="bilikara-cache-track")
-            future_to_track = {
-                executor.submit(
-                    self._download_page_stream,
-                    item,
-                    binary_path,
-                    ffmpeg_path,
-                    item_dir,
-                    log_path,
-                    page=int(track["page"]),
-                    stream_kind=str(track["stream_kind"]),
-                    track_key=str(track["key"]),
-                    download_source=download_source,
-                    playback_selector=playback_selector,
-                ): track
-                for track in download_tracks
-            }
-            try:
-                done, pending = wait(future_to_track, return_when=FIRST_EXCEPTION)
-                exceptions: list[Exception] = []
-                for future in done:
-                    if future.cancelled():
-                        continue
-                    try:
-                        future.result()
-                    except Exception as exc:  # noqa: BLE001
-                        exceptions.append(exc)
-
-                if exceptions:
-                    for future in pending:
-                        future.cancel()
-                    self._terminate_item_processes(item.id)
-                    still_running = [future for future in pending if not future.cancelled()]
-                    if still_running:
-                        wait(still_running)
-                        for future in still_running:
-                            if future.cancelled():
-                                continue
-                            try:
-                                future.result()
-                            except Exception as exc:  # noqa: BLE001
-                                exceptions.append(exc)
-                    raise self._preferred_download_exception(exceptions)
-
-                for future, track in future_to_track.items():
-                    result_paths[str(track["key"])] = future.result()
-            finally:
-                executor.shutdown(wait=True)
+            raise RuntimeError("source must be executed by the shared Rust runtime")
 
         video_file = result_paths[str(video_track["key"])]
         audio_files: list[tuple[int, Path, str]] = []
@@ -2122,11 +2821,11 @@ class CacheManager:
                 )
             )
 
-        self.store.update_item(
+        self._project_cache_progress(
             item.id,
-            cache_progress=99.0,
-            cache_message=f"准备 {len(audio_files)} 条音轨",
-            persist_backup=False,
+            cache_attempt_token=cache_attempt_token,
+            progress=99.0,
+            message=f"准备 {len(audio_files)} 条音轨",
         )
         self._record_item_activity(item.id)
 
@@ -2211,17 +2910,20 @@ class CacheManager:
             "selected_audio_variant_id": selected_audio_variant_id,
             "validation_files": validation_files,
         }
-        if download_source == DOWNLOAD_SOURCE_DOWNKYI:
+        if download_source == DOWNLOAD_SOURCE_NATIVE:
             validation_metadata = [
                 dict(track.get("validation_metadata") or {})
                 for track in download_tracks
                 if isinstance(track.get("validation_metadata"), dict)
             ]
             if len(validation_metadata) != len(download_tracks):
-                raise DownloadCommandError("缓存校验失败: DownKyi 轨道缺少独立校验结果")
+                source_label = self._download_source_label(download_source)
+                raise DownloadCommandError(
+                    f"缓存校验失败: {source_label} 轨道缺少独立校验结果"
+                )
             result["validation_metadata"] = validation_metadata
             result["validation_failure_count"] = 0
-            result["downkyi_tracks_prevalidated"] = True
+            result["native_tracks_prevalidated"] = True
         return result
 
     @staticmethod
@@ -2234,6 +2936,61 @@ class CacheManager:
             return 2
 
         return sorted(exceptions, key=priority)[0]
+
+    @staticmethod
+    def _is_terminal_track_failure(exc: BaseException) -> bool:
+        if isinstance(exc, media_cli.MediaCliDisabledError):
+            return True
+        terminal_kinds = {
+            "access_forbidden",
+            "authentication",
+            "authentication_required",
+            "codec_policy",
+            "forbidden",
+            "invalid_request",
+            "media_contract_violation",
+            "no_matching_stream",
+            "risk_control",
+            "selection",
+            "unavailable",
+            "unsupported",
+            "unsupported_codec",
+            "unsupported_container_layout",
+            "unsupported_content",
+        }
+        current: BaseException | None = exc
+        seen: set[int] = set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            kind = str(getattr(current, "kind", "") or "").strip().lower()
+            response = getattr(current, "response", None)
+            error = response.get("error") if isinstance(response, dict) else None
+            error = error if isinstance(error, dict) else {}
+            if not kind:
+                kind = str(error.get("kind") or "").strip().lower()
+            raw_status = (
+                getattr(current, "http_status", None)
+                or getattr(current, "status_code", None)
+                or error.get("http_status")
+                or error.get("status_code")
+            )
+            raw_api_code = getattr(current, "api_code", None) or error.get("api_code")
+            try:
+                status = int(raw_status) if raw_status is not None else None
+            except (TypeError, ValueError):
+                status = None
+            try:
+                api_code = int(raw_api_code) if raw_api_code is not None else None
+            except (TypeError, ValueError):
+                api_code = None
+            if kind in terminal_kinds:
+                return True
+            if kind in {"http", "http_status"} and status in {401, 402, 403}:
+                return True
+            if api_code in {-101, -400, -403, -404, -352, -412, 412, 62002}:
+                return True
+            current = current.__cause__ or current.__context__
+        return False
 
     @staticmethod
     def _download_track_key(stream_kind: str, page: int) -> str:
@@ -2255,8 +3012,8 @@ class CacheManager:
         page: int,
         stream_kind: str,
         track_key: str,
+        cache_attempt_token: int,
         download_source: str,
-        playback_selector: PlaybackSelector | None = None,
     ) -> Path:
         page_url = self._page_url(item.resolved_url, page)
         target_dir = item_dir / f"{stream_kind}-p{page}"
@@ -2269,7 +3026,6 @@ class CacheManager:
             page=page,
             stream_kind=stream_kind,
             target_dir=target_dir,
-            playback_selector=playback_selector,
         )
 
         label = "视频轨" if stream_kind == "video" else "音轨"
@@ -2284,6 +3040,7 @@ class CacheManager:
             stream_kind=stream_kind,
             target_dir=target_dir,
             track_key=track_key,
+            cache_attempt_token=cache_attempt_token,
             tool_dir=binary_path.parent,
         )
 
@@ -2298,6 +3055,7 @@ class CacheManager:
             final_size = 0
         self._update_download_track_progress(
             item.id,
+            cache_attempt_token=cache_attempt_token,
             track_key=track_key,
             target_dir=target_dir,
             target_bytes=final_size,
@@ -2315,7 +3073,6 @@ class CacheManager:
         page: int,
         stream_kind: str,
         target_dir: Path,
-        playback_selector: PlaybackSelector | None = None,
     ) -> list[str]:
         if download_source == DOWNLOAD_SOURCE_YTDLP:
             return self._ytdlp_download_command(
@@ -2325,60 +3082,22 @@ class CacheManager:
                 page=page,
                 stream_kind=stream_kind,
                 target_dir=target_dir,
-                playback_selector=playback_selector,
             )
-        if download_source == DOWNLOAD_SOURCE_DOWNKYI:
-            return self._downkyi_download_command(
-                binary_path,
-                ffmpeg_path,
-                page_url,
-                page=page,
-                stream_kind=stream_kind,
-                target_dir=target_dir,
-            )
-        return self._bbdown_download_command(
-            binary_path,
-            ffmpeg_path,
-            page_url,
-            page=page,
-            stream_kind=stream_kind,
-            target_dir=target_dir,
-            playback_selector=playback_selector,
-        )
+        raise RuntimeError("source must be executed by the shared Rust runtime")
 
-    def _bbdown_download_command(
-        self,
-        binary_path: Path,
-        ffmpeg_path: Path,
-        page_url: str,
-        *,
-        page: int,
-        stream_kind: str,
-        target_dir: Path,
-        playback_selector: PlaybackSelector | None = None,
-    ) -> list[str]:
-        command = [
-            self._tool_arg_path(binary_path),
-            page_url,
-            "-p",
-            str(page),
-            *self._bbdown_stream_preference_args(stream_kind, playback_selector=playback_selector),
-            "--work-dir",
-            self._tool_arg_path(target_dir),
-            "--ffmpeg-path",
-            self._bbdown_ffmpeg_path_arg(ffmpeg_path),
-            "--file-pattern",
-            f"{stream_kind}-p{page}",
-            "--skip-mux",
-            "--skip-subtitle",
-            "--skip-cover",
-            "--skip-ai",
-            "--video-only" if stream_kind == "video" else "--audio-only",
-        ]
-        cookie = effective_bilibili_cookie()
-        if cookie:
-            command.extend(["-c", cookie])
-        return command
+    def _download_login_error(
+        self, source: str, item_id: str | None = None, *, cookie: str | None = None
+    ) -> str:
+        message = rust_runtime.desktop_login(
+            "download_access", source=source,
+            cookie=effective_bilibili_cookie() if cookie is None else cookie,
+        )["message"] or ""
+        if message and item_id:
+            self._append_log_line(
+                self._item_log_path(item_id, source),
+                f"download_login_required source={source}: {message}",
+            )
+        return message
 
     def _ytdlp_download_command(
         self,
@@ -2389,10 +3108,10 @@ class CacheManager:
         page: int,
         stream_kind: str,
         target_dir: Path,
-        playback_selector: PlaybackSelector | None = None,
     ) -> list[str]:
         command = [
             self._tool_arg_path(binary_path),
+            *(["--ignore-config", "--fixup", "never", "--downloader", "native"] if media_cli.DISABLED else []),
             "--newline",
             "--no-playlist",
             "--retries",
@@ -2407,10 +3126,9 @@ class CacheManager:
             "100K",
             "--concurrent-fragments",
             "1",
-            "--ffmpeg-location",
-            self._tool_arg_path(ffmpeg_path),
+            *([] if media_cli.DISABLED else ["--ffmpeg-location", self._tool_arg_path(ffmpeg_path)]),
             "-f",
-            self._ytdlp_format_selector(stream_kind, playback_selector=playback_selector),
+            self._ytdlp_format_selector(stream_kind),
             "-o",
             self._tool_arg_path(target_dir / f"{stream_kind}-p{page}.%(ext)s"),
             page_url,
@@ -2426,8 +3144,6 @@ class CacheManager:
     def _ytdlp_format_selector(
         self,
         stream_kind: str,
-        *,
-        playback_selector: PlaybackSelector | None = None,
     ) -> str:
         if stream_kind == "audio":
             with self.lock:
@@ -2438,9 +3154,7 @@ class CacheManager:
             video_quality = self.video_quality
             force_avc = self._should_force_avc_locked()
             avc_quality_cap = self.avc_quality_cap if force_avc else ""
-        max_height = self._ytdlp_max_height(
-            video_quality, avc_quality_cap, playback_selector=playback_selector
-        )
+        max_height = self._ytdlp_max_height(video_quality, avc_quality_cap)
         codec_filter = "[vcodec^=avc1]" if force_avc else ""
         height_filter = f"[height<={max_height}]" if max_height else ""
         return (
@@ -2450,37 +3164,12 @@ class CacheManager:
         )
 
     @staticmethod
-    def _py_ytdlp_max_height(video_quality: object, quality_cap: object = "") -> int:
-        quality = CacheManager._py_optional_video_quality(
-            quality_cap
-        ) or CacheManager._py_normalize_video_quality(video_quality)
-        if "360" in quality:
-            return 360
-        if "480" in quality:
-            return 480
-        if "720" in quality:
-            return 720
-        if "1080" in quality:
-            return 1080
-        if "4K" in quality:
-            return 2160
-        if "8K" in quality:
-            return 4320
-        return 1080
-
-    @staticmethod
     def _ytdlp_max_height(
         video_quality: object,
         quality_cap: object = "",
-        *,
-        playback_selector: PlaybackSelector | None = None,
     ) -> int:
-        response = CacheManager._native_quality_policy(
-            video_quality, quality_cap, playback_selector=playback_selector
-        )
-        if response is not None:
-            return int(response["effective_max_height"])
-        return CacheManager._py_ytdlp_max_height(video_quality, quality_cap)
+        response = CacheManager._native_quality_policy(video_quality, quality_cap)
+        return int(response["effective_max_height"])
 
     @staticmethod
     def _ytdlp_browser_cookie_source() -> str:
@@ -2521,7 +3210,7 @@ class CacheManager:
         item,
         cid: int | None = None,
         *,
-        playback_selector: PlaybackSelector | None = None,
+        native_media: bool = False,
     ) -> dict:
         """Resolve DASH stream URLs from Bilibili API for the given item.
 
@@ -2532,16 +3221,24 @@ class CacheManager:
           - "dolby": Dolby stream dict or None
         """
         cookie = effective_bilibili_cookie()
-        if not cookie:
-            raise BilibiliError("Downkyi 模式需要 Bilibili Cookie 才能获取播放地址")
 
         resolved_cid = cid if cid is not None else item.cid
 
-        dash = fetch_dash_playurl(
-            bvid=item.bvid,
-            cid=resolved_cid,
-            avid=item.aid,
-        )
+        if native_media:
+            dash = rust_runtime.fetch_bilibili_dash_playurl(
+                bvid=item.bvid,
+                cid=resolved_cid,
+                avid=item.aid,
+                cookie=cookie,
+                user_agent=str(BILIBILI_HEADERS.get("User-Agent") or ""),
+                referer=str(BILIBILI_HEADERS.get("Referer") or ""),
+            )
+        else:
+            dash = fetch_dash_playurl(
+                bvid=item.bvid,
+                cid=resolved_cid,
+                avid=item.aid,
+            )
 
         if not dash.get("video") and not dash.get("audio"):
             raise BilibiliError("未获取到任何视频/音频流地址")
@@ -2553,29 +3250,37 @@ class CacheManager:
             audio_hires = self.audio_hires
 
         video_streams = dash.get("video") or []
-        codec_filter = "avc" if force_avc else None
-        max_quality_id = self._dash_max_quality_id(
-            video_quality, playback_selector=playback_selector
-        )
+        codec_filter = "avc" if force_avc or native_media else None
+        max_quality_id = self._dash_max_quality_id(video_quality)
         filtered_video = self._select_dash_video_stream(
             video_streams,
             max_quality_id=max_quality_id,
             codec_filter=codec_filter,
             avc_quality_cap=avc_quality_cap,
-            playback_selector=playback_selector,
         )
+        if native_media and filtered_video and filtered_video.get("codec_name") != "avc":
+            raise BilibiliError("Rust Native 未找到可用的 AVC 视频流")
         audio_streams = dash.get("audio") or []
         selected_audio = self._select_dash_audio_stream(
-            audio_streams, audio_hires=audio_hires, playback_selector=playback_selector
+            audio_streams, audio_hires=audio_hires
         )
         flac_info = dash.get("flac")
         dolby_info = dash.get("dolby")
 
+        if native_media:
+            # The native media backend supports FLAC-in-MP4, but not Dolby E-AC-3.
+            selected_audio = self._select_preferred_dash_audio(
+                [selected_audio] if selected_audio else [],
+                flac_info,
+                None,
+                audio_hires=audio_hires,
+            )
+
         result = {
             "video": [filtered_video] if filtered_video else [],
             "audio": [selected_audio] if selected_audio else [],
-            "flac": flac_info if audio_hires and flac_info else None,
-            "dolby": dolby_info if audio_hires and dolby_info else None,
+            "flac": flac_info if audio_hires and flac_info and not native_media else None,
+            "dolby": dolby_info if audio_hires and dolby_info and not native_media else None,
         }
 
         if not result["video"]:
@@ -2647,72 +3352,9 @@ class CacheManager:
             return 0
 
     @staticmethod
-    def _py_dash_max_quality_id(video_quality: str) -> int:
-        quality_id_map = {
-            "360P 流畅": 16,
-            "480P 清晰": 32,
-            "720P 高清": 64,
-            "720P 60帧": 74,
-            "1080P 高清": 80,
-            "1080P 高码率": 112,
-            "1080P 高帧率": 116,
-            "4K 超清": 120,
-            "HDR 真彩": 125,
-            "杜比视界": 126,
-            "8K 超高清": 127,
-        }
-        return quality_id_map.get(video_quality, 80)
-
-    @staticmethod
-    def _dash_max_quality_id(
-        video_quality: str,
-        *,
-        playback_selector: PlaybackSelector | None = None,
-    ) -> int:
-        if not isinstance(video_quality, str):
-            return CacheManager._py_dash_max_quality_id(video_quality)
-        response = CacheManager._native_quality_policy(
-            video_quality, playback_selector=playback_selector
-        )
-        if response is not None:
-            return int(response["dash_max_quality_id"])
-        return CacheManager._py_dash_max_quality_id(video_quality)
-
-    @staticmethod
-    def _py_select_dash_video_stream(
-        video_streams: list[dict],
-        *,
-        max_quality_id: int,
-        codec_filter: str | None = None,
-        avc_quality_cap: str = "",
-    ) -> dict | None:
-        max_avc_quality_id = (
-            CacheManager._py_dash_max_quality_id(avc_quality_cap)
-            if avc_quality_cap
-            else 0
-        )
-        candidates = []
-        for stream in video_streams:
-            quality_id = stream.get("quality_id", 0)
-            if quality_id > max_quality_id:
-                continue
-            codec_name = stream.get("codec_name", "")
-            if codec_filter and codec_name != codec_filter:
-                continue
-            if codec_filter == "avc" and max_avc_quality_id and quality_id > max_avc_quality_id:
-                continue
-            candidates.append(stream)
-        if not candidates:
-            for stream in video_streams:
-                quality_id = stream.get("quality_id", 0)
-                if quality_id <= max_quality_id:
-                    candidates.append(stream)
-            if not candidates:
-                candidates = list(video_streams)
-        if not candidates:
-            return None
-        candidates.sort(key=lambda s: (-s.get("quality_id", 0), -s.get("bandwidth", 0)))
-        return candidates[0]
+    def _dash_max_quality_id(video_quality: str) -> int:
+        response = CacheManager._native_quality_policy(video_quality)
+        return int(response["dash_max_quality_id"])
 
     @staticmethod
     def _select_dash_video_stream(
@@ -2721,7 +3363,6 @@ class CacheManager:
         max_quality_id: int,
         codec_filter: str | None = None,
         avc_quality_cap: str = "",
-        playback_selector: PlaybackSelector | None = None,
     ) -> dict | None:
         try:
             streams = [
@@ -2734,9 +3375,7 @@ class CacheManager:
                 for index, stream in enumerate(video_streams)
             ]
             max_avc_quality_id = (
-                CacheManager._dash_max_quality_id(
-                    avc_quality_cap, playback_selector=playback_selector
-                )
+                CacheManager._dash_max_quality_id(avc_quality_cap)
                 if avc_quality_cap
                 else None
             )
@@ -2747,72 +3386,31 @@ class CacheManager:
                 "max_avc_quality_id": max_avc_quality_id,
                 "streams": streams,
             }
-            if playback_selector is not None:
-                def decode_native_video(response: object) -> dict | None:
-                    if not isinstance(response, dict):
-                        raise ValueError("invalid video stream response")
-                    if response.get("status") == "no_match":
-                        return None
-                    return video_streams[response["selected_index"]]
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise rust_backend.PlaybackCapabilityError(
+                "select_video_stream", "invalid request"
+            ) from exc
 
-                return playback_selector.decide(
-                    "select_video_stream",
-                    python=lambda: CacheManager._py_select_dash_video_stream(
-                        video_streams,
-                        max_quality_id=max_quality_id,
-                        codec_filter=codec_filter,
-                        avc_quality_cap=avc_quality_cap,
-                    ),
-                    rust=lambda: rust_backend.try_select_video_stream(
-                        request, allow_python_reference=False
-                    ),
-                    decode_rust=decode_native_video,
-                )
-            completed, response = rust_backend.try_select_video_stream(request)
-            if completed and response is not None:
-                if response["status"] == "no_match":
-                    return None
-                return video_streams[response["selected_index"]]
-        except (AttributeError, IndexError, TypeError, ValueError):
-            pass
-        return rust_backend.python_fallback(
+        def decode_native_video(response: object) -> dict | None:
+            if not isinstance(response, dict):
+                raise ValueError("invalid video stream response")
+            if response.get("status") == "no_match":
+                return None
+            return video_streams[response["selected_index"]]
+
+        return rust_backend.require_playback_capability(
             "select_video_stream",
-            lambda: CacheManager._py_select_dash_video_stream(
-                video_streams,
-                max_quality_id=max_quality_id,
-                codec_filter=codec_filter,
-                avc_quality_cap=avc_quality_cap,
+            lambda: rust_backend.try_select_video_stream(
+                request, allow_python_reference=False
             ),
+            decode=decode_native_video,
         )
-
-    @staticmethod
-    def _py_select_dash_audio_stream(
-        audio_streams: list[dict], *, audio_hires: bool = True
-    ) -> dict | None:
-        if not audio_streams:
-            return None
-        candidates = list(audio_streams)
-        quality_order = {
-            30250: 0,   # Dolby Atmos
-            30251: 1,   # Hi-Res FLAC
-            30280: 2,   # High 192K
-            30232: 3,   # Mid 132K
-            30216: 4,   # Low 64K
-        }
-        if not audio_hires:
-            high_quality_ids = {30250, 30251}
-            candidates = [s for s in candidates if s.get("quality_id") not in high_quality_ids]
-            if not candidates:
-                candidates = list(audio_streams)
-        candidates.sort(key=lambda s: quality_order.get(s.get("quality_id", 0), 99))
-        return candidates[0]
 
     @staticmethod
     def _select_dash_audio_stream(
         audio_streams: list[dict],
         *,
         audio_hires: bool = True,
-        playback_selector: PlaybackSelector | None = None,
     ) -> dict | None:
         try:
             request = {
@@ -2827,50 +3425,24 @@ class CacheManager:
                     for index, stream in enumerate(audio_streams)
                 ],
             }
-            if playback_selector is not None:
-                def decode_native_audio(response: object) -> dict | None:
-                    if not isinstance(response, dict):
-                        raise ValueError("invalid audio stream response")
-                    selected_index = response["selected_index"]
-                    return None if selected_index is None else audio_streams[selected_index]
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise rust_backend.PlaybackCapabilityError(
+                "select_audio_stream", "invalid request"
+            ) from exc
 
-                return playback_selector.decide(
-                    "select_audio_stream",
-                    python=lambda: CacheManager._py_select_dash_audio_stream(
-                        audio_streams, audio_hires=audio_hires
-                    ),
-                    rust=lambda: rust_backend.try_select_audio_stream(
-                        request, allow_python_reference=False
-                    ),
-                    decode_rust=decode_native_audio,
-                )
-            completed, response = rust_backend.try_select_audio_stream(request)
-            if completed and response is not None:
-                selected_index = response["selected_index"]
-                return None if selected_index is None else audio_streams[selected_index]
-        except (AttributeError, IndexError, TypeError, ValueError):
-            pass
-        return rust_backend.python_fallback(
+        def decode_native_audio(response: object) -> dict | None:
+            if not isinstance(response, dict):
+                raise ValueError("invalid audio stream response")
+            selected_index = response["selected_index"]
+            return None if selected_index is None else audio_streams[selected_index]
+
+        return rust_backend.require_playback_capability(
             "select_audio_stream",
-            lambda: CacheManager._py_select_dash_audio_stream(
-                audio_streams, audio_hires=audio_hires
+            lambda: rust_backend.try_select_audio_stream(
+                request, allow_python_reference=False
             ),
+            decode=decode_native_audio,
         )
-
-    @staticmethod
-    def _py_select_preferred_dash_audio(
-        best_audio: list[dict],
-        flac_audio: dict | None,
-        dolby_audio: dict | None,
-        *,
-        audio_hires: bool,
-    ) -> dict | None:
-        preferred_audio = best_audio[0] if best_audio else None
-        if flac_audio and audio_hires:
-            preferred_audio = flac_audio
-        if dolby_audio and audio_hires:
-            preferred_audio = dolby_audio
-        return preferred_audio
 
     @staticmethod
     def _select_preferred_dash_audio(
@@ -2879,7 +3451,6 @@ class CacheManager:
         dolby_audio: dict | None,
         *,
         audio_hires: bool,
-        playback_selector: PlaybackSelector | None = None,
     ) -> dict | None:
         try:
             request = {
@@ -2891,469 +3462,332 @@ class CacheManager:
                 "flac_available": bool(flac_audio),
                 "dolby_available": bool(dolby_audio),
             }
-            if playback_selector is not None:
-                def decode_native_preferred(response: object) -> dict | None:
-                    if not isinstance(response, dict):
-                        raise ValueError("invalid preferred audio response")
-                    source = response["preferred_source"]
-                    if source == "dolby":
-                        return dolby_audio
-                    if source == "flac":
-                        return flac_audio
-                    if source == "regular":
-                        return best_audio[response["selected_regular_index"]]
-                    return None
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise rust_backend.PlaybackCapabilityError(
+                "select_preferred_audio_source", "invalid request"
+            ) from exc
 
-                return playback_selector.decide(
-                    "select_preferred_audio_source",
-                    python=lambda: CacheManager._py_select_preferred_dash_audio(
-                        best_audio,
-                        flac_audio,
-                        dolby_audio,
-                        audio_hires=audio_hires,
-                    ),
-                    rust=lambda: rust_backend.try_select_preferred_audio_source(
-                        request, allow_python_reference=False
-                    ),
-                    decode_rust=decode_native_preferred,
-                )
-            completed, response = rust_backend.try_select_preferred_audio_source(request)
-            if completed and response is not None:
-                source = response["preferred_source"]
-                if source == "dolby":
-                    return dolby_audio
-                if source == "flac":
-                    return flac_audio
-                if source == "regular":
-                    selected_index = response["selected_regular_index"]
-                    return best_audio[selected_index]
-                return None
-        except (AttributeError, IndexError, TypeError, ValueError):
-            pass
-        return rust_backend.python_fallback(
+        def decode_native_preferred(response: object) -> dict | None:
+            if not isinstance(response, dict):
+                raise ValueError("invalid preferred audio response")
+            source = response["preferred_source"]
+            if source == "dolby":
+                return dolby_audio
+            if source == "flac":
+                return flac_audio
+            if source == "regular":
+                return best_audio[response["selected_regular_index"]]
+            return None
+
+        return rust_backend.require_playback_capability(
             "select_preferred_audio_source",
-            lambda: CacheManager._py_select_preferred_dash_audio(
-                best_audio,
-                flac_audio,
-                dolby_audio,
-                audio_hires=audio_hires,
+            lambda: rust_backend.try_select_preferred_audio_source(
+                request, allow_python_reference=False
             ),
+            decode=decode_native_preferred,
         )
 
-    def _download_dash_streams_with_aria2c(
+    def _download_dash_streams_native(
         self,
         item,
-        binary_path: Path,
-        ffmpeg_path: Path,
         item_dir: Path,
         log_path: Path,
         *,
         dash_streams: dict,
         video_track: dict,
         audio_tracks: list[dict],
-        validate_tracks: bool = False,
-        playback_selector: PlaybackSelector | None = None,
+        cache_attempt_token: int,
     ) -> dict[str, Path]:
+        """Historical Python Native adapter retained for direct regression tests.
+
+        Production enqueue/retry/sync submit Native jobs to Rust CacheRuntime.
+        This adapter is not an availability fallback or its production retry loop.
+        """
         item_id = item.id
         cookie = effective_bilibili_cookie()
-
         selected_pages = self._selected_pages_for_item(item)
         video_page = item.video_page if item.video_page in selected_pages else selected_pages[0]
+        video_stream = (dash_streams.get("video") or [{}])[0]
+        video_urls = self._dash_stream_urls(dash_streams, "video")
+        if not video_urls or str(video_stream.get("codec_name") or "") != "avc":
+            raise DownloadCommandError("Rust Native 未找到可用的 AVC 视频流")
 
-        with self.lock:
-            audio_hires = self.audio_hires
-
-        video_urls = self._dash_stream_urls(
-            dash_streams, "video", playback_selector=playback_selector
-        )
-        if not video_urls:
-            raise DownloadCommandError("未找到视频流下载地址")
-        video_target_dir = item_dir / f"video-p{video_page}"
-        video_target_dir.mkdir(parents=True, exist_ok=True)
-
-        ffprobe_path = self._ffprobe_path_for_ffmpeg(ffmpeg_path) if validate_tracks else None
-        if validate_tracks and not ffprobe_path:
-            raise DownloadCommandError("缓存校验失败: DownKyi 下载需要可用的 ffprobe")
-
-        track_args: list[tuple[dict, list[str], str, Path, str, str, dict[str, object]]] = []
-        track_args.append((
-            video_track,
-            video_urls,
-            f"video-p{video_page}.mp4",
-            video_target_dir,
-            f"下载视频轨 P{video_page}",
-            "video",
-            (dash_streams.get("video") or [{}])[0],
-        ))
-
+        track_args: list[tuple[dict, list[str], str, Path, str, str, dict[str, object]]] = [
+            (
+                video_track,
+                video_urls,
+                f"video-p{video_page}.mp4",
+                item_dir / f"video-p{video_page}",
+                f"下载视频轨 P{video_page}",
+                "video",
+                video_stream,
+            )
+        ]
         for track in audio_tracks:
             page = int(track["page"])
-            label = str(track["label"])
-            audio_target_dir = item_dir / f"audio-p{page}"
-            audio_target_dir.mkdir(parents=True, exist_ok=True)
-
             cid = self._cid_for_page(item, page)
-            self._append_log_line(log_path, f"[{self._log_timestamp()}] resolve audio DASH: page={page}, cid={cid}")
-            self._append_log_line(log_path, f"[{self._log_timestamp()}] download audio track: page={page}, label={label}")
-
+            self._append_log_line(
+                log_path,
+                f"[{self._log_timestamp()}] resolve native audio DASH: page={page}, cid={cid}",
+            )
             try:
-                page_dash_streams = self._resolve_dash_streams(
-                    item, cid=cid, playback_selector=playback_selector
+                page_dash = self._resolve_dash_streams(
+                    item,
+                    cid=cid,
+                    native_media=True,
                 )
-            except Exception as exc:
-                raise RuntimeError(f"P{page} 音频解析失败: {exc}") from exc
-
-            best_audio = page_dash_streams.get("audio") or []
-            flac_audio = page_dash_streams.get("flac")
-            dolby_audio = page_dash_streams.get("dolby")
-            preferred_audio = self._select_preferred_dash_audio(
-                best_audio,
-                flac_audio,
-                dolby_audio,
-                audio_hires=audio_hires,
-                playback_selector=playback_selector,
+            except Exception as exc:  # noqa: BLE001
+                raise DownloadCommandError(f"P{page} 音频解析失败: {exc}") from exc
+            audio_stream = (page_dash.get("audio") or [{}])[0]
+            audio_urls = self._preferred_audio_urls(audio_stream)
+            if not audio_urls:
+                raise DownloadCommandError(f"Rust Native 未找到音频轨 P{page} 的下载地址")
+            audio_extension = (
+                ".flac"
+                if str(audio_stream.get("codec_name") or "") == "flac"
+                else ".m4a"
+            )
+            track_args.append(
+                (
+                    track,
+                    audio_urls,
+                    f"audio-p{page}{audio_extension}",
+                    item_dir / f"audio-p{page}",
+                    f"下载音轨 P{page}",
+                    "audio",
+                    audio_stream,
+                )
             )
 
-            if preferred_audio:
-                audio_urls = self._preferred_audio_urls(
-                    preferred_audio, playback_selector=playback_selector
-                )
-            else:
-                audio_urls = self._dash_stream_urls(
-                    page_dash_streams, "audio", playback_selector=playback_selector
-                )
-            if not audio_urls:
-                raise DownloadCommandError(f"未找到音频轨 P{page} 的下载地址")
-
-            out_ext = ".flac" if (flac_audio and preferred_audio is flac_audio and audio_hires) else ".m4a"
-            track_args.append((
-                track,
-                audio_urls,
-                f"audio-p{page}{out_ext}",
-                audio_target_dir,
-                f"下载音轨 P{page}",
-                "audio",
-                preferred_audio or {},
-            ))
-
-        result_paths: dict[str, Path] = {}
-        max_workers = max(1, min(len(track_args), MAX_PARALLEL_TRACK_DOWNLOADS))
-        executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="bilikara-downkyi-track")
-
-        def _download_track(args: tuple) -> tuple[str, Path]:
+        def download_track(args: tuple) -> tuple[str, Path]:
             track, urls, out_name, target_dir, stage_label, stream_kind, stream_metadata = args
             track["stream_metadata"] = dict(stream_metadata)
             track_key = str(track["key"])
             page = int(track["page"])
             cid = self._cid_for_page(item, page)
-            validation_label = f"{'视频轨' if stream_kind == 'video' else '音轨'} P{page}"
-            max_attempts = DOWNKYI_TRACK_MAX_ATTEMPTS if validate_tracks else 1
-            last_error = "未知错误"
-
-            for attempt in range(1, max_attempts + 1):
-                if validate_tracks:
-                    self._raise_if_retry_requested(item_id)
-                    self._raise_if_priority_shift(item_id)
+            last_error = "unknown error"
+            for attempt in range(1, DOWNKYI_TRACK_MAX_ATTEMPTS + 1):
+                self._raise_if_retry_requested(item_id)
+                self._raise_if_priority_shift(item_id)
                 if attempt > 1:
-                    self._reset_download_track_progress(item_id, track_key)
+                    self._reset_download_track_progress(
+                        item_id,
+                        track_key,
+                        cache_attempt_token=cache_attempt_token,
+                    )
                 self._set_download_track_phase(
                     item_id,
                     track_key,
+                    cache_attempt_token=cache_attempt_token,
                     phase="downloading",
                     attempt=attempt,
-                    max_attempts=max_attempts,
+                    max_attempts=DOWNKYI_TRACK_MAX_ATTEMPTS,
                 )
-                self._append_log_line(
-                    log_path,
-                    f"[{self._log_timestamp()}] media_diagnostic: "
-                    f"{json.dumps({'event': 'downkyi_track_attempt', 'item_id': item_id, 'track_key': track_key, 'stream_kind': stream_kind, 'page': page, 'attempt': attempt, 'max_attempts': max_attempts, 'status': 'start'}, ensure_ascii=False, sort_keys=True)}",
-                )
-                media_path: Path | None = None
+                raw_path: Path | None = None
                 try:
-                    media_path = self._download_stream_with_aria2c(
-                        item_id, binary_path, ffmpeg_path, target_dir, log_path,
+                    raw_name = f".{Path(out_name).stem}.raw-{uuid.uuid4().hex}{Path(out_name).suffix}"
+                    raw_path = self._download_stream_with_rust(
+                        item_id,
+                        target_dir,
+                        log_path,
                         urls=urls,
-                        out_name=out_name,
+                        out_name=raw_name,
                         cookie=cookie,
                         stage_label=stage_label,
                         track_key=track_key,
+                        cache_attempt_token=cache_attempt_token,
                         stream_kind=stream_kind,
                         page=page,
                         cid=cid,
                         stream_metadata=stream_metadata,
-                        mark_done=not validate_tracks,
+                        mark_done=False,
                     )
-                    if validate_tracks:
-                        self._set_download_track_phase(
-                            item_id,
-                            track_key,
-                            phase="validating",
-                            attempt=attempt,
-                            max_attempts=max_attempts,
-                        )
-                        assert ffprobe_path is not None
-                        source_audio_duration = None
-                        if stream_kind == "audio":
-                            source_audio_duration = self._probe_original_audio_duration(
-                                ffprobe_path,
-                                ffmpeg_path,
-                                media_path,
-                                label=validation_label,
-                                log_path=log_path,
-                            )
-                        self._normalize_downkyi_media_file(
-                            ffmpeg_path,
-                            media_path,
-                            label=validation_label,
-                            stream_kind=stream_kind,
-                            log_path=log_path,
-                        )
-                        validation_entry: dict[str, object] = {
-                            "label": validation_label,
-                            "path": media_path,
-                            "required_streams": {stream_kind},
-                            "stream_kind": stream_kind,
-                            "page": page,
-                            "cid": cid,
-                            "download_source": DOWNLOAD_SOURCE_DOWNKYI,
-                            "stream_metadata": dict(stream_metadata),
-                        }
-                        if stream_kind == "video":
-                            validation_entry["expected_duration"] = self._duration_for_page(item, page)
-                        if source_audio_duration is not None:
-                            validation_entry["source_audio_duration"] = source_audio_duration
-                        metadata = self._validate_media_file(
-                            ffprobe_path,
-                            ffmpeg_path,
-                            media_path,
-                            label=validation_label,
-                            required_streams={stream_kind},
-                            log_path=log_path,
-                            diagnostic_context={**validation_entry, "item_id": item_id},
-                        )
-                        metadata.update({
-                            "label": validation_label,
-                            "page": page,
-                            "stream_kind": stream_kind,
-                            "expected_duration": self._optional_probe_float(
-                                validation_entry.get("expected_duration")
-                            ),
-                            "source_audio_duration": self._optional_probe_float(
-                                validation_entry.get("source_audio_duration")
-                            ),
-                        })
-                        track["validation_metadata"] = metadata
-                        final_size = media_path.stat().st_size
-                        self._update_download_track_progress(
-                            item_id,
-                            track_key=track_key,
-                            target_dir=media_path.parent,
-                            current_bytes=final_size,
-                            target_bytes=final_size,
-                            done=True,
-                            measure_path=False,
-                        )
-                        self._set_download_track_phase(
-                            item_id,
-                            track_key,
-                            phase="ready",
-                            attempt=attempt,
-                            max_attempts=max_attempts,
-                        )
-                    self._append_log_line(
-                        log_path,
-                        f"[{self._log_timestamp()}] media_diagnostic: "
-                        f"{json.dumps({'event': 'downkyi_track_attempt', 'item_id': item_id, 'track_key': track_key, 'stream_kind': stream_kind, 'page': page, 'attempt': attempt, 'max_attempts': max_attempts, 'status': 'ok'}, ensure_ascii=False, sort_keys=True)}",
-                    )
-                    return track_key, media_path
-                except CacheCancelledError:
-                    if media_path is not None:
-                        self._safe_rmtree(media_path.parent)
                     self._set_download_track_phase(
                         item_id,
                         track_key,
-                        phase="retrying",
+                        cache_attempt_token=cache_attempt_token,
+                        phase="validating",
                         attempt=attempt,
-                        max_attempts=max_attempts,
+                        max_attempts=DOWNKYI_TRACK_MAX_ATTEMPTS,
                     )
-                    raise
-                except Exception as exc:  # noqa: BLE001
-                    last_error = self._compact_probe_error(str(exc)) or type(exc).__name__
-                    if media_path is not None:
-                        self._safe_rmtree(media_path.parent)
+                    normalized_path = raw_path.with_name(out_name)
+                    normalized = rust_runtime.normalize_media(
+                        source=raw_path,
+                        destination=normalized_path,
+                        expected_kind=stream_kind,
+                    )
+                    raw_path.unlink(missing_ok=True)
+                    output = normalized["output"]
+                    duration = float(output.get("duration_seconds") or 0)
+                    if duration < 1.0:
+                        raise DownloadCommandError(
+                            f"{stage_label}: Rust media validation reported an invalid duration"
+                        )
+                    expected_duration = (
+                        self._duration_for_page(item, page) if stream_kind == "video" else None
+                    )
+                    metadata = {
+                        **dict(output),
+                        "label": str(track.get("label") or stage_label),
+                        "page": page,
+                        "stream_kind": stream_kind,
+                        "expected_duration": expected_duration,
+                        "stream_metadata": dict(stream_metadata),
+                    }
+                    track["validation_metadata"] = metadata
+                    final_size = normalized_path.stat().st_size
+                    self._update_download_track_progress(
+                        item_id,
+                        cache_attempt_token=cache_attempt_token,
+                        track_key=track_key,
+                        target_dir=normalized_path.parent,
+                        current_bytes=final_size,
+                        target_bytes=final_size,
+                        done=True,
+                        measure_path=False,
+                    )
+                    self._set_download_track_phase(
+                        item_id,
+                        track_key,
+                        cache_attempt_token=cache_attempt_token,
+                        phase="ready",
+                        attempt=attempt,
+                        max_attempts=DOWNKYI_TRACK_MAX_ATTEMPTS,
+                    )
                     self._append_log_line(
                         log_path,
                         f"[{self._log_timestamp()}] media_diagnostic: "
-                        f"{json.dumps({'event': 'downkyi_track_attempt', 'item_id': item_id, 'track_key': track_key, 'stream_kind': stream_kind, 'page': page, 'attempt': attempt, 'max_attempts': max_attempts, 'status': 'failed', 'error': last_error}, ensure_ascii=False, sort_keys=True)}",
+                        f"{json.dumps({'event': 'rust_media_ready', 'item_id': item_id, 'track_key': track_key, 'page': page, 'stream_kind': stream_kind, 'codec': output.get('codec'), 'duration': duration, 'sample_count': output.get('sample_count'), 'file_size': final_size}, ensure_ascii=False, sort_keys=True)}",
                     )
-                    if attempt >= max_attempts:
-                        raise DownloadCommandError(
-                            f"{validation_label} 已尝试 {max_attempts} 次仍失败: {last_error}"
-                        ) from exc
-                    if self.stop_event.wait(DOWNKYI_TRACK_RETRY_WAIT_SECONDS):
-                        raise CacheCancelledError("缓存已停止") from exc
-
+                    return track_key, normalized_path
+                except CacheCancelledError:
+                    if raw_path is not None:
+                        self._safe_rmtree(raw_path.parent)
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    last_error = self._compact_probe_error(str(exc))
+                    if raw_path is not None:
+                        self._safe_rmtree(raw_path.parent)
+                    terminal = self._is_terminal_track_failure(exc)
+                    self._append_log_line(
+                        log_path,
+                        f"[{self._log_timestamp()}] Rust Native track "
+                        f"{'terminal failure' if terminal else f'attempt {attempt}/{DOWNKYI_TRACK_MAX_ATTEMPTS} failed'}: "
+                        f"{last_error}",
+                    )
+                    if terminal:
+                        raise
+                    if attempt < DOWNKYI_TRACK_MAX_ATTEMPTS:
+                        self._set_download_track_phase(
+                            item_id,
+                            track_key,
+                            cache_attempt_token=cache_attempt_token,
+                            phase="retrying",
+                            attempt=attempt,
+                            max_attempts=DOWNKYI_TRACK_MAX_ATTEMPTS,
+                        )
+                        if self.stop_event.wait(DOWNKYI_TRACK_RETRY_WAIT_SECONDS):
+                            raise CacheCancelledError("cache stopped") from exc
             raise DownloadCommandError(
-                f"{validation_label} 已尝试 {max_attempts} 次仍失败: {last_error}"
+                f"{stage_label}: Rust Native failed after "
+                f"{DOWNKYI_TRACK_MAX_ATTEMPTS} attempts: {last_error}"
             )
 
+        result_paths: dict[str, Path] = {}
+        max_workers = max(1, min(len(track_args), MAX_PARALLEL_TRACK_DOWNLOADS))
+        executor = ThreadPoolExecutor(
+            max_workers=max_workers, thread_name_prefix="bilikara-native-track"
+        )
         future_to_track = {
-            executor.submit(_download_track, args): args[0]
-            for args in track_args
+            executor.submit(download_track, args): args[0] for args in track_args
         }
         try:
             done, pending = wait(future_to_track, return_when=FIRST_EXCEPTION)
             exceptions: list[Exception] = []
             for future in done:
-                if future.cancelled():
-                    continue
                 try:
-                    key, path = future.result()
-                    result_paths[key] = path
+                    track_key, media_path = future.result()
+                    result_paths[track_key] = media_path
                 except Exception as exc:  # noqa: BLE001
                     exceptions.append(exc)
-
             if exceptions:
                 for future in pending:
                     future.cancel()
-                self._terminate_item_processes(item_id)
-                still_running = [future for future in pending if not future.cancelled()]
-                if still_running:
-                    wait(still_running)
-                    for future in still_running:
-                        if future.cancelled():
-                            continue
-                        try:
-                            future.result()
-                        except Exception as exc:  # noqa: BLE001
-                            exceptions.append(exc)
-                raise self._preferred_download_exception(exceptions)
-
-            for future, track_ref in future_to_track.items():
-                if future not in done:
+                for future in pending:
+                    if future.cancelled():
+                        continue
                     try:
-                        key, path = future.result()
-                        result_paths[key] = path
+                        future.result()
                     except Exception as exc:  # noqa: BLE001
                         exceptions.append(exc)
+                raise self._preferred_download_exception(exceptions)
+            for future in pending:
+                track_key, media_path = future.result()
+                result_paths[track_key] = media_path
         finally:
             executor.shutdown(wait=True)
-
         return result_paths
 
-    @staticmethod
-    def _py_dash_stream_urls(dash_streams: dict, stream_kind: str) -> list[str]:
-        if stream_kind == "video":
-            streams = dash_streams.get("video") or []
-            urls = []
-            for stream in streams:
-                url = str(stream.get("url") or "").strip()
-                if url:
-                    urls.append(url)
-                for backup in stream.get("backup_urls") or []:
-                    backup_url = str(backup).strip()
-                    if backup_url:
-                        urls.append(backup_url)
-            return urls
-        if stream_kind == "audio":
-            streams = dash_streams.get("audio") or []
-            urls = []
-            for stream in streams:
-                url = str(stream.get("url") or "").strip()
-                if url:
-                    urls.append(url)
-                for backup in stream.get("backup_urls") or []:
-                    backup_url = str(backup).strip()
-                    if backup_url:
-                        urls.append(backup_url)
-            return urls
-        return []
 
     @staticmethod
     def _dash_stream_urls(
         dash_streams: dict,
         stream_kind: str,
-        *,
-        playback_selector: PlaybackSelector | None = None,
     ) -> list[str]:
         if stream_kind not in {"video", "audio"}:
-            if playback_selector is not None:
-                if playback_selector.mode == "rust":
-                    raise PlaybackCapabilityError(
-                        "plan_media_download_candidates",
-                        "invalid stream_kind",
-                    )
-                return CacheManager._py_dash_stream_urls(
-                    dash_streams, stream_kind
-                )
-            return rust_backend.python_fallback(
+            raise rust_backend.PlaybackCapabilityError(
                 "plan_media_download_candidates",
-                lambda: CacheManager._py_dash_stream_urls(dash_streams, stream_kind),
+                "invalid stream_kind",
             )
-        streams = dash_streams.get(stream_kind) or []
-        request = {
-            "schema_version": 1,
-            "mode": "dash_streams",
-            "stream_kind": stream_kind,
-            "streams": [
-                {
-                    "original_index": index,
-                    "primary_url": str(stream.get("url") or ""),
-                    "backup_urls": [
-                        str(backup) for backup in (stream.get("backup_urls") or [])
-                    ],
-                }
-                for index, stream in enumerate(streams)
-            ],
-        }
-        if playback_selector is not None:
-            return playback_selector.decide(
-                "plan_media_download_candidates",
-                python=lambda: CacheManager._py_dash_stream_urls(
-                    dash_streams, stream_kind
-                ),
-                rust=lambda: rust_backend.try_plan_media_download_candidates(
-                    request, allow_python_reference=False
-                ),
-                decode_rust=lambda response: [
-                    candidate["url"] for candidate in response["candidates"]
+        try:
+            streams = dash_streams.get(stream_kind) or []
+            request = {
+                "schema_version": 1,
+                "mode": "dash_streams",
+                "stream_kind": stream_kind,
+                "streams": [
+                    {
+                        "original_index": index,
+                        "primary_url": str(stream.get("url") or ""),
+                        "backup_urls": [
+                            str(backup)
+                            for backup in (stream.get("backup_urls") or [])
+                        ],
+                    }
+                    for index, stream in enumerate(streams)
                 ],
-            )
-        completed, response = rust_backend.try_plan_media_download_candidates(request)
-        if completed and response is not None:
-            return [candidate["url"] for candidate in response["candidates"]]
-        return rust_backend.python_fallback(
+            }
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise rust_backend.PlaybackCapabilityError(
+                "plan_media_download_candidates", "invalid request"
+            ) from exc
+        return rust_backend.require_playback_capability(
             "plan_media_download_candidates",
-            lambda: CacheManager._py_dash_stream_urls(dash_streams, stream_kind),
+            lambda: rust_backend.try_plan_media_download_candidates(
+                request, allow_python_reference=False
+            ),
+            decode=lambda response: [
+                candidate["url"] for candidate in response["candidates"]
+            ],
         )
-
-    @staticmethod
-    def _py_preferred_audio_urls(preferred_audio: dict) -> list[str]:
-        urls = [preferred_audio["url"]]
-        urls.extend(preferred_audio.get("backup_urls") or [])
-        return urls
 
     @staticmethod
     def _preferred_audio_urls(
         preferred_audio: dict,
-        *,
-        playback_selector: PlaybackSelector | None = None,
     ) -> list[str]:
-        primary_url = preferred_audio["url"]
-        backup_urls = list(preferred_audio.get("backup_urls") or [])
+        try:
+            primary_url = preferred_audio["url"]
+            backup_urls = list(preferred_audio.get("backup_urls") or [])
+        except (AttributeError, KeyError, TypeError, ValueError) as exc:
+            raise rust_backend.PlaybackCapabilityError(
+                "plan_media_download_candidates", "invalid request"
+            ) from exc
         if not isinstance(primary_url, str) or not all(
             isinstance(url, str) for url in backup_urls
         ):
-            if playback_selector is not None:
-                if playback_selector.mode == "rust":
-                    raise PlaybackCapabilityError(
-                        "plan_media_download_candidates",
-                        "preferred audio URLs must be strings",
-                    )
-                return CacheManager._py_preferred_audio_urls(preferred_audio)
-            return rust_backend.python_fallback(
+            raise rust_backend.PlaybackCapabilityError(
                 "plan_media_download_candidates",
-                lambda: CacheManager._py_preferred_audio_urls(preferred_audio),
+                "preferred audio URLs must be strings",
             )
         request = {
             "schema_version": 1,
@@ -3367,25 +3801,14 @@ class CacheManager:
                 }
             ],
         }
-        if playback_selector is not None:
-            return playback_selector.decide(
-                "plan_media_download_candidates",
-                python=lambda: CacheManager._py_preferred_audio_urls(
-                    preferred_audio
-                ),
-                rust=lambda: rust_backend.try_plan_media_download_candidates(
-                    request, allow_python_reference=False
-                ),
-                decode_rust=lambda response: [
-                    candidate["url"] for candidate in response["candidates"]
-                ],
-            )
-        completed, response = rust_backend.try_plan_media_download_candidates(request)
-        if completed and response is not None:
-            return [candidate["url"] for candidate in response["candidates"]]
-        return rust_backend.python_fallback(
+        return rust_backend.require_playback_capability(
             "plan_media_download_candidates",
-            lambda: CacheManager._py_preferred_audio_urls(preferred_audio),
+            lambda: rust_backend.try_plan_media_download_candidates(
+                request, allow_python_reference=False
+            ),
+            decode=lambda response: [
+                candidate["url"] for candidate in response["candidates"]
+            ],
         )
 
     @staticmethod
@@ -3454,11 +3877,10 @@ class CacheManager:
             "numbered_alternatives": [entry["name"] for entry in entries if entry["numbered_alternative"]],
         }
 
-    def _download_stream_with_aria2c(
+
+    def _download_stream_with_rust(
         self,
         item_id: str,
-        binary_path: Path,
-        ffmpeg_path: Path,
         target_dir: Path,
         log_path: Path,
         *,
@@ -3467,125 +3889,133 @@ class CacheManager:
         cookie: str,
         stage_label: str,
         track_key: str,
+        cache_attempt_token: int,
         stream_kind: str,
         page: int = 0,
         cid: int = 0,
         stream_metadata: dict[str, object] | None = None,
         mark_done: bool = True,
     ) -> Path:
-        if not urls:
-            raise DownloadCommandError(f"{stage_label}: 没有可用的下载地址")
+        """Transfer helper for the historical Native adapter and direct tests.
 
+        Production Native transfers run inside Rust CacheRuntime, not here.
+        """
         download_urls = [str(url).strip() for url in urls if str(url).strip()]
         if not download_urls:
-            raise DownloadCommandError(f"{stage_label}: 没有可用的下载地址")
+            raise DownloadCommandError(f"{stage_label}: no download URL is available")
 
-        target_dir.mkdir(parents=True, exist_ok=True)
         attempt_dir = target_dir / f".attempt-{uuid.uuid4().hex}"
-        attempt_dir.mkdir(parents=False, exist_ok=False)
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            attempt_dir.mkdir(parents=False, exist_ok=False)
+        except OSError as exc:
+            raise DownloadCommandError(
+                f"{stage_label}: unable to prepare Rust download output"
+            ) from exc
         expected_path = attempt_dir / out_name
-        final_path = target_dir / out_name
         metadata = stream_metadata or {}
-        selection_summary = {
-            "event": "downkyi_track_selected",
-            "item_id": item_id,
-            "page": page,
-            "cid": cid,
-            "stream_kind": stream_kind,
-            "quality_id": int(metadata.get("quality_id") or 0),
-            "codec_name": str(metadata.get("codec_name") or ""),
-            "codec_string": str(metadata.get("codecs") or ""),
-            "mime_type": str(metadata.get("mime_type") or ""),
-            "bandwidth": int(metadata.get("bandwidth") or 0),
-            "primary_url": self._safe_url_summary(download_urls[0]),
-            "backup_url_count": max(0, len(download_urls) - 1),
-            "expected_output": str(expected_path),
-            "final_output": str(final_path),
-        }
         self._append_log_line(
             log_path,
             f"[{self._log_timestamp()}] media_diagnostic: "
-            f"{json.dumps(selection_summary, ensure_ascii=False, sort_keys=True)}",
+            f"{json.dumps({'event': 'rust_downloader_selected', 'item_id': item_id, 'page': page, 'cid': cid, 'stream_kind': stream_kind, 'quality_id': int(metadata.get('quality_id') or 0), 'codec_name': str(metadata.get('codec_name') or ''), 'bandwidth': int(metadata.get('bandwidth') or 0), 'backup_url_count': max(0, len(download_urls) - 1), 'expected_output': str(expected_path)}, ensure_ascii=False, sort_keys=True)}",
         )
 
-        connections = str(ARIA2_CONNECTIONS_PER_TRACK)
-        command = [
-            self._tool_arg_path(binary_path),
-            *download_urls,
-            "--dir", self._tool_arg_path(attempt_dir),
-            "--out", out_name,
-            "--continue=false",
-            "--auto-file-renaming=false",
-            "--allow-overwrite=false",
-            "--max-tries=1",
-            "--retry-wait=3",
-            f"--split={connections}",
-            "--min-split-size=5M",
-            f"--max-connection-per-server={connections}",
-            "--file-allocation=none",
-            "--human-readable=false",
-            "--summary-interval=1",
-            "--console-log-level=notice",
+        headers = [
+            ("Origin", "https://www.bilibili.com"),
+            ("Referer", "https://www.bilibili.com"),
         ]
-
         if cookie:
-            command.extend(["--header", f"Cookie: {cookie}"])
-        command.extend(["--header", "Origin: https://www.bilibili.com"])
-        command.extend(["--header", "Referer: https://www.bilibili.com"])
+            headers.append(("Cookie", cookie))
         user_agent = BILIBILI_HEADERS.get("User-Agent", "")
         if user_agent:
-            command.extend(["--header", f"User-Agent: {user_agent}"])
+            headers.append(("User-Agent", user_agent))
 
-        exit_code: int | None = None
-        try:
-            self._run_item_command(
+        cancellation: list[CacheCancelledError] = []
+
+        def should_cancel() -> bool:
+            try:
+                if self.stop_event.is_set():
+                    raise CacheCancelledError("cache stopped")
+                self._raise_if_retry_requested(item_id)
+                self._raise_if_priority_shift(item_id)
+                return False
+            except CacheCancelledError as exc:
+                cancellation.append(exc)
+                return True
+
+        def on_progress(current_bytes: int, target_bytes: int) -> None:
+            self._update_download_track_progress(
                 item_id,
-                command,
-                ffmpeg_path,
-                log_path,
-                stage_label=stage_label,
-                stream_kind=stream_kind,
-                target_dir=attempt_dir,
+                cache_attempt_token=cache_attempt_token,
                 track_key=track_key,
-                tool_dir=binary_path.parent,
-                silent=True,
-                is_preallocated=False,
-                progress_from_output=True,
-                mark_done_on_exit=False,
+                target_dir=attempt_dir,
+                current_bytes=current_bytes,
+                target_bytes=target_bytes,
+                done=False,
+                measure_path=False,
             )
-            exit_code = 0
-        except Exception as exc:
-            exit_code = getattr(exc, "return_code", None)
-            raise
-        finally:
-            output_summary = self._aria2_output_diagnostics(attempt_dir, expected_path)
-            output_summary.update(
-                event="aria2_output",
-                item_id=item_id,
-                exit_code=exit_code,
-                stream_kind=stream_kind,
-                page=page,
-                cid=cid,
-                final_output=str(final_path),
-            )
-            self._append_log_line(
-                log_path,
-                f"[{self._log_timestamp()}] media_diagnostic: "
-                f"{json.dumps(output_summary, ensure_ascii=False, sort_keys=True)}",
-            )
-            if exit_code != 0:
-                self._safe_rmtree(attempt_dir)
 
-        self._raise_if_retry_requested(item_id)
-        output_summary = self._aria2_output_diagnostics(attempt_dir, expected_path)
         try:
-            self._require_exact_aria2_output(output_summary, expected_path, stage_label)
-        except Exception:
+            result = rust_runtime.download_to_path(
+                urls=download_urls,
+                destination=expected_path,
+                headers=headers,
+                on_progress=on_progress,
+                should_cancel=should_cancel,
+            )
+        except rust_runtime.RustDownloadCancelledError as exc:
             self._safe_rmtree(attempt_dir)
-            raise
-        final_size = expected_path.stat().st_size
+            if cancellation:
+                raise cancellation[-1] from exc
+            raise CacheCancelledError("Rust HTTP download cancelled") from exc
+        except rust_runtime.RustDownloadError as exc:
+            self._safe_rmtree(attempt_dir)
+            error_payload = (
+                exc.response.get("error") if isinstance(exc.response, dict) else None
+            )
+            error_payload = error_payload if isinstance(error_payload, dict) else {}
+            raw_status = error_payload.get("http_status") or error_payload.get("status_code")
+            try:
+                status = int(raw_status) if raw_status is not None else None
+            except (TypeError, ValueError):
+                status = None
+            if exc.kind == "http_status" and status == 401:
+                message = (
+                    f"{stage_label}: Rust Native Bilibili login/Cookie is invalid or "
+                    "expired (HTTP 401)"
+                )
+                kind = "authentication"
+            elif exc.kind == "http_status" and status == 402:
+                message = (
+                    f"{stage_label}: Rust Native Bilibili media access is unavailable "
+                    "or requires payment (HTTP 402)"
+                )
+                kind = "unavailable"
+            elif exc.kind == "http_status" and status == 403:
+                message = (
+                    f"{stage_label}: Rust Native Bilibili media access was forbidden "
+                    "(HTTP 403)"
+                )
+                kind = "forbidden"
+            elif exc.kind == "invalid_request":
+                message = f"{stage_label}: Rust Native rejected an invalid media request"
+                kind = exc.kind
+            else:
+                message = f"{stage_label}: Rust HTTP downloader failed ({exc.kind})"
+                kind = exc.kind
+            wrapped = DownloadCommandError(message)
+            wrapped.kind = kind
+            wrapped.http_status = status
+            wrapped.status_code = status
+            raise wrapped from exc
+
+        final_size = int(result.get("bytes_written") or 0)
+        if final_size <= 0 or not expected_path.is_file():
+            self._safe_rmtree(attempt_dir)
+            raise DownloadCommandError(f"{stage_label}: Rust HTTP downloader produced no output")
         self._update_download_track_progress(
             item_id,
+            cache_attempt_token=cache_attempt_token,
             track_key=track_key,
             target_dir=attempt_dir,
             current_bytes=final_size,
@@ -3593,136 +4023,69 @@ class CacheManager:
             done=mark_done,
             measure_path=False,
         )
+        self._append_log_line(
+            log_path,
+            f"[{self._log_timestamp()}] media_diagnostic: "
+            f"{json.dumps({'event': 'rust_downloader_output', 'item_id': item_id, 'stream_kind': stream_kind, 'page': page, 'cid': cid, 'bytes_written': final_size, 'candidate_index': int(result.get('candidate_index') or 0), 'segments_used': int(result.get('segments_used') or 1), 'workers_used': int(result.get('workers_used') or 1), 'host_rewritten': bool(result.get('host_rewritten')), 'transport': str(result.get('transport') or ''), 'final_host': str(result.get('final_host') or ''), 'elapsed_ms': int(result.get('elapsed_ms') or 0), 'average_bytes_per_second': int(result.get('average_bytes_per_second') or 0), 'status': 'ok'}, ensure_ascii=False, sort_keys=True)}",
+        )
         return expected_path
-
-    @staticmethod
-    def _require_exact_aria2_output(
-        output_summary: dict[str, object],
-        expected_path: Path,
-        stage_label: str,
-    ) -> None:
-        aria2_files = list(output_summary.get("aria2_files") or [])
-        if aria2_files:
-            raise DownloadCommandError(
-                f"{stage_label} 完成后仍有 aria2 控制文件: {', '.join(map(str, aria2_files))}"
-            )
-        numbered = list(output_summary.get("numbered_alternatives") or [])
-        if numbered:
-            raise DownloadCommandError(
-                f"{stage_label} 生成了意外的编号输出: {', '.join(map(str, numbered))}"
-            )
-        media_files = [
-            entry
-            for entry in list(output_summary.get("files") or [])
-            if isinstance(entry, dict) and bool(entry.get("media_like"))
-        ]
-        if len(media_files) != 1 or str(media_files[0].get("name") or "") != expected_path.name:
-            names = ", ".join(str(entry.get("name") or "") for entry in media_files) or "无"
-            raise DownloadCommandError(f"{stage_label} 输出不唯一或路径不符: {names}")
-        if not bool(output_summary.get("expected_exists")):
-            raise DownloadCommandError(f"{stage_label} 完成后未找到精确输出文件 {expected_path.name}")
-        if int(media_files[0].get("size") or 0) <= 0:
-            raise DownloadCommandError(f"{stage_label} 输出文件为空")
-
-    def _downkyi_download_command(
-        self,
-        binary_path: Path,
-        ffmpeg_path: Path,
-        page_url: str,
-        *,
-        page: int,
-        stream_kind: str,
-        target_dir: Path,
-    ) -> list[str]:
-        raise DownloadCommandError("Downkyi 模式不使用 URL 下载命令，请使用 _download_dash_streams_with_aria2c")
-
-    def _bbdown_stream_preference_args(
-        self,
-        stream_kind: str,
-        *,
-        playback_selector: PlaybackSelector | None = None,
-    ) -> list[str]:
-        with self.lock:
-            video_quality = self.video_quality
-            audio_hires = self.audio_hires
-            force_avc = self._should_force_avc_locked()
-            avc_quality_cap = self.avc_quality_cap if force_avc else ""
-        if stream_kind == "video":
-            args = [
-                "-q",
-                self._video_quality_priority(
-                    video_quality,
-                    avc_quality_cap,
-                    playback_selector=playback_selector,
-                ),
-            ]
-            if force_avc:
-                args.extend(["-e", "avc"])
-            return args
-        if stream_kind == "audio" and not audio_hires:
-            # BBDown 1.6.x does not expose a direct "highest non-Hi-Res"
-            # selector. The closest safe fallback is to prefer the smaller
-            # audio stream when Hi-Res is disabled.
-            return ["--audio-ascending"]
-        return []
 
     def _should_force_avc_locked(self) -> bool:
         return self.hevc_supported is False
 
     def _request_desired_recaching(self, message: str) -> None:
+        if self._current_download_source() in (DOWNLOAD_SOURCE_NATIVE, DOWNLOAD_SOURCE_BBDOWN, DOWNLOAD_SOURCE_DOWNKYI):
+            self._sync_native_with_playlist()
+            return
         with self.lock:
             item_ids = set(self.desired_ids)
             active_item_id = self.active_item_id if self.active_item_id in item_ids else None
             active_processes = self._active_processes_locked(active_item_id) if active_item_id else []
             pending_ids = set(self.pending_ids)
+            download_source = self.download_source
+        if (
+            item_ids
+            and (login_error := self._download_login_error(download_source))
+        ):
+            raise ValueError(login_error)
+        observed_items = {
+            item.id: item
+            for item in self.store.list_items()
+            if item.id in item_ids
+        }
+        refresh_tokens = {
+            item_id: self._begin_cache_attempt_for_item(item)
+            for item_id, item in observed_items.items()
+        }
+        item_ids = set(refresh_tokens)
+        with self.lock:
             for item_id in item_ids:
+                self.python_worker_download_sources[item_id] = download_source
+                self.python_cache_attempt_tokens[item_id] = refresh_tokens[item_id]
                 if item_id == active_item_id or item_id in pending_ids:
                     self.retry_requested_ids.add(item_id)
 
         for item_id in item_ids:
-            self.store.update_item(
+            self._project_cache_event(
                 item_id,
-                cache_status="pending",
-                cache_progress=0.0,
-                cache_message=message,
-                video_relative_path="",
-                video_media_url="",
-                audio_variants=[],
-                selected_audio_variant_id="",
-                persist_backup=False,
+                "queued",
+                cache_attempt_token=refresh_tokens[item_id],
+                message=message,
             )
             self._record_item_activity(item_id)
             if item_id == active_item_id or item_id in pending_ids:
                 continue
-            self._remove_cache_dir(item_id)
             self.enqueue(item_id)
 
         self._terminate_processes(active_processes)
 
     @staticmethod
-    def _py_video_quality_priority(video_quality: object, quality_cap: object = "") -> str:
-        normalized_quality = CacheManager._py_normalize_video_quality(video_quality)
-        start_index = VIDEO_QUALITY_CHOICES.index(normalized_quality)
-        cap_quality = CacheManager._py_optional_video_quality(quality_cap)
-        if cap_quality:
-            start_index = max(start_index, VIDEO_QUALITY_CHOICES.index(cap_quality))
-        return ",".join(VIDEO_QUALITY_CHOICES[start_index:])
-
-    @staticmethod
     def _video_quality_priority(
         video_quality: object,
         quality_cap: object = "",
-        *,
-        playback_selector: PlaybackSelector | None = None,
     ) -> str:
-        response = CacheManager._native_quality_policy(
-            video_quality,
-            quality_cap,
-            playback_selector=playback_selector,
-        )
-        if response is not None:
-            return ",".join(response["bbdown_quality_order"])
-        return CacheManager._py_video_quality_priority(video_quality, quality_cap)
+        response = CacheManager._native_quality_policy(video_quality, quality_cap)
+        return ",".join(response["bbdown_quality_order"])
 
     def _run_item_command(
         self,
@@ -3735,21 +4098,21 @@ class CacheManager:
         stream_kind: str,
         target_dir: Path,
         track_key: str,
+        cache_attempt_token: int,
         tool_dir: Path | None = None,
         silent: bool = True,
         is_preallocated: bool = False,
-        progress_from_output: bool = False,
         mark_done_on_exit: bool = True,
     ) -> None:
+        media_cli.require_media_cli(command[0])
         safe_command = self._redacted_command_for_log(command)
         self._append_log_line(log_path, f"[{self._log_timestamp()}] command: {json.dumps(safe_command, ensure_ascii=False)}")
         if not silent:
             _debug_print(f"[bilikara-cache] [{stage_label}] command: {json.dumps(safe_command, ensure_ascii=False)}")
         target_bytes_state = {"value": 0}
-        current_bytes_state = {"value": 0}
-        progress_percent_state: dict[str, float | None] = {"value": None}
         monitor_stop = threading.Event()
 
+        media_cli.require_media_cli(command[0])
         process = subprocess.Popen(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
             command,
             shell=False,
@@ -3767,25 +4130,25 @@ class CacheManager:
         self._register_active_process(item_id, process)
         self._update_download_track_progress(
             item_id,
+            cache_attempt_token=cache_attempt_token,
             track_key=track_key,
             target_dir=target_dir,
             target_bytes=0,
             is_preallocated=is_preallocated,
-            measure_path=not progress_from_output,
+            measure_path=True,
         )
         monitor = threading.Thread(
             target=self._monitor_download_track_progress,
             kwargs={
                 "item_id": item_id,
+                "cache_attempt_token": cache_attempt_token,
                 "process": process,
                 "stop_event": monitor_stop,
                 "track_key": track_key,
                 "target_dir": target_dir,
                 "target_bytes_state": target_bytes_state,
-                "current_bytes_state": current_bytes_state if progress_from_output else None,
-                "progress_percent_state": progress_percent_state if progress_from_output else None,
                 "is_preallocated": is_preallocated,
-                "measure_path": not progress_from_output,
+                "measure_path": True,
             },
             daemon=True,
         )
@@ -3796,34 +4159,27 @@ class CacheManager:
                 line = self._normalize_output_line(raw_line)
                 if not line:
                     continue
-                last_message = line
+                safe_line = line
+                last_message = safe_line
                 if not silent:
-                    _debug_print(f"[bilikara-cache] [{stage_label}] {line}")
-                self._append_log_line(log_path, f"[{self._log_timestamp()}] {line}")
+                    _debug_print(f"[bilikara-cache] [{stage_label}] {safe_line}")
+                self._append_log_line(log_path, f"[{self._log_timestamp()}] {safe_line}")
                 self._record_item_activity(item_id)
-                aria2_progress = self._aria2_progress_bytes(line) if progress_from_output else None
-                if aria2_progress is not None:
-                    downloaded_bytes, target_bytes, progress = aria2_progress
-                    current_bytes_state["value"] = max(
-                        current_bytes_state["value"],
-                        downloaded_bytes,
-                    )
-                    progress_percent_state["value"] = progress
-                else:
-                    downloaded_bytes = None
-                    progress = self._extract_progress(line)
-                    target_bytes = self._selected_stream_size_hint_bytes(line, stream_kind)
+                downloaded_bytes = None
+                progress = self._extract_progress(line)
+                target_bytes = 0
                 if target_bytes:
                     target_bytes_state["value"] = max(target_bytes_state["value"], target_bytes)
                 self._update_download_track_progress(
                     item_id,
+                    cache_attempt_token=cache_attempt_token,
                     track_key=track_key,
                     target_dir=target_dir,
                     current_bytes=downloaded_bytes,
                     target_bytes=target_bytes_state["value"],
                     progress_percent=progress,
                     is_preallocated=is_preallocated,
-                    measure_path=not progress_from_output,
+                    measure_path=True,
                 )
                 if self.stop_event.is_set():
                     self._terminate_process(process)
@@ -3835,6 +4191,8 @@ class CacheManager:
         finally:
             monitor_stop.set()
             monitor.join(timeout=1.0)
+            if process.stdout is not None:
+                process.stdout.close()
             self._unregister_active_process(process)
 
         interrupt_message = self._peek_cache_interrupt_message(item_id)
@@ -3865,6 +4223,7 @@ class CacheManager:
         if mark_done_on_exit:
             self._update_download_track_progress(
                 item_id,
+                cache_attempt_token=cache_attempt_token,
                 track_key=track_key,
                 target_dir=target_dir,
                 target_bytes=target_bytes_state["value"],
@@ -4122,6 +4481,25 @@ class CacheManager:
     ) -> None:
         if not media_path.exists() or media_path.stat().st_size <= 0:
             raise DownloadCommandError(f"缓存规范化失败: {label} 原始文件不可用")
+        if media_cli.DISABLED:
+            normalized_path = media_path.with_name(f".{media_path.stem}.normalized-{uuid.uuid4().hex}{media_path.suffix}")
+            try:
+                rust_runtime.normalize_media(source=media_path, destination=normalized_path, expected_kind=stream_kind)
+                normalized_path.replace(media_path)
+            finally:
+                normalized_path.unlink(missing_ok=True)
+            return
+        # Duration discovery is metadata-only. Preserve the source media
+        # contract at this explicit legacy transform boundary before it can
+        # turn malformed input into a parseable candidate. Timestamp policy
+        # below remains the existing DownKyi CLI policy.
+        source_check = self._inspect_application_media(
+            media_path, expected_kind=stream_kind, operation="validate", log_path=log_path,
+            container_hint="mp4" if media_path.suffix.lower() != ".flac" else None,
+        )
+        if source_check["action"] == "compatibility" and source_check["backend"] == "ffprobe":
+            self._probe_media_metadata(None, ffmpeg_path, media_path, label=label, log_path=log_path,
+                expected_kind=stream_kind, _routing_decision=source_check)
         normalized_path = media_path.with_name(
             f".{media_path.stem}.normalized-{uuid.uuid4().hex}{media_path.suffix}"
         )
@@ -4150,6 +4528,7 @@ class CacheManager:
             f"[{self._log_timestamp()}] command: {json.dumps(command, ensure_ascii=False)}",
         )
         try:
+            media_cli.require_media_cli()
             process = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
                 command,
                 shell=False,
@@ -4189,75 +4568,100 @@ class CacheManager:
             f"{json.dumps({'event': 'downkyi_track_remuxed', 'path': str(media_path), 'stream_kind': stream_kind, 'raw_size': raw_size, 'remuxed_size': normalized_size}, ensure_ascii=False, sort_keys=True)}",
         )
 
-    @staticmethod
-    def _final_path_for_attempt(path: Path) -> Path:
-        if path.parent.name.startswith(".attempt-"):
-            return path.parent.parent / path.name
-        return path
-
-    @classmethod
-    def _cleanup_attempt_dirs(cls, item_dir: Path) -> None:
-        try:
-            attempts = [
-                path
-                for path in item_dir.rglob(".attempt-*")
-                if path.is_dir()
-            ]
-        except OSError:
-            return
-        for attempt_dir in sorted(attempts, key=lambda path: len(path.parts), reverse=True):
-            cls._safe_rmtree(attempt_dir)
-
     def _publish_validated_cache_result(
         self,
+        item_id: str,
+        cache_attempt_token: int,
+        reservation: dict[str, Any],
+        staging_dir: Path,
         cache_result: dict[str, object],
         log_path: Path,
     ) -> None:
+        token = self._require_cache_attempt_token(cache_attempt_token)
+        expected_reservation, expected_staging_dir, committed_dir = (
+            self._cache_attempt_paths(token)
+        )
+        if reservation != expected_reservation or staging_dir != expected_staging_dir:
+            raise DownloadCommandError("缓存发布失败: Rust 缓存尝试身份不匹配")
         validation_files = cache_result.get("validation_files")
-        if not isinstance(validation_files, list):
+        if not isinstance(validation_files, list) or not validation_files:
             raise DownloadCommandError("缓存发布失败: 缺少校验文件清单")
 
+        complete_dir = staging_dir / "complete"
+        try:
+            complete_dir.mkdir(parents=False, exist_ok=False)
+        except OSError as exc:
+            raise DownloadCommandError(f"缓存发布失败: 无法建立完整集合: {exc}") from exc
+
         publish_pairs: list[tuple[Path, Path]] = []
-        for entry in validation_files:
+        seen_names: set[str] = set()
+        staging_root = staging_dir.resolve()
+        for index, entry in enumerate(validation_files):
             if not isinstance(entry, dict):
-                continue
+                raise DownloadCommandError("缓存发布失败: 校验文件描述无效")
             source = entry.get("path")
             if not isinstance(source, Path):
                 raise DownloadCommandError("缓存发布失败: 媒体路径无效")
-            final_path = self._final_path_for_attempt(source)
-            if final_path == source:
-                continue
-            if not source.exists() or source.stat().st_size <= 0:
+            resolved_source = source.resolve()
+            if (
+                source.is_symlink()
+                or not self._path_is_within(resolved_source, staging_root)
+                or not resolved_source.is_file()
+                or resolved_source.stat().st_size <= 0
+            ):
                 raise DownloadCommandError(f"缓存发布失败: 临时文件不可用 {source.name}")
-            publish_pairs.append((source, final_path))
+            stream_kind = str(entry.get("stream_kind") or "").strip().lower()
+            page = max(1, int(entry.get("page") or index + 1))
+            if stream_kind not in {"video", "audio"}:
+                raise DownloadCommandError("缓存发布失败: 媒体轨道类型无效")
+            suffix = source.suffix.lower()
+            if not suffix or any(character not in ".abcdefghijklmnopqrstuvwxyz0123456789" for character in suffix):
+                raise DownloadCommandError("缓存发布失败: 媒体文件扩展名无效")
+            final_name = f"{stream_kind}-p{page}{suffix}"
+            if final_name in seen_names:
+                raise DownloadCommandError("缓存发布失败: 多条媒体轨道指向同一最终路径")
+            seen_names.add(final_name)
+            publish_pairs.append((source, complete_dir / final_name))
 
-        if not publish_pairs:
-            raise DownloadCommandError("缓存发布失败: DownKyi 没有待发布的临时文件")
-        if len({str(final) for _source, final in publish_pairs}) != len(publish_pairs):
-            raise DownloadCommandError("缓存发布失败: 多条媒体轨道指向同一最终路径")
-
-        published: dict[str, Path] = {}
+        staged_to_complete: dict[str, Path] = {}
         try:
             for source, final_path in publish_pairs:
-                final_path.parent.mkdir(parents=True, exist_ok=True)
-                os.replace(source, final_path)
-                published[str(source)] = final_path
+                os.rename(source, final_path)
+                staged_to_complete[str(source)] = final_path
                 self._append_log_line(
                     log_path,
                     f"[{self._log_timestamp()}] media_diagnostic: "
-                    f"{json.dumps({'event': 'downkyi_track_published', 'temporary_output': str(source), 'final_output': str(final_path), 'size': final_path.stat().st_size}, ensure_ascii=False, sort_keys=True)}",
+                    f"{json.dumps({'event': 'cache_track_assembled', 'temporary_output': str(source), 'assembled_output': str(final_path), 'size': final_path.stat().st_size}, ensure_ascii=False, sort_keys=True)}",
                 )
         except OSError as exc:
-            for final_path in published.values():
-                try:
-                    final_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
             raise DownloadCommandError(f"缓存发布失败: {exc}") from exc
 
+        if not self.store.authorize_cache_publication(
+            item_id,
+            cache_attempt_token=token,
+            item_incarnation_id=str(reservation.get("item_incarnation_id") or ""),
+            artifact_set_id=str(reservation.get("artifact_set_id") or ""),
+            artifact_relative_directory=str(
+                reservation.get("artifact_relative_directory") or ""
+            ),
+        ):
+            raise DownloadCommandError("缓存发布失败: Rust 拒绝发布所有权")
+        if committed_dir.exists():
+            raise DownloadCommandError("缓存发布失败: 不可变缓存集合目标已存在")
+        try:
+            if not self._artifact_request("publish", cache_attempt_token=token)["accepted"]:
+                raise ValueError("Rust rejected committed artifact publication")
+        except (ValueError, rust_runtime.RustRuntimeServiceError) as exc:
+            raise DownloadCommandError(f"缓存发布失败: 无法原子发布完整集合: {exc}") from exc
+
+        published = {
+            source: committed_dir / complete_path.name
+            for source, complete_path in staged_to_complete.items()
+        }
+        if any(not path.is_file() or path.stat().st_size <= 0 for path in published.values()):
+            raise DownloadCommandError("缓存发布失败: 已发布集合不完整")
+
         for entry in validation_files:
-            if not isinstance(entry, dict):
-                continue
             source = entry.get("path")
             if isinstance(source, Path) and str(source) in published:
                 entry["path"] = published[str(source)]
@@ -4274,26 +4678,40 @@ class CacheManager:
         video_source = cache_result.get("video_file")
         if isinstance(video_source, Path) and str(video_source) in published:
             video_file = published[str(video_source)]
+            video_relative_path = video_file.relative_to(CACHE_DIR).as_posix()
             cache_result["video_file"] = video_file
-            cache_result["video_relative_path"] = str(video_file.relative_to(CACHE_DIR))
-            cache_result["video_media_url"] = self._build_media_url(str(video_file.relative_to(CACHE_DIR)))
+            cache_result["video_relative_path"] = video_relative_path
+            cache_result["video_media_url"] = self._build_media_url(
+                video_relative_path
+            )
 
         variants = cache_result.get("audio_variants")
         if isinstance(variants, list):
             url_map = {
-                self._build_media_url(str(Path(source).relative_to(CACHE_DIR))):
-                self._build_media_url(str(final.relative_to(CACHE_DIR)))
+                self._build_media_url(
+                    Path(source).relative_to(CACHE_DIR).as_posix()
+                ): self._build_media_url(final.relative_to(CACHE_DIR).as_posix())
                 for source, final in published.items()
             }
             for variant in variants:
                 if not isinstance(variant, dict):
                     continue
-                current_url = str(variant.get("audio_url") or "")
+                current_url = str(variant.get("audio_url") or "").replace(
+                    "\\", "/"
+                )
                 if current_url in url_map:
                     variant["audio_url"] = url_map[current_url]
 
-        for source, _final_path in publish_pairs:
-            self._safe_rmtree(source.parent)
+        cache_result["item_incarnation_id"] = str(
+            reservation.get("item_incarnation_id") or ""
+        )
+        cache_result["artifact_set_id"] = str(
+            reservation.get("artifact_set_id") or ""
+        )
+        cache_result["artifact_relative_directory"] = str(
+            reservation.get("artifact_relative_directory") or ""
+        )
+        self._safe_rmtree(staging_dir)
 
     def _validate_cache_result(
         self,
@@ -4301,41 +4719,27 @@ class CacheManager:
         cache_result: dict[str, object],
         ffmpeg_path: Path,
         log_path: Path,
+        *,
+        cache_attempt_token: int,
     ) -> None:
+        cache_attempt_token = self._require_cache_attempt_token(
+            cache_attempt_token
+        )
         validation_files = cache_result.get("validation_files")
         if not isinstance(validation_files, list):
             return
 
-        requires_strict_validation = any(
-            isinstance(entry, dict)
-            and str(entry.get("download_source") or "") in (DOWNLOAD_SOURCE_DOWNKYI, DOWNLOAD_SOURCE_BBDOWN)
-            for entry in validation_files
-        )
-        ffprobe_path = self._ffprobe_path_for_ffmpeg(ffmpeg_path)
-        if not ffprobe_path:
-            message = "缓存校验失败: BBDown/DownKyi 下载需要可用的 ffprobe"
-            self._append_log_line(
-                log_path,
-                f"[{self._log_timestamp()}] ffprobe validate: failed, ffprobe unavailable",
+        if self.store.get_item(item_id) is not None:
+            self._project_cache_progress(
+                item_id,
+                cache_attempt_token=cache_attempt_token,
+                progress=99.5,
+                message="正在校验缓存",
             )
-            if requires_strict_validation:
-                raise DownloadCommandError(message)
-            self._append_log_line(
-                log_path,
-                f"[{self._log_timestamp()}] ffprobe validate: skipped for non-strict source",
-            )
-            return
-
-        self.store.update_item(
-            item_id,
-            cache_progress=99.5,
-            cache_message="正在校验缓存",
-            persist_backup=False,
-        )
-        self._record_item_activity(item_id)
+            self._record_item_activity(item_id)
         self._append_log_line(
             log_path,
-            f"[{self._log_timestamp()}] ffprobe validate: start ({len(validation_files)} files)",
+            f"[{self._log_timestamp()}] media validate: start ({len(validation_files)} files)",
         )
 
         validation_errors: list[str] = []
@@ -4353,7 +4757,7 @@ class CacheManager:
                 if not isinstance(required_streams, set):
                     required_streams = set(required_streams or [])
                 metadata = self._validate_media_file(
-                    ffprobe_path,
+                    None,
                     ffmpeg_path,
                     path,
                     label=label,
@@ -4383,7 +4787,7 @@ class CacheManager:
                     self._discard_invalid_media(path)
                 self._append_log_line(
                     log_path,
-                    f"[{self._log_timestamp()}] ffprobe validate {label}: failed: {message}",
+                    f"[{self._log_timestamp()}] media validate {label}: failed: {message}",
                 )
 
         cache_result["validation_metadata"] = validation_metadata
@@ -4395,7 +4799,7 @@ class CacheManager:
                     f"[{self._log_timestamp()}] cache validation error: {message}",
                 )
             raise DownloadCommandError("；".join(validation_errors))
-        self._append_log_line(log_path, f"[{self._log_timestamp()}] ffprobe validate: ok")
+        self._append_log_line(log_path, f"[{self._log_timestamp()}] media validate: ok")
 
     def _probe_media_payload(
         self,
@@ -4406,6 +4810,7 @@ class CacheManager:
         label: str,
         log_path: Path,
     ) -> tuple[int, dict[str, object]]:
+        ffprobe_path = rust_runtime.media_compatibility_tool("ffprobe", ffprobe_path)
         if not media_path.exists():
             raise DownloadCommandError(f"缓存校验失败: {label} 文件不存在")
         size = media_path.stat().st_size
@@ -4426,6 +4831,7 @@ class CacheManager:
             log_path,
             f"[{self._log_timestamp()}] command: {json.dumps(command, ensure_ascii=False)}",
         )
+        media_cli.require_media_cli()
         process = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
             command,
             shell=False,
@@ -4436,7 +4842,7 @@ class CacheManager:
             check=False,
             timeout=20,
             cwd=self._tool_arg_path(BB_DOWN_DIR),
-            env=self._tool_process_env(ffmpeg_path),
+            env=rust_runtime.media_compatibility_env(self._tool_process_env(ffmpeg_path)),
             **self._hidden_process_kwargs(),
         )
         if process.returncode != 0:
@@ -4453,32 +4859,37 @@ class CacheManager:
 
     def _probe_original_audio_duration(
         self,
-        ffprobe_path: Path,
+        ffprobe_path: Path | None,
         ffmpeg_path: Path,
         media_path: Path,
         *,
         label: str,
         log_path: Path,
+        rust_container_hint: str | None = None,
     ) -> float:
-        _size, payload = self._probe_media_payload(
+        metadata = self._probe_media_metadata(
             ffprobe_path,
             ffmpeg_path,
             media_path,
             label=f"{label} 原始音轨",
             log_path=log_path,
+            expected_kind="audio",
+            rust_container_hint=rust_container_hint,
+            metadata_only=True,
         )
-        duration = self._probe_stream_duration(payload, "audio")
+        duration = self._normalized_stream_duration(metadata, "audio")
         if duration is None:
             raise DownloadCommandError(f"缓存校验失败: {label} 原始音轨未报告有效时长")
         self._append_log_line(
             log_path,
-            f"[{self._log_timestamp()}] ffprobe source audio {label}: duration={duration:.6f}s",
+            f"[{self._log_timestamp()}] media source audio {label}: "
+            f"backend={metadata['backend']}, duration={duration:.6f}s",
         )
         return duration
 
     def _validate_media_file(
         self,
-        ffprobe_path: Path,
+        ffprobe_path: Path | None,
         ffmpeg_path: Path,
         media_path: Path,
         *,
@@ -4487,15 +4898,24 @@ class CacheManager:
         log_path: Path,
         diagnostic_context: dict[str, object] | None = None,
     ) -> dict[str, object]:
-        size, payload = self._probe_media_payload(
-            ffprobe_path, ffmpeg_path, media_path, label=label, log_path=log_path
+        if len(required_streams) != 1:
+            raise DownloadCommandError(f"缓存校验失败: {label}: 必须指定单一媒体流类型")
+        primary_stream_kind = next(iter(required_streams))
+        metadata = self._probe_media_metadata(
+            ffprobe_path,
+            ffmpeg_path,
+            media_path,
+            label=label,
+            log_path=log_path,
+            expected_kind=primary_stream_kind,
         )
-        streams = payload.get("streams")
+        size = int(metadata["size"])
+        streams = metadata.get("streams")
         if not isinstance(streams, list) or not streams:
             raise DownloadCommandError(f"缓存校验失败: {label}: 未识别到媒体流")
 
         detected_streams = {
-            str(stream.get("codec_type") or "").strip()
+            str(stream.get("kind") or "").strip()
             for stream in streams
             if isinstance(stream, dict)
         }
@@ -4507,26 +4927,21 @@ class CacheManager:
                 f"缓存校验失败: {label}: 缺少 {missing_label} 流，实际为 {detected_label}"
             )
 
-        primary_stream_kind = next(iter(required_streams)) if len(required_streams) == 1 else None
-        stream_duration = (
-            self._probe_stream_duration(payload, primary_stream_kind)
-            if primary_stream_kind is not None
-            else None
+        stream_duration = self._normalized_stream_duration(
+            metadata, primary_stream_kind
         )
-        duration = stream_duration or self._probe_duration(payload)
+        duration = stream_duration or self._optional_probe_float(
+            metadata.get("duration_seconds")
+        )
         context = diagnostic_context or {}
         expected_duration = self._optional_probe_float(context.get("expected_duration"))
         if expected_duration is not None and expected_duration > 0 and duration is None:
             raise DownloadCommandError(f"缓存校验失败: {label} 未报告有效时长")
         if duration is not None and duration < 1.0:
             raise DownloadCommandError(f"缓存校验失败: {label} 时长异常，实际 {duration:.2f} 秒")
-        if expected_duration is not None and expected_duration > 0 and duration is not None:
-            tolerance = self._duration_tolerance(expected_duration)
-            if duration + tolerance < expected_duration:
-                raise DownloadCommandError(
-                    f"缓存校验失败: {label} 时长异常，预期约 {expected_duration:.0f} 秒，"
-                    f"实际 {duration:.0f} 秒"
-                )
+        # A page's duration can follow its longer audio track. The Rust media
+        # inspection above validates the file itself; page metadata is only
+        # diagnostic context, not evidence that this track was truncated.
         if "source_audio_duration" in context:
             source_audio_duration = self._optional_probe_float(context.get("source_audio_duration"))
             if (
@@ -4544,7 +4959,8 @@ class CacheManager:
                     f"原始 {source_audio_duration:.3f} 秒，实际 {stream_duration:.3f} 秒，"
                     f"相差 {difference:.3f} 秒"
                 )
-        if str(context.get("download_source") or "") in (DOWNLOAD_SOURCE_DOWNKYI, DOWNLOAD_SOURCE_BBDOWN):
+        if (str(context.get("download_source") or "") in (DOWNLOAD_SOURCE_DOWNKYI, DOWNLOAD_SOURCE_BBDOWN)
+                and metadata.get("inspection_level") != "packet_scan"):
             self._validate_demux_file(
                 ffmpeg_path,
                 media_path,
@@ -4557,32 +4973,10 @@ class CacheManager:
         stream_label = "/".join(sorted(stream for stream in detected_streams if stream)) or "unknown"
         self._append_log_line(
             log_path,
-            f"[{self._log_timestamp()}] ffprobe validate {label}: ok "
-            f"(streams={stream_label}, duration={duration_label}, size={size})",
+            f"[{self._log_timestamp()}] media validate {label}: ok "
+            f"(backend={metadata['backend']}, streams={stream_label}, "
+            f"duration={duration_label}, size={size})",
         )
-
-        file_format = payload.get("format") if isinstance(payload.get("format"), dict) else {}
-        normalized_streams = [
-            {
-                "codec_type": str(stream.get("codec_type") or ""),
-                "codec_name": str(stream.get("codec_name") or ""),
-                "codec_tag_string": str(stream.get("codec_tag_string") or ""),
-                "duration": self._optional_probe_float(stream.get("duration")),
-                "start_time": self._optional_probe_float(stream.get("start_time")),
-                "duration_ts": stream.get("duration_ts"),
-                "time_base": str(stream.get("time_base") or ""),
-            }
-            for stream in streams
-            if isinstance(stream, dict)
-        ]
-        metadata: dict[str, object] = {
-            "path": str(media_path),
-            "size": size,
-            "format_name": str(file_format.get("format_name") or ""),
-            "duration": duration,
-            "start_time": self._optional_probe_float(file_format.get("start_time")),
-            "streams": normalized_streams,
-        }
         if str(context.get("download_source") or "") == DOWNLOAD_SOURCE_DOWNKYI:
             selected = context.get("stream_metadata") if isinstance(context.get("stream_metadata"), dict) else {}
             summary = {
@@ -4604,7 +4998,7 @@ class CacheManager:
                     for candidate in media_path.parent.glob("*.aria2")
                     if candidate.is_file()
                 ],
-                "ffprobe": metadata,
+                "media_probe": metadata,
             }
             self._append_log_line(
                 log_path,
@@ -4613,9 +5007,224 @@ class CacheManager:
             )
         return metadata
 
-    @staticmethod
-    def _duration_tolerance(expected_duration: float) -> float:
-        return max(3.0, expected_duration * 0.02)
+    def _probe_media_metadata(
+        self,
+        ffprobe_path: Path | None,
+        ffmpeg_path: Path,
+        media_path: Path,
+        *,
+        label: str,
+        log_path: Path,
+        expected_kind: str,
+        rust_container_hint: str | None = None,
+        metadata_only: bool = False,
+        _routing_decision: dict[str, Any] | None = None,
+    ) -> dict[str, object]:
+        routed = _routing_decision or self._inspect_application_media(
+            media_path, expected_kind=expected_kind,
+            operation="metadata" if metadata_only else "validate",
+            container_hint=rust_container_hint, log_path=log_path,
+        )
+        if routed["action"] == "completed":
+            metadata = routed["metadata"]
+            metadata["path"] = str(media_path)
+            return metadata
+        if routed["backend"] == "ffprobe":
+            resolved = rust_runtime.media_compatibility_tool("ffprobe", ffprobe_path)
+            if resolved is None:
+                raise DownloadCommandError("Same-build ffprobe compatibility is unavailable")
+            size, payload = self._probe_media_payload(
+                resolved, ffmpeg_path, media_path, label=label, log_path=log_path,
+            )
+            metadata = self._normalized_ffprobe_media_probe(
+                payload, media_path=media_path, size=size, fallback_reason=routed["reason"],
+            )
+            if not metadata_only:
+                self._validate_demux_file(ffmpeg_path, media_path, label=label,
+                    stream_kind=expected_kind, log_path=log_path, compatibility=routed)
+            completed = self._inspect_application_media(
+                media_path, expected_kind=expected_kind, operation="metadata" if metadata_only else "validate",
+                log_path=log_path, compatibility={
+                    "reason": routed["reason"], "size": size, "container": metadata["container"],
+                    "duration_seconds": metadata["duration_seconds"], "streams": metadata["streams"],
+                    "packet_scan_complete": not metadata_only,
+                },
+            )
+            metadata = completed["metadata"]
+            metadata["path"] = str(media_path)
+            return metadata
+        # Rust selected the pre-M6 path for a build without the package or an
+        # explicit startup rollback. Keep that existing compatibility code.
+        if not media_path.exists():
+            raise DownloadCommandError(f"缓存校验失败: {label} 文件不存在")
+        size = media_path.stat().st_size
+        if size <= 0:
+            raise DownloadCommandError(f"缓存校验失败: {label} 文件为空")
+        use_rust = (
+            rust_container_hint == "mp4"
+            or (
+                rust_container_hint is None
+                and media_path.suffix.lower() in RUST_MEDIA_PROBE_CONTAINER_SUFFIXES
+            )
+        )
+        fallback_reason = "unsupported_container"
+        if not use_rust and not rust_runtime.media_backend_available():
+            status = rust_runtime.runtime_status()
+            message = str(status.get("error") or "Rust MediaBackend unavailable")
+            raise DownloadCommandError(
+                f"缓存校验失败: {label}: Rust MediaBackend 不可用: {message}"
+            )
+        if use_rust:
+            try:
+                probe = rust_runtime.probe_media(
+                    source=media_path,
+                    expected_kind=expected_kind,
+                )
+            except rust_runtime.RustMediaError as exc:
+                if exc.kind not in RUST_MEDIA_PROBE_FALLBACK_ERROR_KINDS:
+                    raise DownloadCommandError(
+                        f"缓存校验失败: {label}: Rust MediaBackend "
+                        f"{exc.kind}: {self._compact_probe_error(str(exc))}"
+                    ) from exc
+                fallback_reason = exc.kind
+                self._append_log_line(
+                    log_path,
+                    f"[{self._log_timestamp()}] media probe {label}: "
+                    f"Rust unsupported ({exc.kind}), using ffprobe compatibility",
+                )
+            except rust_runtime.RustRuntimeUnavailableError as exc:
+                raise DownloadCommandError(
+                    f"缓存校验失败: {label}: Rust MediaBackend 不可用: "
+                    f"{self._compact_probe_error(str(exc))}"
+                ) from exc
+            except Exception as exc:  # noqa: BLE001
+                raise DownloadCommandError(
+                    f"缓存校验失败: {label}: Rust MediaBackend 执行失败: "
+                    f"{self._compact_probe_error(str(exc))}"
+                ) from exc
+            else:
+                # Rust receives a canonical path across the FFI boundary. Keep
+                # cache metadata in the caller's path namespace so downstream
+                # publication can still derive paths relative to CACHE_DIR.
+                metadata = self._normalized_rust_media_probe(
+                    probe, media_path=media_path
+                )
+                self._append_log_line(
+                    log_path,
+                    f"[{self._log_timestamp()}] media probe {label}: Rust ok "
+                    f"(codec={probe['codec']}, samples={probe['sample_count']})",
+                )
+                self._log_media_route(log_path, {
+                    "operation": "metadata" if metadata_only else "validate", "backend": "pure_rust",
+                    "outcome": "success", "compatibility_reason": routed["reason"],
+                })
+                return metadata
+
+        resolved_ffprobe = ffprobe_path or self._ffprobe_path_for_ffmpeg(ffmpeg_path)
+        if resolved_ffprobe is None:
+            raise DownloadCommandError(
+                f"缓存校验失败: {label}: Rust MediaBackend 不支持 "
+                f"({fallback_reason})，需要可用的 ffprobe 兼容校验"
+            )
+        _size, payload = self._probe_media_payload(
+            resolved_ffprobe,
+            ffmpeg_path,
+            media_path,
+            label=label,
+            log_path=log_path,
+        )
+        metadata = self._normalized_ffprobe_media_probe(
+            payload,
+            media_path=media_path,
+            size=size,
+            fallback_reason=fallback_reason,
+        )
+        self._append_log_line(
+            log_path,
+            f"[{self._log_timestamp()}] media probe {label}: ffprobe compatibility ok "
+            f"(reason={fallback_reason})",
+        )
+        self._log_media_route(log_path, {
+            "operation": "metadata" if metadata_only else "validate", "backend": "ffprobe",
+            "outcome": "success", "compatibility_reason": routed["reason"],
+        })
+        return metadata
+
+    @classmethod
+    def _normalized_rust_media_probe(
+        cls, probe: dict[str, object], *, media_path: Path
+    ) -> dict[str, object]:
+        duration = cls._optional_probe_float(probe.get("duration_seconds"))
+        kind = str(probe.get("kind") or "")
+        return {
+            "backend": "rust",
+            "path": str(media_path),
+            "size": int(probe.get("file_bytes") or 0),
+            "container": "mp4",
+            "duration_seconds": duration,
+            "stream_count": 1,
+            "streams": [
+                {
+                    "kind": kind,
+                    "codec": str(probe.get("codec") or ""),
+                    "duration_seconds": duration,
+                }
+            ],
+            "sample_count": int(probe.get("sample_count") or 0),
+            "sample_bytes": int(probe.get("sample_bytes") or 0),
+            "fragmented": bool(probe.get("fragmented")),
+            "fast_start": bool(probe.get("fast_start")),
+        }
+
+    @classmethod
+    def _normalized_ffprobe_media_probe(
+        cls,
+        payload: dict[str, object],
+        *,
+        media_path: Path,
+        size: int,
+        fallback_reason: str,
+    ) -> dict[str, object]:
+        raw_streams = payload.get("streams")
+        raw_streams = raw_streams if isinstance(raw_streams, list) else []
+        streams = [
+            {
+                "kind": str(stream.get("codec_type") or ""),
+                "codec": str(stream.get("codec_name") or ""),
+                "duration_seconds": cls._probe_stream_duration(
+                    {"streams": [stream]}, str(stream.get("codec_type") or "")
+                ),
+            }
+            for stream in raw_streams
+            if isinstance(stream, dict)
+        ]
+        file_format = payload.get("format")
+        file_format = file_format if isinstance(file_format, dict) else {}
+        return {
+            "backend": "ffprobe",
+            "fallback_reason": fallback_reason,
+            "path": str(media_path),
+            "size": size,
+            "container": str(file_format.get("format_name") or ""),
+            "duration_seconds": cls._probe_duration(payload),
+            "stream_count": len(streams),
+            "streams": streams,
+        }
+
+    @classmethod
+    def _normalized_stream_duration(
+        cls, metadata: dict[str, object], stream_kind: str
+    ) -> float | None:
+        streams = metadata.get("streams")
+        if not isinstance(streams, list):
+            return None
+        for stream in streams:
+            if not isinstance(stream, dict) or str(stream.get("kind") or "") != stream_kind:
+                continue
+            duration = cls._optional_probe_float(stream.get("duration_seconds"))
+            if duration is not None and duration > 0:
+                return duration
+        return None
 
     @staticmethod
     def _discard_invalid_media(media_path: Path) -> None:
@@ -4633,7 +5242,14 @@ class CacheManager:
         label: str,
         stream_kind: str,
         log_path: Path,
+        compatibility: dict[str, Any] | None = None,
     ) -> None:
+        routed = compatibility or self._inspect_application_media(
+            media_path, expected_kind=stream_kind, operation="packet_scan", log_path=log_path,
+        )
+        if routed["action"] == "completed":
+            return
+        ffmpeg_path = rust_runtime.media_compatibility_tool("ffmpeg", ffmpeg_path)
         map_specifier = "0:v:0" if stream_kind == "video" else "0:a:0"
         command = [
             self._tool_arg_path(ffmpeg_path),
@@ -4655,6 +5271,7 @@ class CacheManager:
             f"[{self._log_timestamp()}] command: {json.dumps(command, ensure_ascii=False)}",
         )
         try:
+            media_cli.require_media_cli()
             process = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
                 command,
                 shell=False,
@@ -4665,7 +5282,7 @@ class CacheManager:
                 check=False,
                 timeout=120,
                 cwd=self._tool_arg_path(BB_DOWN_DIR),
-                env=self._tool_process_env(ffmpeg_path),
+                env=rust_runtime.media_compatibility_env(self._tool_process_env(ffmpeg_path)),
                 **self._hidden_process_kwargs(),
             )
         except subprocess.TimeoutExpired as exc:
@@ -4676,6 +5293,37 @@ class CacheManager:
                 f"缓存校验失败: {label}: FFmpeg 完整包扫描失败: "
                 f"{self._compact_probe_error(message)}"
             )
+        self._log_media_route(log_path, {
+            "operation": "packet_scan", "backend": "ffmpeg", "outcome": "success",
+            "compatibility_reason": routed["reason"],
+        })
+
+    def _log_media_route(self, log_path: Path, diagnostic: dict[str, object]) -> None:
+        self._append_log_line(log_path, "media_diagnostic: " + json.dumps(diagnostic, sort_keys=True))
+
+    def _inspect_application_media(self, media_path: Path, *, expected_kind: str,
+                                   operation: str, log_path: Path,
+                                   container_hint: str | None = None,
+                                   compatibility: dict[str, Any] | None = None) -> dict[str, Any]:
+        try:
+            result = rust_runtime.inspect_media(
+                source=media_path, expected_kind=expected_kind, operation=operation,
+                container_hint=container_hint,
+                compatibility=compatibility,
+                should_cancel=self.stop_event.is_set if hasattr(self, "stop_event") else None,
+            )
+        except rust_runtime.RustMediaError as exc:
+            diagnostic = exc.response.get("error", {}).get("diagnostic")
+            if isinstance(diagnostic, dict):
+                self._log_media_route(log_path, diagnostic)
+            if exc.kind == "cancelled":
+                raise CacheCancelledError("Media operation cancelled") from exc
+            raise DownloadCommandError(f"Media operation failed: {exc.kind}") from exc
+        except rust_runtime.RustRuntimeUnavailableError as exc:
+            raise DownloadCommandError("Rust MediaBackend unavailable") from exc
+        if result["action"] == "completed":
+            self._log_media_route(log_path, result["diagnostic"])
+        return result
 
     @staticmethod
     def _optional_probe_float(value: object) -> float | None:
@@ -4751,6 +5399,12 @@ class CacheManager:
 
     @classmethod
     def _ffprobe_path_for_ffmpeg(cls, ffmpeg_path: Path) -> Path | None:
+        if media_cli.DISABLED:
+            return None
+        from .ffmpeg_vendor import runtime_files
+        for vendor in (VENDOR_DIR, INTERNAL_VENDOR_DIR):
+            if runtime_files(vendor) is not None:
+                return FFPROBE_RUNTIME_PATH if cls._is_usable_ffprobe(FFPROBE_RUNTIME_PATH) else None
         candidates = []
         if FFPROBE_RUNTIME_PATH.exists():
             candidates.append(FFPROBE_RUNTIME_PATH)
@@ -4829,6 +5483,7 @@ class CacheManager:
             return f"{stage_label}: {line}"
         return stage_label
 
+    # Frozen output reference for compatibility tests; not a downloader dependency.
     @staticmethod
     def _selected_stream_size_hint_bytes(line: str, stream_kind: str) -> int:
         normalized_line = str(line or "").strip()
@@ -4917,9 +5572,17 @@ class CacheManager:
             return f"{stage_label} · 已写入 {cls._format_stage_bytes(normalized_current)}"
         return f"{stage_label} 准备中"
 
-    def _begin_download_progress(self, item_id: str, tracks: list[dict[str, object]]) -> None:
+    def _begin_download_progress(
+        self,
+        item_id: str,
+        tracks: list[dict[str, object]],
+        *,
+        cache_attempt_token: int,
+    ) -> None:
+        token = self._require_cache_attempt_token(cache_attempt_token)
         with self.lock:
             self.item_stage_progress_signatures.pop(item_id, None)
+            self.item_download_attempt_tokens[item_id] = token
             self.item_download_progress[item_id] = {
                 str(track.get("key") or ""): {
                     "key": str(track.get("key") or ""),
@@ -4936,15 +5599,41 @@ class CacheManager:
                 for track in tracks
                 if str(track.get("key") or "")
             }
-        self._publish_download_progress(item_id)
+        self._publish_download_progress(
+            item_id,
+            cache_attempt_token=token,
+        )
 
-    def _clear_item_download_progress(self, item_id: str) -> None:
+    def _clear_item_download_progress(
+        self,
+        item_id: str,
+        *,
+        cache_attempt_token: int | None = None,
+    ) -> None:
         with self.lock:
+            if (
+                cache_attempt_token is not None
+                and self.item_download_attempt_tokens.get(item_id)
+                != self._require_cache_attempt_token(cache_attempt_token)
+            ):
+                return
             self.item_stage_progress_signatures.pop(item_id, None)
             self.item_download_progress.pop(item_id, None)
+            self.item_download_attempt_tokens.pop(item_id, None)
 
-    def _reset_download_track_progress(self, item_id: str, track_key: str) -> None:
+    def _reset_download_track_progress(
+        self,
+        item_id: str,
+        track_key: str,
+        *,
+        cache_attempt_token: int,
+    ) -> None:
         with self.lock:
+            if (
+                self.item_download_attempt_tokens.get(item_id)
+                != cache_attempt_token
+            ):
+                return
             tracks = self.item_download_progress.get(item_id)
             if not tracks or track_key not in tracks:
                 return
@@ -4954,18 +5643,27 @@ class CacheManager:
             track["progress_percent"] = None
             track["done"] = False
             self.item_stage_progress_signatures.pop(item_id, None)
-        self._publish_download_progress(item_id)
+        self._publish_download_progress(
+            item_id,
+            cache_attempt_token=cache_attempt_token,
+        )
 
     def _set_download_track_phase(
         self,
         item_id: str,
         track_key: str,
         *,
+        cache_attempt_token: int,
         phase: str,
         attempt: int,
         max_attempts: int,
     ) -> None:
         with self.lock:
+            if (
+                self.item_download_attempt_tokens.get(item_id)
+                != cache_attempt_token
+            ):
+                return
             tracks = self.item_download_progress.get(item_id)
             if not tracks or track_key not in tracks:
                 return
@@ -4974,7 +5672,10 @@ class CacheManager:
             track["attempt"] = max(0, int(attempt or 0))
             track["max_attempts"] = max(0, int(max_attempts or 0))
             self.item_stage_progress_signatures.pop(item_id, None)
-        self._publish_download_progress(item_id)
+        self._publish_download_progress(
+            item_id,
+            cache_attempt_token=cache_attempt_token,
+        )
 
     @staticmethod
     def _download_track_progress_label(track: dict[str, object]) -> str:
@@ -4994,6 +5695,7 @@ class CacheManager:
         self,
         item_id: str,
         *,
+        cache_attempt_token: int,
         track_key: str,
         target_dir: Path,
         current_bytes: int | None = None,
@@ -5004,6 +5706,11 @@ class CacheManager:
         measure_path: bool = True,
     ) -> None:
         with self.lock:
+            if (
+                self.item_download_attempt_tokens.get(item_id)
+                != cache_attempt_token
+            ):
+                return
             tracks = self.item_download_progress.get(item_id)
             if not tracks or track_key not in tracks:
                 return
@@ -5045,13 +5752,26 @@ class CacheManager:
 
             if done:
                 track["target_bytes"] = int(track.get("current_bytes") or 0)
-        self._publish_download_progress(item_id)
+        self._publish_download_progress(
+            item_id,
+            cache_attempt_token=cache_attempt_token,
+        )
 
-    def _publish_download_progress(self, item_id: str) -> None:
+    def _publish_download_progress(
+        self,
+        item_id: str,
+        *,
+        cache_attempt_token: int,
+    ) -> None:
+        token = self._require_cache_attempt_token(cache_attempt_token)
         with self.lock:
+            if self.item_download_attempt_tokens.get(item_id) != token:
+                return
             tracks_by_key = self.item_download_progress.get(item_id) or {}
             tracks = [dict(track) for track in tracks_by_key.values()]
         if not tracks:
+            return
+        if self.store.get_item(item_id) is None:
             return
 
         tracks.sort(key=lambda track: int(track.get("order") or 0))
@@ -5076,6 +5796,7 @@ class CacheManager:
         signature = json.dumps(
             {
                 "item_id": item_id,
+                "cache_attempt_token": token,
                 "message": message,
                 "cache_progress": cache_progress_signature,
             },
@@ -5086,7 +5807,12 @@ class CacheManager:
             if self.item_stage_progress_signatures.get(item_id) == signature:
                 return
             self.item_stage_progress_signatures[item_id] = signature
-        self.store.update_item(item_id, persist_backup=False, **changes)
+        self._project_cache_progress(
+            item_id,
+            cache_attempt_token=token,
+            progress=changes.get("cache_progress"),
+            message=changes["cache_message"],
+        )
         self._record_item_activity(item_id)
 
     @classmethod
@@ -5161,6 +5887,7 @@ class CacheManager:
         self,
         *,
         item_id: str,
+        cache_attempt_token: int,
         process: subprocess.Popen[str],
         stop_event: threading.Event,
         track_key: str,
@@ -5174,6 +5901,7 @@ class CacheManager:
         while not stop_event.wait(1.0):
             self._update_download_track_progress(
                 item_id,
+                cache_attempt_token=cache_attempt_token,
                 track_key=track_key,
                 target_dir=target_dir,
                 current_bytes=(current_bytes_state or {}).get("value"),
@@ -5189,6 +5917,7 @@ class CacheManager:
         self,
         item_id: str,
         *,
+        cache_attempt_token: int,
         stage_label: str,
         target_dir: Path,
         target_bytes: int,
@@ -5220,13 +5949,19 @@ class CacheManager:
             if self.item_stage_progress_signatures.get(item_id) == signature:
                 return
             self.item_stage_progress_signatures[item_id] = signature
-        self.store.update_item(item_id, persist_backup=False, **changes)
+        self._project_cache_progress(
+            item_id,
+            cache_attempt_token=cache_attempt_token,
+            progress=changes.get("cache_progress"),
+            message=changes["cache_message"],
+        )
         self._record_item_activity(item_id)
 
     def _monitor_structured_stage_progress(
         self,
         *,
         item_id: str,
+        cache_attempt_token: int,
         process: subprocess.Popen[str],
         stop_event: threading.Event,
         stage_label: str,
@@ -5238,6 +5973,7 @@ class CacheManager:
         while not stop_event.wait(1.0):
             self._update_structured_stage_progress(
                 item_id,
+                cache_attempt_token=cache_attempt_token,
                 stage_label=stage_label,
                 target_dir=target_dir,
                 target_bytes=target_bytes_state.get("value", 0),
@@ -5253,6 +5989,8 @@ class CacheManager:
 
     @staticmethod
     def _download_source_label(download_source: str) -> str:
+        if download_source == DOWNLOAD_SOURCE_NATIVE:
+            return "Rust Native"
         if download_source == DOWNLOAD_SOURCE_YTDLP:
             return "yt-dlp"
         if download_source == DOWNLOAD_SOURCE_DOWNKYI:
@@ -5260,22 +5998,31 @@ class CacheManager:
         return "BBDown"
 
     def _ensure_downloader(self, download_source: str, *, force_refresh: bool = False) -> Path:
+        if download_source == DOWNLOAD_SOURCE_NATIVE:
+            if not rust_runtime.http_download_available():
+                status = rust_runtime.runtime_status()
+                raise RuntimeError(status.get("error") or "Rust runtime unavailable")
+            return Path()
         if download_source == DOWNLOAD_SOURCE_YTDLP:
             return self._ensure_ytdlp()
         if download_source == DOWNLOAD_SOURCE_DOWNKYI:
             return self._ensure_aria2c()
-        return self._ensure_bbdown(force_refresh=force_refresh)
+        raise RuntimeError("source must be executed by the shared Rust runtime")
 
     def _ensure_bbdown(self, force_refresh: bool = False) -> Path:
+        media_cli.require_media_cli("BBDown")
         with self.binary_prepare_lock:
             override = Path(BB_DOWN_PATH_OVERRIDE).expanduser() if BB_DOWN_PATH_OVERRIDE else None
             override_exists = bool(override and override.exists())
+            if override is not None and not override.is_file():
+                raise RuntimeError("BB_DOWN_PATH does not name an installed BBDown executable")
             current_binary = self._local_binary_path()
             if PACKAGED_RUNTIME:
                 if override_exists:
+                    version = self._read_bbdown_version(override)
                     with self.lock:
                         self.binary_state = "ready"
-                        self.binary_version = self._read_bbdown_version(override)
+                        self.binary_version = version
                         self.binary_message = f"使用外部 BBDown: {override}"
                     return override
                 return self._ensure_packaged_bbdown(
@@ -5506,6 +6253,7 @@ class CacheManager:
             temporary_path.unlink(missing_ok=True)
 
     def _ensure_ytdlp(self) -> Path:
+        media_cli.require_media_cli("yt-dlp")
         with self.binary_prepare_lock:
             override = Path(YTDLP_PATH_OVERRIDE).expanduser() if YTDLP_PATH_OVERRIDE else None
             if override and override.exists():
@@ -5543,58 +6291,10 @@ class CacheManager:
             return binary_path
 
     def _ensure_aria2c(self) -> Path:
-        with self.binary_prepare_lock:
-            override = Path(ARIA2C_PATH_OVERRIDE).expanduser() if ARIA2C_PATH_OVERRIDE else None
-            if override and override.exists():
-                with self.lock:
-                    self.binary_state = "ready"
-                    version = self._read_aria2c_version(override)
-                    self.binary_version = version
-                    self.binary_message = f"使用外部 aria2c: {override}"
-                return override
-
-            system_path = self._system_aria2c_path()
-            if system_path:
-                version = self._read_aria2c_version(system_path)
-                if version:
-                    with self.lock:
-                        self.binary_state = "ready"
-                        self.binary_version = version
-                        self.binary_message = f"使用系统 aria2c: {system_path}"
-                    return system_path
-
-            binary_path = self._local_aria2c_binary_path()
-            local_version = self._read_aria2c_version(binary_path) if binary_path.exists() else ""
-            if not local_version:
-                system, arch = self._current_platform_tokens()
-                if not self._aria2_auto_prepare_supported(system, arch):
-                    raise RuntimeError(
-                        f"未找到 aria2c。请安装 aria2c，或将可执行文件放入 {binary_path} 后再切换。"
-                    )
-                with self.lock:
-                    self.binary_state = "installing"
-                    self.binary_message = "正在下载 aria2c"
-                try:
-                    self._install_aria2c(binary_path)
-                except Exception as exc:
-                    with self.lock:
-                        self.binary_state = "error"
-                        self.binary_message = f"下载 aria2c 失败: {exc}"
-                    raise
-            if not binary_path.exists():
-                raise RuntimeError(
-                    f"未找到 aria2c，可将 aria2c 放入 {ARIA2C_DIR}\n"
-                    f"下载地址: https://github.com/aria2/aria2/releases"
-                )
-            binary_path.chmod(binary_path.stat().st_mode | stat.S_IEXEC)
-            version = self._read_aria2c_version(binary_path)
-            if not version:
-                raise RuntimeError(f"aria2c 不可执行: {binary_path}")
-            with self.lock:
-                self.binary_state = "ready"
-                self.binary_version = version
-                self.binary_message = f"aria2c {version} 已就绪"
-            return binary_path
+        result = self._configure_aria2_executor(install=True)
+        if not result["ready"]:
+            raise RuntimeError(result["message"])
+        return Path(result["path"])
 
     @staticmethod
     def _local_aria2c_binary_path() -> Path:
@@ -5749,6 +6449,7 @@ class CacheManager:
         ARIA2C_DIR.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=str(ARIA2C_DIR)) as tmpdir:
             try:
+                media_cli.require_media_cli("aria2c")
                 subprocess.run(
                     ["apt-get", "download", "aria2", "libaria2-0", "libssh2-1", "libc-ares2"],
                     cwd=tmpdir,
@@ -5759,6 +6460,7 @@ class CacheManager:
                 )
             except (subprocess.CalledProcessError, subprocess.SubprocessError):
                 try:
+                    media_cli.require_media_cli("aria2c")
                     subprocess.run(
                         ["apt-get", "download", "aria2", "libaria2-0"],
                         cwd=tmpdir,
@@ -5769,6 +6471,7 @@ class CacheManager:
                     )
                 except (subprocess.CalledProcessError, subprocess.SubprocessError):
                     try:
+                        media_cli.require_media_cli("aria2c")
                         subprocess.run(
                             ["apt-get", "download", "aria2"],
                             cwd=tmpdir,
@@ -5791,6 +6494,7 @@ class CacheManager:
             extract_dir.mkdir(parents=True, exist_ok=True)
             for deb_file in deb_files:
                 try:
+                    media_cli.require_media_cli("aria2c")
                     subprocess.run(
                         ["dpkg-deb", "-x", str(deb_file), str(extract_dir)],
                         check=True,
@@ -5837,6 +6541,7 @@ class CacheManager:
         brew = str(brew_path or self._brew_executable() or "brew")
         ARIA2C_DIR.mkdir(parents=True, exist_ok=True)
         try:
+            media_cli.require_media_cli("aria2c")
             subprocess.run(
                 [brew, "fetch", "--bottle", "aria2"],
                 check=True,
@@ -5846,6 +6551,7 @@ class CacheManager:
             )
         except (subprocess.CalledProcessError, subprocess.SubprocessError):
             try:
+                media_cli.require_media_cli("aria2c")
                 subprocess.run(
                     [brew, "fetch", "aria2"],
                     check=True,
@@ -5860,6 +6566,7 @@ class CacheManager:
                 )
 
         try:
+            media_cli.require_media_cli("aria2c")
             res = subprocess.run(
                 [brew, "--cache", "--bottle", "aria2"],
                 check=True,
@@ -5870,6 +6577,7 @@ class CacheManager:
             cache_path_str = res.stdout.strip()
         except (subprocess.CalledProcessError, subprocess.SubprocessError):
             try:
+                media_cli.require_media_cli("aria2c")
                 res = subprocess.run(
                     [brew, "--cache", "aria2"],
                     check=True,
@@ -5891,6 +6599,7 @@ class CacheManager:
 
         if not cache_file_path.exists():
             try:
+                media_cli.require_media_cli("aria2c")
                 res = subprocess.run(
                     [brew, "--cache"],
                     check=True,
@@ -6397,6 +7106,7 @@ class CacheManager:
     @staticmethod
     def _read_aria2c_version(binary_path: Path) -> str:
         try:
+            media_cli.require_media_cli("aria2c")
             process = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
                 [str(binary_path), "--version"],
                 shell=False,
@@ -6598,6 +7308,7 @@ class CacheManager:
             return line
         return f"缓存中 {round(progress)}%"
 
+    # Frozen output reference for compatibility tests; not a downloader dependency.
     @staticmethod
     def _should_force_refresh_bbdown(message: str) -> bool:
         text = str(message or "")
@@ -6615,9 +7326,16 @@ class CacheManager:
         return f"/media/{relative_path.replace(os.sep, '/')}"
 
     def _ensure_ffmpeg(self, force_refresh: bool = False) -> Path:
+        media_cli.require_media_cli()
         with self.ffmpeg_prepare_lock:
+            from .ffmpeg_vendor import MANIFEST, runtime_files
+            packaged_files = None
+            for vendor in (VENDOR_DIR, INTERNAL_VENDOR_DIR):
+                packaged_files = runtime_files(vendor)
+                if packaged_files is not None:
+                    break
             override = Path(FFMPEG_PATH_OVERRIDE).expanduser() if FFMPEG_PATH_OVERRIDE else None
-            if override and override.exists():
+            if packaged_files is None and override and override.exists():
                 version = self._read_ffmpeg_version(override)
                 if not version:
                     raise RuntimeError(f"外部 FFmpeg 不可执行: {override}")
@@ -6637,6 +7355,23 @@ class CacheManager:
 
             if source_ffmpeg:
                 FFMPEG_TOOLS_DIR.mkdir(parents=True, exist_ok=True)
+                if packaged_files is not None:
+                    # Shared CLI copies need the exact vendor closure. Refresh
+                    # a changed build together; identical sizes alone do not
+                    # identify a build. A completed group can stay in use by
+                    # another CLI process (Windows locks loaded executables).
+                    source_manifest = source_ffmpeg.parent / MANIFEST
+                    runtime_manifest = FFMPEG_TOOLS_DIR / MANIFEST
+                    same_group = (
+                        runtime_manifest.is_file()
+                        and runtime_manifest.read_bytes() == source_manifest.read_bytes()
+                    )
+                    for source in packaged_files:
+                        self._sync_runtime_tool(source, FFMPEG_TOOLS_DIR / source.name,
+                                                force_refresh=force_refresh or not same_group)
+                    # Only a complete copy establishes this restore marker.
+                    if not same_group:
+                        shutil.copy2(source_manifest, runtime_manifest)
                 self._sync_runtime_tool(source_ffmpeg, runtime_ffmpeg, force_refresh=force_refresh)
                 if source_ffprobe:
                     self._sync_runtime_tool(source_ffprobe, runtime_ffprobe, force_refresh=force_refresh)
@@ -6653,7 +7388,11 @@ class CacheManager:
             return runtime_ffmpeg
 
     def _preferred_ffmpeg_sources(self) -> tuple[Path | None, Path | None]:
+        from .ffmpeg_vendor import runtime_files
         tool_suffix = ".exe" if os.name == "nt" else ""
+        for vendor in (VENDOR_DIR, INTERNAL_VENDOR_DIR):
+            if runtime_files(vendor) is not None:
+                return vendor / f"ffmpeg{tool_suffix}", vendor / f"ffprobe{tool_suffix}"
         vendor_pairs = (
             (
                 VENDOR_DIR / f"ffmpeg{tool_suffix}",
@@ -6691,9 +7430,12 @@ class CacheManager:
 
     @staticmethod
     def _read_tool_version(binary_path: Path, tool_name: str) -> str:
+        if media_cli.DISABLED:
+            return ""
         if not binary_path.exists():
             return ""
         try:
+            media_cli.require_media_cli(tool_name)
             process = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
                 [str(binary_path), "-version"],
                 shell=False,
@@ -6732,6 +7474,7 @@ class CacheManager:
         if not binary_path.exists():
             return ""
         try:
+            media_cli.require_media_cli("yt-dlp")
             process = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
                 [str(binary_path), "--version"],
                 shell=False,
@@ -6753,6 +7496,7 @@ class CacheManager:
         if not binary_path.exists():
             return ""
         try:
+            media_cli.require_media_cli("BBDown")
             process = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
                 [str(binary_path), "--help"],
                 shell=False,
@@ -6770,6 +7514,8 @@ class CacheManager:
         output = "\n".join(part for part in (process.stdout, process.stderr) if part).strip()
         match = re.search(r"(?i)\b(?:v|version\s*)?(\d+(?:\.\d+){1,3}(?:[-+._0-9A-Za-z]*)?)", output)
         return match.group(1) if match else ""
+
+    # Frozen path-format reference; no live BBDown execution uses a muxer.
     @staticmethod
     def _bbdown_ffmpeg_path_arg(binary_path: Path) -> str:
         target = binary_path if binary_path.is_dir() else binary_path.parent
@@ -6800,16 +7546,6 @@ class CacheManager:
     @staticmethod
     def _bbdown_data_path() -> Path:
         return BB_DOWN_DIR / "BBDown.data"
-
-    @staticmethod
-    def _bbdown_qr_image_path() -> Path:
-        return BB_DOWN_DIR / "qrcode.png"
-
-    def _remove_bbdown_qr_image(self) -> None:
-        try:
-            self._bbdown_qr_image_path().unlink(missing_ok=True)
-        except OSError:
-            pass
 
     def _notify_bbdown_login_success(self) -> None:
         if self.on_bbdown_login_success is None:
@@ -6926,16 +7662,15 @@ class CacheManager:
             return
 
     def _cleanup_orphan_cache_dirs(self, valid_ids: set[str]) -> None:
-        for child in CACHE_DIR.iterdir():
-            if child.name not in valid_ids:
-                if child.is_dir():
-                    self._safe_rmtree(child)
-                else:
-                    self._safe_unlink(child)
-                self._remove_item_log(child.name)
+        del valid_ids
+        self.collect_retired_artifacts()
 
     def _clear_cache_root(self) -> None:
         for child in CACHE_DIR.iterdir():
+            # Immutable artifacts are reclaimed only through Rust leases, even
+            # during shutdown. Keep unrelated/imported files out of this path.
+            if child.name != ".staging":
+                continue
             if child.is_dir():
                 self._safe_rmtree(child)
             else:
@@ -7010,55 +7745,59 @@ class CacheManager:
         if item.cache_status == "failed":
             return
         if self._item_cache_ready(item):
-            self.store.update_item(
-                item.id,
-                video_media_url=self._build_media_url(item.video_relative_path) if item.video_relative_path else "",
-                audio_variants=item.audio_variants,
-                selected_audio_variant_id=item.selected_audio_variant_id,
-                cache_status="ready",
-                cache_progress=100.0,
-                cache_message="缓存已完成",
-                persist_backup=False,
-            )
             return
 
         with self.lock:
-            already_in_flight = item.id in self.pending_ids or self.active_item_id == item.id
+            already_in_flight = (item.id in self.pending_ids or self.active_item_id == item.id
+                or item.id in self.native_cache_snapshot.get("active_item_ids", [])
+                or item.id in self.native_cache_snapshot.get("pending_ids", []))
         if already_in_flight:
             return
 
-        self.store.update_item(
-            item.id,
-            cache_status="pending",
-            cache_progress=0.0,
-            cache_message="等待缓存",
-            video_relative_path="",
-            video_media_url="",
-            audio_variants=[],
-            persist_backup=False,
-        )
-        self._record_item_activity(item.id)
         self.enqueue(item.id)
 
-    def _drop_item_cache(self, item_id: str, message: str) -> None:
-        self._clear_item_download_progress(item_id)
-        self._remove_cache_dir(item_id)
-        self.store.update_item(
+    def _drop_item_cache(
+        self,
+        item_id: str,
+        message: str,
+        *,
+        cache_attempt_token: int | None = None,
+    ) -> None:
+        item = self.store.get_item(item_id)
+        if item is None:
+            return
+        token = (
+            self._begin_cache_attempt_for_item(item)
+            if cache_attempt_token is None
+            else self._require_cache_attempt_token(cache_attempt_token)
+        )
+        self._clear_item_download_progress(
             item_id,
-            cache_status="pending",
-            cache_progress=0.0,
-            cache_message=message,
-            video_relative_path="",
-            video_media_url="",
-            audio_variants=[],
-            persist_backup=False,
+            cache_attempt_token=token,
+        )
+        self._remove_cache_dir(item_id, cache_attempt_token=token)
+        self._project_cache_event(
+            item_id,
+            "evicted",
+            cache_attempt_token=token,
+            message=message,
         )
         self._record_item_activity(item_id)
-
-    def _remove_cache_dir(self, item_id: str) -> None:
-        self._clear_item_download_progress(item_id)
-        self._safe_rmtree(CACHE_DIR / item_id)
         self._remove_item_log(item_id)
+
+    def _remove_cache_dir(
+        self,
+        item_id: str,
+        *,
+        cache_attempt_token: int | None = None,
+    ) -> None:
+        self._clear_item_download_progress(
+            item_id,
+            cache_attempt_token=cache_attempt_token,
+        )
+        if cache_attempt_token is not None:
+            token = self._require_cache_attempt_token(cache_attempt_token)
+            self._safe_rmtree(CACHE_DIR / ".staging" / f"attempt-{token}")
 
     def _remove_item_log(self, item_id: str) -> None:
         for source in DOWNLOAD_SOURCE_CHOICES:
@@ -7104,6 +7843,99 @@ class CacheManager:
             self.retry_requested_ids.discard(item_id)
             return True
 
+    def _begin_worker_attempt_scope(self, cache_attempt_token: int) -> None:
+        """Start recording the attempt identities this worker actually owns.
+
+        The token a worker is handed when it dequeues an item is not necessarily
+        the one it settles: a retry handoff, a download failure or a refresh
+        replaces the attempt mid-flight through
+        ``_replacement_cache_attempt_token``.  The record is thread-local because
+        the normal lane and every urgent lane run one whole attempt chain on
+        their own thread, and it is written as the identity changes rather than
+        returned, so settlement still sees it when the attempt raises or is
+        cancelled.
+        """
+        self.worker_attempt_scope.owned = {cache_attempt_token}
+
+    def _record_worker_attempt(self, cache_attempt_token: int) -> None:
+        owned = getattr(self.worker_attempt_scope, "owned", None)
+        if owned is not None:
+            owned.add(cache_attempt_token)
+
+    def _end_worker_attempt_scope(self) -> set[int]:
+        owned = getattr(self.worker_attempt_scope, "owned", None)
+        self.worker_attempt_scope.owned = None
+        return set(owned) if owned else set()
+
+    def _release_worker_attempt_bookkeeping_locked(
+        self,
+        item_id: str,
+        owned_attempt_tokens: set[int],
+        *,
+        release_ownership: bool,
+    ) -> None:
+        """Release the bookkeeping a finished worker owns.
+
+        Call with ``self.lock`` held.  Only records matching one of this
+        worker's own attempt identities are removed, so an attempt a genuinely
+        newer and independent executor reserved afterwards - or one belonging to
+        a different item incarnation - keeps its own state.  The retry-window
+        markers are always released because those tokens are this worker's and
+        are dead once it exits; the ownership records are kept when the item was
+        handed to another executor.
+        """
+        self.settling_cache_attempt_tokens.difference_update(owned_attempt_tokens)
+        if not release_ownership:
+            return
+        current_attempt_token = self.python_cache_attempt_tokens.get(item_id)
+        if (
+            current_attempt_token is not None
+            and current_attempt_token not in owned_attempt_tokens
+        ):
+            return
+        self.pending_ids.discard(item_id)
+        self.retry_requested_ids.discard(item_id)
+        self.python_worker_download_sources.pop(item_id, None)
+        self.cache_interrupted_messages.pop(item_id, None)
+        if current_attempt_token is not None:
+            self.python_cache_attempt_tokens.pop(item_id, None)
+
+    def _python_retry_window_open_locked(self, item_id: str) -> bool:
+        """Whether an external-tool worker can still consume a replacement request.
+
+        Call with ``self.lock`` held.  The window is open while the item is owned
+        by a Python external-tool worker whose current attempt has not yet passed
+        its last retry check (see ``_close_python_retry_window``).  Ownership
+        alone is not enough: a worker that already started publishing keeps its
+        owner entry until settlement but will never look at
+        ``retry_requested_ids`` again.
+        """
+        if item_id not in self.python_worker_download_sources:
+            return False
+        cache_attempt_token = self.python_cache_attempt_tokens.get(item_id)
+        return (
+            cache_attempt_token is not None
+            and cache_attempt_token not in self.settling_cache_attempt_tokens
+        )
+
+    def _close_python_retry_window(self, item_id: str, cache_attempt_token: int) -> bool:
+        """Stop accepting replacement requests for this attempt.
+
+        Returns ``True`` when a request was already handed over, so the caller
+        must restart rather than publish or settle terminally.  The attempt is
+        marked closed in either case.  This is the counterpart of
+        ``_python_retry_window_open_locked``: both run under ``self.lock``, so a
+        capability recache either reserves the handoff while this worker can
+        still take it, or observes the window closed and routes the replacement
+        through the Rust runtime.  Neither side can miss the other, so the item
+        always ends up with exactly one replacement executor.
+        """
+        with self.lock:
+            retry_requested = item_id in self.retry_requested_ids
+            self.retry_requested_ids.discard(item_id)
+            self.settling_cache_attempt_tokens.add(cache_attempt_token)
+            return retry_requested
+
     def _peek_cache_interrupt_message(self, item_id: str) -> str:
         with self.lock:
             return self.cache_interrupted_messages.get(item_id, "")
@@ -7127,6 +7959,8 @@ class CacheManager:
     def _should_cache(self, item_id: str) -> bool:
         with self.lock:
             if self.stop_event.is_set():
+                return False
+            if self.cache_interrupted_messages.get(item_id) == "等待共享 Rust 缓存":
                 return False
             if item_id in self.urgent_cache_ids:
                 return item_id in self.desired_ids
@@ -7218,25 +8052,6 @@ class CacheManager:
                 pass
 
     @staticmethod
-    def _bilibili_login_request_json(
-        opener: urllib.request.OpenerDirector,
-        url: str,
-    ) -> dict[str, Any]:
-        request = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": BILIBILI_HEADERS["User-Agent"],
-                "Referer": "https://www.bilibili.com/",
-            },
-            method="GET",
-        )
-        with opener.open(request, timeout=15) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-        if not isinstance(payload, dict):
-            raise ValueError("Bilibili login response is not an object")
-        return payload
-
-    @staticmethod
     def _sanitized_bilibili_login_error(exc: BaseException) -> str:
         message = " ".join(str(exc).split())
 
@@ -7259,181 +8074,34 @@ class CacheManager:
         )
         return message[:500] if message else "(no exception message)"
 
-    def _log_bilibili_login_failure(self, stage: str, exc: BaseException) -> None:
-        safe_stage = re.sub(r"[^a-z0-9_-]+", "-", stage.lower()).strip("-") or "unknown"
-        safe_message = self._sanitized_bilibili_login_error(exc)
-        self._append_log_line(
-            self.log_dir / BILIBILI_LOGIN_LOG_NAME,
-            f"[{self._log_timestamp()}] QR login failure: stage={safe_stage} "
-            f"type={type(exc).__name__} message={safe_message}",
-        )
-
-    @staticmethod
-    def _write_bbdown_login_qr(qr_url: str, target_path: Path) -> str:
+    def _bbdown_login_worker(self, generation: int) -> None:
+        # The blocking FFI call owns HTTP, waits, interpretation and credential
+        # publication. This thread only adapts its result to the existing hook.
         try:
-            import qrcode  # type: ignore[import-not-found]
-        except ImportError as exc:
-            raise RuntimeError("缺少本地二维码组件，请重新安装或更新 bilikara") from exc
-
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        qrcode.make(qr_url).save(target_path)
-        target_path.chmod(0o600)
-        encoded = base64.b64encode(target_path.read_bytes()).decode("ascii")
-        return f"data:image/png;base64,{encoded}"
-
-    @staticmethod
-    def _cookie_text_from_login_jar(cookie_jar: http.cookiejar.CookieJar) -> str:
-        pairs: dict[str, str] = {}
-        for cookie in cookie_jar:
-            name = str(cookie.name or "").strip()
-            value = str(cookie.value or "").strip()
-            if name and value:
-                pairs[name] = value
-
-        lower_names = {name.lower(): name for name in pairs}
-        if "sessdata" not in lower_names or "bili_jct" not in lower_names:
-            return ""
-
-        ordered_names: list[str] = []
-        for preferred in BILIBILI_LOGIN_COOKIE_ORDER:
-            actual = lower_names.get(preferred.lower())
-            if actual and actual not in ordered_names:
-                ordered_names.append(actual)
-        return "; ".join(f"{name}={pairs[name]}" for name in ordered_names)
-
-    def _save_bbdown_login_cookie(self, cookie_text: str) -> bool:
-        data_path = self._bbdown_data_path()
-        temporary_path = data_path.with_name(f".{data_path.name}.login.tmp")
-        try:
-            data_path.parent.mkdir(parents=True, exist_ok=True)
-            temporary_path.write_text(cookie_text, encoding="utf-8")
-            temporary_path.chmod(0o600)
-            os.replace(temporary_path, data_path)
-            data_path.chmod(0o600)
-        except OSError:
+            result = rust_runtime.desktop_login(
+                "run", data_path=str(self._bbdown_data_path()), generation=generation
+            )
             try:
-                temporary_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-            return False
-        return bool(cookie_from_bbdown_data(data_path))
-
-    def _bbdown_login_worker(self, cancel_event: threading.Event | None = None) -> None:
-        cancel_event = cancel_event or threading.Event()
-        with self.lock:
-            if self.bbdown_login_cancel_event is None:
-                self.bbdown_login_cancel_event = cancel_event
-
-        login_succeeded = False
-        notify_success = False
-        failure_message = "Bilibili 登录失败，请重试"
-        cookie_jar = http.cookiejar.CookieJar()
-        opener = urllib.request.build_opener(
-            urllib.request.HTTPCookieProcessor(cookie_jar)
-        )
-        login_stage = "generate"
-
-        try:
-            generated = self._bilibili_login_request_json(
-                opener,
-                BILIBILI_QR_GENERATE_URL,
-            )
-            generated_data = generated.get("data")
-            if not isinstance(generated_data, dict):
-                raise ValueError("Bilibili QR response has no data object")
-            qr_url = str(generated_data.get("url") or "").strip()
-            qr_key = str(generated_data.get("qrcode_key") or "").strip()
-            if not qr_url or not qr_key:
-                raise ValueError("Bilibili QR response is incomplete")
-
-            login_stage = "render-qr"
-            qr_image = self._write_bbdown_login_qr(
-                qr_url,
-                self._bbdown_qr_image_path(),
-            )
-            with self.lock:
-                if self.bbdown_login_cancel_event is not cancel_event:
-                    return
-                self.bbdown_login_state = "waiting"
-                self.bbdown_login_message = "请使用哔哩哔哩 App 扫码登录"
-                self.bbdown_login_qr_image = qr_image
-
-            while not cancel_event.wait(1.0):
-                login_stage = "poll"
-                query = urllib.parse.urlencode(
-                    {"qrcode_key": qr_key, "source": "main-fe-header"}
-                )
-                polled = self._bilibili_login_request_json(
-                    opener,
-                    f"{BILIBILI_QR_POLL_URL}?{query}",
-                )
-                poll_data = polled.get("data")
-                if not isinstance(poll_data, dict):
-                    raise ValueError("Bilibili QR poll response has no data object")
-                code = int(poll_data.get("code", -1))
-                if code == BILIBILI_QR_WAITING_SCAN:
-                    continue
-                if code == BILIBILI_QR_WAITING_CONFIRMATION:
-                    with self.lock:
-                        if self.bbdown_login_cancel_event is cancel_event:
-                            self.bbdown_login_message = "扫码成功，请在哔哩哔哩 App 中确认"
-                    continue
-                if code == BILIBILI_QR_EXPIRED:
-                    failure_message = "二维码已过期，请重新生成"
-                    break
-                if code != 0:
-                    break
-
-                with self.lock:
-                    if (
-                        cancel_event.is_set()
-                        or self.bbdown_login_cancel_event is not cancel_event
-                    ):
-                        return
-
-                cookie_text = self._cookie_text_from_login_jar(cookie_jar)
-                if not cookie_text:
-                    failure_message = (
-                        "Bilibili 登录完成，但响应中未检测到有效的 "
-                        "SESSDATA 和 bili_jct"
+                for diagnostic in result["diagnostics"]:
+                    self._append_log_line(
+                        self.log_dir / BILIBILI_LOGIN_LOG_NAME,
+                        json.dumps(diagnostic, ensure_ascii=False, separators=(",", ":")),
                     )
-                    break
-                login_stage = "save-cookie"
-                if not self._save_bbdown_login_cookie(cookie_text):
-                    failure_message = "Bilibili 登录完成，但 Cookie 保存或验证失败"
-                    break
-                login_succeeded = True
-                break
-        except (OSError, ValueError, json.JSONDecodeError, urllib.error.URLError) as exc:
-            self._log_bilibili_login_failure(login_stage, exc)
-            failure_message = "Bilibili 登录请求失败，请重试"
-        except RuntimeError as exc:
-            self._log_bilibili_login_failure(login_stage, exc)
-            failure_message = str(exc)
-        except Exception as exc:  # noqa: BLE001 - never expose login response details
-            self._log_bilibili_login_failure(login_stage, exc)
-            failure_message = "Bilibili 登录请求失败，请重试"
+            except OSError:
+                pass  # Diagnostic I/O cannot turn a committed login into failure.
+        except (RuntimeError, OSError):
+            # Never expose FFI payloads or credential-bearing exception text.
+            rust_runtime.set_bilibili_login_status(
+                "failed", message="Bilibili 登录服务不可用，请重试", generation=generation
+            )
         finally:
+            # The same lock serializes start/logout/shutdown and hook delivery.
+            # Rust consumes this generation's committed success at most once.
             with self.lock:
-                is_current_login = self.bbdown_login_cancel_event is cancel_event
-                if is_current_login:
-                    self.bbdown_login_cancel_event = None
-                    self._remove_bbdown_qr_image()
-                    self.bbdown_login_qr_image = ""
-                    if cancel_event.is_set():
-                        if self.bbdown_login_state not in {"idle", "logged_in"}:
-                            self.bbdown_login_state = "idle"
-                            self.bbdown_login_message = "未登录"
-                    elif login_succeeded:
-                        self.bbdown_login_state = "logged_in"
-                        self.bbdown_login_message = "BBDown 已登录"
-                        notify_success = True
-                    else:
-                        self.bbdown_login_state = "failed"
-                        self.bbdown_login_message = failure_message
-
-        if notify_success:
-            self._notify_bbdown_login_success()
+                if not self.stop_event.is_set() and rust_runtime.desktop_login(
+                    "take_success", generation=generation
+                )["notify"]:
+                    self._notify_bbdown_login_success()
 
     def _outside_window_message(self) -> str:
         if self.max_cache_items <= 0:

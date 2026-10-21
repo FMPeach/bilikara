@@ -1,0 +1,552 @@
+use super::*;
+use crate::app_state::{
+    AppStateRequest,
+    native_session::{positive, text},
+};
+use crate::native_video::{NativeVideoRequest, fetch_native_video};
+
+pub(super) fn queue_space(length: usize) -> Result<(), ApiError> {
+    if length >= 200 {
+        return Err(ApiError::new(
+            429,
+            "queue_full",
+            "此 Beta 点歌列表最多 200 首",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn video_error(error: crate::native_video::NativeVideoError) -> ApiError {
+    let mut api = ApiError::new(
+        if error.binding.is_some() { 409 } else { 400 },
+        &error.code,
+        error.message,
+    );
+    if let Some(binding) = error.binding {
+        api.extra = json!({"binding":binding});
+    }
+    api
+}
+
+pub(super) fn dispatch(
+    context: &Arc<HostContext>,
+    identity: &Identity,
+    host: bool,
+    method: &Method,
+    path: &str,
+    query: &str,
+    body: Value,
+) -> Result<Value, ApiError> {
+    with_app(|app| app.native_authorize(identity, false))?;
+    if context.desktop {
+        if path.starts_with("/api/app/") {
+            with_app(|app| app.native_authorize(identity, true))?;
+        }
+        if method == Method::GET && path == "/api/app/update/status" {
+            return updates::desktop_status(identity);
+        }
+        // Public Host routes expose checks/status. Install/cancel/activation
+        // require the shell capability in the HTTP owner before dispatch.
+        let admitted = matches!(path, "/api/app/update/status" | "/api/app/update/check");
+        if path.starts_with("/api/app/") && !admitted {
+            return Err(desktop::unavailable());
+        }
+    }
+    if method == Method::GET {
+        // Authenticated LAN devices can share the same invitation they used
+        // to join. This is not a public snapshot or Internet protocol route.
+        if path == "/api/remote-access" {
+            return with_app(|app| Ok(app.native().remote_access.clone()));
+        }
+        if path == "/api/internet-remote/state" {
+            return internet::route(context, identity, path, &body);
+        }
+        if path == "/api/ui-language" {
+            return preferences::language(context, identity, None);
+        }
+        if path == "/api/playlist/export-data" {
+            return exports::snapshot(identity, query);
+        }
+        if path == "/api/played-sessions" {
+            return exports::sessions(identity);
+        }
+        if matches!(
+            path,
+            "/api/catalog/search"
+                | "/api/lark/search"
+                | "/api/d1/browse"
+                | "/api/d1/category-browse"
+        ) {
+            return catalog::read(context, path, query);
+        }
+        if path.starts_with("/api/gatcha/") {
+            return library::read(context, identity, path, query);
+        }
+        return with_app(|app| match path {
+            "/api/state" => app.native_snapshot(host),
+            "/api/remote-identity" => app.native_identity(identity),
+            "/api/diagnostics/native" if host => Ok(app.native_diagnostics()),
+            _ => Err(unavailable()),
+        });
+    }
+    if method != Method::POST {
+        return Err(ApiError::new(405, "method", "此接口需要 POST"));
+    }
+    if !body.is_object() {
+        return Err(ApiError::invalid("请求必须为 JSON 对象"));
+    }
+    if path.starts_with("/api/announcements/") {
+        return announcements::route(context, identity, path, &body);
+    }
+    if admin::handles(path) {
+        return admin::route(context, identity, path, &body);
+    }
+    if path == "/api/player/automatic-volume" {
+        return with_app(|app| app.native_automatic_volume(identity, &body));
+    }
+    if path == "/api/session/startup-choice" {
+        return with_app(|app| {
+            app.native_authorize(identity, true)?;
+            let continue_previous = match body["choice"].as_str() {
+                Some("continue") => true,
+                Some("new") => false,
+                _ => return Err(ApiError::invalid("请选择继续上一场或开启新一场")),
+            };
+            let now = now();
+            app.native_execute(AppStateRequest::ResolveNativeSession {
+                schema_version: 1,
+                continue_previous,
+                new_session: crate::app_state::SessionArchiveSeed {
+                    file_name: format!("played-native-{}.json", (now * 1000.0) as u64),
+                    session_started_at: now,
+                    items: Vec::new(),
+                },
+                now,
+            })?;
+            app.native_snapshot(true)
+        });
+    }
+    if path == "/api/ui-language" {
+        return preferences::language(context, identity, Some(&body));
+    }
+    if context.desktop && path == "/api/client/media-capabilities" {
+        return with_app(|app| app.native_media_capabilities(identity, &body));
+    }
+    if with_app(|app| Ok(app.native_session_choice_pending()))? {
+        return Err(ApiError::new(
+            409,
+            "session_choice_pending",
+            "请先在 Host 选择继续上一场或开启新一场",
+        ));
+    }
+    if matches!(
+        path,
+        "/api/cache-downloader/status" | "/api/cache-downloader/prepare"
+    ) {
+        with_app(|app| app.native_authorize(identity, true))?;
+        if matches!(body["download_source"].as_str(), Some("yt-dlp" | "ytdlp")) {
+            if path.ends_with("/prepare") {
+                return Err(ApiError::new(
+                    501,
+                    "cache_source_unavailable",
+                    "yt-dlp 接口保留，当前版本暂不启用",
+                ));
+            }
+            return Ok(
+                json!({"download_source":"ytdlp","tool":"yt-dlp","ready":false,"enabled":false,"state":"disabled","auto_prepare_supported":false,"message":"yt-dlp 接口保留，当前版本暂不启用"}),
+            );
+        }
+        if body.as_object().is_none_or(|v| v.len() != 1) || body["download_source"] != "downkyi" {
+            return Err(ApiError::invalid("Only a source choice is accepted"));
+        }
+        let install = path.ends_with("/prepare");
+        let ready = context.prepare_aria2(install);
+        return Ok(match ready {
+            Ok(()) => {
+                json!({"download_source":"downkyi","tool":"aria2c","ready":true,"requires_prepare":false,"auto_prepare_supported":false,"message":"DownKyi/aria2c ready"})
+            }
+            Err(e) if install => return Err(e),
+            Err(e) => {
+                json!({"download_source":"downkyi","tool":"aria2c","ready":false,"requires_prepare":true,"message":e.message,"auto_prepare_supported":e.code != "invalid_override" && crate::cache_runtime::aria2::Executable::can_prepare(&[])})
+            }
+        });
+    }
+    if path == "/api/cache-policy" {
+        return preferences::update(context, identity, &body);
+    }
+    if path.starts_with("/api/app/update/") {
+        return updates::route(context, identity, path, &body);
+    }
+    if path.starts_with("/api/internet-remote/") {
+        return internet::route(context, identity, path, &body);
+    }
+    if path == "/api/rating/submit" {
+        return ratings::submit(context, identity, &body);
+    }
+    if path == "/api/rating/log" {
+        with_app(|app| app.native_requester(identity, ""))?;
+        // Backend-owned outcomes are logged separately; never persist arbitrary
+        // client messages, usernames or capability URLs in diagnostics.
+        return Ok(json!({}));
+    }
+    if path.starts_with("/api/gatcha/") {
+        return library::write(context, identity, path, &body);
+    }
+    if path == "/api/diagnostics/markdown" {
+        return diagnostics::markdown(context, identity, &body);
+    }
+    if path == "/api/config/cookie" {
+        return login::configure(context, identity, &body);
+    }
+    if path == "/api/bbdown/login/start" {
+        return login::begin(
+            context.clone(),
+            identity,
+            body["force"].as_bool().unwrap_or(false),
+        );
+    }
+    if path == "/api/bbdown/logout" {
+        return login::logout(context, identity);
+    }
+    if path == "/api/playlist/add" {
+        let url = text(&body, "url")?;
+        let (cookie, session_generation, requester, requester_user_id) = with_app(|app| {
+            let requester =
+                app.native_requester(identity, body["requester_name"].as_str().unwrap_or(""))?;
+            let snapshot = app.native_core_snapshot()?;
+            if snapshot.session_users.is_empty() {
+                return Err(ApiError::invalid("请先添加本场 KTV 用户"));
+            }
+            if !context.desktop {
+                queue_space(snapshot.playlist.len())?;
+            }
+            let requester = if requester.is_empty() {
+                snapshot.session_users[0].clone()
+            } else {
+                requester
+            };
+            let user = snapshot
+                .session_user_entries
+                .iter()
+                .find(|user| user.name == requester)
+                .ok_or_else(|| {
+                    ApiError::new(409, "session_user_not_found", "点歌人已移除，请重新选择")
+                })?;
+            Ok((
+                app.native().cookie.clone(),
+                snapshot.session_generation,
+                requester,
+                user.id.clone(),
+            ))
+        })?;
+        let request=serde_json::from_value::<NativeVideoRequest>(json!({"url":url,"selected_video_page":body.get("selected_video_page"),"selected_audio_pages":body.get("selected_audio_pages")})).map_err(|_|ApiError::invalid("分 P 选择格式无效"))?;
+        let item = fetch_native_video(&request, &cookie).map_err(|error| {
+            if let Some(bvid) = &error.missing_bvid {
+                catalog::delete_invalid(bvid);
+            }
+            video_error(error)
+        })?;
+        let (snapshot, accepted_item) = with_app(|app| {
+            if context.stop.load(Ordering::Acquire) {
+                return Err(ApiError::new(503, "stopped", "Host 已停止"));
+            }
+            // Reauthorize the device, retaining the request-time label/ID.
+            // A renamed identity is still this singer; a removed one is not.
+            if !host {
+                let current_identity = app.native_identity(identity)?;
+                if current_identity["user_id"] != requester_user_id {
+                    return Err(ApiError::new(409, "identity_required", "请重新登记点歌人"));
+                }
+            }
+            let snapshot = app.native_core_snapshot()?;
+            if snapshot.session_generation != session_generation {
+                return Err(ApiError::new(
+                    409,
+                    "session_changed",
+                    "本场 KTV 已更换，请重新点歌",
+                ));
+            }
+            // Other phones can finish metadata I/O first. Recheck admission
+            // under the same lock as AddItem, not only before the HTTP request.
+            if !context.desktop {
+                queue_space(snapshot.playlist.len())?;
+            }
+            let reset_av_delay = app.native().cache_policy.reset_offset_on_next;
+            let result = app.native_execute(AppStateRequest::AddItem {
+                requester_user_id: Some(requester_user_id),
+
+                schema_version: 1,
+                item: item.clone(),
+                position: body["position"]
+                    .as_str()
+                    .filter(|position| !position.is_empty())
+                    .unwrap_or("tail")
+                    .into(),
+                requester_name: requester,
+                reset_av_delay,
+                allow_repeat: body["allow_repeat"].as_bool().unwrap_or(false),
+                now: now(),
+            });
+            if let Err(mut error) = result {
+                if error.code == "duplicate_session_request" {
+                    error.extra["duplicate_item"] = json!(item);
+                }
+                return Err(error);
+            }
+            Ok((
+                app.native_snapshot(host)?,
+                catalog_append::accepted_item(app, &item.id)?,
+            ))
+        })?;
+        catalog_append::enqueue(&accepted_item);
+        return Ok(snapshot);
+    }
+    if path == "/api/cache/retry" {
+        let (item, cookie) = with_app(|app| {
+            app.native_authorize(identity, false)?;
+            let id = text(&body, "item_id")?;
+            let expected = text(&body, "expected_item_incarnation_id")?;
+            let snapshot = app.native_core_snapshot()?;
+            let item = snapshot
+                .current_item
+                .iter()
+                .chain(snapshot.playlist.iter())
+                .find(|item| item.id == id && item.item_incarnation_id == expected)
+                .cloned()
+                .ok_or_else(|| ApiError::new(409, "stale_item", "此歌曲已更换"))?;
+            Ok((item, app.native().cookie.clone()))
+        })?;
+        cache::retry(
+            context,
+            &item,
+            &cookie,
+            body["force"].as_bool().unwrap_or(false),
+        )?;
+        return with_app(|app| app.native_snapshot(host));
+    }
+    with_app(|app| {
+        let now = now();
+        match path {
+            "/api/remote-identity/register" => {
+                return app.native_register(identity, &body, false, now);
+            }
+            "/api/remote-identity/rename" => {
+                return app.native_register(identity, &body, true, now);
+            }
+            "/api/player/claim-program" => return app.native_claim(identity, &body, false),
+            "/api/player/retire-program" => return app.native_claim(identity, &body, true),
+            "/api/player/status" => return app.native_player_status(identity, &body, now),
+            "/api/player/control" => {
+                app.native_control(identity, &body, now)?;
+                return app.native_snapshot(host);
+            }
+            "/api/player/control-ack" => {
+                app.native_ack(identity, &body)?;
+                return Ok(json!({}));
+            }
+            "/api/player/diagnostic" => {
+                app.native_authorize(identity, true)?;
+                app.native_diagnostic(&body, now);
+                return Ok(json!({}));
+            }
+            "/api/client/disconnect" => return Ok(json!({})),
+            "/api/remote/connection-diagnostic" => {
+                app.native_requester(identity, "")?;
+                app.native_remote_connection_diagnostic(&body, now);
+                return Ok(json!({}));
+            }
+            "/api/client/media-capabilities" => {
+                return app.native_media_capabilities(identity, &body);
+            }
+            _ => {}
+        }
+        let shared = [
+            "/api/player/next",
+            "/api/player/audio-variant",
+            "/api/player/volume",
+            "/api/player/av-delay-action",
+            "/api/player/key-shift",
+            "/api/playlist/reorder",
+            "/api/playlist/resort",
+            "/api/playlist/remove",
+            "/api/playlist/play-now",
+            "/api/playlist/move-next",
+        ];
+        app.native_authorize(identity, !shared.contains(&path))?;
+        let mut command = json!({"schema_version":1,"now":now});
+        match path {
+            "/api/session-users/add" => {
+                command["command"] = json!("add_session_user");
+                command["name"] = json!(text(&body, "name")?);
+            }
+            "/api/session-users/remove" => {
+                command["command"] = json!("remove_session_user");
+                command["name"] = json!(text(&body, "name")?);
+            }
+            "/api/session-users/edit" => {
+                command["command"] = json!("edit_session_users");
+                command["expected_version"] = json!(text(&body, "expected_version")?);
+                command["edit"] = body["edit"].clone();
+            }
+            "/api/session-users/reorder" => {
+                command["command"] = json!("move_session_user_to_index");
+                command["name"] = body["name"].clone();
+                // Shared Host sends `index`; retain the early Alpha spelling.
+                command["target_index"] =
+                    body.get("index").unwrap_or(&body["target_index"]).clone();
+            }
+            "/api/playlist/remove" | "/api/playlist/play-now" | "/api/playlist/move-next" => {
+                command["command"] = json!(match path {
+                    "/api/playlist/remove" => "remove_item",
+                    "/api/playlist/play-now" => "move_to_front",
+                    _ => "move_to_next",
+                });
+                command["item_id"] = json!(text(&body, "item_id")?);
+            }
+            "/api/playlist/reorder" => {
+                command["command"] = json!("move_item_to_index");
+                command["expected_queue_version"] = body["expected_queue_version"].clone();
+                command["item_id"] = json!(text(&body, "item_id")?);
+                command["target_index"] =
+                    body.get("index").unwrap_or(&body["target_index"]).clone();
+            }
+            "/api/playlist/defer-current" => {
+                command["command"] = json!("defer_current_item");
+                for key in ["item_id", "expected_item_incarnation_id"] {
+                    command[key] = json!(text(&body, key)?);
+                }
+                command["expected_playback_generation"] =
+                    json!(positive(&body, "playback_generation")?);
+                command["expected_playlist_item_ids"] = body["expected_playlist_item_ids"].clone();
+                command["target_index"] = body["index"].clone();
+            }
+            "/api/playlist/resort" => command["command"] = json!("resort_playlist_by_cycle"),
+            "/api/playlist/clear" => command["command"] = json!("clear_playlist"),
+            "/api/history/clear" => command["command"] = json!("clear_history"),
+            "/api/history/remove" => {
+                command["command"] = json!("remove_history_entry");
+                let key = text(&body, "key")?;
+                if key.trim().is_empty() {
+                    return Err(ApiError::invalid("历史记录标识无效"));
+                }
+                command["key"] = json!(key);
+            }
+            "/api/player/next" => {
+                command["command"] = json!("advance_to_next");
+                command["expected_playback_generation"] =
+                    json!(positive(&body, "playback_generation")?);
+            }
+            "/api/player/reset" => command["command"] = json!("reset_player"),
+            "/api/player/restart-program" => {
+                command = json!({"command":"restart_playback_program","schema_version":1});
+                app.native_release_claim();
+            }
+            "/api/player/audio-variant" => {
+                command["command"] = json!("set_audio_variant");
+                for key in ["item_id", "expected_item_incarnation_id", "variant_id"] {
+                    command[key] = json!(text(&body, key)?);
+                }
+            }
+            "/api/player/volume" => {
+                if body.get("volume_percent").is_none() && body.get("is_muted").is_none() {
+                    return Err(ApiError::invalid("缺少音量或静音状态"));
+                }
+                // Parse both inputs before committing either existing core command.
+                let settings = app.native_core_snapshot()?.player_settings;
+                let volume = body
+                    .get("volume_percent")
+                    .cloned()
+                    .unwrap_or(json!(settings.volume_percent))
+                    .as_i64()
+                    .ok_or_else(|| ApiError::invalid("音量无效"))?
+                    .clamp(0, i64::from(crate::app_state::MAX_VOLUME_PERCENT))
+                    as i32;
+                let muted = body
+                    .get("is_muted")
+                    .cloned()
+                    .unwrap_or(json!(settings.is_muted))
+                    .as_bool()
+                    .ok_or_else(|| ApiError::invalid("静音状态无效"))?;
+                if body.get("volume_percent").is_some() {
+                    app.native_execute(AppStateRequest::SetVolume {
+                        schema_version: 1,
+                        volume_percent: volume,
+                        expected_item_incarnation_id: body
+                            .get("expected_item_incarnation_id")
+                            .map(|value| {
+                                value
+                                    .as_str()
+                                    .map(str::to_owned)
+                                    .ok_or_else(|| ApiError::invalid("歌曲标识无效"))
+                            })
+                            .transpose()?,
+                        now,
+                    })?;
+                }
+                app.native_execute(AppStateRequest::SetMuted {
+                    schema_version: 1,
+                    is_muted: muted,
+                    now,
+                })?;
+                return app.native_snapshot(host);
+            }
+            "/api/player/advance-delay" => {
+                command["command"] = json!("set_song_advance_delay");
+                command["delay_seconds"] = body["delay_seconds"].clone();
+            }
+            "/api/player/key-shift" => {
+                command["command"] = json!("set_key_shift");
+                command["key_shift"] = body["key_shift"].clone();
+            }
+            "/api/player/av-delay-action" => {
+                command["command"] = json!("apply_av_delay");
+                command["action"] = body.clone();
+            }
+            "/api/backup/discard" | "/api/data/reset" => {
+                command["command"] = json!(if path == "/api/data/reset" {
+                    "reset_runtime"
+                } else {
+                    "discard_backup"
+                });
+                command["new_session"] = json!({"file_name":format!("session-{}.json",(now*1000.0) as u64),"session_started_at":now,"items":[]});
+            }
+            "/api/session/continue-previous" => {
+                command["command"] = json!("continue_previous_session")
+            }
+            _ => return Err(unavailable()),
+        }
+        let request: AppStateRequest = serde_json::from_value(command)
+            .map_err(|_| ApiError::invalid("操作参数不完整或格式无效"))?;
+        let result = app.native_execute(request)?;
+        if path == "/api/player/audio-variant" && result["found"] != true {
+            return Err(ApiError::invalid("音轨无效"));
+        }
+        if path == "/api/session/continue-previous" && result["changed"] != true {
+            return Err(ApiError::invalid("没有可继续的上一场记录"));
+        }
+        if path == "/api/player/av-delay-action" {
+            Ok(json!(app.native_core_snapshot()?.player_settings.av_delay))
+        } else {
+            app.native_snapshot(host)
+        }
+    })
+}
+
+fn unavailable() -> ApiError {
+    ApiError::new(501, "native_unavailable", "当前 Rust Host 尚不支持此接口")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn bounded_queue_admission_rejects_the_first_overflow_and_larger_values() {
+        assert!(queue_space(0).is_ok());
+        assert!(queue_space(199).is_ok());
+        for length in [200, 201, usize::MAX] {
+            let error = queue_space(length).unwrap_err();
+            assert_eq!(error.status, 429);
+            assert_eq!(error.code, "queue_full");
+        }
+    }
+}

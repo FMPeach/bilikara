@@ -1,17 +1,19 @@
+pub mod announcement_policy;
 mod archive;
 mod asset_selection;
 mod asset_tokens;
 mod audio_binding;
 mod audio_stream_ranking;
+pub mod automatic_volume;
 mod av_delay;
 mod cache_planning;
 mod download_candidate_planning;
 mod ffi;
 mod filename;
+mod internet_remote_protocol;
 mod media_download_candidate_planning;
 mod media_page_selection;
 mod platform;
-mod playback_selector_policy;
 mod playlist_planning;
 mod preferred_audio_source_binding;
 mod quality_policy;
@@ -23,6 +25,12 @@ mod url_utils;
 mod version;
 mod video_stream_ranking;
 
+/// Maximum linear playback gain, expressed as a percentage of the source level.
+pub const MAX_VOLUME_PERCENT: i32 = 500;
+
+pub use asset_selection::{
+    UpdateAssetCandidate, UpdateAssetSelection, UpdateAssetTarget, select_update_asset,
+};
 pub use audio_binding::{
     AudioBindingDecision, AudioBindingError, AudioBindingMode, AudioBindingRequest,
     AudioBindingResult, AudioPageDescriptor, decide_audio_binding,
@@ -46,15 +54,24 @@ pub use ffi::{
     rust_apply_av_delay_action, rust_asset_has_arm64, rust_asset_has_linux, rust_asset_has_macos,
     rust_asset_has_universal, rust_asset_has_windows, rust_asset_has_x64, rust_asset_tokens,
     rust_backend_abi_version, rust_clean_display_title, rust_decide_audio_binding,
-    rust_decide_playback_selector_policy, rust_decide_playlist_duplicate,
-    rust_decide_quality_policy, rust_decide_tool_prepare_policy, rust_format_download_proxy_url,
-    rust_free_string, rust_is_downloadable_archive, rust_normalize_machine_arch,
-    rust_normalize_version_tag, rust_plan_cache_window, rust_plan_media_download_candidates,
-    rust_plan_playlist_order, rust_plan_tool_download_candidates,
-    rust_plan_update_download_candidates, rust_release_list_api_from_latest, rust_safe_filename,
-    rust_select_audio_stream, rust_select_media_pages, rust_select_preferred_audio_source,
-    rust_select_release, rust_select_update_asset, rust_select_video_stream, rust_version_sort_key,
-    rust_version_tuple,
+    rust_decide_playlist_duplicate, rust_decide_quality_policy, rust_decide_tool_prepare_policy,
+    rust_format_download_proxy_url, rust_free_string, rust_is_downloadable_archive,
+    rust_normalize_machine_arch, rust_normalize_version_tag, rust_plan_cache_window,
+    rust_plan_media_download_candidates, rust_plan_playlist_order,
+    rust_plan_tool_download_candidates, rust_plan_update_download_candidates,
+    rust_release_list_api_from_latest, rust_safe_filename, rust_select_audio_stream,
+    rust_select_media_pages, rust_select_preferred_audio_source, rust_select_release,
+    rust_select_update_asset, rust_select_video_stream, rust_version_sort_key, rust_version_tuple,
+};
+pub use internet_remote_protocol::{
+    INTERNET_REMOTE_PROTOCOL_VERSION, MAX_BROWSE_RESULTS, MAX_CONTROL_MESSAGE_BYTES,
+    MAX_REMOTE_STATE_ITEMS, MAX_SAFE_JSON_INTEGER, MAX_SEARCH_RESULTS, RemoteAudioVariantV1,
+    RemoteAutomaticVolumeV1, RemoteAvDelayActionV1, RemoteCacheDownloadTrackV1,
+    RemoteCacheStatusV1, RemoteCapability, RemoteCatalogBrowseKindV1, RemoteHistoryEntryV1,
+    RemoteLane, RemoteOperation, RemotePlaybackModeV1, RemotePlaybackStatusV1,
+    RemotePlayerSettingsV1, RemotePlaylistItemV1, RemotePlaylistPositionV1, RemoteProfile,
+    RemoteProtocolError, RemoteRequestEnvelopeV1, RemoteRequestV1, RemoteSessionUserV1,
+    RemoteStateV1, RemoteValidationContext, decode_remote_request_v1, profile_allows,
 };
 pub use media_download_candidate_planning::{
     MediaCandidateSource, MediaDownloadPlan, MediaDownloadPlanError, MediaDownloadPlanMode,
@@ -64,12 +81,6 @@ pub use media_download_candidate_planning::{
 pub use media_page_selection::{
     MediaPageDescriptor, MediaPageSelection, MediaPageSelectionError, MediaPageSelectionRequest,
     select_media_pages,
-};
-pub use playback_selector_policy::{
-    DEFAULT_PLAYBACK_SELECTOR_MODE, PersistedPlaybackSelectorMode, PlaybackSelectorDecision,
-    PlaybackSelectorMode, PlaybackSelectorReason, PlaybackSelectorStatus,
-    VALID_PLAYBACK_SELECTOR_MODES, decide_persisted_playback_selector_mode,
-    validate_requested_playback_selector_mode,
 };
 pub use playlist_planning::{
     DuplicateActiveItem, DuplicateHistoryEntry, PlaylistDuplicateDecision,
@@ -85,8 +96,8 @@ pub use quality_policy::{
     QualityPolicyDecision, QualityPolicyRequest, VideoQuality, decide_quality_policy,
 };
 pub use release_selection::{
-    ReleaseCandidate, ReleaseSelection, ReleaseSelectionError, ReleaseSelectionRequest,
-    select_release,
+    ReleaseCandidate, ReleaseDecision, ReleaseSelection, ReleaseSelectionError,
+    ReleaseSelectionRequest, UpdateAction, UpdateReason, decide_release_update, select_release,
 };
 pub use tool_download_candidate_planning::{
     PlannedToolCandidate, ToolAssetInput, ToolCandidateSource, ToolDownloadPlan,
@@ -100,3 +111,8 @@ pub use video_stream_ranking::{
     VideoCodec, VideoSelectionReason, VideoStreamDescriptor, VideoStreamSelection,
     VideoStreamSelectionError, VideoStreamSelectionRequest, select_video_stream,
 };
+
+pub use title_cleanup::clean_display_title_impl as clean_display_title;
+pub mod media_source;
+pub mod playlist_export;
+pub mod youtube_selection;

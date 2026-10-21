@@ -8,7 +8,7 @@ import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
-from bilikara import playback_selector, updater
+from bilikara import updater
 
 
 def release(
@@ -32,6 +32,33 @@ def release(
 
 
 DECISION_CASES = (
+    {
+        "name": "v0.8 preview hidden from stable channel",
+        "current": "v0.7.2",
+        "include_preview": False,
+        "releases": [release("v0.8.0-preview.1", prerelease=True), release("v0.7.2")],
+        "latest": "v0.7.2",
+        "action": "no_action",
+        "reason": "already_current",
+    },
+    {
+        "name": "v0.8 preview opt in",
+        "current": "v0.7.2",
+        "include_preview": True,
+        "releases": [release("v0.8.0-preview.1", prerelease=True), release("v0.7.2")],
+        "latest": "v0.8.0-preview.1",
+        "action": "normal_upgrade",
+        "reason": "newer_version",
+    },
+    {
+        "name": "v0.8 preview opt out returns to v0.7.2",
+        "current": "v0.8.0-preview.1",
+        "include_preview": False,
+        "releases": [release("v0.8.0-preview.1", prerelease=True), release("v0.7.2")],
+        "latest": "v0.7.2",
+        "action": "preview_to_stable",
+        "reason": "preview_channel_disabled",
+    },
     {
         "name": "stable normal upgrade",
         "current": "v0.6.3",
@@ -208,10 +235,6 @@ class UpdateChannelDecisionTest(unittest.TestCase):
             updater,
             "is_newer_version",
             side_effect=AssertionError("channel switches must not use is_newer_version"),
-        ), patch.object(
-            playback_selector.PlaybackSelector,
-            "dispatch",
-            side_effect=AssertionError("updater must not consult playback routing"),
         ):
             result = updater.check_for_update(
                 current_version="v0.7.0-preview.3",
@@ -341,48 +364,58 @@ class UpdateChannelDecisionTest(unittest.TestCase):
         start = source.index("async function checkAppUpdate")
         end = source.index("async function addSessionUser", start)
         function_source = source[start:end]
+        helper_start = source.index("function appUpdateStatus")
+        helper_end = source.index("function appUpdateProgressPercent", helper_start)
+        helper_source = source[helper_start:helper_end]
         script = f"""
 (async () => {{
   const state = {{
-    updateChecking: false,
+    updateCheckRequestInFlight: false,
+    updateAutomaticEnabled: true,
+    updateManualVisibleChannel: "",
     updatePreviewEnabled: false,
-    data: {{ app_update: {{ state: "idle" }} }},
+    data: {{ app_update: {{ state: "idle", include_preview: false }} }},
   }};
   const elements = {{ updateCheckButton: {{ id: "update-check-button" }}, cacheSettings: {{}} }};
-  const window = {{ setTimeout, clearTimeout }};
-  const appUpdateCheckTimeoutMs = 1000;
   const confirms = [];
-  const messages = [];
-  let result = null;
-  function isAppUpdateBusy() {{ return false; }}
-  function renderUpdatePreviewControl() {{}}
+  let checks = 0;
   function anchorPointForEvent() {{ return {{ x: 1, y: 2 }}; }}
-  async function apiGet() {{ return result; }}
+  async function requestAppUpdateCheck() {{ checks += 1; }}
   function openConfirm(value) {{ confirms.push(value); }}
-  function setAppMessage(message, isError = false) {{ messages.push({{ message, isError }}); }}
+  function safeHttpUrl(value) {{ return value; }}
+  function openExternalUrl() {{ throw new Error("unexpected view action"); }}
+  function setAppMessage() {{}}
   function t(key) {{ return key; }}
+  {helper_source}
   {function_source}
 
-  result = {{
+  state.data.app_update = {{
+    state: "available",
+    include_preview: false,
     update_action: "preview_to_stable",
     update_installable: true,
     switch_to_release_available: true,
+    eligible_update: true,
     auto_update_supported: true,
     release_url: "https://example.test/v0.6.4",
+    latest_version: "v0.6.4",
     message: "switch",
   }};
   await checkAppUpdate({{}});
 
-  result = {{
+  state.data.app_update = {{
+    state: "available",
+    include_preview: false,
     update_action: "no_action",
     update_installable: true,
     update_available: true,
     switch_to_release_available: true,
+    eligible_update: true,
     auto_update_supported: true,
   }};
   await checkAppUpdate({{}});
 
-  console.log(JSON.stringify({{ confirms, messages }}));
+  console.log(JSON.stringify({{ confirms, checks }}));
 }})().catch((error) => {{ console.error(error); process.exit(1); }});
 """
         completed = subprocess.run(
@@ -397,7 +430,7 @@ class UpdateChannelDecisionTest(unittest.TestCase):
         self.assertEqual(len(result["confirms"]), 1)
         self.assertEqual(result["confirms"][0]["type"], "install-app-update")
         self.assertFalse(result["confirms"][0]["includePreview"])
-        self.assertEqual(result["messages"][-1]["message"], "service.upToDate")
+        self.assertEqual(result["checks"], 1)
 
 
 if __name__ == "__main__":

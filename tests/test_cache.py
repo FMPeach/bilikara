@@ -13,27 +13,182 @@ import threading
 import unittest
 import urllib.error
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from bilikara import rust_backend
+from bilikara import rust_backend, rust_runtime
 from bilikara.cache import (
     CachePlan,
     CacheManager,
+    RUST_MEDIA_PROBE_FALLBACK_ERROR_KINDS,
     DOWNLOAD_SOURCE_BBDOWN,
     DOWNLOAD_SOURCE_DOWNKYI,
+    DOWNLOAD_SOURCE_NATIVE,
     DOWNLOAD_SOURCE_YTDLP,
     DownloadCommandError,
     SOURCE_AUDIO_DURATION_TOLERANCE_SECONDS,
     VIDEO_QUALITY_CHOICES,
 )
 from bilikara.models import PlaylistItem
-from bilikara.store import PlaylistStore
+from bilikara.store import PlaylistStore, PlaylistStoreCommandError
+
+
+def begin_cache_attempt(store: PlaylistStore, item_id: str) -> int:
+    observed = store.get_item(item_id)
+    if observed is None:
+        raise AssertionError(f"missing cache item fixture: {item_id}")
+    return store.begin_cache_attempt(item_id, observed.item_incarnation_id)
+
+
+def retry_cache_item(
+    manager: CacheManager,
+    store: PlaylistStore,
+    item_id: str,
+    *,
+    force: bool = False,
+) -> None:
+    observed = store.get_item(item_id)
+    if observed is None:
+        raise AssertionError(f"missing cache retry fixture: {item_id}")
+    manager.retry_item(
+        item_id,
+        expected_item_incarnation_id=observed.item_incarnation_id,
+        force=force,
+    )
+
+
+def cache_observation_fixture(response=None, *, item_ids=(), settlements=(), errors=()):
+    """Already-applied service output; interpretation is tested in Rust.
+
+    Empty scheduler stubs must still supply the real authoritative observation.
+    """
+    if response is None:
+        response = rust_runtime.app_state_request("snapshot")
+    return {
+        "effects": {
+            "observation": response,
+            "settlements": list(settlements),
+            "activity_item_ids": list(item_ids),
+            "settled_item_ids": list(item_ids),
+            "cancelled": False,
+            "errors": list(errors),
+        },
+        "snapshot": {},
+    }
+
+
+def observe_cache_projection(manager, item_id, token, projection, *, artifact=None):
+    """Exercise only default Host observation/collector compatibility glue."""
+    import time
+    errors = []
+    try:
+        response = rust_runtime.app_state_request(
+            "apply_cache_event", item_id=item_id, cache_attempt_token=token,
+            event=projection, now=time.time(),
+        )
+    except rust_runtime.RustAppStateRejectedError as exc:
+        errors.append({"kind": exc.kind})
+        response = rust_runtime.app_state_request("snapshot")
+    batch = cache_observation_fixture(
+        response, item_ids=[item_id], errors=errors,
+        settlements=[{"cache_attempt_token": token, "artifact": artifact}],
+    )
+    with patch.object(manager, "_native_cache_request", return_value=batch):
+        manager._drain_native_cache_events()
+    return batch
 
 
 class CacheManagerOutputTest(unittest.TestCase):
+    def test_source_tool_prepare_rejects_malformed_native_response(self):
+        request = {"schema_version": 1, "override_exists": False, "installed_exists": True,
+                   "force_refresh": False, "version_metadata_present": True}
+        with patch.object(rust_backend, "_call_json_capability", return_value={"schema_version": 1}):
+            self.assertEqual(rust_backend.try_decide_tool_prepare_policy(request), (False, None))
+
+    def test_source_tool_prepare_fails_closed_when_native_is_unavailable(self):
+        request = {"schema_version": 1, "override_exists": False, "installed_exists": True,
+                   "force_refresh": False, "version_metadata_present": True}
+        with patch.object(rust_backend, "_rust_lib", None):
+            self.assertEqual(rust_backend.try_decide_tool_prepare_policy(request), (False, None))
+
+    def test_prewarm_prepares_legacy_tools_without_overriding_runtime_status(self):
+        manager = CacheManager.__new__(CacheManager)
+        manager.lock = threading.RLock()
+        manager.binary_state = "failed"
+        manager.binary_version = ""
+        manager.binary_message = "stale BBDown failure"
+        manager.ffmpeg_state = "failed"
+        manager.ffmpeg_version = ""
+        manager.ffmpeg_message = "stale FFmpeg failure"
+        with patch.object(
+            manager,
+            "_ensure_bbdown",
+            return_value=Path("BBDown"),
+        ) as ensure_bbdown, patch.object(
+            manager,
+            "_ensure_ffmpeg",
+            return_value=Path("ffmpeg"),
+        ) as ensure_ffmpeg:
+            manager._prewarm_binary_worker()
+
+        ensure_bbdown.assert_called_once_with()
+        ensure_ffmpeg.assert_called_once_with(force_refresh=True)
+        self.assertEqual(manager.binary_state, "failed")
+        self.assertEqual(manager.binary_message, "stale BBDown failure")
+        self.assertEqual(manager.ffmpeg_state, "failed")
+        self.assertEqual(manager.ffmpeg_message, "stale FFmpeg failure")
+
+    def test_diagnostic_snapshot_preserves_frontend_service_failure_reason(self):
+        manager = CacheManager.__new__(CacheManager)
+        manager.lock = threading.RLock()
+        manager.aria2_configuration_lock = threading.Lock()
+        manager.aria2_configuration = None
+        manager.active_item_id = "item-1"
+        manager.native_cache_snapshot = {}
+        manager.urgent_cache_ids = set()
+        manager.pending_ids = {"item-1"}
+        manager.ordered_desired_ids = ["item-1"]
+        manager.tasks = queue.Queue()
+        manager.binary_state = "failed"
+        manager.binary_version = ""
+        manager.binary_message = "legacy BBDown prewarm failed"
+        manager.ffmpeg_state = "ready"
+        manager.ffmpeg_version = "ffmpeg 7"
+        manager.ffmpeg_message = "FFmpeg ready"
+        manager.max_cache_items = 3
+        manager.download_source = DOWNLOAD_SOURCE_NATIVE
+        manager.media_capabilities = {}
+        manager.client_media_capabilities = {}
+        runtime = {
+            "loaded": True,
+            "path": "C:/bundle/rust/bilikara_runtime.dll",
+            "error": "",
+            "abi_version": 1,
+            "capabilities": {"http_download": True, "media_backend": True},
+            "load_diagnostics": {"stage": "ready"},
+        }
+
+        with patch("bilikara.cache.rust_runtime.runtime_status", return_value=runtime), patch.object(
+            manager,
+            "bbdown_login_status",
+            return_value={"state": "idle", "logged_in": False},
+        ):
+            snapshot = manager.diagnostic_snapshot()
+
+        native = snapshot["tools"]["Rust Native"]
+        media = snapshot["tools"]["Rust MediaBackend"]
+        bbdown = snapshot["tools"]["BBDown"]
+        self.assertEqual(bbdown["state"], "failed")
+        self.assertEqual(native["state"], "ready")
+        self.assertEqual(native["message"], "Rust Native ready")
+        self.assertEqual(native["runtime_state"], "ready")
+        self.assertEqual(media["state"], "ready")
+        self.assertEqual(media["message"], "Rust MediaBackend ready")
+
     def test_iter_output_messages_handles_carriage_return_updates(self):
         stream = io.StringIO("0%\r14.5%\r89.1%\n下载完成\n")
         self.assertEqual(
@@ -106,20 +261,26 @@ class CacheManagerOutputTest(unittest.TestCase):
                     handle.write(b"x")
                 self.assertEqual(sparse.stat().st_size, 10 * 1024 * 1024)
 
-                manager._begin_download_progress("song", [{
-                    "key": "video-p1",
-                    "label": "视频轨P1",
-                    "order": 0,
-                }])
-                manager._update_download_track_progress(
-                    "song",
-                    track_key="video-p1",
-                    target_dir=attempt,
-                    current_bytes=1024 * 1024,
-                    target_bytes=10 * 1024 * 1024,
-                    progress_percent=10,
-                    measure_path=False,
-                )
+                with patch.object(manager, "_project_cache_progress"):
+                    manager._begin_download_progress(
+                        "song",
+                        [{
+                            "key": "video-p1",
+                            "label": "视频轨P1",
+                            "order": 0,
+                        }],
+                        cache_attempt_token=1,
+                    )
+                    manager._update_download_track_progress(
+                        "song",
+                        cache_attempt_token=1,
+                        track_key="video-p1",
+                        target_dir=attempt,
+                        current_bytes=1024 * 1024,
+                        target_bytes=10 * 1024 * 1024,
+                        progress_percent=10,
+                        measure_path=False,
+                    )
                 progress = manager.item_download_progress["song"]["video-p1"]
                 self.assertEqual(progress["current_bytes"], 1024 * 1024)
                 self.assertEqual(progress["target_bytes"], 10 * 1024 * 1024)
@@ -189,6 +350,10 @@ class CacheManagerOutputTest(unittest.TestCase):
 
 class CacheManagerPolicyTest(unittest.TestCase):
     def setUp(self) -> None:
+        # These lifecycle fixtures model an authenticated external-tool session.
+        credential_patch = patch("bilikara.bilibili.cfg.COOKIE", "SESSDATA=synthetic; bili_jct=csrf")
+        credential_patch.start()
+        self.addCleanup(credential_patch.stop)
         self.temp_dir = TemporaryDirectory()
         temp_path = Path(self.temp_dir.name)
         self.cache_dir = temp_path / "cache"
@@ -223,31 +388,503 @@ class CacheManagerPolicyTest(unittest.TestCase):
         )
 
     def mark_item_ready_with_files(self, item_id: str) -> None:
-        item_dir = self.cache_dir / item_id
+        token = begin_cache_attempt(self.store, item_id)
+        reservation = self.store.cache_attempt_reservation(token)
+        relative_directory = reservation["artifact_relative_directory"]
+        item_dir = self.cache_dir / relative_directory
         item_dir.mkdir(parents=True, exist_ok=True)
         (item_dir / "video.mp4").write_bytes(b"video")
         (item_dir / "audio.m4a").write_bytes(b"audio")
-        self.store.update_item(
+        self.store.apply_cache_event(
             item_id,
-            cache_status="ready",
-            cache_progress=100.0,
-            cache_message="缓存已完成",
-            video_relative_path=f"{item_id}/video.mp4",
-            video_media_url=f"/media/{item_id}/video.mp4",
-            audio_variants=[
-                {"id": "p1", "label": "P1", "audio_url": f"/media/{item_id}/audio.m4a"}
-            ],
-            selected_audio_variant_id="p1",
-            persist_backup=False,
+            cache_attempt_token=token,
+            event={
+                "kind": "ready",
+                "progress": 100.0,
+                "message": "缓存已完成",
+                "video_relative_path": f"{relative_directory}/video.mp4",
+                "video_media_url": f"/media/{relative_directory}/video.mp4",
+                "audio_variants": [
+                    {
+                        "id": "p1",
+                        "label": "P1",
+                        "page": 1,
+                        "audio_url": f"/media/{relative_directory}/audio.m4a",
+                    }
+                ],
+                "selected_audio_variant_id": "p1",
+                "item_incarnation_id": reservation["item_incarnation_id"],
+                "artifact_set_id": reservation["artifact_set_id"],
+                "artifact_relative_directory": relative_directory,
+            },
         )
 
+    def ready_payload(
+        self,
+        item_id: str,
+        cache_attempt_token: int,
+        *,
+        video_name: str = "video.mp4",
+        audio_name: str = "audio.m4a",
+        variant_id: str = "p1",
+    ) -> dict[str, object]:
+        reservation = self.store.cache_attempt_reservation(cache_attempt_token)
+        relative_directory = reservation["artifact_relative_directory"]
+        return {
+            "video_relative_path": f"{relative_directory}/{video_name}",
+            "video_media_url": f"/media/{relative_directory}/{video_name}",
+            "audio_variants": [
+                {
+                    "id": variant_id,
+                    "label": "P1",
+                    "page": 1,
+                    "audio_url": f"/media/{relative_directory}/{audio_name}",
+                }
+            ],
+            "selected_audio_variant_id": variant_id,
+            "item_incarnation_id": reservation["item_incarnation_id"],
+            "artifact_set_id": reservation["artifact_set_id"],
+            "artifact_relative_directory": relative_directory,
+        }
+
+
+    def add_native_cache_item(self, item_id: str):
+        item = self.make_item(item_id)
+        item.selected_pages = [1]
+        item.selected_cids = [456]
+        item.selected_durations = [120]
+        self.store.add_item(item, requester_name="cache-test-user")
+        return item
+
+    def project_cache_started(
+        self, item_id: str, *, message: str, progress: float | None = None
+    ) -> int:
+        token = begin_cache_attempt(self.store, item_id)
+        self.store.apply_cache_event(
+            item_id,
+            cache_attempt_token=token,
+            event={"kind": "started", "message": message},
+        )
+        if progress is not None:
+            self.store.apply_cache_event(
+                item_id,
+                cache_attempt_token=token,
+                event={
+                    "kind": "progress",
+                    "progress": progress,
+                    "message": message,
+                },
+            )
+        return token
+
+    def project_cache_failed(self, item_id: str, *, message: str) -> None:
+        token = begin_cache_attempt(self.store, item_id)
+        self.store.apply_cache_event(
+            item_id,
+            cache_attempt_token=token,
+            event={"kind": "failed", "message": message},
+        )
+
+    def project_missing_ready(self, item_id: str) -> None:
+        token = begin_cache_attempt(self.store, item_id)
+        payload = self.ready_payload(item_id, token)
+        directory = self.cache_dir / payload["artifact_relative_directory"]
+        directory.mkdir(parents=True)
+        (directory / "synthetic-media").write_bytes(b"published fixture")
+        self.store.apply_cache_event(
+            item_id,
+            cache_attempt_token=token,
+            event={"kind": "ready", "progress": 100.0, "message": "缓存已完成", **payload},
+        )
+        shutil.rmtree(directory)
+
+    def staged_cache_result(
+        self,
+        staging_dir: Path,
+        *,
+        native_tracks_prevalidated: bool = False,
+    ) -> dict[str, object]:
+        video = staging_dir / "video-source.mp4"
+        audio = staging_dir / "audio-source.m4a"
+        video.parent.mkdir(parents=True, exist_ok=True)
+        video.write_bytes(b"video")
+        audio.write_bytes(b"audio")
+        return {
+            "video_file": video,
+            "video_relative_path": str(video.relative_to(self.cache_dir)),
+            "video_media_url": f"/media/{video.relative_to(self.cache_dir).as_posix()}",
+            "audio_variants": [
+                {
+                    "id": "p1",
+                    "label": "P1",
+                    "page": 1,
+                    "audio_url": f"/media/{audio.relative_to(self.cache_dir).as_posix()}",
+                }
+            ],
+            "selected_audio_variant_id": "p1",
+            "validation_files": [
+                {"path": video, "stream_kind": "video", "page": 1},
+                {"path": audio, "stream_kind": "audio", "page": 1},
+            ],
+            "validation_metadata": [{"path": str(video)}, {"path": str(audio)}],
+            "validation_failure_count": 0,
+            "native_tracks_prevalidated": native_tracks_prevalidated,
+        }
+
+
+    def test_external_sources_reserve_before_worker_queueing(self):
+        for index, download_source in enumerate(
+            (DOWNLOAD_SOURCE_YTDLP,),
+            start=1,
+        ):
+            with self.subTest(download_source=download_source), patch.object(
+                CacheManager, "_worker_loop", lambda self: None
+            ):
+                item = self.make_item(f"song-reserve-{index}")
+                self.store.add_item(item, requester_name="cache-test-user")
+                manager = CacheManager(self.store, max_cache_items=1)
+                events: list[str] = []
+                original_begin = manager._begin_cache_attempt
+
+                def reserve(item_id: str, item_incarnation_id: str) -> int:
+                    events.append("reserve")
+                    return original_begin(item_id, item_incarnation_id)
+
+                try:
+                    manager.download_source = download_source
+                    with patch.object(
+                        manager,
+                        "_begin_cache_attempt",
+                        side_effect=reserve,
+                    ), patch.object(
+                        manager.tasks,
+                        "put",
+                        side_effect=lambda _item_id: events.append("queue"),
+                    ):
+                        manager.enqueue(item.id)
+
+                    self.assertEqual(events, ["reserve", "queue"])
+                    self.assertGreater(
+                        manager.python_cache_attempt_tokens[item.id],
+                        0,
+                    )
+                    self.assertEqual(
+                        manager.python_worker_download_sources[item.id],
+                        download_source,
+                    )
+                finally:
+                    manager.shutdown()
+
+    def test_downkyi_checks_cookie_then_reserves_without_starting_work(self):
+        item = self.make_item("song-downkyi-reservation-order")
+        self.store.add_item(item, requester_name="cache-test-user")
+        with patch.object(CacheManager, "_worker_loop", lambda self: None):
+            manager = CacheManager(self.store, max_cache_items=1)
+            events: list[str] = []
+            original_begin = manager._begin_cache_attempt
+
+            def check_cookie() -> str:
+                events.append("cookie")
+                return ""
+
+            def reserve(item_id: str, item_incarnation_id: str) -> int:
+                events.append("reserve")
+                return original_begin(item_id, item_incarnation_id)
+
+            try:
+                manager.download_source = DOWNLOAD_SOURCE_DOWNKYI
+                with patch(
+                    "bilikara.cache.effective_bilibili_cookie",
+                    side_effect=check_cookie,
+                ), patch.object(
+                    manager,
+                    "_begin_cache_attempt",
+                    side_effect=reserve,
+                ), patch.object(
+                    manager.tasks,
+                    "put",
+                ) as queue_work, patch.object(
+                    manager,
+                    "_ensure_downloader",
+                ) as prepare_tool, patch(
+                    "bilikara.cache.subprocess.Popen",
+                ) as spawn_process:
+                    manager.enqueue(item.id)
+
+                self.assertEqual(events, ["cookie"])
+                self.assertEqual(manager.python_cache_attempt_tokens, {})
+                self.assertEqual(manager.python_worker_download_sources, {})
+                queue_work.assert_not_called()
+                prepare_tool.assert_not_called()
+                spawn_process.assert_not_called()
+                self.assertEqual(self.store.get_item(item.id).cache_status, "failed")
+            finally:
+                manager.download_source = DOWNLOAD_SOURCE_YTDLP
+                manager.shutdown()
+
+    def test_external_reservation_failure_starts_no_worker_or_process(self):
+        item = self.make_item("song-reservation-failure")
+        self.store.add_item(item, requester_name="cache-test-user")
+        with patch.object(CacheManager, "_worker_loop", lambda self: None):
+            manager = CacheManager(self.store, max_cache_items=1)
+            try:
+                manager.download_source = DOWNLOAD_SOURCE_YTDLP
+                with patch.object(
+                    manager,
+                    "_begin_cache_attempt",
+                    side_effect=RuntimeError("reservation failed"),
+                ), patch.object(
+                    manager.tasks,
+                    "put",
+                ) as queue_work, patch.object(
+                    manager,
+                    "_ensure_downloader",
+                ) as prepare_tool, patch(
+                    "bilikara.cache.subprocess.Popen",
+                ) as spawn_process:
+                    with self.assertRaisesRegex(RuntimeError, "reservation failed"):
+                        manager.enqueue(item.id)
+
+                queue_work.assert_not_called()
+                prepare_tool.assert_not_called()
+                spawn_process.assert_not_called()
+                self.assertNotIn(item.id, manager.pending_ids)
+                self.assertNotIn(item.id, manager.python_worker_download_sources)
+                self.assertNotIn(item.id, manager.python_cache_attempt_tokens)
+            finally:
+                manager.shutdown()
+
+    def test_stale_python_attempt_starts_no_tool_native_or_subprocess_work(self):
+        old_item = self.make_item("song-reused-id")
+        self.store.add_item(old_item, requester_name="cache-test-user")
+        old_item = self.store.get_item(old_item.id)
+        self.assertIsNotNone(old_item)
+        stale_token = self.store.begin_cache_attempt(
+            old_item.id,
+            old_item.item_incarnation_id,
+        )
+        self.assertTrue(self.store.remove_item(old_item.id))
+        replacement = self.make_item(old_item.id)
+        replacement.bvid = "BV1yy411c7mE"
+        self.store.add_item(replacement, requester_name="cache-test-user")
+
+        with patch.object(CacheManager, "_worker_loop", lambda self: None):
+            manager = CacheManager(self.store, max_cache_items=1)
+            try:
+                manager.download_source = DOWNLOAD_SOURCE_YTDLP
+                with manager.lock:
+                    manager.desired_ids = {old_item.id}
+                    manager.python_worker_download_sources[old_item.id] = (
+                        DOWNLOAD_SOURCE_YTDLP
+                    )
+                    manager.python_cache_attempt_tokens[old_item.id] = stale_token
+                with patch.object(
+                    manager,
+                    "_ensure_downloader",
+                ) as prepare_tool, patch.object(
+                    manager,
+                    "_ensure_ffmpeg",
+                ) as prepare_ffmpeg, patch.object(
+                    manager,
+                    "_native_cache_request",
+                ) as native_work, patch(
+                    "bilikara.cache.subprocess.Popen",
+                ) as spawn_process:
+                    with self.assertRaisesRegex(
+                        (RuntimeError, ValueError),
+                        "unavailable|incarnation changed",
+                    ):
+                        manager._cache_item(old_item.id, stale_token)
+
+                prepare_tool.assert_not_called()
+                prepare_ffmpeg.assert_not_called()
+                native_work.assert_not_called()
+                spawn_process.assert_not_called()
+                self.assertEqual(
+                    manager.python_cache_attempt_tokens[old_item.id],
+                    stale_token,
+                )
+            finally:
+                manager.shutdown()
+
+    def test_stale_manager_shutdown_does_not_clear_reinitialized_owner(self):
+        item = self.make_item("song-removed-before-shutdown")
+        self.store.add_item(item, requester_name="cache-test-user")
+        with patch.object(CacheManager, "_worker_loop", lambda self: None):
+            manager = CacheManager(self.store, max_cache_items=1)
+            replacement_store = PlaylistStore(
+                state_file=Path(self.temp_dir.name) / "replacement-state.json",
+                backup_file=Path(self.temp_dir.name) / "replacement-backup.json",
+            )
+            try:
+                before = replacement_store.snapshot()
+                with patch.object(manager, "_clear_cache_root") as clear_cache:
+                    manager.shutdown()
+
+                clear_cache.assert_not_called()
+                self.assertEqual(replacement_store.snapshot(), before)
+                self.assertTrue(manager.stop_event.is_set())
+            finally:
+                replacement_store.shutdown()
+
+    def test_requeued_python_item_retains_original_source_after_switch(self):
+        worker_loop = CacheManager._worker_loop
+        item = self.make_item("song-python-requeued")
+        self.store.add_item(item, requester_name="cache-test-user")
+        with patch("bilikara.cache.CACHE_DIR", self.cache_dir), patch.object(
+            CacheManager, "_worker_loop", lambda self: None
+        ):
+            manager = CacheManager(self.store, max_cache_items=1)
+            try:
+                manager.download_source = DOWNLOAD_SOURCE_YTDLP
+                manager.enqueue(item.id)
+                with manager.lock:
+                    manager.requeued_active_ids.add(item.id)
+                manager.download_source = DOWNLOAD_SOURCE_NATIVE
+                executed_sources = []
+
+                def interrupt_and_requeue(item_id, _cache_attempt_token):
+                    executed_sources.append(
+                        manager.python_worker_download_sources[item_id]
+                    )
+                    manager.stop_event.set()
+                    return False
+
+                with patch.object(
+                    manager, "_cache_item", side_effect=interrupt_and_requeue
+                ):
+                    worker_loop(manager)
+
+                self.assertEqual(executed_sources, [DOWNLOAD_SOURCE_YTDLP])
+                self.assertEqual(
+                    manager.python_worker_download_sources[item.id],
+                    DOWNLOAD_SOURCE_YTDLP,
+                )
+                self.assertIn(item.id, manager.pending_ids)
+            finally:
+                manager.stop_event.clear()
+                manager.download_source = DOWNLOAD_SOURCE_YTDLP
+                manager.shutdown()
+
+    def test_native_terminal_events_release_bookkeeping_after_source_switch(self):
+        terminal_payloads = {
+            "ready": {
+                "video_relative_path": "video.mp4",
+                "video_media_url": "/media/video.mp4",
+                "audio_variants": [
+                    {
+                        "id": "p1",
+                        "label": "P1",
+                        "page": 1,
+                        "audio_url": "/media/audio.m4a",
+                    }
+                ],
+                "selected_audio_variant_id": "p1",
+            },
+            "failed": {"message": "native failure"},
+            "cancelled": {"reason": "cancelled"},
+            "evicted": {"reason": "evicted"},
+        }
+        with patch("bilikara.cache.CACHE_DIR", self.cache_dir), patch.object(
+            CacheManager, "_worker_loop", lambda self: None
+        ):
+            manager = CacheManager(self.store, max_cache_items=4)
+            try:
+                for sequence, (kind, payload) in enumerate(
+                    terminal_payloads.items(), start=1
+                ):
+                    with self.subTest(kind=kind):
+                        item = self.make_item(f"song-native-{kind}")
+                        self.store.add_item(item, requester_name="cache-test-user")
+                        cache_attempt_token = begin_cache_attempt(self.store, item.id)
+                        if kind == "ready":
+                            payload = self.ready_payload(
+                                item.id,
+                                cache_attempt_token,
+                            )
+                        with manager.lock:
+                            manager.download_source = DOWNLOAD_SOURCE_YTDLP
+                            manager._apply_native_cache_snapshot({
+                                "pending_ids": [item.id], "urgent_item_ids": [item.id],
+                                "active_item_ids": [item.id], "primary_active_item_id": item.id,
+                            })
+
+                        projection = {"kind": kind, "message": kind}
+                        if kind == "ready":
+                            projection.update(payload)
+                        observe_cache_projection(
+                            manager, item.id, cache_attempt_token, projection,
+                            artifact=payload if kind == "ready" else None,
+                        )
+
+                        with manager.lock:
+                            self.assertNotIn(item.id, manager.pending_ids)
+                            self.assertNotIn(item.id, manager.urgent_cache_ids)
+                            self.assertIsNone(manager.active_item_id)
+                        manager.enqueue(item.id)
+                        self.assertEqual(
+                            manager.python_worker_download_sources[item.id],
+                            DOWNLOAD_SOURCE_YTDLP,
+                        )
+                        self.assertEqual(manager.tasks.get_nowait(), item.id)
+                        manager.tasks.task_done()
+                        with manager.lock:
+                            manager.pending_ids.discard(item.id)
+                            manager.python_worker_download_sources.pop(item.id)
+                            manager.python_cache_attempt_tokens.pop(item.id)
+            finally:
+                manager.shutdown()
+
+    def test_native_terminal_event_does_not_clear_active_python_bookkeeping(self):
+        item = self.make_item("song-python-active-after-native")
+        self.store.add_item(item, requester_name="cache-test-user")
+        native_token = begin_cache_attempt(self.store, item.id)
+        python_token = begin_cache_attempt(self.store, item.id)
+        with patch("bilikara.cache.CACHE_DIR", self.cache_dir), patch.object(
+            CacheManager, "_worker_loop", lambda self: None
+        ):
+            manager = CacheManager(self.store, max_cache_items=1)
+            try:
+                with manager.lock:
+                    manager.download_source = DOWNLOAD_SOURCE_YTDLP
+                    manager.python_worker_download_sources[item.id] = (
+                        DOWNLOAD_SOURCE_YTDLP
+                    )
+                    manager.python_cache_attempt_tokens[item.id] = python_token
+                    manager.pending_ids.add(item.id)
+                    manager.urgent_cache_ids.add(item.id)
+                    manager.active_item_id = item.id
+
+                batch = observe_cache_projection(
+                    manager, item.id, native_token,
+                    {"kind": "cancelled", "message": "old native job ended"},
+                )
+                self.assertEqual(batch["effects"]["errors"][0]["kind"], "cache_attempt_superseded")
+
+                with manager.lock:
+                    self.assertIn(item.id, manager.pending_ids)
+                    self.assertIn(item.id, manager.urgent_cache_ids)
+                    self.assertEqual(manager.active_item_id, item.id)
+                    self.assertEqual(
+                        manager.python_worker_download_sources[item.id],
+                        DOWNLOAD_SOURCE_YTDLP,
+                    )
+            finally:
+                manager.shutdown()
+
+
     def test_cache_metrics_reports_usage_by_item(self):
-        first = self.cache_dir / "song-a"
-        second = self.cache_dir / "song-b"
-        first.mkdir()
-        second.mkdir()
-        (first / "video.mp4").write_bytes(b"1234")
-        (second / "video.mp4").write_bytes(b"123456")
+        for item_id in ("song-a", "song-b"):
+            self.store.add_item(
+                self.make_item(item_id), requester_name="cache-test-user"
+            )
+            self.mark_item_ready_with_files(item_id)
+        orphan = self.cache_dir / "artifacts" / "orphan"
+        orphan.mkdir(parents=True)
+        (orphan / "retained.bin").write_bytes(b"retained")
+        staging = self.cache_dir / ".staging" / "attempt"
+        staging.mkdir(parents=True)
+        (staging / "partial.bin").write_bytes(b"partial")
 
         log_dir = Path(self.temp_dir.name) / "logs"
         with patch("bilikara.cache.CACHE_DIR", self.cache_dir), patch("bilikara.cache.LOG_DIR", log_dir):
@@ -257,10 +894,16 @@ class CacheManagerPolicyTest(unittest.TestCase):
             finally:
                 manager.shutdown()
 
-        self.assertEqual(metrics["total_bytes"], 10)
+        self.assertEqual(metrics["total_bytes"], 20)
         self.assertEqual(metrics["item_count"], 2)
-        self.assertEqual(metrics["item_bytes"]["song-a"], 4)
-        self.assertEqual(metrics["item_bytes"]["song-b"], 6)
+        self.assertEqual(metrics["item_bytes"]["song-a"], 10)
+        self.assertEqual(metrics["item_bytes"]["song-b"], 10)
+        self.assertEqual(metrics["retained_bytes"], len(b"retained"))
+        self.assertEqual(metrics["staging_bytes"], len(b"partial"))
+        self.assertEqual(
+            metrics["physical_total_bytes"],
+            metrics["total_bytes"] + metrics["retained_bytes"] + metrics["staging_bytes"],
+        )
 
     def test_set_max_cache_items_clamps_to_picker_range(self):
         with patch("bilikara.cache.CACHE_DIR", self.cache_dir):
@@ -293,102 +936,74 @@ class CacheManagerPolicyTest(unittest.TestCase):
             finally:
                 restored.shutdown()
 
-    def test_cache_policy_persists_download_source(self):
+
+    def test_download_source_change_only_applies_to_future_downloads(self):
+        current = self.make_item("song-a")
+        downloading = self.make_item("song-b")
+        self.store.add_item(current, requester_name="cache-test-user")
+        self.store.add_item(downloading, requester_name="cache-test-user")
+        self.mark_item_ready_with_files(current.id)
+        self.project_cache_started(
+            downloading.id,
+            message="BBDown 下载中",
+            progress=42.0,
+        )
+
+        with patch("bilikara.cache.CACHE_DIR", self.cache_dir), patch(
+            "bilikara.cache.effective_bilibili_cookie", return_value=""
+        ), patch.object(CacheManager, "_worker_loop", lambda self: None):
+            manager = CacheManager(self.store, max_cache_items=3)
+            try:
+                manager.download_source = DOWNLOAD_SOURCE_YTDLP
+                with patch.object(
+                    manager, "_ensure_native_cache_runtime"
+                ), patch.object(
+                    manager,
+                    "_native_cache_request",
+                    side_effect=RuntimeError("native takeover conflict"),
+                ) as native_request:
+                    snapshot = manager.set_cache_policy(
+                        download_source=DOWNLOAD_SOURCE_NATIVE
+                    )
+
+                self.assertEqual(snapshot["download_source"], DOWNLOAD_SOURCE_NATIVE)
+                native_request.assert_not_called()
+                self.assertEqual(self.store.get_item(current.id).cache_status, "ready")
+                downloading_after = self.store.get_item(downloading.id)
+                self.assertEqual(downloading_after.cache_status, "downloading")
+                self.assertEqual(downloading_after.cache_progress, 42.0)
+                self.assertEqual(downloading_after.cache_message, "BBDown 下载中")
+            finally:
+                manager.shutdown()
+
+    def test_cache_policy_preserves_each_download_source(self):
         with patch("bilikara.cache.CACHE_DIR", self.cache_dir):
             manager = CacheManager(self.store, max_cache_items=3)
             try:
-                snapshot = manager.set_cache_policy(download_source=DOWNLOAD_SOURCE_YTDLP)
-                self.assertEqual(snapshot["download_source"], DOWNLOAD_SOURCE_YTDLP)
+                self.assertEqual(
+                    [choice["value"] for choice in manager.policy_snapshot()["download_source_choices"]],
+                    [DOWNLOAD_SOURCE_NATIVE, DOWNLOAD_SOURCE_BBDOWN, DOWNLOAD_SOURCE_DOWNKYI],
+                )
+                for source in (
+                    DOWNLOAD_SOURCE_BBDOWN,
+                    DOWNLOAD_SOURCE_YTDLP,
+                    DOWNLOAD_SOURCE_DOWNKYI,
+                    DOWNLOAD_SOURCE_NATIVE,
+                ):
+                    snapshot = manager.set_cache_policy(download_source=source)
+                    self.assertEqual(snapshot["download_source"], source)
             finally:
                 manager.shutdown()
 
             restored = CacheManager(self.store, max_cache_items=3)
             try:
                 snapshot = restored.policy_snapshot()
-                self.assertEqual(snapshot["download_source"], DOWNLOAD_SOURCE_YTDLP)
+                self.assertEqual(snapshot["download_source"], DOWNLOAD_SOURCE_NATIVE)
             finally:
                 restored.shutdown()
 
-    def test_downkyi_status_prompts_windows_prepare_when_aria2c_missing(self):
-        aria2_dir = Path(self.temp_dir.name) / "tools" / "aria2c"
-        with patch("bilikara.cache.CACHE_DIR", self.cache_dir), patch(
-            "bilikara.cache.ARIA2C_DIR", aria2_dir
-        ), patch("bilikara.cache.ARIA2C_PATH_OVERRIDE", ""), patch(
-            "bilikara.cache.shutil.which", return_value=None
-        ), patch("bilikara.cache.os.name", "nt"), patch.object(
-            CacheManager,
-            "_current_platform_tokens",
-            return_value=("windows", "x64"),
-        ):
-            manager = CacheManager(self.store, max_cache_items=3)
-            try:
-                status = manager.downloader_status(DOWNLOAD_SOURCE_DOWNKYI)
-            finally:
-                manager.shutdown()
 
-        self.assertFalse(status["ready"])
-        self.assertTrue(status["requires_prepare"])
-        self.assertTrue(status["auto_prepare_supported"])
-        self.assertTrue(status["path"].endswith("aria2c.exe"))
-        self.assertIn(str(aria2_dir), status["message"])
 
-    def test_downkyi_status_uses_manual_prepare_on_linux_when_aria2c_missing(self):
-        aria2_dir = Path(self.temp_dir.name) / "tools" / "aria2c"
-        with patch("bilikara.cache.CACHE_DIR", self.cache_dir), patch(
-            "bilikara.cache.ARIA2C_DIR", aria2_dir
-        ), patch("bilikara.cache.ARIA2C_PATH_OVERRIDE", ""), patch(
-            "bilikara.cache.shutil.which", return_value=None
-        ), patch(
-            "bilikara.cache.TOOL_ASSET_BASE_URL", "https://download.example/bilikara/tools"
-        ), patch("bilikara.cache.os.name", "posix"), patch.object(
-            CacheManager, "_system_aria2c_path", return_value=None
-        ), patch.object(
-            CacheManager,
-            "_current_platform_tokens",
-            return_value=("linux", "x64"),
-        ):
-            manager = CacheManager(self.store, max_cache_items=3)
-            try:
-                status = manager.downloader_status(DOWNLOAD_SOURCE_DOWNKYI)
-            finally:
-                manager.shutdown()
-
-        self.assertFalse(status["ready"])
-        self.assertTrue(status["requires_prepare"])
-        self.assertFalse(status["auto_prepare_supported"])
-        self.assertTrue(status["path"].endswith("aria2c"))
-        self.assertIn(str(aria2_dir), status["message"])
-
-    def test_downkyi_status_uses_manual_prepare_when_fallback_asset_unavailable(self):
-        aria2_dir = Path(self.temp_dir.name) / "tools" / "aria2c"
-        with patch("bilikara.cache.CACHE_DIR", self.cache_dir), patch(
-            "bilikara.cache.ARIA2C_DIR", aria2_dir
-        ), patch("bilikara.cache.ARIA2C_PATH_OVERRIDE", ""), patch(
-            "bilikara.cache.shutil.which", return_value=None
-        ), patch(
-            "bilikara.cache.TOOL_ASSET_BASE_URL", ""
-        ), patch("bilikara.cache.os.name", "posix"), patch.object(
-            CacheManager, "_system_aria2c_path", return_value=None
-        ), patch.object(
-            CacheManager,
-            "_current_platform_tokens",
-            return_value=("linux", "riscv64"),
-        ):
-            manager = CacheManager(self.store, max_cache_items=3)
-            try:
-                status = manager.downloader_status(DOWNLOAD_SOURCE_DOWNKYI)
-                with patch.object(manager, "_install_aria2c") as install:
-                    with self.assertRaisesRegex(RuntimeError, "手动安装"):
-                        manager.prepare_downloader(DOWNLOAD_SOURCE_DOWNKYI)
-                    install.assert_not_called()
-            finally:
-                manager.shutdown()
-
-        self.assertFalse(status["ready"])
-        self.assertTrue(status["requires_prepare"])
-        self.assertFalse(status["auto_prepare_supported"])
-        self.assertTrue(status["path"].endswith("aria2c"))
-        self.assertIn(str(aria2_dir), status["message"])
 
 
     def test_prepare_downkyi_reports_missing_auto_package_for_404_without_polluting_current_source(self):
@@ -421,95 +1036,45 @@ class CacheManagerPolicyTest(unittest.TestCase):
         finally:
             manager.shutdown()
 
-    def test_downkyi_status_accepts_local_aria2c_binary(self):
-        aria2_dir = Path(self.temp_dir.name) / "tools" / "aria2c"
-        target_path = aria2_dir / "aria2c"
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        target_path.write_bytes(b"aria2c-bin")
 
-        with patch("bilikara.cache.CACHE_DIR", self.cache_dir), patch(
-            "bilikara.cache.ARIA2C_DIR", aria2_dir
-        ), patch("bilikara.cache.ARIA2C_PATH_OVERRIDE", ""), patch(
-            "bilikara.cache.os.name", "posix"
-        ), patch.object(
-            CacheManager,
-            "_system_aria2c_path",
-            return_value=None,
-        ), patch.object(
-            CacheManager,
-            "_current_platform_tokens",
-            return_value=("linux", "x64"),
-        ):
-            manager = CacheManager(self.store, max_cache_items=3)
-            try:
-                with patch.object(manager, "_read_aria2c_version", return_value="1.37.0"):
-                    status = manager.downloader_status(DOWNLOAD_SOURCE_DOWNKYI)
-            finally:
-                manager.shutdown()
-
-        self.assertTrue(status["ready"])
-        self.assertFalse(status["requires_prepare"])
-        self.assertEqual(status["path"], str(target_path))
-        self.assertEqual(status["version"], "1.37.0")
-
-    def test_macos_direct_metadata_enables_prepare_without_homebrew_or_path(self):
-        root = Path(self.temp_dir.name) / "macos-direct-status"
-        executable = root / "bilikara.app" / "Contents" / "MacOS" / "bilikara"
-        metadata_path = (
-            executable.parent.parent / "Resources" / "vendor" / "aria2-macos.json"
-        )
-        metadata_path.parent.mkdir(parents=True)
-        revision = "a" * 40
-        asset_name = f"aria2-1.37.0-macos-arm64-{revision}.tar.gz"
-        metadata_path.write_text(
-            json.dumps(
-                {
-                    "schema_version": 2,
-                    "tool": "aria2c",
-                    "provider": "bilikara-r2",
-                    "platform": "darwin",
-                    "arch": "arm64",
-                    "name": asset_name,
-                    "url": f"https://download.example/bilikara/tools/aria2/1.37.0/{revision}/{asset_name}",
-                    "sha256": "b" * 64,
-                    "version": "1.37.0",
-                    "source_url": (
-                        "https://github.com/aria2/aria2/releases/download/"
-                        "release-1.37.0/aria2-1.37.0.tar.xz"
-                    ),
-                    "source_sha256": (
-                        "60a420ad7085eb616cb6e2bdf0a7206d68ff3d37fb5a956dc44242eb2f79b66b"
-                    ),
-                    "recipe_revision": revision,
-                }
-            ),
-            encoding="utf-8",
-        )
+    def test_native_aria2_prepare_status_does_not_use_python_platform_discovery(self):
+        root = Path(self.temp_dir.name)
         aria2_dir = root / "tools" / "aria2c"
+        vendor = root / "vendor"
+        internal = root / "internal-vendor"
+        decision = {
+            "ready": False, "auto_prepare_supported": True,
+            "path": str(aria2_dir / "aria2c"), "version": "",
+            "message": "Pinned native preparation is available", "kind": "unavailable",
+        }
+        # Platform/metadata/PATH policy now belongs to Rust. A Python platform
+        # mock cannot change the compiled runtime or the runner's installed tools.
         with patch("bilikara.cache.CACHE_DIR", self.cache_dir), patch(
             "bilikara.cache.ARIA2C_DIR", aria2_dir
         ), patch("bilikara.cache.ARIA2C_PATH_OVERRIDE", ""), patch(
-            "bilikara.cache.ARIA2_MACOS_METADATA_PATH",
-            root / "missing-vendor" / "aria2-macos.json",
-        ), patch("bilikara.cache.INTERNAL_VENDOR_DIR", root / "missing-internal"), patch(
-            "bilikara.cache.TOOL_ASSET_BASE_URL",
-            "https://download.example/bilikara/tools",
-        ), patch("bilikara.cache.PACKAGED_RUNTIME", True), patch(
-            "bilikara.cache.sys.executable", str(executable)
-        ), patch.object(CacheManager, "_system_aria2c_path", return_value=None), patch.object(
-            CacheManager, "_brew_executable", return_value=None
+            "bilikara.cache.VENDOR_DIR", vendor
+        ), patch("bilikara.cache.INTERNAL_VENDOR_DIR", internal), patch(
+            "bilikara.cache.rust_runtime.configure_aria2", return_value=decision
+        ) as configure, patch.object(
+            CacheManager, "_system_aria2c_path", side_effect=AssertionError("Python PATH policy")
         ), patch.object(
-            CacheManager, "_current_platform_tokens", return_value=("darwin", "arm64")
+            CacheManager, "_brew_executable", side_effect=AssertionError("Python platform policy")
         ):
             manager = CacheManager(self.store, max_cache_items=3)
             try:
                 status = manager.downloader_status(DOWNLOAD_SOURCE_DOWNKYI)
+                configure.assert_called_once_with(
+                    owner=manager._artifact_owner, directory=aria2_dir,
+                    override_path=None, vendor_roots=[vendor, internal], install=False,
+                )
             finally:
                 manager.shutdown()
 
         self.assertFalse(status["ready"])
         self.assertTrue(status["auto_prepare_supported"])
         self.assertTrue(status["requires_prepare"])
+        for key, value in decision.items():
+            self.assertEqual(status[key], value)
 
     def test_macos_direct_prepare_downloads_validates_and_publishes_atomically(self):
         root = Path(self.temp_dir.name) / "macos-direct-install"
@@ -614,43 +1179,8 @@ class CacheManagerPolicyTest(unittest.TestCase):
                 manager.shutdown()
 
         self.assertEqual(target.read_bytes(), b"existing-runtime")
-        self.assertEqual(manager.download_source, "bbdown")
+        self.assertEqual(manager.download_source, DOWNLOAD_SOURCE_NATIVE)
 
-    def test_existing_runtime_aria2c_skips_all_preparation_network(self):
-        aria2_dir = Path(self.temp_dir.name) / "existing-aria2" / "tools" / "aria2c"
-        target = aria2_dir / ("aria2c.exe" if os.name == "nt" else "aria2c")
-        target.parent.mkdir(parents=True)
-        target.write_bytes(b"existing-aria2")
-        with patch("bilikara.cache.CACHE_DIR", self.cache_dir), patch(
-            "bilikara.cache.ARIA2C_DIR", aria2_dir
-        ), patch("bilikara.cache.ARIA2C_PATH_OVERRIDE", ""), patch.object(
-            CacheManager, "_system_aria2c_path", return_value=None
-        ):
-            manager = CacheManager(self.store, max_cache_items=3)
-            try:
-                with patch.object(manager, "_local_aria2c_binary_path", return_value=target), patch.object(
-                    manager, "_read_aria2c_version", return_value="1.37.0"
-                ), patch.object(manager, "_install_aria2c") as install, patch.object(
-                    manager, "_fetch_aria2_release"
-                ) as fetch:
-                    self.assertEqual(manager._ensure_aria2c(), target)
-            finally:
-                manager.shutdown()
-        install.assert_not_called()
-        fetch.assert_not_called()
-
-    def test_bbdown_stream_preference_args_use_cache_policy(self):
-        with patch("bilikara.cache.CACHE_DIR", self.cache_dir):
-            manager = CacheManager(self.store, max_cache_items=3)
-            try:
-                manager.set_cache_policy(video_quality="720P 高清", audio_hires=False)
-                self.assertEqual(
-                    manager._bbdown_stream_preference_args("video"),
-                    ["-q", "720P 高清,480P 清晰,360P 流畅"],
-                )
-                self.assertEqual(manager._bbdown_stream_preference_args("audio"), ["--audio-ascending"])
-            finally:
-                manager.shutdown()
 
     def test_ytdlp_download_command_uses_policy_and_login_cookie(self):
         target_dir = self.cache_dir / "song-a" / "video-p2"
@@ -730,30 +1260,6 @@ class CacheManagerPolicyTest(unittest.TestCase):
         self.assertEqual(command[command.index("--cookies-from-browser") + 1], "firefox")
         self.assertNotIn("--add-header", command)
 
-    def test_bbdown_stream_preference_args_force_avc_when_hevc_unsupported(self):
-        with patch("bilikara.cache.CACHE_DIR", self.cache_dir):
-            manager = CacheManager(self.store, max_cache_items=3)
-            try:
-                snapshot = manager.set_client_media_capabilities(
-                    {
-                        "hevc_supported": False,
-                        "avc_supported": True,
-                        "max_avc_quality_index": 2,
-                        "can_play_type": {'video/mp4; codecs="hvc1"': ""},
-                        "user_agent": "Firefox on Windows 7",
-                        "platform": "Win32",
-                    }
-                )
-                self.assertTrue(snapshot["force_avc"])
-                self.assertEqual(snapshot["max_avc_quality"], VIDEO_QUALITY_CHOICES[2])
-                self.assertEqual(
-                    manager._bbdown_stream_preference_args("video"),
-                    ["-q", ",".join(VIDEO_QUALITY_CHOICES[2:]), "-e", "avc"],
-                )
-                self.assertEqual(manager._bbdown_stream_preference_args("audio"), [])
-            finally:
-                manager.shutdown()
-
     def test_avc_quality_cap_does_not_raise_lower_manual_quality(self):
         with patch("bilikara.cache.CACHE_DIR", self.cache_dir):
             manager = CacheManager(self.store, max_cache_items=3)
@@ -769,8 +1275,8 @@ class CacheManagerPolicyTest(unittest.TestCase):
                     }
                 )
                 self.assertEqual(
-                    manager._bbdown_stream_preference_args("video"),
-                    ["-q", ",".join(VIDEO_QUALITY_CHOICES[manual_quality_index:]), "-e", "avc"],
+                    manager._video_quality_priority(manager.video_quality, manager.avc_quality_cap),
+                    ",".join(VIDEO_QUALITY_CHOICES[manual_quality_index:]),
                 )
             finally:
                 manager.shutdown()
@@ -782,34 +1288,22 @@ class CacheManagerPolicyTest(unittest.TestCase):
                 snapshot = manager.set_client_media_capabilities({"hevc_supported": False})
                 self.assertEqual(snapshot["max_avc_quality"], VIDEO_QUALITY_CHOICES[-1])
                 self.assertEqual(
-                    manager._bbdown_stream_preference_args("video"),
-                    ["-q", VIDEO_QUALITY_CHOICES[-1], "-e", "avc"],
+                    manager._video_quality_priority(manager.video_quality, manager.avc_quality_cap),
+                    VIDEO_QUALITY_CHOICES[-1],
                 )
             finally:
                 manager.shutdown()
 
     def test_hevc_unsupported_requeues_desired_ready_items_for_avc(self):
-        item_dir = self.cache_dir / "song-a"
-        video_file = item_dir / "video-p1" / "video.mp4"
-        video_file.parent.mkdir(parents=True, exist_ok=True)
-        video_file.write_bytes(b"media")
-
         with patch("bilikara.cache.CACHE_DIR", self.cache_dir):
             manager = CacheManager(self.store, max_cache_items=3)
             try:
+                manager.download_source = DOWNLOAD_SOURCE_YTDLP
                 item = self.make_item("song-a")
                 self.store.add_item(item, requester_name="cache-test-user")
-                self.store.update_item(
-                    "song-a",
-                    cache_status="ready",
-                    cache_progress=100.0,
-                    cache_message="ready",
-                    video_relative_path="song-a/video-p1/video.mp4",
-                    video_media_url="/media/song-a/video-p1/video.mp4",
-                    audio_variants=[{"id": "p1", "audio_url": "/media/song-a/audio-p1/audio.m4a"}],
-                    selected_audio_variant_id="p1",
-                    persist_backup=False,
-                )
+                self.mark_item_ready_with_files("song-a")
+                before = self.store.get_item("song-a")
+                item_dir = self.cache_dir / before.artifact_relative_directory
                 with manager.lock:
                     manager.desired_ids = {"song-a"}
                 with patch.object(manager, "enqueue") as enqueue_mock:
@@ -817,13 +1311,198 @@ class CacheManagerPolicyTest(unittest.TestCase):
 
                 refreshed = self.store.get_item("song-a")
                 self.assertIsNotNone(refreshed)
-                self.assertEqual(refreshed.cache_status, "pending")
-                self.assertEqual(refreshed.video_media_url, "")
-                self.assertEqual(refreshed.audio_variants, [])
-                self.assertFalse(item_dir.exists())
+                self.assertEqual(refreshed.cache_status, "ready")
+                self.assertEqual(refreshed.video_media_url, before.video_media_url)
+                self.assertEqual(refreshed.audio_variants, before.audio_variants)
+                self.assertEqual(refreshed.selected_audio_variant_id, "p1")
+                self.assertTrue(item_dir.exists())
                 enqueue_mock.assert_called_once_with("song-a")
             finally:
                 manager.shutdown()
+
+
+    def manager_bookkeeping(self, manager) -> dict:
+        with manager.lock:
+            return {
+                "python_owners": dict(manager.python_worker_download_sources),
+                "python_attempt_tokens": dict(manager.python_cache_attempt_tokens),
+                "retry_requested_ids": sorted(manager.retry_requested_ids),
+                "pending_ids": sorted(manager.pending_ids),
+                "settling_cache_attempt_tokens": sorted(
+                    manager.settling_cache_attempt_tokens
+                ),
+            }
+
+
+    def run_urgent_settlement(self, item_id: str, *, fail: bool) -> dict:
+        """Run one urgent attempt whose identity is replaced before it starts.
+
+        A replacement request handed over before the urgent lane runs makes
+        ``_cache_item`` swap the attempt identity, so the token the caller passed
+        in no longer describes what the worker settles.  ``fail`` selects whether
+        that replaced attempt publishes or raises, because settlement must know
+        the final identity on both exits.
+        """
+        item = self.add_native_cache_item(item_id)
+        attempts: list[int] = []
+
+        with patch("bilikara.cache.CACHE_DIR", self.cache_dir), patch.object(
+            CacheManager, "_worker_loop", lambda self: None
+        ):
+            manager = CacheManager(self.store, max_cache_items=3)
+            try:
+                manager.download_source = DOWNLOAD_SOURCE_YTDLP
+                entry_token = begin_cache_attempt(self.store, item.id)
+                with manager.lock:
+                    manager.desired_ids = {item.id}
+                    manager.ordered_desired_ids = [item.id]
+                    manager.pending_ids.add(item.id)
+                    manager.python_worker_download_sources[item.id] = (
+                        DOWNLOAD_SOURCE_YTDLP
+                    )
+                    manager.python_cache_attempt_tokens[item.id] = entry_token
+                    # A replacement request handed over before the urgent lane
+                    # runs makes _cache_item swap the attempt identity, which is
+                    # exactly the case the entry token no longer describes.
+                    manager.retry_requested_ids.add(item.id)
+
+                def external_download(
+                    _item,
+                    _binary_path,
+                    _ffmpeg_path,
+                    item_dir,
+                    _log_path,
+                    *,
+                    cache_attempt_token,
+                    download_source,
+                ):
+                    attempts.append(cache_attempt_token)
+                    if fail:
+                        raise DownloadCommandError("synthetic external failure")
+                    return self.staged_cache_result(item_dir)
+
+                with patch.object(
+                    manager, "_ensure_downloader", return_value=Path(sys.executable)
+                ), patch.object(
+                    manager, "_ensure_ffmpeg", return_value=Path(sys.executable)
+                ), patch.object(
+                    manager, "_download_selected_streams", side_effect=external_download
+                ), patch.object(
+                    manager, "_validate_cache_result"
+                ), patch(
+                    "bilikara.cache.rust_runtime.http_download_available",
+                    return_value=True,
+                ), patch(
+                    "bilikara.cache.rust_runtime.media_backend_available",
+                    return_value=True,
+                ), patch.object(manager, "sync_with_playlist"):
+                    manager._urgent_cache_worker(item.id, entry_token)
+
+                state = self.manager_bookkeeping(manager)
+                observed = self.store.get_item(item.id)
+            finally:
+                manager.shutdown()
+
+        self.assertEqual(len(attempts), 1)
+        return {
+            "item_id": item.id,
+            "entry_token": entry_token,
+            "final_token": attempts[0],
+            "state": state,
+            "cache_status": observed.cache_status,
+        }
+
+    def assert_urgent_settlement_released(self, observed: dict) -> None:
+        item_id = observed["item_id"]
+        state = observed["state"]
+        # The identity really was replaced, so settling by the entry token alone
+        # would leave the record the worker actually ran under.
+        self.assertNotEqual(observed["final_token"], observed["entry_token"])
+        self.assertNotIn(item_id, state["python_owners"])
+        self.assertNotIn(item_id, state["pending_ids"])
+        self.assertNotIn(item_id, state["retry_requested_ids"])
+        self.assertNotIn(item_id, state["python_attempt_tokens"])
+        self.assertFalse(
+            {observed["entry_token"], observed["final_token"]}
+            & set(state["settling_cache_attempt_tokens"])
+        )
+
+    def test_urgent_worker_settles_by_its_final_attempt_identity(self):
+        """S1-R3: the urgent lane settles the identity it actually ran."""
+        observed = self.run_urgent_settlement("song-urgent-settlement", fail=False)
+        self.assertEqual(observed["cache_status"], "ready")
+        self.assert_urgent_settlement_released(observed)
+
+    def test_urgent_worker_settles_final_identity_after_a_failed_attempt(self):
+        """S1-R3: the final identity is still known when the attempt raises."""
+        observed = self.run_urgent_settlement("song-urgent-failure", fail=True)
+        self.assertEqual(observed["cache_status"], "failed")
+        self.assert_urgent_settlement_released(observed)
+
+    def test_worker_settlement_preserves_a_newer_independent_attempt(self):
+        """S1-R3: settlement releases only what the exiting worker owned."""
+        item = self.add_native_cache_item("song-settlement-scope")
+        with patch("bilikara.cache.CACHE_DIR", self.cache_dir), patch.object(
+            CacheManager, "_worker_loop", lambda self: None
+        ):
+            manager = CacheManager(self.store, max_cache_items=3)
+            try:
+                exiting_tokens = {
+                    begin_cache_attempt(self.store, item.id),
+                    begin_cache_attempt(self.store, item.id),
+                }
+                newer_token = begin_cache_attempt(self.store, item.id)
+                self.assertNotIn(newer_token, exiting_tokens)
+                with manager.lock:
+                    manager.pending_ids.add(item.id)
+                    manager.retry_requested_ids.add(item.id)
+                    manager.python_worker_download_sources[item.id] = (
+                        DOWNLOAD_SOURCE_YTDLP
+                    )
+                    # A genuinely newer independent executor already owns the
+                    # item's attempt when the previous worker exits.
+                    manager.python_cache_attempt_tokens[item.id] = newer_token
+                    manager.settling_cache_attempt_tokens.update(exiting_tokens)
+                    manager.settling_cache_attempt_tokens.add(newer_token)
+                    manager._release_worker_attempt_bookkeeping_locked(
+                        item.id,
+                        exiting_tokens,
+                        release_ownership=True,
+                    )
+                    preserved = self.manager_bookkeeping(manager)
+
+                    # The same helper releases the record once the exiting
+                    # worker is the identity actually recorded for the item.
+                    manager._release_worker_attempt_bookkeeping_locked(
+                        item.id,
+                        {newer_token},
+                        release_ownership=True,
+                    )
+                    released = self.manager_bookkeeping(manager)
+            finally:
+                manager.shutdown()
+
+        self.assertEqual(
+            preserved["python_attempt_tokens"], {item.id: newer_token}
+        )
+        self.assertEqual(
+            preserved["python_owners"], {item.id: DOWNLOAD_SOURCE_YTDLP}
+        )
+        self.assertEqual(preserved["pending_ids"], [item.id])
+        self.assertEqual(preserved["retry_requested_ids"], [item.id])
+        self.assertFalse(
+            exiting_tokens & set(preserved["settling_cache_attempt_tokens"])
+        )
+        self.assertIn(
+            newer_token, preserved["settling_cache_attempt_tokens"]
+        )
+        self.assertEqual(released["python_attempt_tokens"], {})
+        self.assertEqual(released["python_owners"], {})
+        self.assertEqual(released["pending_ids"], [])
+        self.assertEqual(released["retry_requested_ids"], [])
+        self.assertNotIn(
+            newer_token, released["settling_cache_attempt_tokens"]
+        )
 
     def test_hidden_process_kwargs_hides_windows_console(self):
         with patch("bilikara.cache.os.name", "nt"):
@@ -882,11 +1561,10 @@ class CacheManagerPolicyTest(unittest.TestCase):
                 log_path = manager._item_log_path("song-a")
                 manager._append_log_line(log_path, "缓存日志")
                 manager._drop_item_cache("song-a", "释放缓存")
+                self.assertTrue(item_dir.exists())
+                self.assertFalse(log_path.exists())
             finally:
                 manager.shutdown()
-
-        self.assertFalse(item_dir.exists())
-        self.assertFalse(log_path.exists())
 
     def test_remove_cache_dir_ignores_windows_missing_path_race(self):
         log_dir = Path(self.temp_dir.name) / "logs"
@@ -899,11 +1577,13 @@ class CacheManagerPolicyTest(unittest.TestCase):
         ) as rmtree_mock:
             manager = CacheManager(self.store, max_cache_items=3)
             try:
-                manager._remove_cache_dir("song-a")
+                manager._remove_cache_dir("song-a", cache_attempt_token=41)
             finally:
                 manager.shutdown()
 
-        rmtree_mock.assert_called_once_with(self.cache_dir / "song-a", ignore_errors=True)
+        rmtree_mock.assert_called_once_with(
+            self.cache_dir / ".staging" / "attempt-41", ignore_errors=True
+        )
 
     def test_path_size_ignores_directory_removed_during_scan(self):
         item_dir = self.cache_dir / "song-a"
@@ -962,6 +1642,7 @@ class CacheManagerPolicyTest(unittest.TestCase):
         ):
             manager = CacheManager(self.store, max_cache_items=3)
             try:
+                manager.download_source = DOWNLOAD_SOURCE_YTDLP
                 item = self.make_item("song-a")
                 item.page = 2
                 item.video_page = 2
@@ -988,22 +1669,11 @@ class CacheManagerPolicyTest(unittest.TestCase):
         ):
             manager = CacheManager(self.store, max_cache_items=3)
             try:
+                manager.download_source = DOWNLOAD_SOURCE_YTDLP
                 self.store.add_item(self.make_item("song-a"), requester_name="cache-test-user")
                 self.store.add_item(self.make_item("song-b"), requester_name="cache-test-user")
                 self.store.add_item(self.make_item("song-c"), requester_name="cache-test-user")
-                self.store.update_item(
-                    "song-a",
-                    cache_status="ready",
-                    cache_progress=100.0,
-                    cache_message="缓存已完成",
-                    video_relative_path="song-a/video.mp4",
-                    video_media_url="/media/song-a/video.mp4",
-                    audio_variants=[
-                        {"id": "p1", "label": "P1", "audio_url": "/media/song-a/audio.m4a"}
-                    ],
-                    selected_audio_variant_id="p1",
-                    persist_backup=False,
-                )
+                self.project_missing_ready("song-a")
                 with manager.lock:
                     manager.pending_ids = {"song-b", "song-c"}
                     for item_id in ["song-b", "song-c"]:
@@ -1036,23 +1706,9 @@ class CacheManagerPolicyTest(unittest.TestCase):
         ):
             manager = CacheManager(self.store, max_cache_items=1)
             try:
+                manager.download_source = DOWNLOAD_SOURCE_YTDLP
                 self.store.add_item(self.make_item("song-a"), requester_name="cache-test-user")
-                self.store.update_item(
-                    "song-a",
-                    cache_status="ready",
-                    cache_progress=100.0,
-                    cache_message="缓存已完成",
-                    video_relative_path="song-a/missing-video.mp4",
-                    video_media_url="/media/song-a/missing-video.mp4",
-                    audio_variants=[
-                        {
-                            "id": "p1",
-                            "label": "P1",
-                            "audio_url": "/media/song-a/missing-audio.m4a",
-                        }
-                    ],
-                    persist_backup=False,
-                )
+                self.project_missing_ready("song-a")
                 events = []
                 planned_statuses = []
                 original_planner = manager._plan_cache_snapshot
@@ -1091,6 +1747,7 @@ class CacheManagerPolicyTest(unittest.TestCase):
         ):
             manager = CacheManager(self.store, max_cache_items=3)
             try:
+                manager.download_source = DOWNLOAD_SOURCE_YTDLP
                 for item_id in ["song-a", "song-b", "song-c", "song-d"]:
                     self.store.add_item(self.make_item(item_id), requester_name="cache-test-user")
                 self.mark_item_ready_with_files("song-a")
@@ -1104,7 +1761,9 @@ class CacheManagerPolicyTest(unittest.TestCase):
                 song_a = self.store.get_item("song-a")
                 self.assertIsNotNone(song_a)
                 self.assertEqual(song_a.cache_status, "ready")
-                self.assertTrue((self.cache_dir / "song-a").exists())
+                self.assertTrue(
+                    (self.cache_dir / song_a.artifact_relative_directory).exists()
+                )
                 self.assertEqual(manager.desired_ids, {"song-a", "song-b", "song-c"})
                 self.assertEqual(manager.ordered_desired_ids, ["song-b", "song-c"])
                 self.assertEqual(planner_mock.call_count, 1)
@@ -1165,6 +1824,7 @@ class CacheManagerPolicyTest(unittest.TestCase):
                 kill=lambda: None,
             )
             try:
+                manager.download_source = DOWNLOAD_SOURCE_YTDLP
                 for item_id in ["song-a", "song-b", "song-c"]:
                     self.store.add_item(self.make_item(item_id), requester_name="cache-test-user")
                 with manager.lock:
@@ -1227,6 +1887,7 @@ class CacheManagerPolicyTest(unittest.TestCase):
         ):
             manager = CacheManager(self.store, max_cache_items=2)
             try:
+                manager.download_source = DOWNLOAD_SOURCE_YTDLP
                 for item_id in ["song-a", "song-b"]:
                     self.store.add_item(self.make_item(item_id), requester_name="cache-test-user")
                 state_plan = CachePlan(
@@ -1277,34 +1938,30 @@ class CacheManagerPolicyTest(unittest.TestCase):
         ):
             manager = CacheManager(self.store, max_cache_items=3)
             try:
+                manager.download_source = DOWNLOAD_SOURCE_NATIVE
                 item = self.make_item("song-a")
                 self.store.add_item(item, requester_name="cache-test-user")
+                item = self.store.get_item(item.id)
+                self.assertIsNotNone(item)
                 with manager.lock:
                     manager.desired_ids = {"song-a"}
                     manager.ordered_desired_ids = ["song-a"]
-                cache_result = {
-                    "video_file": Path("/tmp/video.mp4"),
-                    "video_relative_path": "song-a/video.mp4",
-                    "video_media_url": "/media/song-a/video.mp4",
-                    "audio_variants": [
-                        {"id": "p1", "label": "P1", "audio_url": "/media/song-a/audio.m4a"}
-                    ],
-                    "selected_audio_variant_id": "p1",
-                    "validation_files": [],
-                }
-                with patch.object(manager, "_ensure_bbdown", return_value=Path("/tools/BBDown")), patch.object(
-                    manager,
-                    "_ensure_ffmpeg",
-                    return_value=Path("/tools/ffmpeg"),
+                    manager.python_worker_download_sources["song-a"] = (
+                        DOWNLOAD_SOURCE_NATIVE
+                    )
+                with patch("bilikara.cache.rust_runtime.http_download_available", return_value=True), patch(
+                    "bilikara.cache.rust_runtime.media_backend_available", return_value=True
                 ), patch.object(
                     manager,
                     "_download_selected_streams",
-                    return_value=cache_result,
-                ), patch.object(manager, "_validate_cache_result"), patch.object(
+                    side_effect=lambda *_args, **_kwargs: self.staged_cache_result(
+                        _args[3], native_tracks_prevalidated=True
+                    ),
+                ), patch.object(
                     manager,
                     "sync_with_playlist",
                 ) as sync_mock:
-                    should_resync = manager._cache_item_multi("song-a", item, allow_refresh_retry=True)
+                    should_resync = manager._cache_item_multi("song-a", item)
 
                 cached = self.store.get_item("song-a")
                 self.assertIsNotNone(cached)
@@ -1314,7 +1971,200 @@ class CacheManagerPolicyTest(unittest.TestCase):
             finally:
                 manager.shutdown()
 
-    def test_downkyi_prevalidated_tracks_skip_later_batch_remux_and_validation(self):
+    def test_python_cache_lifecycle_uses_typed_appstate_events(self):
+        item = self.make_item("song-python-events")
+        self.store.add_item(item, requester_name="cache-test-user")
+        item = self.store.get_item(item.id)
+        self.assertIsNotNone(item)
+        with patch("bilikara.cache.CACHE_DIR", self.cache_dir), patch.object(
+            CacheManager,
+            "_worker_loop",
+            lambda self: None,
+        ):
+            manager = CacheManager(self.store, max_cache_items=3)
+            try:
+                with manager.lock:
+                    manager.download_source = DOWNLOAD_SOURCE_YTDLP
+                    manager.desired_ids = {item.id}
+                    manager.ordered_desired_ids = [item.id]
+                    manager.python_worker_download_sources[item.id] = (
+                        DOWNLOAD_SOURCE_YTDLP
+                    )
+
+                projected_events: list[tuple[int, dict[str, object]]] = []
+                operation_order: list[str] = []
+                apply_cache_event = self.store.apply_cache_event
+                begin_cache_attempt = manager._begin_cache_attempt
+
+                def reserve_attempt(
+                    item_id: str,
+                    item_incarnation_id: str,
+                ) -> int:
+                    operation_order.append("reserve")
+                    return begin_cache_attempt(item_id, item_incarnation_id)
+
+                def record_event(
+                    item_id: str,
+                    *,
+                    cache_attempt_token: int,
+                    event: dict[str, object],
+                ) -> bool:
+                    projected_events.append((cache_attempt_token, dict(event)))
+                    return apply_cache_event(
+                        item_id,
+                        cache_attempt_token=cache_attempt_token,
+                        event=event,
+                    )
+
+                def download_with_progress(*_args, **_kwargs):
+                    operation_order.append("download")
+                    manager._project_cache_progress(
+                        item.id,
+                        cache_attempt_token=_kwargs["cache_attempt_token"],
+                        progress=42.0,
+                        message="BBDown 缓存中 42%",
+                    )
+                    return self.staged_cache_result(_args[3])
+
+                with patch.object(
+                    self.store,
+                    "apply_cache_event",
+                    side_effect=record_event,
+                ), patch.object(
+                    manager,
+                    "_begin_cache_attempt",
+                    side_effect=reserve_attempt,
+                ), patch.object(
+                    self.store,
+                    "update_item",
+                    side_effect=AssertionError("generic item patch used by cache worker"),
+                ), patch.object(
+                    manager,
+                    "_ensure_downloader",
+                    side_effect=lambda _source: (
+                        operation_order.append("prepare-downloader")
+                        or Path("BBDown")
+                    ),
+                ), patch.object(
+                    manager,
+                    "_ensure_ffmpeg",
+                    side_effect=lambda **_kwargs: (
+                        operation_order.append("prepare-ffmpeg")
+                        or Path("ffmpeg")
+                    ),
+                ), patch.object(
+                    manager,
+                    "_download_selected_streams",
+                    side_effect=download_with_progress,
+                ), patch.object(manager, "_validate_cache_result"):
+                    self.assertTrue(
+                        manager._cache_item_multi(
+                            item.id,
+                            item,
+                        )
+                    )
+
+                self.assertEqual(
+                    [event["kind"] for _, event in projected_events],
+                    ["queued", "started", "progress", "ready"],
+                )
+                self.assertEqual(
+                    [token for token, _ in projected_events],
+                    [projected_events[0][0]] * 4,
+                )
+                self.assertGreater(projected_events[0][0], 0)
+                self.assertEqual(
+                    operation_order,
+                    ["reserve", "prepare-downloader", "prepare-ffmpeg", "download"],
+                )
+                cached = self.store.get_item(item.id)
+                self.assertEqual(cached.cache_status, "ready")
+                self.assertEqual(
+                    cached.video_relative_path,
+                    f"{cached.artifact_relative_directory}/video-p1.mp4",
+                )
+                self.assertEqual(cached.selected_audio_variant_id, "p1")
+            finally:
+                manager.shutdown()
+
+    def test_all_retained_sources_publish_only_rust_reserved_immutable_paths(self):
+        with patch("bilikara.cache.CACHE_DIR", self.cache_dir), patch.object(
+            CacheManager,
+            "_worker_loop",
+            lambda self: None,
+        ), patch(
+            "bilikara.cache.effective_bilibili_cookie", return_value="SESSDATA=test; bili_jct=csrf"
+        ), patch(
+            "bilikara.cache.rust_runtime.http_download_available", return_value=True
+        ), patch(
+            "bilikara.cache.rust_runtime.media_backend_available", return_value=True
+        ):
+            manager = CacheManager(self.store, max_cache_items=5)
+            try:
+                for source in (
+                    DOWNLOAD_SOURCE_YTDLP,
+                    DOWNLOAD_SOURCE_DOWNKYI,
+                    DOWNLOAD_SOURCE_NATIVE,
+                ):
+                    with self.subTest(source=source):
+                        item = self.make_item(f"song-{source}")
+                        self.store.add_item(
+                            item, requester_name="cache-test-user"
+                        )
+                        item = self.store.get_item(item.id)
+                        self.assertIsNotNone(item)
+                        with manager.lock:
+                            manager.download_source = source
+                            manager.desired_ids.add(item.id)
+                            manager.python_worker_download_sources[item.id] = source
+
+                        def fixture(*args, **_kwargs):
+                            result = self.staged_cache_result(
+                                args[3],
+                                native_tracks_prevalidated=(
+                                    source == DOWNLOAD_SOURCE_NATIVE
+                                ),
+                            )
+                            if source == DOWNLOAD_SOURCE_DOWNKYI:
+                                result["downkyi_tracks_prevalidated"] = True
+                            return result
+
+                        with patch.object(
+                            manager, "_ensure_downloader", return_value=Path(source)
+                        ), patch.object(
+                            manager, "_ensure_ffmpeg", return_value=Path("ffmpeg")
+                        ), patch.object(
+                            manager,
+                            "_download_selected_streams",
+                            side_effect=fixture,
+                        ), patch.object(manager, "_validate_cache_result"):
+                            self.assertTrue(
+                                manager._cache_item_multi(
+                                    item.id,
+                                    item,
+                                )
+                            )
+
+                        committed = self.store.get_item(item.id)
+                        self.assertEqual(committed.cache_status, "ready")
+                        self.assertTrue(committed.item_incarnation_id.startswith("i-"))
+                        self.assertTrue(committed.artifact_set_id.startswith("a-"))
+                        self.assertTrue(
+                            committed.video_relative_path.startswith(
+                                f"{committed.artifact_relative_directory}/"
+                            )
+                        )
+                        self.assertTrue(
+                            (
+                                self.cache_dir
+                                / committed.artifact_relative_directory
+                                / "video-p1.mp4"
+                            ).is_file()
+                        )
+            finally:
+                manager.shutdown()
+
+    def test_native_prevalidated_tracks_skip_legacy_batch_validation(self):
         with patch("bilikara.cache.CACHE_DIR", self.cache_dir), patch.object(
             CacheManager,
             "_worker_loop",
@@ -1328,52 +2178,32 @@ class CacheManagerPolicyTest(unittest.TestCase):
                 item.selected_durations = [120]
                 item.video_page = 1
                 self.store.add_item(item, requester_name="cache-test-user")
-                manager.download_source = DOWNLOAD_SOURCE_DOWNKYI
+                item = self.store.get_item(item.id)
+                self.assertIsNotNone(item)
+                manager.download_source = DOWNLOAD_SOURCE_NATIVE
                 with manager.lock:
                     manager.desired_ids = {item.id}
                     manager.ordered_desired_ids = [item.id]
+                    manager.python_worker_download_sources[item.id] = (
+                        DOWNLOAD_SOURCE_NATIVE
+                    )
 
                 def prevalidated_result(*_args, **_kwargs):
-                    item_dir = self.cache_dir / item.id
-                    video = item_dir / "video-p1" / ".attempt-video" / "video-p1.mp4"
-                    audio = item_dir / "audio-p1" / ".attempt-audio" / "audio-p1.m4a"
-                    video.parent.mkdir(parents=True)
-                    audio.parent.mkdir(parents=True)
-                    video.write_bytes(b"video")
-                    audio.write_bytes(b"audio")
-                    return {
-                        "video_file": video,
-                        "video_relative_path": str(video.relative_to(self.cache_dir)),
-                        "video_media_url": f"/media/{video.relative_to(self.cache_dir).as_posix()}",
-                        "audio_variants": [{
-                            "id": "p1",
-                            "label": "P1",
-                            "page": 1,
-                            "audio_url": f"/media/{audio.relative_to(self.cache_dir).as_posix()}",
-                        }],
-                        "selected_audio_variant_id": "p1",
-                        "validation_files": [{"path": video}, {"path": audio}],
-                        "validation_metadata": [{"path": str(video)}, {"path": str(audio)}],
-                        "validation_failure_count": 0,
-                        "downkyi_tracks_prevalidated": True,
-                    }
+                    return self.staged_cache_result(
+                        _args[3], native_tracks_prevalidated=True
+                    )
 
-                with patch.object(
-                    manager, "_ensure_downloader", return_value=Path("/tools/aria2c")
-                ), patch.object(
-                    manager, "_ensure_ffmpeg", return_value=Path("/tools/ffmpeg")
+                with patch("bilikara.cache.rust_runtime.http_download_available", return_value=True), patch(
+                    "bilikara.cache.rust_runtime.media_backend_available", return_value=True
                 ), patch.object(
                     manager, "_download_selected_streams", side_effect=prevalidated_result
                 ), patch.object(
-                    manager, "_normalize_downkyi_cache_result"
-                ) as normalize_mock, patch.object(
                     manager, "_validate_cache_result"
                 ) as validate_mock:
                     self.assertTrue(
-                        manager._cache_item_multi(item.id, item, allow_refresh_retry=False)
+                        manager._cache_item_multi(item.id, item)
                     )
 
-                normalize_mock.assert_not_called()
                 validate_mock.assert_not_called()
                 cached = self.store.get_item(item.id)
                 self.assertIsNotNone(cached)
@@ -1391,8 +2221,10 @@ class CacheManagerPolicyTest(unittest.TestCase):
             lambda self: None,
         ):
             manager = CacheManager(self.store, max_cache_items=3)
+            manager.download_source = DOWNLOAD_SOURCE_YTDLP
             try:
                 manager.pending_ids = {"song-a"}
+                manager.python_cache_attempt_tokens["song-a"] = 1
                 manager.tasks.put("song-a")
                 resync_states = []
 
@@ -1410,6 +2242,59 @@ class CacheManagerPolicyTest(unittest.TestCase):
                 sync_mock.assert_called_once_with()
                 self.assertEqual(resync_states, [(set(), None)])
             finally:
+                manager.shutdown()
+
+    def test_worker_continues_after_typed_attempt_publication_rejection(self):
+        worker_loop = CacheManager._worker_loop
+        bad = self.make_item("song-stale-publication")
+        good = self.make_item("song-after-stale-publication")
+        for item in (bad, good):
+            self.store.add_item(item, requester_name="cache-test-user")
+        stale_token = begin_cache_attempt(self.store, bad.id)
+        begin_cache_attempt(self.store, bad.id)
+        good_token = begin_cache_attempt(self.store, good.id)
+
+        with patch("bilikara.cache.CACHE_DIR", self.cache_dir), patch.object(
+            CacheManager,
+            "_worker_loop",
+            lambda self: None,
+        ):
+            manager = CacheManager(self.store, max_cache_items=2)
+            manager.download_source = DOWNLOAD_SOURCE_YTDLP
+            processed: list[str] = []
+            try:
+                with manager.lock:
+                    manager.pending_ids = {bad.id, good.id}
+                    manager.python_worker_download_sources = {
+                        bad.id: DOWNLOAD_SOURCE_YTDLP,
+                        good.id: DOWNLOAD_SOURCE_YTDLP,
+                    }
+                    manager.python_cache_attempt_tokens = {
+                        bad.id: stale_token,
+                        good.id: good_token,
+                    }
+                manager.tasks.put(bad.id)
+                manager.tasks.put(good.id)
+
+                def cache_item(item_id: str, cache_attempt_token: int) -> bool:
+                    if item_id == bad.id:
+                        manager._project_cache_event(
+                            item_id,
+                            "failed",
+                            cache_attempt_token=cache_attempt_token,
+                            message="stale terminal",
+                        )
+                    processed.append(item_id)
+                    manager.stop_event.set()
+                    return False
+
+                with patch.object(manager, "_cache_item", side_effect=cache_item):
+                    worker_loop(manager)
+
+                self.assertEqual(processed, [good.id])
+                self.assertEqual(self.store.get_item(bad.id).cache_status, "pending")
+            finally:
+                manager.stop_event.clear()
                 manager.shutdown()
 
     def test_sync_with_playlist_keeps_three_ready_items_as_retention_buffer(self):
@@ -1431,12 +2316,19 @@ class CacheManagerPolicyTest(unittest.TestCase):
                     cached = self.store.get_item(item_id)
                     self.assertIsNotNone(cached)
                     self.assertEqual(cached.cache_status, "ready")
-                    self.assertTrue((self.cache_dir / item_id).exists())
+                    self.assertTrue(
+                        (self.cache_dir / cached.artifact_relative_directory).exists()
+                    )
 
                 song_e = self.store.get_item("song-e")
                 self.assertIsNotNone(song_e)
                 self.assertEqual(song_e.cache_status, "pending")
-                self.assertFalse((self.cache_dir / "song-e").exists())
+                self.assertTrue(
+                    any(
+                        path.is_file()
+                        for path in (self.cache_dir / "artifacts").rglob("*")
+                    )
+                )
             finally:
                 manager.shutdown()
 
@@ -1444,98 +2336,116 @@ class CacheManagerPolicyTest(unittest.TestCase):
         with patch("bilikara.cache.CACHE_DIR", self.cache_dir):
             manager = CacheManager(self.store, max_cache_items=3)
             try:
+                manager.download_source = DOWNLOAD_SOURCE_YTDLP
                 item = self.make_item("song-a")
                 self.store.add_item(item, requester_name="cache-test-user")
-                self.store.update_item(
-                    "song-a",
-                    cache_status="failed",
-                    cache_message="缓存失败",
-                    persist_backup=False,
-                )
+                self.project_cache_failed("song-a", message="缓存失败")
                 with manager.lock:
                     manager.desired_ids = {"song-a"}
                 with patch.object(manager, "enqueue") as enqueue_mock:
-                    manager.retry_item("song-a")
+                    retry_cache_item(manager, self.store, "song-a")
                     retried = self.store.get_item("song-a")
                     self.assertIsNotNone(retried)
-                    self.assertEqual(retried.cache_status, "pending")
+                    self.assertEqual(retried.cache_status, "queued")
                     self.assertEqual(retried.cache_message, "准备重新下载")
                     enqueue_mock.assert_called_once_with("song-a")
             finally:
                 manager.shutdown()
 
-    def test_aria2c_download_uses_backup_urls_as_mirror_uris(self):
-        with patch("bilikara.cache.CACHE_DIR", self.cache_dir):
+    def test_retry_item_rejects_same_id_replacement_before_manager_mutation(self):
+        with patch("bilikara.cache.CACHE_DIR", self.cache_dir), patch.object(
+            CacheManager,
+            "_worker_loop",
+            lambda self: None,
+        ):
             manager = CacheManager(self.store, max_cache_items=3)
             try:
-                target_dir = self.cache_dir / "song-a" / "video-p1"
-                log_path = Path(self.temp_dir.name) / "download.log"
-                captured = {}
+                old = self.make_item("same-song")
+                self.store.add_item(old, requester_name="cache-test-user")
+                stale_incarnation = self.store.get_item(
+                    "same-song"
+                ).item_incarnation_id
+                self.assertTrue(self.store.remove_item("same-song"))
+                replacement = self.make_item("same-song")
+                replacement.bvid = "BV1replacement"
+                self.store.add_item(
+                    replacement,
+                    requester_name="cache-test-user",
+                )
+                self.project_cache_failed("same-song", message="缓存失败")
+                live_incarnation = self.store.get_item(
+                    "same-song"
+                ).item_incarnation_id
+                self.assertNotEqual(stale_incarnation, live_incarnation)
+                with manager.lock:
+                    manager.desired_ids = {"same-song"}
 
-                def fake_run_item_command(_item_id, command, *_args, **_kwargs):
-                    captured["command"] = list(command)
-                    attempt_dir = Path(command[command.index("--dir") + 1])
-                    out_name = command[command.index("--out") + 1]
-                    attempt_dir.mkdir(parents=True, exist_ok=True)
-                    (attempt_dir / out_name).write_bytes(b"video")
+                snapshot_before = self.store.authoritative_snapshot()
+                manager_state_before = {
+                    "pending_ids": set(manager.pending_ids),
+                    "retry_requested_ids": set(manager.retry_requested_ids),
+                    "worker_sources": dict(manager.python_worker_download_sources),
+                    "attempt_tokens": dict(manager.python_cache_attempt_tokens),
+                }
+                with patch.object(manager, "enqueue") as enqueue_mock, patch.object(
+                    manager,
+                    "_append_log_line",
+                ) as append_log:
+                    with self.assertRaises(PlaylistStoreCommandError) as rejected:
+                        manager.retry_item(
+                            "same-song",
+                            expected_item_incarnation_id=stale_incarnation,
+                        )
 
-                with patch.object(manager, "_run_item_command", side_effect=fake_run_item_command):
-                    path = manager._download_stream_with_aria2c(
-                        "song-a",
-                        Path("aria2c.exe"),
-                        Path("ffmpeg.exe"),
-                        target_dir,
-                        log_path,
-                        urls=["https://primary.example/video.m4s", "https://backup.example/video.m4s"],
-                        out_name="video-p1.mp4",
-                        cookie="",
-                        stage_label="download video",
-                        track_key="video-p1",
-                        stream_kind="video",
-                    )
-
-                command = captured["command"]
-                self.assertEqual(path.name, "video-p1.mp4")
-                self.assertTrue(path.parent.name.startswith(".attempt-"))
-                self.assertEqual(path.parent.parent, target_dir)
-                self.assertFalse((target_dir / "video-p1.mp4").exists())
-                self.assertIn("https://primary.example/video.m4s", command)
-                self.assertIn("https://backup.example/video.m4s", command)
-                self.assertLess(command.index("https://backup.example/video.m4s"), command.index("--dir"))
-                self.assertNotIn("--referer", command)
-                self.assertIn("--continue=false", command)
-                self.assertIn("--max-tries=1", command)
-                self.assertIn("--human-readable=false", command)
-                self.assertIn("--split=16", command)
-                self.assertIn("--max-connection-per-server=16", command)
-                self.assertIn("--auto-file-renaming=false", command)
-                self.assertIn("--allow-overwrite=false", command)
-                self.assertNotIn("--continue=true", command)
+                self.assertEqual(
+                    rejected.exception.kind,
+                    "item_incarnation_mismatch",
+                )
+                self.assertEqual(
+                    self.store.authoritative_snapshot(),
+                    snapshot_before,
+                )
+                self.assertEqual(
+                    {
+                        "pending_ids": set(manager.pending_ids),
+                        "retry_requested_ids": set(manager.retry_requested_ids),
+                        "worker_sources": dict(manager.python_worker_download_sources),
+                        "attempt_tokens": dict(manager.python_cache_attempt_tokens),
+                    },
+                    manager_state_before,
+                )
+                enqueue_mock.assert_not_called()
+                append_log.assert_not_called()
             finally:
                 manager.shutdown()
+
 
     def test_retry_item_can_force_requeue_ready_cache_item(self):
         with patch("bilikara.cache.CACHE_DIR", self.cache_dir):
             manager = CacheManager(self.store, max_cache_items=3)
             try:
+                manager.download_source = DOWNLOAD_SOURCE_YTDLP
                 item = self.make_item("song-a")
                 self.store.add_item(item, requester_name="cache-test-user")
-                self.store.update_item(
-                    "song-a",
-                    cache_status="ready",
-                    cache_message="缓存完成",
-                    video_media_url="/media/song-a/video.mp4",
-                    persist_backup=False,
-                )
+                self.mark_item_ready_with_files("song-a")
+                before = self.store.get_item("song-a")
                 with manager.lock:
                     manager.desired_ids = {"song-a"}
                 with patch.object(manager, "enqueue") as enqueue_mock:
-                    manager.retry_item("song-a", force=True)
+                    retry_cache_item(
+                        manager, self.store, "song-a", force=True
+                    )
                     retried = self.store.get_item("song-a")
                     self.assertIsNotNone(retried)
-                    self.assertEqual(retried.cache_status, "pending")
+                    self.assertEqual(retried.cache_status, "ready")
                     self.assertEqual(retried.cache_message, "准备重新下载")
-                    self.assertEqual(retried.video_media_url, "")
+                    self.assertEqual(retried.video_media_url, before.video_media_url)
+                    self.assertEqual(retried.artifact_set_id, before.artifact_set_id)
+                    self.assertTrue(
+                        (
+                            self.cache_dir / before.artifact_relative_directory
+                        ).is_dir()
+                    )
                     enqueue_mock.assert_called_once_with("song-a")
             finally:
                 manager.shutdown()
@@ -1544,27 +2454,23 @@ class CacheManagerPolicyTest(unittest.TestCase):
         with patch("bilikara.cache.CACHE_DIR", self.cache_dir):
             manager = CacheManager(self.store, max_cache_items=3)
             try:
+                manager.download_source = DOWNLOAD_SOURCE_YTDLP
                 item = self.make_item("song-a")
                 self.store.add_item(item, requester_name="cache-test-user")
                 item_dir = self.cache_dir / "song-a" / "video-p1"
                 item_dir.mkdir(parents=True, exist_ok=True)
                 (item_dir / "video.mp4").write_bytes(b"media")
-                self.store.update_item(
-                    "song-a",
-                    cache_status="downloading",
-                    cache_message="downloading",
-                    persist_backup=False,
-                )
+                self.project_cache_started("song-a", message="downloading")
                 with manager.lock:
                     manager.desired_ids = {"song-a"}
                     manager.pending_ids = {"song-a"}
                 with patch.object(manager, "enqueue") as enqueue_mock, patch.object(
                     manager, "_terminate_process"
                 ) as terminate_mock:
-                    manager.retry_item("song-a")
+                    retry_cache_item(manager, self.store, "song-a")
                     retried = self.store.get_item("song-a")
                     self.assertIsNotNone(retried)
-                    self.assertEqual(retried.cache_status, "pending")
+                    self.assertEqual(retried.cache_status, "queued")
                     self.assertTrue((self.cache_dir / "song-a").exists())
                     self.assertIn("song-a", manager.retry_requested_ids)
                     enqueue_mock.assert_not_called()
@@ -1580,16 +2486,12 @@ class CacheManagerPolicyTest(unittest.TestCase):
         ):
             manager = CacheManager(self.store, max_cache_items=3)
             try:
+                manager.download_source = DOWNLOAD_SOURCE_YTDLP
                 target = self.make_item("song-a")
                 active = self.make_item("song-b")
                 self.store.add_item(target, requester_name="cache-test-user")
                 self.store.add_item(active, requester_name="cache-test-user")
-                self.store.update_item(
-                    "song-a",
-                    cache_status="failed",
-                    cache_message="缓存失败",
-                    persist_backup=False,
-                )
+                self.project_cache_failed("song-a", message="缓存失败")
                 fake_process = SimpleNamespace(poll=lambda: 0)
                 with manager.lock:
                     manager.desired_ids = {"song-a", "song-b"}
@@ -1599,10 +2501,12 @@ class CacheManagerPolicyTest(unittest.TestCase):
                 with patch.object(manager, "_start_urgent_cache") as urgent_cache_mock, patch.object(
                     manager, "_terminate_process"
                 ) as terminate_mock:
-                    manager.retry_item("song-a", force=True)
+                    retry_cache_item(
+                        manager, self.store, "song-a", force=True
+                    )
                     retried = self.store.get_item("song-a")
                     self.assertIsNotNone(retried)
-                    self.assertEqual(retried.cache_status, "pending")
+                    self.assertEqual(retried.cache_status, "queued")
                     self.assertEqual(retried.cache_message, "准备重新下载")
                     self.assertNotIn("song-b", manager.cache_interrupted_messages)
                     urgent_cache_mock.assert_called_once_with("song-a")
@@ -1618,20 +2522,18 @@ class CacheManagerPolicyTest(unittest.TestCase):
             lambda self: None,
         ):
             manager = CacheManager(self.store, max_cache_items=3)
+            manager.download_source = DOWNLOAD_SOURCE_YTDLP
             target = self.make_item("song-a")
             active = self.make_item("song-b")
             self.store.add_item(target, requester_name="cache-test-user")
             self.store.add_item(active, requester_name="cache-test-user")
-            self.store.update_item(
-                "song-a",
-                cache_status="failed",
-                cache_message="缓存失败",
-                persist_backup=False,
-            )
+            self.project_cache_failed("song-a", message="缓存失败")
             urgent_started = threading.Event()
             release_urgent = threading.Event()
 
-            def fake_cache_item(item_id, allow_refresh_retry=True):
+            def fake_cache_item(
+                item_id, _cache_attempt_token
+            ):
                 self.assertEqual(item_id, "song-a")
                 urgent_started.set()
                 self.assertTrue(release_urgent.wait(2))
@@ -1653,7 +2555,9 @@ class CacheManagerPolicyTest(unittest.TestCase):
                 with patch.object(manager, "_cache_item", side_effect=fake_cache_item), patch.object(
                     manager, "_terminate_process"
                 ) as terminate_mock:
-                    manager.retry_item("song-a", force=True)
+                    retry_cache_item(
+                        manager, self.store, "song-a", force=True
+                    )
                     self.assertTrue(urgent_started.wait(2))
                     with manager.lock:
                         self.assertEqual(manager.active_item_id, "song-b")
@@ -1771,6 +2675,7 @@ class CacheManagerPolicyTest(unittest.TestCase):
             lambda self: None,
         ):
             manager = CacheManager(self.store, max_cache_items=3)
+            manager.download_source = DOWNLOAD_SOURCE_YTDLP
             try:
                 self.store.add_item(self.make_item("song-a"), requester_name="cache-test-user")
                 self.store.add_item(self.make_item("song-b"), requester_name="cache-test-user")
@@ -1917,7 +2822,7 @@ class CacheManagerPolicyTest(unittest.TestCase):
             finally:
                 manager.shutdown()
 
-    def test_cache_item_clears_old_cache_dir_before_processing_pending_retry(self):
+    def test_cache_item_preserves_committed_dir_before_processing_pending_retry(self):
         with patch("bilikara.cache.CACHE_DIR", self.cache_dir):
             manager = CacheManager(self.store, max_cache_items=3)
             try:
@@ -1929,14 +2834,27 @@ class CacheManagerPolicyTest(unittest.TestCase):
                 with manager.lock:
                     manager.desired_ids = {"song-a"}
                     manager.retry_requested_ids.add("song-a")
+                old_token = begin_cache_attempt(self.store, "song-a")
+                manager.python_cache_attempt_tokens["song-a"] = old_token
                 with patch.object(manager, "_cache_item_multi") as cache_item_multi_mock:
-                    manager._cache_item("song-a")
-                    self.assertFalse((self.cache_dir / "song-a").exists())
+                    manager._cache_item(
+                        "song-a",
+                        old_token,
+                    )
+                    self.assertTrue((self.cache_dir / "song-a").exists())
                     cache_item_multi_mock.assert_called_once()
+                    fresh_token = cache_item_multi_mock.call_args.kwargs[
+                        "cache_attempt_token"
+                    ]
+                    self.assertGreater(fresh_token, old_token)
+                    self.assertEqual(
+                        manager.python_cache_attempt_tokens["song-a"],
+                        fresh_token,
+                    )
             finally:
                 manager.shutdown()
 
-    def test_validate_media_file_logs_ffprobe_success(self):
+    def test_validate_media_file_logs_ffprobe_compatibility_success(self):
         log_dir = Path(self.temp_dir.name) / "logs"
         media_file = self.cache_dir / "song-a" / "video.mp4"
         media_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1945,12 +2863,16 @@ class CacheManagerPolicyTest(unittest.TestCase):
             "streams": [{"codec_type": "video", "duration": "12.34"}],
             "format": {"duration": "12.34"},
         }
-
         with patch("bilikara.cache.CACHE_DIR", self.cache_dir), patch("bilikara.cache.LOG_DIR", log_dir):
             manager = CacheManager(self.store, max_cache_items=3)
             try:
                 log_path = manager._item_log_path("song-a")
                 with patch(
+                    "bilikara.cache.rust_runtime.probe_media",
+                    side_effect=rust_runtime.RustMediaError(
+                        "unsupported_codec", "unsupported MP4 codec", response={}
+                    ),
+                ), patch(
                     "bilikara.cache.subprocess.run",
                     return_value=SimpleNamespace(
                         returncode=0,
@@ -1971,7 +2893,8 @@ class CacheManagerPolicyTest(unittest.TestCase):
                 manager.shutdown()
 
         self.assertTrue(run_mock.called)
-        self.assertIn("ffprobe validate 视频轨 P1: ok", log_text)
+        self.assertIn("media validate 视频轨 P1: ok", log_text)
+        self.assertIn("backend=ffprobe", log_text)
         self.assertIn("duration=12.34s", log_text)
 
     def test_validate_media_file_rejects_missing_required_stream(self):
@@ -1988,6 +2911,11 @@ class CacheManagerPolicyTest(unittest.TestCase):
             try:
                 log_path = manager._item_log_path("song-a")
                 with patch(
+                    "bilikara.cache.rust_runtime.probe_media",
+                    side_effect=rust_runtime.RustMediaError(
+                        "unsupported_codec", "unsupported MP4 codec", response={}
+                    ),
+                ), patch(
                     "bilikara.cache.subprocess.run",
                     return_value=SimpleNamespace(
                         returncode=0,
@@ -2012,23 +2940,17 @@ class CacheManagerPolicyTest(unittest.TestCase):
         media_file = self.cache_dir / "song-a" / "audio.m4a"
         media_file.parent.mkdir(parents=True, exist_ok=True)
         media_file.write_bytes(b"media")
-        probe_payload = {
-            "streams": [{"codec_type": "video", "duration": "12.34"}],
-            "format": {"duration": "12.34"},
-        }
 
         with patch("bilikara.cache.CACHE_DIR", self.cache_dir), patch("bilikara.cache.LOG_DIR", log_dir):
             manager = CacheManager(self.store, max_cache_items=3)
             try:
                 log_path = manager._item_log_path("song-a")
-                with patch.object(manager, "_ffprobe_path_for_ffmpeg", return_value=Path("/tools/ffprobe")), patch(
-                    "bilikara.cache.subprocess.run",
-                    return_value=SimpleNamespace(
-                        returncode=0,
-                        stdout=json.dumps(probe_payload),
-                        stderr="",
+                with patch(
+                    "bilikara.cache.rust_runtime.probe_media",
+                    side_effect=rust_runtime.RustMediaError(
+                        "invalid_media", "truncated MP4", response={}
                     ),
-                ):
+                ), patch("bilikara.cache.subprocess.run") as subprocess_run:
                     with self.assertRaisesRegex(DownloadCommandError, "音轨 P1"):
                         manager._validate_cache_result(
                             "song-a",
@@ -2043,12 +2965,14 @@ class CacheManagerPolicyTest(unittest.TestCase):
                             },
                             Path("/tools/ffmpeg"),
                             log_path,
+                            cache_attempt_token=1,
                         )
+                    subprocess_run.assert_not_called()
                 log_text = log_path.read_text(encoding="utf-8")
             finally:
                 manager.shutdown()
 
-        self.assertIn("ffprobe validate 音轨 P1: failed", log_text)
+        self.assertIn("media validate 音轨 P1: failed", log_text)
         self.assertIn("cache validation error", log_text)
         self.assertFalse(media_file.exists())
 
@@ -2549,183 +3473,10 @@ class CacheManagerPolicyTest(unittest.TestCase):
         self.assertEqual(target_path.read_bytes(), b"yt-dlp-bin")
         self.assertEqual(manager.binary_version, "2026.06.15")
 
-    def test_ensure_aria2c_downloads_and_extracts_zip_when_missing(self):
-        aria2_dir = Path(self.temp_dir.name) / "tools" / "aria2c"
-        target_path = aria2_dir / "aria2c.exe"
-        release = {
-            "assets": [
-                {
-                    "name": "aria2-1.37.0-win-64bit-build1.zip",
-                    "browser_download_url": "https://example.test/aria2.zip",
-                }
-            ],
-        }
-
-        def fake_download(url: str, path: Path) -> None:
-            self.assertEqual(url, "https://example.test/aria2.zip")
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with zipfile.ZipFile(path, "w") as zf:
-                zf.writestr("aria2-1.37.0-win-64bit-build1/aria2c.exe", b"aria2c-bin")
-
-        with patch("bilikara.cache.CACHE_DIR", self.cache_dir), patch(
-            "bilikara.cache.ARIA2C_DIR", aria2_dir
-        ), patch("bilikara.cache.ARIA2C_PATH_OVERRIDE", ""), patch.object(
-            CacheManager, "_system_aria2c_path", return_value=None
-        ), patch(
-            "bilikara.cache.platform.system",
-            return_value="Windows",
-        ), patch(
-            "bilikara.cache.platform.machine",
-            return_value="AMD64",
-        ):
-            manager = CacheManager(self.store, max_cache_items=3)
-            try:
-                with patch.object(manager, "_local_aria2c_binary_path", return_value=target_path), patch.object(
-                    manager, "_fetch_aria2_release", return_value=release
-                ), patch.object(manager, "_download_url", side_effect=fake_download), patch.object(
-                    manager,
-                    "_read_aria2c_version",
-                    return_value="1.37.0",
-                ):
-                    path = manager._ensure_aria2c()
-            finally:
-                manager.shutdown()
-
-        self.assertEqual(path, target_path)
-        self.assertEqual(target_path.read_bytes(), b"aria2c-bin")
-        self.assertEqual(manager.binary_version, "1.37.0")
-        self.assertFalse((aria2_dir / "aria2-1.37.0-win-64bit-build1.zip").exists())
 
 
-    def test_ensure_aria2c_resolves_system_path_when_available(self):
-        with patch("bilikara.cache.CACHE_DIR", self.cache_dir), patch(
-            "bilikara.cache.ARIA2C_PATH_OVERRIDE", ""
-        ), patch(
-            "bilikara.cache.shutil.which", return_value="/usr/bin/aria2c"
-        ):
-            manager = CacheManager(self.store, max_cache_items=3)
-            try:
-                with patch.object(
-                    manager,
-                    "_read_aria2c_version",
-                    return_value="1.37.0",
-                ) as mock_read_version:
-                    path = manager._ensure_aria2c()
-                    mock_read_version.assert_called_once_with(Path("/usr/bin/aria2c"))
-            finally:
-                manager.shutdown()
 
-        self.assertEqual(path, Path("/usr/bin/aria2c"))
-        self.assertEqual(manager.binary_version, "1.37.0")
-        self.assertIn("使用系统 aria2c", manager.binary_message)
 
-    def test_ensure_aria2c_downloads_via_apt_on_linux(self):
-        aria2_dir = Path(self.temp_dir.name) / "tools" / "aria2c"
-        target_path = aria2_dir / "aria2c"
-
-        def fake_which(cmd):
-            if cmd in ("apt-get", "dpkg-deb"):
-                return f"/usr/bin/{cmd}"
-            return None
-
-        import subprocess
-        def fake_run(args, **kwargs):
-            if args[0] == "apt-get" and args[1] == "download":
-                cwd = kwargs.get("cwd")
-                if cwd:
-                    Path(cwd).mkdir(parents=True, exist_ok=True)
-                    (Path(cwd) / "aria2_1.36.0-1_amd64.deb").write_bytes(b"fake-deb")
-                return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
-            if args[0] == "dpkg-deb" and args[1] == "-x":
-                extract_dir = Path(args[3])
-                binary_dir = extract_dir / "usr" / "bin"
-                binary_dir.mkdir(parents=True, exist_ok=True)
-                (binary_dir / "aria2c").write_bytes(b"fake-aria2c-bin")
-                return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
-            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
-
-        with patch("bilikara.cache.CACHE_DIR", self.cache_dir), patch(
-            "bilikara.cache.ARIA2C_DIR", aria2_dir
-        ), patch("bilikara.cache.ARIA2C_PATH_OVERRIDE", ""), patch(
-            "bilikara.cache.shutil.which", side_effect=fake_which
-        ), patch(
-            "bilikara.cache.platform.system",
-            return_value="Linux",
-        ), patch(
-            "bilikara.cache.platform.machine",
-            return_value="x86_64",
-        ):
-            manager = CacheManager(self.store, max_cache_items=3)
-            try:
-                with patch("subprocess.run", side_effect=fake_run), patch.object(
-                    manager, "_system_aria2c_path", return_value=None
-                ), patch.object(
-                    manager, "_local_aria2c_binary_path", return_value=target_path
-                ), patch.object(
-                    manager, "_read_aria2c_version", return_value="1.37.0"
-                ):
-                    path = manager._ensure_aria2c()
-            finally:
-                manager.shutdown()
-
-        self.assertEqual(path, target_path)
-        self.assertEqual(target_path.read_bytes(), b"fake-aria2c-bin")
-
-    def test_ensure_aria2c_downloads_via_brew_on_macos(self):
-        aria2_dir = Path(self.temp_dir.name) / "tools" / "aria2c"
-        target_path = aria2_dir / "aria2c"
-
-        def fake_which(cmd):
-            if cmd == "brew":
-                return "/usr/local/bin/brew"
-            return None
-
-        import subprocess
-        fake_cache_dir = Path(self.temp_dir.name) / "brew_cache"
-        fake_cache_dir.mkdir(parents=True, exist_ok=True)
-        fake_bottle_file = fake_cache_dir / "aria2-1.37.0.bottle.tar.gz"
-
-        def fake_run(args, **kwargs):
-            if "fetch" in args:
-                fake_bottle_file.write_bytes(b"fake-bottle-tar-gz")
-                return subprocess.CompletedProcess(args, 0, stdout="Fetched", stderr="")
-            if "--cache" in args:
-                return subprocess.CompletedProcess(args, 0, stdout=str(fake_bottle_file), stderr="")
-            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
-
-        with patch("bilikara.cache.CACHE_DIR", self.cache_dir), patch(
-            "bilikara.cache.ARIA2C_DIR", aria2_dir
-        ), patch("bilikara.cache.ARIA2C_PATH_OVERRIDE", ""), patch(
-            "bilikara.cache.shutil.which", side_effect=fake_which
-        ), patch(
-            "bilikara.cache.platform.system",
-            return_value="Darwin",
-        ), patch(
-            "bilikara.cache.platform.machine",
-            return_value="arm64",
-        ):
-            manager = CacheManager(self.store, max_cache_items=3)
-            try:
-                with patch("subprocess.run", side_effect=fake_run), patch.object(
-                    manager, "_system_aria2c_path", return_value=None
-                ), patch.object(
-                    manager, "_local_aria2c_binary_path", return_value=target_path
-                ), patch.object(
-                    manager, "_fetch_aria2_release", return_value={"assets": []}
-                ), patch.object(
-                    manager, "_macos_aria2_asset", return_value=None
-                ), patch.object(
-                    manager, "_extract_tool_binary_from_archive",
-                    side_effect=lambda archive, out_dir, bin_name: target_path.write_bytes(b"fake-brew-aria2c-bin")
-                ), patch.object(
-                    manager, "_read_aria2c_version", return_value="1.37.0"
-                ):
-                    path = manager._ensure_aria2c()
-            finally:
-                manager.shutdown()
-
-        self.assertEqual(path, target_path)
-        self.assertEqual(target_path.read_bytes(), b"fake-brew-aria2c-bin")
     def test_urlopen_retries_ssl_certificate_failure_with_certifi(self):
         certificate_error = urllib.error.URLError(
             ssl.SSLCertVerificationError("CERTIFICATE_VERIFY_FAILED")
@@ -2840,15 +3591,18 @@ class CacheManagerPolicyTest(unittest.TestCase):
                 item = self.make_item("song-a")
                 item.selected_pages = [1]
                 item.video_page = 1
+                self.store.add_item(item, requester_name="cache-test-user")
+                cache_attempt_token = begin_cache_attempt(self.store, item.id)
                 manager.desired_ids.add(item.id)
-                with patch.object(manager, "_download_page_stream", side_effect=[video_file, audio_file]):
+                with patch.object(manager, "_download_page_stream", side_effect=[audio_file, video_file]):
                     result = manager._download_selected_streams(
                         item,
                         Path("/tools/BBDown"),
                         Path("/tools/ffmpeg"),
                         item_dir,
                         log_path,
-                        download_source="bbdown",
+                        cache_attempt_token=cache_attempt_token,
+                        download_source="ytdlp",
                     )
             finally:
                 manager.shutdown()
@@ -2882,15 +3636,18 @@ class CacheManagerPolicyTest(unittest.TestCase):
                 item.available_pages = [1, 2]
                 item.available_parts = ["原曲", "伴奏"]
                 item.video_page = 2
+                self.store.add_item(item, requester_name="cache-test-user")
+                cache_attempt_token = begin_cache_attempt(self.store, item.id)
                 manager.desired_ids.add(item.id)
-                with patch.object(manager, "_download_page_stream", side_effect=[video_file, audio_file]):
+                with patch.object(manager, "_download_page_stream", side_effect=[audio_file, video_file]):
                     result = manager._download_selected_streams(
                         item,
                         Path("/tools/BBDown"),
                         Path("/tools/ffmpeg"),
                         item_dir,
                         log_path,
-                        download_source="bbdown",
+                        cache_attempt_token=cache_attempt_token,
+                        download_source="ytdlp",
                     )
             finally:
                 manager.shutdown()
@@ -2925,15 +3682,18 @@ class CacheManagerPolicyTest(unittest.TestCase):
                 item.available_parts = ["main track", "off vocal"]
                 item.selected_audio_variant_id = "p2_off_vocal"
                 item.video_page = 2
+                self.store.add_item(item, requester_name="cache-test-user")
+                cache_attempt_token = begin_cache_attempt(self.store, item.id)
                 manager.desired_ids.add(item.id)
-                with patch.object(manager, "_download_page_stream", side_effect=[video_file, audio_p1_file, audio_p2_file]):
+                with patch.object(manager, "_download_page_stream", side_effect=[audio_p1_file, audio_p2_file, video_file]):
                     result = manager._download_selected_streams(
                         item,
                         Path("/tools/BBDown"),
                         Path("/tools/ffmpeg"),
                         item_dir,
                         log_path,
-                        download_source="bbdown",
+                        cache_attempt_token=cache_attempt_token,
+                        download_source="ytdlp",
                     )
             finally:
                 manager.shutdown()
@@ -2979,272 +3739,8 @@ class CacheManagerPolicyTest(unittest.TestCase):
         self.assertFalse(data_path.exists())
         self.assertFalse(status["logged_in"])
 
-    def test_bbdown_login_success_triggers_callback(self):
-        bbdown_dir = Path(self.temp_dir.name) / "tools" / "bbdown"
-        bbdown_dir.mkdir(parents=True, exist_ok=True)
-        callback_calls: list[str] = []
-        cancel_event = Mock()
-        cancel_event.wait.return_value = False
-        cancel_event.is_set.return_value = False
-
-        with patch("bilikara.cache.CACHE_DIR", self.cache_dir), patch("bilikara.cache.BB_DOWN_DIR", bbdown_dir):
-            manager = CacheManager(
-                self.store,
-                max_cache_items=3,
-                on_bbdown_login_success=lambda: callback_calls.append("refresh"),
-            )
-            try:
-                manager.bbdown_login_cancel_event = cancel_event
-                with patch.object(
-                    manager,
-                    "_bilibili_login_request_json",
-                    side_effect=[
-                        {"data": {"url": "synthetic-qr-url", "qrcode_key": "synthetic-qr-key"}},
-                        {"data": {"code": 0}},
-                    ],
-                ), patch.object(
-                    manager,
-                    "_write_bbdown_login_qr",
-                    return_value="data:image/png;base64,synthetic",
-                ), patch.object(
-                    manager,
-                    "_cookie_text_from_login_jar",
-                    return_value="SESSDATA=synthetic-session; bili_jct=synthetic-csrf",
-                ):
-                    manager._bbdown_login_worker(cancel_event)
-
-                self.assertEqual(callback_calls, ["refresh"])
-                self.assertEqual(manager.bbdown_login_status()["state"], "logged_in")
-            finally:
-                manager.shutdown()
-
-    def test_bbdown_login_generate_failure_logs_sanitized_exception(self):
-        bbdown_dir = Path(self.temp_dir.name) / "tools" / "bbdown"
-        log_dir = Path(self.temp_dir.name) / "logs"
-        cancel_event = Mock()
-        cancel_event.is_set.return_value = False
-        secret_values = (
-            "synthetic-qr-secret",
-            "synthetic-session-secret",
-            "synthetic-access-secret",
-        )
-        request_error = urllib.error.URLError(
-            "[SSL: CERTIFICATE_VERIFY_FAILED] self-signed certificate in certificate chain "
-            "at https://passport.bilibili.com/x/passport-login/web/qrcode/generate"
-            f"?qrcode_key={secret_values[0]} Cookie: SESSDATA={secret_values[1]} "
-            f"access_token={secret_values[2]}"
-        )
-
-        with patch("bilikara.cache.CACHE_DIR", self.cache_dir), patch(
-            "bilikara.cache.BB_DOWN_DIR", bbdown_dir
-        ):
-            manager = CacheManager(self.store, max_cache_items=3)
-            manager.log_dir = log_dir
-            try:
-                manager.bbdown_login_cancel_event = cancel_event
-                with patch.object(
-                    manager,
-                    "_bilibili_login_request_json",
-                    side_effect=request_error,
-                ):
-                    manager._bbdown_login_worker(cancel_event)
-                status = manager.bbdown_login_status()
-            finally:
-                manager.shutdown()
-
-        log_text = (log_dir / "bilibili-login.log").read_text(encoding="utf-8")
-        self.assertIn("stage=generate", log_text)
-        self.assertIn("type=URLError", log_text)
-        self.assertIn("CERTIFICATE_VERIFY_FAILED", log_text)
-        for secret_value in secret_values:
-            self.assertNotIn(secret_value, log_text)
-        self.assertEqual(status["state"], "failed")
-        self.assertEqual(status["message"], "Bilibili 登录请求失败，请重试")
-
-    def test_bbdown_login_poll_failure_logs_poll_stage_without_qr_secret(self):
-        bbdown_dir = Path(self.temp_dir.name) / "tools" / "bbdown"
-        log_dir = Path(self.temp_dir.name) / "logs"
-        cancel_event = Mock()
-        cancel_event.wait.return_value = False
-        cancel_event.is_set.return_value = False
-        qr_secret = "synthetic-poll-qr-secret"
-        poll_error = urllib.error.URLError(
-            "timed out requesting "
-            f"https://passport.bilibili.com/x/passport-login/web/qrcode/poll?qrcode_key={qr_secret}"
-        )
-
-        with patch("bilikara.cache.CACHE_DIR", self.cache_dir), patch(
-            "bilikara.cache.BB_DOWN_DIR", bbdown_dir
-        ):
-            manager = CacheManager(self.store, max_cache_items=3)
-            manager.log_dir = log_dir
-            try:
-                manager.bbdown_login_cancel_event = cancel_event
-                with patch.object(
-                    manager,
-                    "_bilibili_login_request_json",
-                    side_effect=[
-                        {"data": {"url": "synthetic-qr-url", "qrcode_key": qr_secret}},
-                        poll_error,
-                    ],
-                ), patch.object(
-                    manager,
-                    "_write_bbdown_login_qr",
-                    return_value="data:image/png;base64,synthetic",
-                ):
-                    manager._bbdown_login_worker(cancel_event)
-            finally:
-                manager.shutdown()
-
-        log_text = (log_dir / "bilibili-login.log").read_text(encoding="utf-8")
-        self.assertIn("stage=poll", log_text)
-        self.assertIn("type=URLError", log_text)
-        self.assertNotIn(qr_secret, log_text)
-
-    def test_bbdown_login_rejects_ticket_only_data_after_zero_exit(self):
-        bbdown_dir = Path(self.temp_dir.name) / "tools" / "bbdown"
-        bbdown_dir.mkdir(parents=True, exist_ok=True)
-        (bbdown_dir / "BBDown.data").write_text(
-            "ticket=synthetic-ticket; gourl=synthetic-path; first_domain=synthetic-domain",
-            encoding="utf-8",
-        )
-        callback_calls: list[str] = []
-        cancel_event = Mock()
-        cancel_event.wait.return_value = False
-        cancel_event.is_set.return_value = False
-
-        with patch("bilikara.cache.CACHE_DIR", self.cache_dir), patch("bilikara.cache.BB_DOWN_DIR", bbdown_dir):
-            manager = CacheManager(
-                self.store,
-                max_cache_items=3,
-                on_bbdown_login_success=lambda: callback_calls.append("refresh"),
-            )
-            try:
-                manager.bbdown_login_cancel_event = cancel_event
-                with patch.object(
-                    manager,
-                    "_bilibili_login_request_json",
-                    side_effect=[
-                        {"data": {"url": "synthetic-qr-url", "qrcode_key": "synthetic-qr-key"}},
-                        {"data": {"code": 0}},
-                    ],
-                ), patch.object(
-                    manager,
-                    "_write_bbdown_login_qr",
-                    return_value="data:image/png;base64,synthetic",
-                ), patch.object(
-                    manager,
-                    "_cookie_text_from_login_jar",
-                    return_value="",
-                ):
-                    manager._bbdown_login_worker(cancel_event)
-
-                status = manager.bbdown_login_status()
-                self.assertEqual(callback_calls, [])
-                self.assertFalse(status["logged_in"])
-                self.assertEqual(status["state"], "failed")
-                self.assertIn("SESSDATA 和 bili_jct", status["message"])
-            finally:
-                manager.shutdown()
-
-    def test_bbdown_login_rejects_valid_cookie_when_poll_fails(self):
-        bbdown_dir = Path(self.temp_dir.name) / "tools" / "bbdown"
-        bbdown_dir.mkdir(parents=True, exist_ok=True)
-        (bbdown_dir / "BBDown.data").write_text(
-            "SESSDATA=synthetic-session; bili_jct=synthetic-csrf",
-            encoding="utf-8",
-        )
-
-        cancel_event = Mock()
-        cancel_event.wait.return_value = False
-        cancel_event.is_set.return_value = False
-
-        with patch("bilikara.cache.CACHE_DIR", self.cache_dir), patch("bilikara.cache.BB_DOWN_DIR", bbdown_dir):
-            manager = CacheManager(self.store, max_cache_items=3)
-            try:
-                manager.bbdown_login_cancel_event = cancel_event
-                with patch.object(
-                    manager,
-                    "_bilibili_login_request_json",
-                    side_effect=[
-                        {"data": {"url": "synthetic-qr-url", "qrcode_key": "synthetic-qr-key"}},
-                        {"data": {"code": 1}},
-                    ],
-                ), patch.object(
-                    manager,
-                    "_write_bbdown_login_qr",
-                    return_value="data:image/png;base64,synthetic",
-                ):
-                    manager._bbdown_login_worker(cancel_event)
-
-                status = manager.bbdown_login_status()
-                self.assertFalse(status["logged_in"])
-                self.assertEqual(status["state"], "failed")
-                self.assertEqual(status["message"], "Bilibili 登录失败，请重试")
-            finally:
-                manager.shutdown()
-
-    def test_cookie_text_from_login_jar_requires_web_cookie_pair(self):
-        complete = [
-            SimpleNamespace(name="bili_jct", value="synthetic-csrf"),
-            SimpleNamespace(name="SESSDATA", value="synthetic-session"),
-            SimpleNamespace(name="DedeUserID", value="100"),
-        ]
-        token_only = [SimpleNamespace(name="access_token", value="synthetic-token")]
-
-        self.assertEqual(
-            CacheManager._cookie_text_from_login_jar(complete),
-            "SESSDATA=synthetic-session; bili_jct=synthetic-csrf; DedeUserID=100",
-        )
-        self.assertEqual(CacheManager._cookie_text_from_login_jar(token_only), "")
-
-    def test_cancelled_login_does_not_save_returned_cookie_material(self):
-        bbdown_dir = Path(self.temp_dir.name) / "tools" / "bbdown"
-        bbdown_dir.mkdir(parents=True, exist_ok=True)
-        cancel_event = Mock()
-        cancel_event.wait.return_value = False
-        cancel_event.is_set.return_value = True
-
-        with patch("bilikara.cache.CACHE_DIR", self.cache_dir), patch("bilikara.cache.BB_DOWN_DIR", bbdown_dir):
-            manager = CacheManager(self.store, max_cache_items=3)
-            try:
-                manager.bbdown_login_cancel_event = cancel_event
-                with patch.object(
-                    manager,
-                    "_bilibili_login_request_json",
-                    side_effect=[
-                        {"data": {"url": "synthetic-qr-url", "qrcode_key": "synthetic-qr-key"}},
-                        {"data": {"code": 0}},
-                    ],
-                ), patch.object(
-                    manager,
-                    "_write_bbdown_login_qr",
-                    return_value="data:image/png;base64,synthetic",
-                ), patch.object(manager, "_save_bbdown_login_cookie") as save_cookie:
-                    manager._bbdown_login_worker(cancel_event)
-
-                save_cookie.assert_not_called()
-                self.assertFalse((bbdown_dir / "BBDown.data").exists())
-            finally:
-                manager.shutdown()
-
-    def test_save_bbdown_login_cookie_is_atomic_and_private(self):
-        bbdown_dir = Path(self.temp_dir.name) / "tools" / "bbdown"
-        with patch("bilikara.cache.CACHE_DIR", self.cache_dir), patch("bilikara.cache.BB_DOWN_DIR", bbdown_dir):
-            manager = CacheManager(self.store, max_cache_items=3)
-            try:
-                saved = manager._save_bbdown_login_cookie(
-                    "SESSDATA=synthetic-session; bili_jct=synthetic-csrf"
-                )
-            finally:
-                manager.shutdown()
-
-        data_path = bbdown_dir / "BBDown.data"
-        self.assertTrue(saved)
-        self.assertTrue(data_path.exists())
-        self.assertFalse((bbdown_dir / ".BBDown.data.login.tmp").exists())
-        if os.name != "nt":
-            self.assertEqual(data_path.stat().st_mode & 0o777, 0o600)
+    # QR HTTP, credential publication, cancellation and success-hook coverage now
+    # runs against the real shared Runtime FFI in test_desktop_login.py.
 
     def test_ensure_ffmpeg_rejects_non_executable_binary(self):
         vendor_dir = Path(self.temp_dir.name) / "vendor"
@@ -3275,11 +3771,22 @@ class CacheManagerPolicyTest(unittest.TestCase):
 
 class CacheManagerMediaIntegrityEvidenceTest(unittest.TestCase):
     def setUp(self) -> None:
+        # These lifecycle fixtures model an authenticated external-tool session.
+        credential_patch = patch("bilikara.bilibili.cfg.COOKIE", "SESSDATA=synthetic; bili_jct=csrf")
+        credential_patch.start()
+        self.addCleanup(credential_patch.stop)
         self.temp_dir = TemporaryDirectory()
         root = Path(self.temp_dir.name)
         self.cache_dir = root / "cache"
         self.cache_dir.mkdir()
         self.log_path = root / "downkyi.log"
+        # Real source-mode remux subprocesses need an owned working directory,
+        # even when the downloader worker is disabled and no BBDown is installed.
+        tool_dir = root / "tools"
+        tool_dir.mkdir()
+        tool_patch = patch("bilikara.cache.BB_DOWN_DIR", tool_dir)
+        tool_patch.start()
+        self.addCleanup(tool_patch.stop)
         self.store = PlaylistStore(root / "state.json", root / "backup.json")
         self.store.add_session_user("diagnostic-user")
 
@@ -3288,6 +3795,108 @@ class CacheManagerMediaIntegrityEvidenceTest(unittest.TestCase):
 
     def _manager(self):
         return CacheManager(self.store, max_cache_items=3)
+
+    def _add_item(self, item_id: str) -> PlaylistItem:
+        item = PlaylistItem(
+            id=item_id,
+            original_url=f"https://example.test/{item_id}",
+            resolved_url=f"https://example.test/{item_id}?p=1",
+            bvid="BV1xx411c7mD",
+            aid=1,
+            cid=2,
+            page=1,
+            title=item_id,
+            part_title="P1",
+            display_title=f"{item_id} - P1",
+            cover_url="",
+            embed_url="",
+        )
+        self.store.add_item(item, requester_name="diagnostic-user")
+        return item
+
+    def _publication_fixture(
+        self,
+        manager: CacheManager,
+        item_id: str,
+        token: int,
+        marker: bytes,
+    ) -> tuple[dict[str, object], dict[str, object], Path, Path]:
+        reservation, staging, committed = manager._cache_attempt_paths(token)
+        staging.mkdir(parents=True)
+        video = staging / "downloaded-video.mp4"
+        audio = staging / "downloaded-audio.m4a"
+        video.write_bytes(b"video-" + marker)
+        audio.write_bytes(b"audio-" + marker)
+        result: dict[str, object] = {
+            "video_file": video,
+            "video_relative_path": str(video.relative_to(self.cache_dir)),
+            "video_media_url": f"/media/{video.relative_to(self.cache_dir)}",
+            "audio_variants": [
+                {
+                    "id": "p1",
+                    "label": "P1",
+                    "page": 1,
+                    "audio_url": f"/media/{audio.relative_to(self.cache_dir)}",
+                }
+            ],
+            "selected_audio_variant_id": "p1",
+            "validation_files": [
+                {"path": video, "stream_kind": "video", "page": 1},
+                {"path": audio, "stream_kind": "audio", "page": 1},
+            ],
+            "validation_metadata": [{"path": str(video)}, {"path": str(audio)}],
+        }
+        return reservation, result, staging, committed
+
+    def test_cache_attempt_paths_preserve_configured_root_representation(self):
+        alias_parent = Path(self.temp_dir.name) / "path-alias"
+        alias_parent.mkdir()
+        alias_cache_dir = alias_parent / ".." / "cache"
+        item = self._add_item("path-representation")
+        token = begin_cache_attempt(self.store, item.id)
+
+        with patch("bilikara.cache.CACHE_DIR", alias_cache_dir), patch.object(
+            CacheManager, "_worker_loop", lambda self: None
+        ):
+            manager = self._manager()
+            try:
+                reservation, staging, committed = manager._cache_attempt_paths(token)
+            finally:
+                manager.shutdown()
+
+        self.assertEqual(
+            staging,
+            alias_cache_dir / ".staging" / f"attempt-{token}",
+        )
+        self.assertEqual(
+            committed,
+            alias_cache_dir / reservation["artifact_relative_directory"],
+        )
+
+    def _apply_ready_result(
+        self,
+        item_id: str,
+        token: int,
+        result: dict[str, object],
+    ) -> bool:
+        return self.store.apply_cache_event(
+            item_id,
+            cache_attempt_token=token,
+            event={
+                "kind": "ready",
+                "progress": 100.0,
+                "message": "ready",
+                "video_relative_path": result["video_relative_path"],
+                "video_media_url": result["video_media_url"],
+                "audio_variants": result["audio_variants"],
+                "selected_audio_variant_id": result["selected_audio_variant_id"],
+                "item_incarnation_id": result["item_incarnation_id"],
+                "artifact_set_id": result["artifact_set_id"],
+                "artifact_relative_directory": result[
+                    "artifact_relative_directory"
+                ],
+            },
+        )
 
     @staticmethod
     def _probe_payload(kind: str, duration: str | None) -> dict:
@@ -3304,6 +3913,28 @@ class CacheManagerMediaIntegrityEvidenceTest(unittest.TestCase):
             stream["duration_ts"] = str(round(float(duration) * 1000))
             file_format["duration"] = duration
         return {"streams": [stream], "format": file_format}
+
+    @staticmethod
+    def _rust_probe_payload(
+        path: Path,
+        kind: str,
+        duration: float,
+        *,
+        codec: str | None = None,
+        fragmented: bool = False,
+        fast_start: bool = True,
+    ) -> dict[str, object]:
+        return {
+            "path": str(path.resolve()),
+            "kind": kind,
+            "codec": codec or ("h264" if kind == "video" else "aac"),
+            "duration_seconds": duration,
+            "sample_count": 25,
+            "sample_bytes": 1024,
+            "file_bytes": path.stat().st_size,
+            "fragmented": fragmented,
+            "fast_start": fast_start,
+        }
 
     def test_downkyi_diagnostics_redact_signed_urls_and_cookie(self):
         safe = CacheManager._safe_url_summary(
@@ -3339,7 +3970,9 @@ class CacheManagerMediaIntegrityEvidenceTest(unittest.TestCase):
         )
 
     def test_validate_media_file_returns_structured_probe_metadata(self):
-        media = self.cache_dir / "song" / "video.mp4"
+        alias_parent = Path(self.temp_dir.name) / "probe-alias"
+        alias_parent.mkdir()
+        media = alias_parent / ".." / "cache" / "song" / "video.mp4"
         media.parent.mkdir(parents=True)
         media.write_bytes(b"media")
         with patch("bilikara.cache.CACHE_DIR", self.cache_dir), patch.object(
@@ -3347,13 +3980,14 @@ class CacheManagerMediaIntegrityEvidenceTest(unittest.TestCase):
         ):
             manager = self._manager()
             try:
-                with patch("bilikara.cache.subprocess.run", return_value=SimpleNamespace(
-                    returncode=0,
-                    stdout=json.dumps(self._probe_payload("video", "120.5")),
-                    stderr="",
-                )):
+                with patch(
+                    "bilikara.cache.rust_runtime.probe_media",
+                    return_value=self._rust_probe_payload(media, "video", 120.5),
+                ), patch.object(
+                    manager, "_ffprobe_path_for_ffmpeg"
+                ) as ffprobe_resolver:
                     result = manager._validate_media_file(
-                        Path("/tools/ffprobe"),
+                        None,
                         Path("/tools/ffmpeg"),
                         media,
                         label="视频轨 P1",
@@ -3365,13 +3999,413 @@ class CacheManagerMediaIntegrityEvidenceTest(unittest.TestCase):
 
         self.assertEqual(result["path"], str(media))
         self.assertEqual(result["size"], 5)
-        self.assertEqual(result["format_name"], "mov,mp4,m4a")
-        self.assertEqual(result["duration"], 120.5)
-        self.assertEqual(result["start_time"], 0.0)
-        self.assertEqual(result["streams"][0]["codec_name"], "h264")
-        self.assertEqual(result["streams"][0]["codec_tag_string"], "avc1")
-        self.assertEqual(result["streams"][0]["duration_ts"], "120500")
-        self.assertEqual(result["streams"][0]["time_base"], "1/1000")
+        self.assertEqual(result["backend"], "rust")
+        self.assertEqual(result["container"], "mp4")
+        self.assertEqual(result["duration_seconds"], 120.5)
+        self.assertEqual(result["stream_count"], 1)
+        self.assertEqual(result["streams"][0]["kind"], "video")
+        self.assertEqual(result["streams"][0]["codec"], "h264")
+        self.assertEqual(result["sample_count"], 25)
+        ffprobe_resolver.assert_not_called()
+
+    def test_rust_non_unsupported_failures_never_reach_ffprobe(self):
+        media = self.cache_dir / "song" / "video.mp4"
+        media.parent.mkdir(parents=True)
+        media.write_bytes(b"corrupt")
+        with patch.object(CacheManager, "_worker_loop", lambda self: None):
+            manager = self._manager()
+            try:
+                # A contract violation joins these: the native backend refused
+                # legible media on purpose, so handing it to ffprobe would let a
+                # more permissive check accept what the operation must reject.
+                for error_kind in (
+                    "invalid_media",
+                    "invalid_response",
+                    "io",
+                    "media_contract_violation",
+                ):
+                    with self.subTest(error_kind=error_kind), patch(
+                        "bilikara.cache.rust_runtime.probe_media",
+                        side_effect=rust_runtime.RustMediaError(
+                            error_kind, "Rust probe failed", response={}
+                        ),
+                    ), patch.object(
+                        manager, "_ffprobe_path_for_ffmpeg"
+                    ) as ffprobe_resolver, patch(
+                        "bilikara.cache.subprocess.run"
+                    ) as subprocess_run:
+                        with self.assertRaisesRegex(DownloadCommandError, error_kind):
+                            manager._validate_media_file(
+                                None,
+                                Path("/tools/ffmpeg"),
+                                media,
+                                label="视频轨 P1",
+                                required_streams={"video"},
+                                log_path=self.log_path,
+                            )
+                        ffprobe_resolver.assert_not_called()
+                        subprocess_run.assert_not_called()
+            finally:
+                manager.shutdown()
+
+    def _native_media_fixtures(self) -> dict[str, Path]:
+        """Real ffmpeg artifacts for the native retry regression.
+
+        The progressive AAC original is the one that must travel the extended
+        AAC preservation path, so its damaged twin exercises the relocation
+        branch this correction is about rather than an earlier check.
+        """
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg or not rust_runtime.media_backend_available():
+            self.skipTest("ffmpeg/Rust MediaBackend unavailable")
+        fixture_dir = self.cache_dir / "native-retry-fixtures"
+        fixture_dir.mkdir(parents=True, exist_ok=True)
+
+        def generate(name: str, arguments: list[str]) -> Path:
+            path = fixture_dir / name
+            produced = subprocess.run(
+                [ffmpeg, "-v", "error", "-y", *arguments, str(path)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if produced.returncode != 0:
+                self.skipTest(f"fixture generation unavailable: {produced.stderr[:120]}")
+            return path
+
+        video = generate(
+            "video.mp4",
+            [
+                "-f", "lavfi", "-i", "color=c=black:s=64x64:r=25:d=2",
+                "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            ],
+        )
+        audio = generate(
+            "audio.m4a",
+            [
+                "-f", "lavfi", "-i",
+                "sine=frequency=440:sample_rate=44100:duration=2",
+                "-vn", "-c:a", "aac",
+            ],
+        )
+        probe = rust_runtime.probe_media(source=audio, expected_kind="audio")
+        self.assertFalse(probe["fast_start"])
+        self.assertFalse(probe["fragmented"])
+
+        # Only the media-data box type changes; size, payload and sample
+        # offsets stay identical, and the header is located rather than matched
+        # by bytes because the file already carries an unrelated free box.
+        damaged_bytes = bytearray(audio.read_bytes())
+        media_boxes = [
+            start
+            for kind, start, _ in self._mp4_top_level_boxes(bytes(damaged_bytes))
+            if kind == b"mdat"
+        ]
+        self.assertEqual(len(media_boxes), 1)
+        damaged_bytes[media_boxes[0] + 4 : media_boxes[0] + 8] = b"free"
+        damaged = fixture_dir / "audio-media-data-as-free.m4a"
+        damaged.write_bytes(bytes(damaged_bytes))
+
+        # The paired control: a genuinely valid layout this backend cannot
+        # normalize, built by moving the moov behind an mdat.
+        fragmented = generate(
+            "audio-fragmented.m4a",
+            [
+                "-f", "lavfi", "-i",
+                "sine=frequency=440:sample_rate=44100:duration=2",
+                "-vn", "-c:a", "aac",
+                "-movflags", "empty_moov+frag_keyframe+default_base_moof",
+            ],
+        )
+        fragmented_bytes = fragmented.read_bytes()
+        kind, start, size = self._mp4_top_level_boxes(fragmented_bytes)[0]
+        self.assertEqual(kind, b"ftyp")
+        layout_limit = fixture_dir / "audio-fragmented-late-moov.m4a"
+        layout_limit.write_bytes(
+            fragmented_bytes[: start + size]
+            + (8).to_bytes(4, "big")
+            + b"mdat"
+            + fragmented_bytes[start + size :]
+        )
+        return {
+            "video": video,
+            "audio": audio,
+            "damaged": damaged,
+            "layout_limit": layout_limit,
+        }
+
+    def _run_native_track_loop(
+        self, manager: CacheManager, item_id: str, artifacts: dict[str, list[Path]]
+    ) -> tuple[dict[str, Path] | None, list[str], BaseException | None]:
+        """Drive the retained Python Native reference over prepared artifacts.
+
+        Only the byte transfer is controlled: `_download_stream_with_rust` is
+        replaced by a hand that copies a prepared file. The retry decision,
+        `rust_runtime.normalize_media` across the real media FFI, and the
+        publication of the accepted artifact are exercised in this historical
+        adapter. This does not exercise production Rust CacheRuntime dispatch;
+        the enqueue/retry/sync tests cover that ownership boundary separately.
+        """
+        item = self.store.get_item(item_id)
+        manager.desired_ids.add(item_id)
+        token = begin_cache_attempt(self.store, item_id)
+        item_dir = self.cache_dir / item_id
+        item_dir.mkdir(parents=True, exist_ok=True)
+        video_track = {
+            "key": "video-p1", "page": 1, "stream_kind": "video",
+            "label": "视频轨P1", "order": 0,
+        }
+        audio_tracks = [{
+            "key": "audio-p1", "page": 1, "stream_kind": "audio",
+            "label": "音轨P1", "order": 1,
+        }]
+        manager._begin_download_progress(
+            item_id, [video_track, *audio_tracks], cache_attempt_token=token
+        )
+        remaining = {kind: list(paths) for kind, paths in artifacts.items()}
+        transfers: list[str] = []
+
+        def deliver(_item_id, target_dir, _log_path, *, out_name, stream_kind, **kwargs):
+            transfers.append(stream_kind)
+            queued = remaining[stream_kind]
+            source = queued.pop(0) if len(queued) > 1 else queued[0]
+            attempt_dir = target_dir / f".attempt-{len(transfers)}"
+            attempt_dir.mkdir(parents=True)
+            delivered = attempt_dir / out_name
+            delivered.write_bytes(source.read_bytes())
+            return delivered
+
+        stream = {"codec_name": "avc", "url": "https://example.test/v.m4s", "backup_urls": []}
+        audio_stream = {"url": "https://example.test/a.m4s", "backup_urls": []}
+        with patch.object(manager, "_download_stream_with_rust", side_effect=deliver), patch(
+            "bilikara.cache.effective_bilibili_cookie", return_value=""
+        ), patch.object(
+            manager, "_resolve_dash_streams", return_value={"audio": [audio_stream]}
+        ), patch("bilikara.cache.DOWNKYI_TRACK_RETRY_WAIT_SECONDS", 0.01):
+            try:
+                paths = manager._download_dash_streams_native(
+                    item,
+                    item_dir,
+                    self.log_path,
+                    dash_streams={"video": [stream], "audio": [audio_stream]},
+                    video_track=video_track,
+                    audio_tracks=audio_tracks,
+                    cache_attempt_token=token,
+                )
+            except BaseException as exc:  # noqa: BLE001
+                return None, transfers, exc
+        return paths, transfers, None
+
+    def test_native_retry_recovers_from_damaged_media_but_not_a_layout_limit(self):
+        """The retry consequence of the classification, through the real loop.
+
+        A damaged artifact must cost a second download and then succeed on the
+        replacement; a genuinely unsupported layout must still stop after one,
+        even though valid bytes are queued behind it.
+        """
+        fixtures = self._native_media_fixtures()
+        item_id = "song-native-retry"
+        self._add_item(item_id)
+        with patch.object(CacheManager, "_worker_loop", lambda self: None):
+            manager = self._manager()
+            try:
+                paths, transfers, failure = self._run_native_track_loop(
+                    manager,
+                    item_id,
+                    {
+                        "video": [fixtures["video"]],
+                        "audio": [fixtures["damaged"], fixtures["audio"]],
+                    },
+                )
+                self.assertIsNone(failure)
+                self.assertEqual(transfers.count("audio"), 2)
+                self.assertEqual(transfers.count("video"), 1)
+                published = paths["audio-p1"]
+                self.assertTrue(published.is_file())
+                recovered = rust_runtime.probe_media(
+                    source=published, expected_kind="audio"
+                )
+                self.assertTrue(recovered["fast_start"])
+                self.assertEqual(
+                    recovered["sample_count"],
+                    rust_runtime.probe_media(
+                        source=fixtures["audio"], expected_kind="audio"
+                    )["sample_count"],
+                )
+            finally:
+                manager.shutdown()
+
+    def test_native_retry_stops_after_one_download_for_a_valid_layout_limit(self):
+        """The paired control for the regression above.
+
+        Valid replacement bytes are queued behind the unsupported layout, so a
+        second download would be observable. It must not happen: this failure
+        is a capability limit, not a damaged artifact.
+        """
+        fixtures = self._native_media_fixtures()
+        item_id = "song-native-layout"
+        self._add_item(item_id)
+        with patch.object(CacheManager, "_worker_loop", lambda self: None):
+            manager = self._manager()
+            try:
+                paths, transfers, failure = self._run_native_track_loop(
+                    manager,
+                    item_id,
+                    {
+                        "video": [fixtures["video"]],
+                        "audio": [fixtures["layout_limit"], fixtures["audio"]],
+                    },
+                )
+                self.assertIsNone(paths)
+                self.assertIsInstance(failure, rust_runtime.RustMediaError)
+                self.assertEqual(failure.kind, "unsupported_container_layout")
+                self.assertTrue(CacheManager._is_terminal_track_failure(failure))
+                # The valid replacement stayed queued: a capability limit must
+                # not spend a second download.
+                self.assertEqual(transfers.count("audio"), 1)
+            finally:
+                manager.shutdown()
+
+    def test_rust_container_layout_limit_uses_normalized_ffprobe_compatibility(self):
+        """A capability limit is the one shape another backend may answer.
+
+        The kind is terminal for the download — repeating it cannot change the
+        packaging — yet it stays eligible for the compatibility backend, which
+        is the whole point of keeping the two decisions separate.
+        """
+        media = self.cache_dir / "song" / "audio.m4a"
+        media.parent.mkdir(parents=True)
+        media.write_bytes(b"fragmented")
+        process = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(self._probe_payload("audio", "120.0")),
+            stderr="",
+        )
+        with patch.object(CacheManager, "_worker_loop", lambda self: None):
+            manager = self._manager()
+            try:
+                with patch(
+                    "bilikara.cache.rust_runtime.probe_media",
+                    side_effect=rust_runtime.RustMediaError(
+                        "unsupported_container_layout",
+                        "fragmented AAC with an extended decoder configuration "
+                        "is not fast-start",
+                        response={},
+                    ),
+                ), patch("bilikara.cache.subprocess.run", return_value=process):
+                    result = manager._validate_media_file(
+                        Path("/tools/ffprobe"),
+                        Path("/tools/ffmpeg"),
+                        media,
+                        label="音轨 P1",
+                        required_streams={"audio"},
+                        log_path=self.log_path,
+                    )
+            finally:
+                manager.shutdown()
+
+        self.assertEqual(result["backend"], "ffprobe")
+        self.assertEqual(result["fallback_reason"], "unsupported_container_layout")
+        self.assertTrue(
+            CacheManager._is_terminal_track_failure(
+                rust_runtime.RustMediaError(
+                    "unsupported_container_layout", "packaging", response={}
+                )
+            )
+        )
+
+    def test_rust_runtime_failure_is_fail_closed_without_ffprobe(self):
+        media = self.cache_dir / "song" / "audio.m4a"
+        media.parent.mkdir(parents=True)
+        media.write_bytes(b"media")
+        with patch.object(CacheManager, "_worker_loop", lambda self: None):
+            manager = self._manager()
+            try:
+                with patch(
+                    "bilikara.cache.rust_runtime.probe_media",
+                    side_effect=rust_runtime.RustRuntimeUnavailableError("ABI unavailable"),
+                ), patch.object(
+                    manager, "_ffprobe_path_for_ffmpeg"
+                ) as ffprobe_resolver:
+                    with self.assertRaisesRegex(DownloadCommandError, "Rust MediaBackend 不可用"):
+                        manager._validate_media_file(
+                            None,
+                            Path("/tools/ffmpeg"),
+                            media,
+                            label="音轨 P1",
+                            required_streams={"audio"},
+                            log_path=self.log_path,
+                        )
+                ffprobe_resolver.assert_not_called()
+            finally:
+                manager.shutdown()
+
+    def test_rust_unsupported_codec_uses_normalized_ffprobe_compatibility(self):
+        media = self.cache_dir / "song" / "video.mp4"
+        media.parent.mkdir(parents=True)
+        media.write_bytes(b"hevc")
+        process = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(self._probe_payload("video", "120.0")),
+            stderr="",
+        )
+        with patch.object(CacheManager, "_worker_loop", lambda self: None):
+            manager = self._manager()
+            try:
+                with patch(
+                    "bilikara.cache.rust_runtime.probe_media",
+                    side_effect=rust_runtime.RustMediaError(
+                        "unsupported_codec", "HEVC is unsupported", response={}
+                    ),
+                ), patch("bilikara.cache.subprocess.run", return_value=process):
+                    result = manager._validate_media_file(
+                        Path("/tools/ffprobe"),
+                        Path("/tools/ffmpeg"),
+                        media,
+                        label="视频轨 P1",
+                        required_streams={"video"},
+                        log_path=self.log_path,
+                    )
+            finally:
+                manager.shutdown()
+
+        self.assertEqual(result["backend"], "ffprobe")
+        self.assertEqual(result["fallback_reason"], "unsupported_codec")
+        self.assertEqual(result["streams"], [{
+            "kind": "video",
+            "codec": "h264",
+            "duration_seconds": 120.0,
+        }])
+
+    def test_downkyi_flac_in_mp4_source_duration_uses_rust_hint(self):
+        media = self.cache_dir / "song" / "audio.flac"
+        media.parent.mkdir(parents=True)
+        media.write_bytes(b"mp4-flac")
+        with patch.object(CacheManager, "_worker_loop", lambda self: None):
+            manager = self._manager()
+            try:
+                with patch(
+                    "bilikara.cache.rust_runtime.probe_media",
+                    return_value=self._rust_probe_payload(
+                        media, "audio", 120.25, codec="flac"
+                    ),
+                ) as rust_probe, patch.object(
+                    manager, "_ffprobe_path_for_ffmpeg"
+                ) as ffprobe_resolver:
+                    duration = manager._probe_original_audio_duration(
+                        None,
+                        Path("/tools/ffmpeg"),
+                        media,
+                        label="音轨 P1",
+                        log_path=self.log_path,
+                        rust_container_hint="mp4",
+                    )
+                ffprobe_resolver.assert_not_called()
+            finally:
+                manager.shutdown()
+
+        self.assertEqual(duration, 120.25)
+        self.assertEqual(rust_probe.call_args.kwargs["expected_kind"], "audio")
 
     def test_audio_stream_duration_does_not_use_video_or_container_duration(self):
         payload = {
@@ -3400,6 +4434,11 @@ class CacheManagerMediaIntegrityEvidenceTest(unittest.TestCase):
             manager = self._manager()
             try:
                 with patch(
+                    "bilikara.cache.rust_runtime.probe_media",
+                    side_effect=rust_runtime.RustMediaError(
+                        "unsupported_codec", "unsupported MP4 codec", response={}
+                    ),
+                ), patch(
                     "bilikara.cache.subprocess.run",
                     return_value=SimpleNamespace(
                         returncode=0,
@@ -3469,6 +4508,11 @@ class CacheManagerMediaIntegrityEvidenceTest(unittest.TestCase):
             manager = self._manager()
             try:
                 with patch.object(manager, "_ffprobe_path_for_ffmpeg", return_value=Path("/tools/ffprobe")), patch(
+                    "bilikara.cache.rust_runtime.probe_media",
+                    side_effect=rust_runtime.RustMediaError(
+                        "unsupported_codec", "unsupported MP4 codec", response={}
+                    ),
+                ), patch(
                     "bilikara.cache.subprocess.run",
                     return_value=SimpleNamespace(
                         returncode=0,
@@ -3486,6 +4530,7 @@ class CacheManagerMediaIntegrityEvidenceTest(unittest.TestCase):
                             }]},
                             Path("/tools/ffmpeg"),
                             self.log_path,
+                            cache_attempt_token=1,
                         )
             finally:
                 manager.shutdown()
@@ -3496,7 +4541,7 @@ class CacheManagerMediaIntegrityEvidenceTest(unittest.TestCase):
 
     def test_source_audio_duration_accepts_observed_remux_delta(self):
         result = self._validate_source_audio_duration("118.0", source_duration=120.0)
-        self.assertEqual(result["duration"], 118.0)
+        self.assertEqual(result["duration_seconds"], 118.0)
 
     def test_source_audio_duration_rejects_shorter_output_beyond_tolerance(self):
         with self.assertRaisesRegex(DownloadCommandError, "与原始音轨时长不一致"):
@@ -3506,17 +4551,55 @@ class CacheManagerMediaIntegrityEvidenceTest(unittest.TestCase):
         with self.assertRaisesRegex(DownloadCommandError, "与原始音轨时长不一致"):
             self._validate_source_audio_duration("122.001", source_duration=120.0)
 
-    def test_video_significantly_shorter_than_expected_is_rejected(self):
-        self._assert_duration_rejected("video", "87", expected=243)
+    def test_video_missing_or_invalid_duration_is_rejected(self):
+        for actual in (None, "0", "0.5"):
+            with self.subTest(actual=actual):
+                self._assert_duration_rejected("video", actual, expected=247)
 
-    def test_downkyi_validation_requires_ffprobe(self):
-        media = self.cache_dir / "song" / "audio.m4a"
+    def test_complete_tracks_can_be_shorter_than_page_duration(self):
+        # BV1gaVD6hEDd reports 247s for the page despite unequal track durations.
+        # Each file's successful structural inspection supplies its own duration.
+        manager = CacheManager.__new__(CacheManager)
+        for kind, duration in (("video", 241.867938), ("audio", 246.186333), ("video", 87.0)):
+            with self.subTest(kind=kind, duration=duration):
+                media = self.cache_dir / f"{kind}.mp4"
+                media.write_bytes(b"inspected media fixture")
+                metadata = manager._normalized_rust_media_probe(
+                    self._rust_probe_payload(media, kind, duration), media_path=media
+                )
+                with patch.object(manager, "_probe_media_metadata", return_value=metadata):
+                    result = manager._validate_media_file(
+                        None, Path("/unused/ffmpeg"), media,
+                        label=f"{kind} P1", required_streams={kind},
+                        log_path=self.log_path,
+                        diagnostic_context={"expected_duration": 247},
+                    )
+                self.assertEqual(result["duration_seconds"], duration)
+
+    def test_truncated_video_is_rejected_without_page_duration_comparison(self):
+        video = self._native_media_fixtures()["video"]
+        truncated = video.with_name("truncated.mp4")
+        truncated.write_bytes(video.read_bytes()[:-32])
+        manager = CacheManager.__new__(CacheManager)
+        with self.assertRaisesRegex(DownloadCommandError, "invalid_media"):
+            manager._validate_media_file(
+                None, Path("/unused/ffmpeg"), truncated,
+                label="视频轨 P1", required_streams={"video"},
+                log_path=self.log_path,
+                diagnostic_context={"expected_duration": 247},
+            )
+
+    def test_downkyi_unsupported_container_requires_ffprobe(self):
+        media = self.cache_dir / "song" / "audio.flac"
         media.parent.mkdir(parents=True)
         media.write_bytes(b"media")
         with patch.object(CacheManager, "_worker_loop", lambda self: None):
             manager = self._manager()
             try:
-                with patch.object(manager, "_ffprobe_path_for_ffmpeg", return_value=None):
+                with patch.object(manager, "_ffprobe_path_for_ffmpeg", return_value=None), patch(
+                    "bilikara.cache.rust_runtime.media_backend_available",
+                    return_value=True,
+                ):
                     with self.assertRaisesRegex(DownloadCommandError, "需要可用的 ffprobe"):
                         manager._validate_cache_result(
                             "song",
@@ -3528,6 +4611,7 @@ class CacheManagerMediaIntegrityEvidenceTest(unittest.TestCase):
                             }]},
                             Path("/tools/ffmpeg"),
                             self.log_path,
+                            cache_attempt_token=1,
                         )
             finally:
                 manager.shutdown()
@@ -3536,16 +4620,14 @@ class CacheManagerMediaIntegrityEvidenceTest(unittest.TestCase):
         media = self.cache_dir / "song" / "audio.m4a"
         media.parent.mkdir(parents=True)
         media.write_bytes(b"partial")
-        probe = SimpleNamespace(
-            returncode=0,
-            stdout=json.dumps(self._probe_payload("audio", "120")),
-            stderr="",
-        )
         demux = SimpleNamespace(returncode=1, stdout="", stderr="partial file: unexpected EOF")
         with patch.object(CacheManager, "_worker_loop", lambda self: None):
             manager = self._manager()
             try:
-                with patch("bilikara.cache.subprocess.run", side_effect=[probe, demux]):
+                with patch(
+                    "bilikara.cache.rust_runtime.probe_media",
+                    return_value=self._rust_probe_payload(media, "audio", 120.0),
+                ), patch("bilikara.cache.subprocess.run", return_value=demux):
                     with self.assertRaisesRegex(DownloadCommandError, "完整包扫描失败"):
                         manager._validate_media_file(
                             Path("/tools/ffprobe"),
@@ -3567,16 +4649,14 @@ class CacheManagerMediaIntegrityEvidenceTest(unittest.TestCase):
         media = self.cache_dir / "song" / "video.mp4"
         media.parent.mkdir(parents=True)
         media.write_bytes(b"partial")
-        probe = SimpleNamespace(
-            returncode=0,
-            stdout=json.dumps(self._probe_payload("video", "120")),
-            stderr="",
-        )
         demux = SimpleNamespace(returncode=1, stdout="", stderr="partial file: unexpected EOF")
         with patch.object(CacheManager, "_worker_loop", lambda self: None):
             manager = self._manager()
             try:
-                with patch("bilikara.cache.subprocess.run", side_effect=[probe, demux]):
+                with patch(
+                    "bilikara.cache.rust_runtime.probe_media",
+                    return_value=self._rust_probe_payload(media, "video", 120.0),
+                ), patch("bilikara.cache.subprocess.run", return_value=demux):
                     with self.assertRaisesRegex(DownloadCommandError, "完整包扫描失败"):
                         manager._validate_media_file(
                             Path("/tools/ffprobe"),
@@ -3593,19 +4673,27 @@ class CacheManagerMediaIntegrityEvidenceTest(unittest.TestCase):
             finally:
                 manager.shutdown()
 
-    def test_bbdown_cache_result_requires_ffprobe_for_strict_validation(self):
+    def test_bbdown_unsupported_codec_requires_ffprobe_compatibility(self):
+        media = self.cache_dir / "song" / "video.mp4"
+        media.parent.mkdir(parents=True)
+        media.write_bytes(b"media")
         with patch.object(CacheManager, "_worker_loop", lambda self: None):
             manager = self._manager()
             try:
-                with patch.object(manager, "_ffprobe_path_for_ffmpeg", return_value=None):
-                    with self.assertRaisesRegex(DownloadCommandError, "BBDown/DownKyi"):
+                with patch.object(manager, "_ffprobe_path_for_ffmpeg", return_value=None), patch(
+                    "bilikara.cache.rust_runtime.probe_media",
+                    side_effect=rust_runtime.RustMediaError(
+                        "unsupported_codec", "HEVC is unsupported", response={}
+                    ),
+                ):
+                    with self.assertRaisesRegex(DownloadCommandError, "unsupported_codec"):
                         manager._validate_cache_result(
                             "test-id",
                             {
                                 "validation_files": [
                                     {
                                         "download_source": DOWNLOAD_SOURCE_BBDOWN,
-                                        "path": Path("/fake/video.mp4"),
+                                        "path": media,
                                         "required_streams": {"video"},
                                         "label": "视频",
                                     }
@@ -3613,6 +4701,7 @@ class CacheManagerMediaIntegrityEvidenceTest(unittest.TestCase):
                             },
                             Path("/tools/ffmpeg"),
                             self.log_path,
+                            cache_attempt_token=1,
                         )
             finally:
                 manager.shutdown()
@@ -3716,9 +4805,289 @@ class CacheManagerMediaIntegrityEvidenceTest(unittest.TestCase):
                 manager.shutdown()
 
         self.assertLessEqual(
-            abs(float(metadata["duration"]) - source_duration),
+            abs(float(metadata["duration_seconds"]) - source_duration),
             SOURCE_AUDIO_DURATION_TOLERANCE_SECONDS,
         )
+
+    def test_real_rust_and_ffprobe_agree_on_supported_mp4_decisions(self):
+        ffmpeg = shutil.which("ffmpeg")
+        ffprobe = shutil.which("ffprobe")
+        if not ffmpeg or not ffprobe or not rust_runtime.media_backend_available():
+            self.skipTest("ffmpeg/ffprobe/Rust MediaBackend unavailable")
+
+        fixture_dir = self.cache_dir / "probe-fixtures"
+        fixture_dir.mkdir(parents=True)
+        fixtures = [
+            (
+                fixture_dir / "video-tail-moov.mp4",
+                "video",
+                [
+                    "-f", "lavfi", "-i", "color=c=black:s=64x64:r=25:d=1.2",
+                    "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                ],
+                False,
+                False,
+            ),
+            (
+                fixture_dir / "video-fast-start.mp4",
+                "video",
+                [
+                    "-f", "lavfi", "-i", "color=c=black:s=64x64:r=25:d=1.2",
+                    "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                    "-movflags", "+faststart",
+                ],
+                False,
+                True,
+            ),
+            (
+                fixture_dir / "audio-fragmented.m4a",
+                "audio",
+                [
+                    "-f", "lavfi", "-i",
+                    "sine=frequency=440:sample_rate=44100:duration=1.2",
+                    "-vn", "-c:a", "aac", "-movflags", "frag_keyframe+empty_moov",
+                ],
+                True,
+                True,
+            ),
+        ]
+        for path, _kind, arguments, _fragmented, _fast_start in fixtures:
+            generated = subprocess.run(
+                [ffmpeg, "-v", "error", "-y", *arguments, str(path)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if generated.returncode != 0:
+                self.skipTest(f"fixture generation unavailable: {generated.stderr[:120]}")
+
+        for path, kind, _arguments, fragmented, fast_start in fixtures:
+            with self.subTest(path=path.name):
+                native = rust_runtime.probe_media(source=path, expected_kind=kind)
+                external = subprocess.run(
+                    [
+                        ffprobe,
+                        "-v", "error", "-show_entries",
+                        "stream=codec_type,codec_name,duration,duration_ts,time_base",
+                        "-show_entries", "format=duration", "-of", "json", str(path),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(external.returncode, 0, external.stderr)
+                payload = json.loads(external.stdout)
+                self.assertEqual(
+                    [stream["codec_type"] for stream in payload["streams"]], [kind]
+                )
+                self.assertGreater(float(native["duration_seconds"]), 1.0)
+                self.assertGreater(
+                    CacheManager._probe_stream_duration(payload, kind) or 0.0, 1.0
+                )
+                self.assertEqual(native["kind"], kind)
+                self.assertEqual(native["codec"], "h264" if kind == "video" else "aac")
+                self.assertEqual(native["fragmented"], fragmented)
+                self.assertEqual(native["fast_start"], fast_start)
+
+        valid_video = fixtures[0][0]
+        corrupt = fixture_dir / "video-truncated.mp4"
+        video_bytes = valid_video.read_bytes()
+        corrupt.write_bytes(video_bytes[: len(video_bytes) // 2])
+        for path in (fixture_dir / "empty.mp4", corrupt):
+            path.touch(exist_ok=True)
+            with self.subTest(path=path.name):
+                with self.assertRaises(rust_runtime.RustMediaError) as raised:
+                    rust_runtime.probe_media(source=path, expected_kind="video")
+                self.assertEqual(raised.exception.kind, "invalid_media")
+                external = subprocess.run(
+                    [ffprobe, "-v", "error", "-show_streams", str(path)],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertNotEqual(external.returncode, 0)
+
+        # Asking a single-track video file for audio is not a claim that the
+        # file is broken: it is legible media that does not satisfy what this
+        # operation requires, so it must not share a kind with corruption.
+        with self.assertRaises(rust_runtime.RustMediaError) as wrong_kind:
+            rust_runtime.probe_media(source=valid_video, expected_kind="audio")
+        self.assertEqual(wrong_kind.exception.kind, "media_contract_violation")
+        self.assertNotIn(
+            wrong_kind.exception.kind, RUST_MEDIA_PROBE_FALLBACK_ERROR_KINDS
+        )
+
+    @staticmethod
+    def _mp4_top_level_boxes(data: bytes) -> list[tuple[bytes, int, int]]:
+        boxes: list[tuple[bytes, int, int]] = []
+        cursor = 0
+        while cursor + 8 <= len(data):
+            size = int.from_bytes(data[cursor : cursor + 4], "big")
+            kind = data[cursor + 4 : cursor + 8]
+            if size == 1:
+                size = int.from_bytes(data[cursor + 8 : cursor + 16], "big")
+            elif size == 0:
+                size = len(data) - cursor
+            boxes.append((kind, cursor, size))
+            cursor += size
+        return boxes
+
+    def test_real_native_media_taxonomy_separates_capability_limits_from_defects(self):
+        """The three failures a caller must never confuse, on real media.
+
+        Each case below crosses the actual Rust media FFI boundary and is then
+        run through the decisions the boundary exists to drive: whether the
+        track attempt stops, and whether a different backend may be offered the
+        same bytes. Those two answers are deliberately independent.
+        """
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg or not rust_runtime.media_backend_available():
+            self.skipTest("ffmpeg/Rust MediaBackend unavailable")
+
+        fixture_dir = self.cache_dir / "taxonomy-fixtures"
+        fixture_dir.mkdir(parents=True)
+
+        def generate(name: str, arguments: list[str]) -> Path:
+            path = fixture_dir / name
+            produced = subprocess.run(
+                [ffmpeg, "-v", "error", "-y", *arguments, str(path)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if produced.returncode != 0:
+                self.skipTest(f"fixture generation unavailable: {produced.stderr[:120]}")
+            return path
+
+        fragmented = generate(
+            "audio-fragmented.m4a",
+            [
+                "-f", "lavfi", "-i",
+                "sine=frequency=440:sample_rate=44100:duration=2",
+                "-vn", "-c:a", "aac",
+                "-movflags", "empty_moov+frag_keyframe+default_base_moof",
+            ],
+        )
+        muxed = generate(
+            "muxed.mp4",
+            [
+                "-f", "lavfi", "-i", "color=c=black:s=64x64:r=25:d=2",
+                "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+                "-shortest", "-movflags", "+faststart",
+            ],
+        )
+
+        # Supported, ordinary media stays accepted end to end.
+        baseline = rust_runtime.probe_media(source=fragmented, expected_kind="audio")
+        self.assertEqual(baseline["codec"], "aac")
+        self.assertTrue(baseline["fragmented"])
+        self.assertTrue(baseline["fast_start"])
+        rust_runtime.normalize_media(
+            source=fragmented,
+            destination=fixture_dir / "audio-fragmented-normalized.m4a",
+            expected_kind="audio",
+        )
+
+        # The audit's packaging: identical media whose moov trails an mdat, so
+        # the native backend can neither copy it nor relocate its moov without
+        # remuxing away the extended AAC configuration.
+        data = fragmented.read_bytes()
+        kind, start, size = self._mp4_top_level_boxes(data)[0]
+        self.assertEqual(kind, b"ftyp")
+        boundary = start + size
+        late_moov = fixture_dir / "audio-fragmented-late-moov.m4a"
+        late_moov.write_bytes(
+            data[:boundary] + (8).to_bytes(4, "big") + b"mdat" + data[boundary:]
+        )
+
+        # It probes cleanly, which is the evidence that it is intact media and
+        # not a corrupt download wearing a permissive kind.
+        packaging = rust_runtime.probe_media(source=late_moov, expected_kind="audio")
+        self.assertTrue(packaging["fragmented"])
+        self.assertFalse(packaging["fast_start"])
+        self.assertEqual(packaging["codec"], baseline["codec"])
+        self.assertEqual(packaging["sample_count"], baseline["sample_count"])
+        self.assertEqual(packaging["sample_bytes"], baseline["sample_bytes"])
+
+        truncated = fixture_dir / "audio-truncated.m4a"
+        truncated.write_bytes(data[: len(data) // 2])
+
+        # Media data declared as discardable free space. The box header is
+        # located rather than matched by bytes, because a progressive MP4
+        # already carries an unrelated free box, and only the four type bytes
+        # change: size, payload and sample offsets are untouched.
+        progressive = generate(
+            "audio-progressive.m4a",
+            [
+                "-f", "lavfi", "-i",
+                "sine=frequency=440:sample_rate=44100:duration=2",
+                "-vn", "-c:a", "aac",
+            ],
+        )
+        progressive_bytes = bytearray(progressive.read_bytes())
+        media_boxes = [
+            start
+            for kind, start, _ in self._mp4_top_level_boxes(bytes(progressive_bytes))
+            if kind == b"mdat"
+        ]
+        self.assertEqual(len(media_boxes), 1)
+        progressive_bytes[media_boxes[0] + 4 : media_boxes[0] + 8] = b"free"
+        no_media_data = fixture_dir / "audio-media-data-as-free.m4a"
+        no_media_data.write_bytes(bytes(progressive_bytes))
+        self.assertEqual(no_media_data.stat().st_size, progressive.stat().st_size)
+
+        # The valid original must really travel the AAC preservation path this
+        # regression is about, otherwise the damaged twin would prove nothing.
+        original = rust_runtime.probe_media(source=progressive, expected_kind="audio")
+        self.assertFalse(original["fast_start"])
+        self.assertFalse(original["fragmented"])
+        rust_runtime.normalize_media(
+            source=progressive,
+            destination=fixture_dir / "audio-progressive-normalized.m4a",
+            expected_kind="audio",
+        )
+        # It still probes, so the failure below is reached in relocation rather
+        # than at an earlier structural check.
+        damaged_probe = rust_runtime.probe_media(
+            source=no_media_data, expected_kind="audio"
+        )
+        self.assertEqual(damaged_probe["sample_count"], original["sample_count"])
+
+        cases = [
+            # fixture, expected kind, terminal, backend-fallback eligible
+            (late_moov, "unsupported_container_layout", True, True),
+            (muxed, "media_contract_violation", True, False),
+            (truncated, "invalid_media", False, False),
+            (no_media_data, "invalid_media", False, False),
+        ]
+        source_bytes = {source: source.read_bytes() for source, *_ in cases}
+        for source, expected_kind, terminal, eligible in cases:
+            with self.subTest(source=source.name):
+                with self.assertRaises(rust_runtime.RustMediaError) as raised:
+                    rust_runtime.normalize_media(
+                        source=source,
+                        destination=fixture_dir / f"out-{source.stem}.m4a",
+                        expected_kind="audio",
+                    )
+                self.assertEqual(raised.exception.kind, expected_kind)
+                self.assertEqual(
+                    CacheManager._is_terminal_track_failure(raised.exception), terminal
+                )
+                self.assertEqual(
+                    expected_kind in RUST_MEDIA_PROBE_FALLBACK_ERROR_KINDS, eligible
+                )
+                self.assertFalse((fixture_dir / f"out-{source.stem}.m4a").exists())
+                self.assertEqual(source.read_bytes(), source_bytes[source])
+
+        # A validation failure reaches the retry decision wrapped in the host's
+        # own error, so the kind has to survive the exception chain too.
+        with self.assertRaises(rust_runtime.RustMediaError) as contract:
+            rust_runtime.probe_media(source=muxed, expected_kind="video")
+        self.assertEqual(contract.exception.kind, "media_contract_violation")
+        wrapped = DownloadCommandError("缓存校验失败: 视频轨 P1")
+        wrapped.__cause__ = contract.exception
+        self.assertTrue(CacheManager._is_terminal_track_failure(wrapped))
 
     def test_downkyi_remux_failure_keeps_raw_file_and_rejects_cache(self):
         media = self.cache_dir / "song" / ".attempt-test" / "audio-p1.m4a"
@@ -3798,35 +5167,32 @@ class CacheManagerMediaIntegrityEvidenceTest(unittest.TestCase):
             ]
         }
         probes = [
-            SimpleNamespace(
-                returncode=0,
-                stdout=json.dumps(self._probe_payload("video", "243")),
-                stderr="",
-            ),
-            SimpleNamespace(
-                returncode=0,
-                stdout=json.dumps(self._probe_payload("audio", "87")),
-                stderr="",
-            ),
+            self._rust_probe_payload(video, "video", 243.0),
+            self._rust_probe_payload(audio, "audio", 87.0),
         ]
 
         with patch.object(CacheManager, "_worker_loop", lambda self: None):
             manager = self._manager()
             try:
-                with patch.object(
-                    manager,
-                    "_ffprobe_path_for_ffmpeg",
-                    return_value=Path("/tools/ffprobe"),
-                ), patch("bilikara.cache.subprocess.run", side_effect=probes):
+                with patch(
+                    "bilikara.cache.rust_runtime.probe_media", side_effect=probes
+                ), patch.object(
+                    manager, "_ffprobe_path_for_ffmpeg"
+                ) as ffprobe_resolver:
                     manager._validate_cache_result(
-                        "song", cache_result, Path("/tools/ffmpeg"), self.log_path
+                        "song",
+                        cache_result,
+                        Path("/tools/ffmpeg"),
+                        self.log_path,
+                        cache_attempt_token=1,
                     )
+                ffprobe_resolver.assert_not_called()
             finally:
                 manager.shutdown()
 
         self.assertEqual(cache_result["validation_failure_count"], 0)
         self.assertEqual(
-            [entry["duration"] for entry in cache_result["validation_metadata"]],
+            [entry["duration_seconds"] for entry in cache_result["validation_metadata"]],
             [243.0, 87.0],
         )
 
@@ -3843,6 +5209,11 @@ class CacheManagerMediaIntegrityEvidenceTest(unittest.TestCase):
             manager = self._manager()
             try:
                 with patch(
+                    "bilikara.cache.rust_runtime.probe_media",
+                    side_effect=rust_runtime.RustMediaError(
+                        "unsupported_codec", "unsupported MP4 codec", response={}
+                    ),
+                ), patch(
                     "bilikara.cache.subprocess.run",
                     return_value=SimpleNamespace(
                         returncode=0,
@@ -3872,7 +5243,12 @@ class CacheManagerMediaIntegrityEvidenceTest(unittest.TestCase):
         ):
             manager = self._manager()
             try:
-                with patch("bilikara.cache.subprocess.run", return_value=SimpleNamespace(
+                with patch(
+                    "bilikara.cache.rust_runtime.probe_media",
+                    side_effect=rust_runtime.RustMediaError(
+                        "unsupported_codec", "unsupported MP4 codec", response={}
+                    ),
+                ), patch("bilikara.cache.subprocess.run", return_value=SimpleNamespace(
                     returncode=0,
                     stdout=json.dumps(self._probe_payload(kind, actual)),
                     stderr="",
@@ -3890,81 +5266,1146 @@ class CacheManagerMediaIntegrityEvidenceTest(unittest.TestCase):
             finally:
                 manager.shutdown()
 
-    def test_aria2_control_file_after_success_is_rejected(self):
-        self._assert_aria2_output_rejected(["video-p1.mp4", "video-p1.mp4.aria2"])
 
-    def test_stale_expected_output_plus_new_numbered_output_is_rejected(self):
-        self._assert_aria2_output_rejected(["video-p1.mp4", "video-p1.1.mp4"])
 
-    def test_multiple_matching_media_outputs_are_rejected(self):
-        self._assert_aria2_output_rejected(["video-p1.mp4", "other.mp4"])
 
-    def _assert_aria2_output_rejected(self, names: list[str]) -> None:
-        target = self.cache_dir / "song" / "video-p1"
-        target.mkdir(parents=True)
-        with patch("bilikara.cache.CACHE_DIR", self.cache_dir), patch.object(
-            CacheManager, "_worker_loop", lambda self: None
-        ):
-            manager = self._manager()
-            try:
-                def fake_run(_item_id, command, *_args, **_kwargs):
-                    attempt_dir = Path(command[command.index("--dir") + 1])
-                    attempt_dir.mkdir(parents=True, exist_ok=True)
-                    for index, name in enumerate(names, start=1):
-                        (attempt_dir / name).write_bytes(b"x" * index)
-
-                with patch.object(manager, "_run_item_command", side_effect=fake_run):
-                    with self.assertRaises(DownloadCommandError):
-                        manager._download_stream_with_aria2c(
-                            "song",
-                            Path("/tools/aria2c"),
-                            Path("/tools/ffmpeg"),
-                            target,
-                            self.log_path,
-                            urls=["https://upos.example/video.m4s?token=secret"],
-                            out_name="video-p1.mp4",
-                            cookie="SESSDATA=secret",
-                            stage_label="下载视频轨 P1",
-                            track_key="video-p1",
-                            stream_kind="video",
-                            page=1,
-                            cid=123,
-                        )
-            finally:
-                manager.shutdown()
 
     def test_validated_attempt_is_atomically_published_and_urls_rewritten(self):
-        target = self.cache_dir / "song" / "video-p1"
-        attempt = target / ".attempt-test"
-        source = attempt / "video-p1.mp4"
-        source.parent.mkdir(parents=True)
-        source.write_bytes(b"validated")
-        result = {
-            "video_file": source,
-            "video_relative_path": str(source.relative_to(self.cache_dir)),
-            "video_media_url": f"/media/{source.relative_to(self.cache_dir)}",
-            "audio_variants": [],
-            "validation_files": [{"path": source}],
-            "validation_metadata": [{"path": str(source)}],
-        }
         with patch("bilikara.cache.CACHE_DIR", self.cache_dir), patch.object(
             CacheManager, "_worker_loop", lambda self: None
         ):
             manager = self._manager()
             try:
-                manager._publish_validated_cache_result(result, self.log_path)
-                final_path = target / "video-p1.mp4"
+                item = PlaylistItem(
+                    id="song",
+                    original_url="https://example.test/song",
+                    resolved_url="https://example.test/song?p=1",
+                    bvid="BV1xx411c7mD",
+                    aid=1,
+                    cid=2,
+                    page=1,
+                    title="song",
+                    part_title="P1",
+                    display_title="song - P1",
+                    cover_url="",
+                    embed_url="",
+                )
+                self.store.add_item(item, requester_name="diagnostic-user")
+                token = begin_cache_attempt(self.store, item.id)
+                reservation, attempt, committed = manager._cache_attempt_paths(token)
+                attempt.mkdir(parents=True)
+                video = attempt / "downloaded-video.mp4"
+                audio = attempt / "downloaded-audio.m4a"
+                video.write_bytes(b"validated-video")
+                audio.write_bytes(b"validated-audio")
+                windows_audio_relative_path = (
+                    audio.relative_to(self.cache_dir).as_posix().replace("/", "\\")
+                )
+                result = {
+                    "video_file": video,
+                    "video_relative_path": str(video.relative_to(self.cache_dir)),
+                    "video_media_url": f"/media/{video.relative_to(self.cache_dir)}",
+                    "audio_variants": [
+                        {
+                            "id": "p1",
+                            "label": "P1",
+                            "page": 1,
+                            "audio_url": f"/media/{windows_audio_relative_path}",
+                        }
+                    ],
+                    "selected_audio_variant_id": "p1",
+                    "validation_files": [
+                        {"path": video, "stream_kind": "video", "page": 1},
+                        {"path": audio, "stream_kind": "audio", "page": 1},
+                    ],
+                    "validation_metadata": [
+                        {"path": str(video)},
+                        {"path": str(audio)},
+                    ],
+                }
+
+                manager._publish_validated_cache_result(
+                    item.id,
+                    token,
+                    reservation,
+                    attempt,
+                    result,
+                    self.log_path,
+                )
+                final_path = committed / "video-p1.mp4"
                 self.assertTrue(final_path.exists())
+                self.assertTrue((committed / "audio-p1.m4a").exists())
                 self.assertFalse(attempt.exists())
                 self.assertEqual(result["video_file"], final_path)
                 self.assertEqual(result["validation_files"][0]["path"], final_path)
                 self.assertEqual(result["validation_metadata"][0]["path"], str(final_path))
-                self.assertNotIn(".attempt-", result["video_media_url"])
+                expected_video_relative_path = (
+                    f"{reservation['artifact_relative_directory']}/video-p1.mp4"
+                )
+                self.assertEqual(
+                    result["video_relative_path"], expected_video_relative_path
+                )
+                self.assertEqual(
+                    result["video_media_url"],
+                    f"/media/{expected_video_relative_path}",
+                )
+                expected_audio_relative_path = (
+                    f"{reservation['artifact_relative_directory']}/audio-p1.m4a"
+                )
+                self.assertEqual(
+                    result["audio_variants"][0]["audio_url"],
+                    f"/media/{expected_audio_relative_path}",
+                )
+                self.assertEqual(self.store.get_item(item.id).cache_status, "pending")
+                # This fixture ends the publisher without a Ready projection;
+                # report the same worker completion used by production finally.
+                manager._finish_artifact_attempts(item.id, {token})
+                self.assertFalse(committed.exists())
             finally:
                 manager.shutdown()
 
+    def test_superseded_ready_leaves_only_an_orphan_and_preserves_old_commit(self):
+        with patch("bilikara.cache.CACHE_DIR", self.cache_dir), patch.object(
+            CacheManager, "_worker_loop", lambda self: None
+        ):
+            manager = self._manager()
+            try:
+                item = self._add_item("song-orphan")
+                first_token = begin_cache_attempt(self.store, item.id)
+                first_reservation, first_result, first_staging, first_committed = (
+                    self._publication_fixture(
+                        manager, item.id, first_token, b"first"
+                    )
+                )
+                manager._publish_validated_cache_result(
+                    item.id,
+                    first_token,
+                    first_reservation,
+                    first_staging,
+                    first_result,
+                    self.log_path,
+                )
+                self.assertTrue(
+                    self._apply_ready_result(item.id, first_token, first_result)
+                )
+                committed_before = self.store.get_item(item.id)
+
+                stale_token = begin_cache_attempt(self.store, item.id)
+                stale_reservation, stale_result, stale_staging, stale_committed = (
+                    self._publication_fixture(
+                        manager, item.id, stale_token, b"stale"
+                    )
+                )
+                manager._publish_validated_cache_result(
+                    item.id,
+                    stale_token,
+                    stale_reservation,
+                    stale_staging,
+                    stale_result,
+                    self.log_path,
+                )
+                newest_token = begin_cache_attempt(self.store, item.id)
+                with self.assertRaisesRegex(ValueError, "superseded"):
+                    self._apply_ready_result(item.id, stale_token, stale_result)
+
+                current = self.store.get_item(item.id)
+                self.assertEqual(
+                    current.artifact_set_id, committed_before.artifact_set_id
+                )
+                self.assertEqual(current.video_media_url, committed_before.video_media_url)
+                self.assertEqual(
+                    (first_committed / "video-p1.mp4").read_bytes(),
+                    b"video-first",
+                )
+                self.assertEqual(
+                    (stale_committed / "video-p1.mp4").read_bytes(),
+                    b"video-stale",
+                )
+                self.assertNotEqual(
+                    first_reservation["artifact_set_id"],
+                    stale_reservation["artifact_set_id"],
+                )
+                self.assertGreater(newest_token, stale_token)
+            finally:
+                manager.shutdown()
+
+    def test_generic_update_cannot_change_committed_media_descriptor_or_bytes(self):
+        with patch("bilikara.cache.CACHE_DIR", self.cache_dir), patch.object(
+            CacheManager, "_worker_loop", lambda self: None
+        ):
+            manager = self._manager()
+            try:
+                item = self._add_item("song-metadata-boundary")
+                token = begin_cache_attempt(self.store, item.id)
+                reservation, result, staging, committed = self._publication_fixture(
+                    manager, item.id, token, b"committed"
+                )
+                manager._publish_validated_cache_result(
+                    item.id,
+                    token,
+                    reservation,
+                    staging,
+                    result,
+                    self.log_path,
+                )
+                self.assertTrue(self._apply_ready_result(item.id, token, result))
+                before = self.store.get_item(item.id)
+                self.assertIsNotNone(before)
+                before_payload = before.serialize()
+                before_bytes = {
+                    path.name: path.read_bytes()
+                    for path in committed.iterdir()
+                    if path.is_file()
+                }
+
+                protected_changes = {
+                    "original_url": "https://example.test/replacement",
+                    "resolved_url": "https://example.test/replacement?p=2",
+                    "bvid": "BV1replacement",
+                    "aid": 99,
+                    "cid": 100,
+                    "page": 2,
+                    "selected_pages": [2],
+                    "selected_cids": [100],
+                    "selected_durations": [999],
+                    "selected_parts": ["replacement"],
+                    "available_pages": [2],
+                    "available_cids": [100],
+                    "available_durations": [999],
+                    "available_parts": ["replacement"],
+                    "video_page": 2,
+                    "manual_selection": True,
+                    "audio_variants": [],
+                    "selected_audio_variant_id": "replacement",
+                    "cache_status": "pending",
+                    "cache_progress": 0.0,
+                    "cache_message": "replacement",
+                    "video_relative_path": "replacement/video.mp4",
+                    "video_media_url": "/media/replacement/video.mp4",
+                    "item_incarnation_id": "i-replacement",
+                    "artifact_set_id": "a-replacement",
+                    "artifact_relative_directory": "artifacts/replacement",
+                }
+                with self.assertRaisesRegex(ValueError, "metadata fields"):
+                    self.store.update_item(item.id, **protected_changes)
+
+                after = self.store.get_item(item.id)
+                self.assertIsNotNone(after)
+                for field in protected_changes:
+                    self.assertEqual(
+                        after.serialize()[field],
+                        before_payload[field],
+                        field,
+                    )
+                self.assertEqual(
+                    {
+                        path.name: path.read_bytes()
+                        for path in committed.iterdir()
+                        if path.is_file()
+                    },
+                    before_bytes,
+                )
+            finally:
+                manager.shutdown()
+
+    def test_partial_or_colliding_refresh_never_modifies_old_committed_bytes(self):
+        with patch("bilikara.cache.CACHE_DIR", self.cache_dir), patch.object(
+            CacheManager, "_worker_loop", lambda self: None
+        ):
+            manager = self._manager()
+            try:
+                item = self._add_item("song-failure")
+                first_token = begin_cache_attempt(self.store, item.id)
+                first_reservation, first_result, first_staging, first_committed = (
+                    self._publication_fixture(manager, item.id, first_token, b"old")
+                )
+                manager._publish_validated_cache_result(
+                    item.id,
+                    first_token,
+                    first_reservation,
+                    first_staging,
+                    first_result,
+                    self.log_path,
+                )
+                self._apply_ready_result(item.id, first_token, first_result)
+                old_identity = self.store.get_item(item.id).artifact_set_id
+
+                partial_token = begin_cache_attempt(self.store, item.id)
+                partial_reservation, partial_result, partial_staging, partial_committed = (
+                    self._publication_fixture(
+                        manager, item.id, partial_token, b"partial"
+                    )
+                )
+                Path(
+                    partial_result["validation_files"][1]["path"]
+                ).unlink()
+                with self.assertRaisesRegex(DownloadCommandError, "临时文件不可用"):
+                    manager._publish_validated_cache_result(
+                        item.id,
+                        partial_token,
+                        partial_reservation,
+                        partial_staging,
+                        partial_result,
+                        self.log_path,
+                    )
+                self.assertFalse(partial_committed.exists())
+                self.store.apply_cache_event(
+                    item.id,
+                    cache_attempt_token=partial_token,
+                    event={"kind": "failed", "message": "partial failed"},
+                )
+                self.assertEqual(self.store.get_item(item.id).artifact_set_id, old_identity)
+
+                collision_token = begin_cache_attempt(self.store, item.id)
+                collision_reservation, collision_result, collision_staging, collision_committed = (
+                    self._publication_fixture(
+                        manager, item.id, collision_token, b"collision"
+                    )
+                )
+                collision_committed.mkdir(parents=True)
+                (collision_committed / "marker").write_bytes(b"existing")
+                with self.assertRaisesRegex(DownloadCommandError, "目标已存在"):
+                    manager._publish_validated_cache_result(
+                        item.id,
+                        collision_token,
+                        collision_reservation,
+                        collision_staging,
+                        collision_result,
+                        self.log_path,
+                    )
+                self.assertEqual(
+                    (collision_committed / "marker").read_bytes(), b"existing"
+                )
+                self.assertFalse((collision_committed / "video-p1.mp4").exists())
+                self.assertEqual(
+                    (first_committed / "video-p1.mp4").read_bytes(), b"video-old"
+                )
+                self.assertEqual(self.store.get_item(item.id).artifact_set_id, old_identity)
+            finally:
+                manager.shutdown()
+
+class CacheManagerArtifactRetirementTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        # Import the server before each test initializes its isolated AppState.
+        from bilikara.server import AppContext
+        cls.app_context_type = AppContext
+
+    def setUp(self) -> None:
+        # These lifecycle fixtures model an authenticated external-tool session.
+        credential_patch = patch("bilikara.bilibili.cfg.COOKIE", "SESSDATA=synthetic; bili_jct=csrf")
+        credential_patch.start()
+        self.addCleanup(credential_patch.stop)
+        self.temp_dir = TemporaryDirectory()
+        root = Path(self.temp_dir.name)
+        self.cache_dir = root / "cache"
+        self.cache_dir.mkdir()
+        self.log_path = root / "cache.log"
+        self.store = PlaylistStore(root / "state.json", root / "backup.json")
+        self.store.add_session_user("retirement-user")
+        policy_patch = patch("bilikara.cache.CACHE_POLICY_FILE", root / "cache-policy.json")
+        policy_patch.start()
+        self.addCleanup(policy_patch.stop)
+        self.cache_patch = patch("bilikara.cache.CACHE_DIR", self.cache_dir)
+        self.worker_patch = patch.object(
+            CacheManager, "_worker_loop", lambda _self: None
+        )
+        self.cache_patch.start()
+        self.worker_patch.start()
+        self.manager = CacheManager(self.store, max_cache_items=2)
+
+    def tearDown(self) -> None:
+        self.manager.shutdown()
+        self.worker_patch.stop()
+        self.cache_patch.stop()
+        self.temp_dir.cleanup()
+
+    @staticmethod
+    def _item(item_id: str) -> PlaylistItem:
+        return PlaylistItem(
+            id=item_id,
+            original_url=f"https://example.test/{item_id}",
+            resolved_url=f"https://example.test/{item_id}?p=1",
+            bvid="BV1xx411c7mD",
+            aid=1,
+            cid=2,
+            page=1,
+            title=item_id,
+            part_title="P1",
+            display_title=f"{item_id} - P1",
+            cover_url="",
+            embed_url="",
+        )
+
+    def _publish_without_ready(
+        self, item_id: str, marker: bytes
+    ) -> dict[str, object]:
+        observed = self.store.get_item(item_id)
+        self.assertIsNotNone(observed)
+        token = self.manager._begin_cache_attempt_for_item(observed)
+        reservation, staging, committed = self.manager._cache_attempt_paths(token)
+        staging.mkdir(parents=True)
+        video = staging / "downloaded-video.mp4"
+        audio = staging / "downloaded-audio.m4a"
+        video.write_bytes(b"video-" + marker)
+        audio.write_bytes(b"audio-" + marker)
+        result: dict[str, object] = {
+            "video_file": video,
+            "video_relative_path": str(video.relative_to(self.cache_dir)),
+            "video_media_url": f"/media/{video.relative_to(self.cache_dir)}",
+            "audio_variants": [
+                {
+                    "id": "p1",
+                    "label": "P1",
+                    "page": 1,
+                    "audio_url": f"/media/{audio.relative_to(self.cache_dir)}",
+                }
+            ],
+            "selected_audio_variant_id": "p1",
+            "validation_files": [
+                {"path": video, "stream_kind": "video", "page": 1},
+                {"path": audio, "stream_kind": "audio", "page": 1},
+            ],
+            "validation_metadata": [{"path": str(video)}, {"path": str(audio)}],
+        }
+        self.manager._publish_validated_cache_result(
+            item_id,
+            token,
+            reservation,
+            staging,
+            result,
+            self.log_path,
+        )
+        return {
+            "token": token,
+            "reservation": reservation,
+            "result": result,
+            "generation": self.store.snapshot()["playback_generation"],
+            "item_incarnation_id": reservation["item_incarnation_id"],
+            "artifact_set_id": reservation["artifact_set_id"],
+            "artifact_relative_directory": reservation[
+                "artifact_relative_directory"
+            ],
+            "directory": committed,
+        }
+
+    def _publish(self, item_id: str, marker: bytes) -> dict[str, object]:
+        published = self._publish_without_ready(item_id, marker)
+        result = published["result"]
+        self.assertIsInstance(result, dict)
+        self.assertTrue(
+            self.manager._project_cache_event(
+                item_id,
+                "ready",
+                cache_attempt_token=published["token"],
+                progress=100.0,
+                message="ready",
+                video_relative_path=result["video_relative_path"],
+                video_media_url=result["video_media_url"],
+                audio_variants=result["audio_variants"],
+                selected_audio_variant_id=result["selected_audio_variant_id"],
+                item_incarnation_id=result["item_incarnation_id"],
+                artifact_set_id=result["artifact_set_id"],
+                artifact_relative_directory=result["artifact_relative_directory"],
+            )
+        )
+        published["generation"] = self.store.snapshot()["playback_generation"]
+        return published
+
+    def _evict(self, item_id: str) -> None:
+        observed = self.store.get_item(item_id)
+        self.assertIsNotNone(observed)
+        token = self.manager._begin_cache_attempt_for_item(observed)
+        self.assertTrue(
+            self.manager._project_cache_event(
+                item_id,
+                "evicted",
+                cache_attempt_token=token,
+                message="test eviction",
+            )
+        )
+
+    def _claim(
+        self, snapshot: dict[str, object], host_client_id: str = "host-client"
+    ) -> bool:
+        program = snapshot["playback_program"]
+        self.assertIsInstance(program, dict)
+        return self.manager.claim_host_playback_program(
+            host_client_id=host_client_id,
+            playback_generation=snapshot["playback_generation"],
+            item_incarnation_id=program["item_incarnation_id"],
+            artifact_set_id=program["artifact_set_id"],
+        )
+
+    def _queue_runtime_eviction(self, item_id):
+        observed = self.store.get_item(item_id)
+        self.manager._native_cache_request("start")
+        self.manager.native_cache_started = True
+        self.manager._native_cache_request(
+            "sync", cache_root=str(self.cache_dir.resolve()),
+            current_ids=[item_id],
+            current_item_incarnations={item_id: observed.item_incarnation_id},
+            retained_ids=[], jobs=[], ordered_ids=[], preempt_item_id="",
+        )
+
+    def _runtime_ready_observation(self, item_id):
+        observed = self.store.get_item(item_id)
+        token = self.manager._begin_cache_attempt_for_item(observed)
+        reservation, _, committed = self.manager._cache_attempt_paths(token)
+        # Rust has published these files but the Python reader registry has not
+        # received the settlement yet.
+        committed.mkdir(parents=True)
+        (committed / "video-p1.mp4").write_bytes(b"runtime-video")
+        (committed / "audio-p1.m4a").write_bytes(b"runtime-audio")
+        artifact = {
+            key: reservation[key]
+            for key in (
+                "item_incarnation_id", "artifact_set_id", "artifact_relative_directory"
+            )
+        }
+        relative_path = f"{artifact['artifact_relative_directory']}/video-p1.mp4"
+        response = rust_runtime.app_state_request(
+            "apply_cache_event", item_id=item_id, cache_attempt_token=token,
+            event={
+                "kind": "ready", "progress": 100.0, "message": "ready",
+                "video_relative_path": relative_path,
+                "video_media_url": f"/media/{relative_path}",
+                "audio_variants": [{
+                    "id": "p1", "label": "P1", "page": 1,
+                    "audio_url": f"/media/{artifact['artifact_relative_directory']}/audio-p1.m4a",
+                }],
+                "selected_audio_variant_id": "p1", **artifact,
+            },
+            now=1.0,
+        )
+        batch = cache_observation_fixture(
+            response, item_ids=[item_id],
+            settlements=[{"cache_attempt_token": token, "artifact": artifact}],
+        )
+        return batch, committed, relative_path
+
+    def test_runtime_ready_media_is_readable_inside_notification(self):
+        self.store.add_item(self._item("song-ready"), requester_name="retirement-user")
+        batch, committed, relative_path = self._runtime_ready_observation("song-ready")
+        readers = []
+
+        def read_notified_media():
+            self.assertEqual(self.store.get_item("song-ready").cache_status, "ready")
+            reader = self.manager.acquire_media_reader(relative_path)
+            self.assertIsNotNone(reader)
+            readers.append(reader)
+            self.assertEqual((committed / "video-p1.mp4").read_bytes(), b"runtime-video")
+
+        notify = Mock(side_effect=read_notified_media)
+        with patch.object(self.store, "on_change", notify), patch.object(
+            self.manager, "_native_cache_request", return_value=batch
+        ), patch.object(
+            self.store, "apply_cache_event", side_effect=AssertionError("Python semantic re-entry")
+        ):
+            self.manager._drain_native_cache_events()
+        notify.assert_called_once_with()
+        self._evict("song-ready")
+        self.assertTrue(committed.is_dir())
+        self.manager.release_media_reader(readers[0])
+        self.assertFalse(committed.exists())
+
+    def test_runtime_ready_persistence_retry_preserves_reader_and_applies_once(self):
+        self.store.add_item(self._item("song-write-ready"), requester_name="retirement-user")
+        batch, committed, relative_path = self._runtime_ready_observation("song-write-ready")
+        notify = Mock()
+        with patch.object(self.store, "on_change", notify), patch.object(
+            self.manager, "_native_cache_request", return_value=batch
+        ) as request:
+            with patch.object(self.store, "_write_json_payload_unlocked", side_effect=OSError("synthetic persistence error")):
+                with self.assertRaisesRegex(OSError, "synthetic persistence error"):
+                    self.manager._drain_native_cache_events()
+            self.assertEqual(self.store.get_item("song-write-ready").cache_status, "ready")
+            revision = self.store.revision
+            reader = self.manager.acquire_media_reader(relative_path)
+            self.assertIsNotNone(reader)
+            self.manager.collect_retired_artifacts()
+            self.assertTrue(committed.is_dir())
+            notify.assert_not_called()
+            self.assertIsNotNone(self.store._pending_cache_observation)
+
+            self.manager._drain_native_cache_events()
+
+            request.assert_called_once_with("process_events", max_events=128, max_cache_items=2)
+            self.assertEqual(self.store.revision, revision)
+            self.assertIsNone(self.store._pending_cache_observation)
+            notify.assert_called_once_with()
+            persisted = json.loads(self.store.player_state_file.read_text())
+            self.assertEqual(persisted["updated_at"], self.store._persistence["updated_at"])
+        self._evict("song-write-ready")
+        self.assertTrue(committed.is_dir())
+        self.manager.release_media_reader(reader)
+        self.assertFalse(committed.exists())
+
+    def test_runtime_batch_reaches_rust_without_python_semantics_and_notifies_sse(self):
+        self.store.add_item(self._item("song-runtime"), requester_name="retirement-user")
+        published = self._publish("song-runtime", b"runtime")
+        reader = self.manager.acquire_media_reader(
+            f"{published['artifact_relative_directory']}/video-p1.mp4"
+        )
+        self.assertIsNotNone(reader)
+        context = self.app_context_type.__new__(self.app_context_type)
+        context._closed = False
+        context._state_change_condition = threading.Condition()
+        context._state_revision = 0
+        context._sse_payload_condition = threading.Condition()
+        context._sse_payload_revision = -1
+        context._sse_payload = b""
+        context._sse_payload_building = False
+        context.snapshot = lambda: {**self.store.snapshot(), "state_revision": context._state_revision}
+        self.store.on_change = context._notify_state_changed
+        before_revision, before_sse = context.serialized_sse_state_event()
+        self._queue_runtime_eviction("song-runtime")
+        with patch.object(self.store, "apply_cache_event", side_effect=AssertionError("Python semantic re-entry")), patch.object(
+            self.manager, "_project_cache_event", side_effect=AssertionError("Python interpreter")
+        ), patch.object(self.manager, "_publish_download_progress", side_effect=AssertionError("Python progress")):
+            self.manager._drain_native_cache_events()
+        self.assertEqual(self.store.get_item("song-runtime").cache_status, "pending")
+        self.assertTrue(context.wait_for_state_change(before_revision, timeout=0.01))
+        after_revision, after_sse = context.serialized_sse_state_event()
+        self.assertGreater(after_revision, before_revision)
+        self.assertNotEqual(after_sse, before_sse)
+        payload = json.loads(after_sse.decode().split("data: ", 1)[1].strip())
+        self.assertEqual(payload["current_item"]["cache_status"], "pending")
+        self.assertEqual(payload["revision"], self.store.revision)
+        persisted = json.loads(self.store.player_state_file.read_text())
+        self.assertEqual(persisted["updated_at"], self.store._persistence["updated_at"])
+        self.assertTrue(published["directory"].is_dir())
+        self.manager.release_media_reader(reader)
+        self.assertFalse(published["directory"].exists())
+        self.manager._drain_native_cache_events()
+        self.assertEqual(context.state_revision_snapshot(), after_revision)
+        with self.assertRaises(rust_runtime.RustRuntimeServiceError) as rejected:
+            self.manager._native_cache_request("drain_events", max_events=1)
+        self.assertEqual(rejected.exception.kind, "event_owner")
+
+    def test_runtime_observation_retries_persistence_error_without_reapplying_mutation(self):
+        self.store.add_item(self._item("song-write"), requester_name="retirement-user")
+        self._publish("song-write", b"write")
+        self._queue_runtime_eviction("song-write")
+        notify = Mock()
+        self.store.on_change = notify
+        original_request = self.manager._native_cache_request
+        with patch.object(self.manager, "_native_cache_request", wraps=original_request) as request:
+            with patch.object(self.store, "_write_json_payload_unlocked", side_effect=OSError("synthetic persistence error")):
+                with self.assertRaisesRegex(OSError, "synthetic persistence error"):
+                    self.manager._drain_native_cache_events()
+            committed_revision = self.store.revision
+            self.assertEqual(self.store.get_item("song-write").cache_status, "pending")
+            notify.assert_not_called()
+            self.assertIsNotNone(self.store._pending_cache_observation)
+            self.manager._drain_native_cache_events()
+            self.assertEqual(request.call_count, 1)
+            self.assertEqual(self.store.revision, committed_revision)
+            self.assertIsNone(self.store._pending_cache_observation)
+            notify.assert_called_once_with()
+        self.assertEqual(json.loads(self.store.player_state_file.read_text())["updated_at"], self.store._persistence["updated_at"])
+
+    def test_real_runtime_failure_is_applied_by_poller_and_does_not_auto_retry(self):
+        import time
+        self.store.add_item(self._item("song-failed"), requester_name="retirement-user")
+        # Fail before provider resolution: the Rust worker cannot create staging.
+        (self.cache_dir / ".staging").write_bytes(b"synthetic obstruction")
+        self.manager.download_source = DOWNLOAD_SOURCE_NATIVE
+        self.manager.log_dir = Path(self.temp_dir.name) / "logs"
+        changed = threading.Event()
+        self.store.on_change = changed.set
+        with patch.object(self.store, "apply_cache_event", side_effect=AssertionError("Python event mutation")), patch.object(
+            self.manager, "_project_cache_event", side_effect=AssertionError("Python event interpreter")
+        ):
+            self.manager.enqueue("song-failed")
+            deadline = time.monotonic() + 5.0
+            while self.store.get_item("song-failed").cache_status != "failed" and time.monotonic() < deadline:
+                changed.wait(0.1)
+                changed.clear()
+            failed = self.store.get_item("song-failed")
+            self.assertEqual(failed.cache_status, "failed")
+            self.assertTrue(failed.cache_message.startswith("缓存失败: "))
+            before = self.manager._native_cache_request("snapshot")["last_event_sequence"]
+            self.manager.sync_with_playlist()
+            self.manager.sync_with_playlist()
+            self.assertEqual(self.manager._native_cache_request("snapshot")["last_event_sequence"], before)
+            self.assertEqual(self.store.get_item("song-failed").cache_status, "failed")
+        self.assertEqual(self.manager.python_worker_download_sources, {})
+        self.assertEqual(self.manager.native_cache_error, "")
+
+    def test_runtime_notification_poller_is_started_once_and_joined_on_shutdown(self):
+        with patch.object(self.manager, "_native_cache_event_loop", wraps=self.manager._native_cache_event_loop) as loop:
+            self.manager._ensure_native_cache_runtime()
+            worker = self.manager.native_cache_event_worker
+            self.manager._ensure_native_cache_runtime()
+            self.assertIs(worker, self.manager.native_cache_event_worker)
+            self.manager.shutdown()
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(loop.call_count, 1)
+            self.assertTrue(self.manager.native_cache_event_stop.is_set())
+            self.assertFalse(self.manager.native_cache_started)
+
+    def test_host_retirement_waits_for_exact_range_reader_then_collects(self):
+        self.store.add_item(
+            self._item("song-a"), requester_name="retirement-user"
+        )
+        old = self._publish("song-a", b"old")
+        self.assertTrue(self._claim(self.store.snapshot()))
+        reader = self.manager.acquire_media_reader(
+            f"{old['artifact_relative_directory']}/video-p1.mp4"
+        )
+        self.assertIsNotNone(reader)
+
+        new = self._publish("song-a", b"new")
+        self.assertTrue(old["directory"].is_dir())
+        self.assertTrue(
+            self.manager.retire_host_playback_program(
+                host_client_id="host-client",
+                playback_generation=old["generation"],
+                item_incarnation_id=old["item_incarnation_id"],
+                artifact_set_id=old["artifact_set_id"],
+            )
+        )
+        self.assertTrue(old["directory"].is_dir())
+
+        self.manager.release_media_reader(reader)
+
+        self.assertFalse(old["directory"].exists())
+        self.assertTrue(new["directory"].is_dir())
+        self.assertFalse(
+            self.manager.retire_host_playback_program(
+                host_client_id="host-client",
+                playback_generation=old["generation"],
+                item_incarnation_id=old["item_incarnation_id"],
+                artifact_set_id=old["artifact_set_id"],
+            )
+        )
+        self.manager.collect_retired_artifacts()
+        self.assertFalse(old["directory"].exists())
+        self.assertEqual(self.manager.cache_metrics()["retained_bytes"], 0)
+
+    def test_live_projection_and_active_publication_pin_exact_artifacts(self):
+        self.store.add_item(
+            self._item("song-a"), requester_name="retirement-user"
+        )
+        current = self._publish("song-a", b"current")
+        self.manager.collect_retired_artifacts()
+        self.assertTrue(current["directory"].is_dir())
+
+        publishing = self._publish_without_ready("song-a", b"publishing")
+        self.manager.collect_retired_artifacts()
+        self.assertTrue(publishing["directory"].is_dir())
+
+        self.assertTrue(
+            self.manager._project_cache_event(
+                "song-a",
+                "failed",
+                cache_attempt_token=publishing["token"],
+                message="publication rejected",
+            )
+        )
+        self.assertFalse(publishing["directory"].exists())
+        self.assertTrue(current["directory"].is_dir())
+
+    def test_rust_native_ready_joins_the_same_committed_retirement_authority(self):
+        self.store.add_item(
+            self._item("song-native"), requester_name="retirement-user"
+        )
+        item = self.store.get_item("song-native")
+        self.assertIsNotNone(item)
+        token = self.manager._begin_cache_attempt_for_item(item)
+        reservation = self.store.cache_attempt_reservation(token)
+        relative_directory = reservation["artifact_relative_directory"]
+        committed = self.cache_dir / relative_directory
+        committed.mkdir(parents=True)
+        (committed / "video.mp4").write_bytes(b"video")
+        (committed / "audio.m4a").write_bytes(b"audio")
+        payload = {
+            "video_relative_path": f"{relative_directory}/video.mp4",
+            "video_media_url": f"/media/{relative_directory}/video.mp4",
+            "audio_variants": [
+                {
+                    "id": "p1",
+                    "label": "P1",
+                    "page": 1,
+                    "audio_url": f"/media/{relative_directory}/audio.m4a",
+                }
+            ],
+            "selected_audio_variant_id": "p1",
+            "item_incarnation_id": reservation["item_incarnation_id"],
+            "artifact_set_id": reservation["artifact_set_id"],
+            "artifact_relative_directory": relative_directory,
+        }
+        projection = {"kind": "ready", "message": "ready", **payload}
+        observe_cache_projection(self.manager, "song-native", token, projection, artifact=payload)
+        observe_cache_projection(self.manager, "song-native", token, projection, artifact=payload)
+
+        self.assertFalse(self.manager._artifact_request("publish", cache_attempt_token=token)["accepted"])
+        snapshot = self.store.snapshot()
+        self.assertEqual(
+            snapshot["current_item"]["artifact_set_id"],
+            reservation["artifact_set_id"],
+        )
+        self.assertTrue(self._claim(snapshot))
+
+        self._evict("song-native")
+        self.assertTrue(committed.is_dir())
+        self.assertTrue(
+            self.manager.retire_host_playback_program(
+                host_client_id="host-client",
+                playback_generation=snapshot["playback_generation"],
+                item_incarnation_id=reservation["item_incarnation_id"],
+                artifact_set_id=reservation["artifact_set_id"],
+            )
+        )
+        self.assertFalse(committed.exists())
+
+    def test_native_ready_for_removed_item_retires_only_its_exact_set(self):
+        self.store.add_item(
+            self._item("song-removed"), requester_name="retirement-user"
+        )
+        published = self._publish_without_ready("song-removed", b"removed")
+        self.assertTrue(self.store.remove_item("song-removed"))
+
+        observe_cache_projection(
+            self.manager, "song-removed", published["token"],
+            {"kind": "ready", "message": "ready", **{key: value for key, value in published["result"].items() if key not in {"video_file", "validation_files", "validation_metadata"}}},
+            artifact=published["result"],
+        )
+
+        self.assertFalse(published["directory"].exists())
+
+    def test_two_reader_leases_release_independently_and_exactly_once(self):
+        self.store.add_item(
+            self._item("song-a"), requester_name="retirement-user"
+        )
+        artifact = self._publish("song-a", b"parallel")
+        video_reader = self.manager.acquire_media_reader(
+            f"{artifact['artifact_relative_directory']}/video-p1.mp4"
+        )
+        audio_reader = self.manager.acquire_media_reader(
+            f"{artifact['artifact_relative_directory']}/p1.m4a"
+        )
+        self.assertIsNotNone(video_reader)
+        self.assertIsNotNone(audio_reader)
+        self.assertFalse(rust_runtime.artifact_lifetime_request(
+            "release", owner=self.manager._artifact_owner, handle="0" * 64,
+        )["accepted"])
+        with self.assertRaises(rust_runtime.RustRuntimeServiceError):
+            rust_runtime.artifact_lifetime_request(
+                "release", owner=self.manager._artifact_owner, handle=123,
+            )
+
+        self._evict("song-a")
+        self.assertTrue(artifact["directory"].is_dir())
+        self.assertTrue(self.manager.release_media_reader(video_reader))
+        self.assertFalse(self.manager.release_media_reader(video_reader))
+        self.assertTrue(artifact["directory"].is_dir())
+        self.assertTrue(self.manager.release_media_reader(audio_reader))
+        self.assertFalse(artifact["directory"].exists())
+
+    def test_explicit_clear_is_logical_until_host_program_retires(self):
+        self.store.add_item(
+            self._item("song-a"), requester_name="retirement-user"
+        )
+        artifact = self._publish("song-a", b"clear")
+        snapshot = self.store.snapshot()
+        self.assertTrue(self._claim(snapshot))
+
+        self.manager.clear_runtime_cache()
+
+        cleared = self.store.get_item("song-a")
+        self.assertIsNotNone(cleared)
+        self.assertNotEqual(cleared.cache_status, "ready")
+        self.assertTrue(artifact["directory"].is_dir())
+        self.assertTrue(
+            self.manager.retire_host_playback_program(
+                host_client_id="host-client",
+                playback_generation=snapshot["playback_generation"],
+                item_incarnation_id=artifact["item_incarnation_id"],
+                artifact_set_id=artifact["artifact_set_id"],
+            )
+        )
+        self.assertFalse(artifact["directory"].exists())
+
+    def test_host_claim_is_idempotent_and_cannot_resurrect_after_retirement(self):
+        self.store.add_item(
+            self._item("song-a"), requester_name="retirement-user"
+        )
+        artifact = self._publish("song-a", b"claim-ordering")
+        snapshot = self.store.snapshot()
+        self.assertTrue(self._claim(snapshot))
+        self.assertTrue(self._claim(snapshot))
+        self.assertTrue(
+            self.manager.retire_host_playback_program(
+                host_client_id="host-client",
+                playback_generation=snapshot["playback_generation"],
+                item_incarnation_id=artifact["item_incarnation_id"],
+                artifact_set_id=artifact["artifact_set_id"],
+            )
+        )
+        self.assertFalse(self._claim(snapshot))
+
+        self._evict("song-a")
+
+        self.assertFalse(artifact["directory"].exists())
+
+    def test_invalid_host_release_cannot_drop_an_exact_owner(self):
+        self.store.add_item(
+            self._item("song-a"), requester_name="retirement-user"
+        )
+        artifact = self._publish("song-a", b"invalid-release")
+        snapshot = self.store.snapshot()
+        self.assertTrue(self._claim(snapshot))
+        self._evict("song-a")
+
+        with self.assertRaisesRegex(
+            ValueError, "invalid Host playback artifact identity"
+        ):
+            self.manager.retire_host_playback_program(
+                host_client_id="host-client",
+                playback_generation=snapshot["playback_generation"],
+                item_incarnation_id=artifact["item_incarnation_id"],
+                artifact_set_id="not-rust-issued",
+            )
+
+        self.assertTrue(artifact["directory"].is_dir())
+        self.assertTrue(
+            self.manager.retire_host_playback_program(
+                host_client_id="host-client",
+                playback_generation=snapshot["playback_generation"],
+                item_incarnation_id=artifact["item_incarnation_id"],
+                artifact_set_id=artifact["artifact_set_id"],
+            )
+        )
+        self.assertFalse(artifact["directory"].exists())
+
+    def test_newer_same_artifact_program_survives_old_generation_retirement(self):
+        self.store.add_item(
+            self._item("song-a"), requester_name="retirement-user"
+        )
+        artifact = self._publish("song-a", b"same-artifact")
+        first_snapshot = self.store.snapshot()
+        self.assertTrue(self._claim(first_snapshot))
+
+        self.assertTrue(self.store.restart_playback_program())
+        second_snapshot = self.store.snapshot()
+        self.assertGreater(
+            second_snapshot["playback_generation"],
+            first_snapshot["playback_generation"],
+        )
+        self.assertEqual(
+            second_snapshot["playback_program"]["artifact_set_id"],
+            artifact["artifact_set_id"],
+        )
+        self.assertTrue(self._claim(second_snapshot))
+        self._evict("song-a")
+
+        self.assertTrue(
+            self.manager.retire_host_playback_program(
+                host_client_id="host-client",
+                playback_generation=first_snapshot["playback_generation"],
+                item_incarnation_id=artifact["item_incarnation_id"],
+                artifact_set_id=artifact["artifact_set_id"],
+            )
+        )
+        self.assertTrue(artifact["directory"].is_dir())
+        self.assertTrue(
+            self.manager.retire_host_playback_program(
+                host_client_id="host-client",
+                playback_generation=second_snapshot["playback_generation"],
+                item_incarnation_id=artifact["item_incarnation_id"],
+                artifact_set_id=artifact["artifact_set_id"],
+            )
+        )
+        self.assertFalse(artifact["directory"].exists())
+
+    def test_same_item_id_replacement_has_independent_exact_identity(self):
+        self.store.add_item(
+            self._item("same-id"), requester_name="retirement-user"
+        )
+        old = self._publish("same-id", b"old-incarnation")
+        self.assertTrue(self._claim(self.store.snapshot()))
+        self.assertTrue(self.store.remove_item("same-id"))
+        self.store.add_item(
+            self._item("same-id"),
+            requester_name="retirement-user",
+            allow_repeat=True,
+        )
+        replacement = self._publish("same-id", b"new-incarnation")
+        self.assertNotEqual(
+            replacement["item_incarnation_id"], old["item_incarnation_id"]
+        )
+        self.assertNotEqual(replacement["artifact_set_id"], old["artifact_set_id"])
+
+        self.assertTrue(
+            self.manager.retire_host_playback_program(
+                host_client_id="host-client",
+                playback_generation=old["generation"],
+                item_incarnation_id=old["item_incarnation_id"],
+                artifact_set_id=old["artifact_set_id"],
+            )
+        )
+        self.assertFalse(old["directory"].exists())
+        self.assertTrue(replacement["directory"].is_dir())
+        self.assertFalse(
+            self.manager.retire_host_playback_program(
+                host_client_id="host-client",
+                playback_generation=old["generation"],
+                item_incarnation_id=old["item_incarnation_id"],
+                artifact_set_id=old["artifact_set_id"],
+            )
+        )
+        self.assertTrue(replacement["directory"].is_dir())
+
+    def test_unknown_and_mismatched_directories_fail_closed(self):
+        unknown_incarnation = "i-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-0000000000000001"
+        unknown_artifact = "a-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-0000000000000001"
+        unknown = (
+            self.cache_dir
+            / "artifacts"
+            / unknown_incarnation
+            / unknown_artifact
+        )
+        malformed = self.cache_dir / "artifacts" / "item" / "set-old"
+        unknown.mkdir(parents=True)
+        malformed.mkdir(parents=True)
+
+        self.manager.collect_retired_artifacts()
+        self.assertFalse(self.manager._artifact_request("publish", cache_attempt_token=2**32)["accepted"])
+        self.assertIsNone(self.manager.acquire_media_reader(f"artifacts/{unknown_incarnation}/{unknown_artifact}/video.mp4"))
+        self.assertIsNone(self.manager.acquire_media_reader("artifacts/../user-file"))
+
+        self.assertTrue(unknown.is_dir())
+        self.assertTrue(malformed.is_dir())
+
+    def test_real_rust_leases_cover_host_stream_completion_errors_head_and_early_return(self):
+        from bilikara.server import BilikaraHandler
+
+        class AbortedWriter:
+            def write(self, _payload):
+                raise BrokenPipeError("synthetic disconnect")
+
+        for mode in ("full", "range", "head", "abort", "failure", "missing", "invalid-range"):
+            with self.subTest(mode=mode):
+                item_id = f"http-{mode}"
+                self.store.add_item(self._item(item_id), requester_name="retirement-user", allow_repeat=True)
+                published = self._publish(item_id, b"http-body")
+                relative = f"{published['artifact_relative_directory']}/video-p1.mp4"
+                handler = BilikaraHandler.__new__(BilikaraHandler)
+                handler.headers = {"Range": "bytes=1-3"} if mode in {"range", "head", "abort"} else {}
+                if mode == "invalid-range":
+                    handler.headers = {"Range": "bytes=99999-"}
+                handler.wfile = AbortedWriter() if mode == "abort" else io.BytesIO()
+                statuses = []
+                handler.send_response = statuses.append
+                handler.send_header = lambda *_args: None
+                handler._write_json = lambda _body, *, status: statuses.append(status)
+
+                def reduce_references():
+                    self._evict(item_id)
+                    self.assertTrue(published["directory"].is_dir())
+
+                handler.end_headers = reduce_references
+                if mode == "failure":
+                    def fail_stream(*_args, **_kwargs):
+                        reduce_references()
+                        raise OSError("synthetic read failure")
+                    handler._stream_file = fail_stream
+                if mode == "missing":
+                    (published["directory"] / "video-p1.mp4").unlink()
+                    # The file-existence early return still owns a real lease.
+                    handler._write_json = lambda _body, *, status: (statuses.append(status), reduce_references())
+
+                with patch("bilikara.server.CACHE_DIR", self.cache_dir), patch(
+                    "bilikara.server.CONTEXT", SimpleNamespace(cache_manager=self.manager)
+                ):
+                    if mode == "failure":
+                        with self.assertRaisesRegex(OSError, "synthetic read failure"):
+                            handler._serve_media(f"/media/{relative}")
+                    else:
+                        handler._serve_media(f"/media/{relative}", head_only=mode == "head")
+                self.assertFalse(published["directory"].exists(), "Rust lease leaked after response")
+                if mode == "full":
+                    self.assertEqual(statuses, [200])
+                    self.assertEqual(handler.wfile.getvalue(), b"video-http-body")
+                elif mode == "range":
+                    self.assertEqual(statuses, [206])
+                    self.assertEqual(handler.wfile.getvalue(), b"ide")
+                elif mode == "head":
+                    self.assertEqual(statuses, [206])
+                    self.assertEqual(handler.wfile.getvalue(), b"")
+                elif mode == "missing":
+                    self.assertEqual(statuses, [404])
+                elif mode == "invalid-range":
+                    self.assertEqual(statuses, [416])
+
+    def test_reader_handles_and_owner_are_invalid_after_app_state_reinitialization(self):
+        self.store.add_item(self._item("before"), requester_name="retirement-user")
+        old = self._publish("before", b"before")
+        old_owner = self.manager._artifact_owner
+        reader = self.manager.acquire_media_reader(f"{old['artifact_relative_directory']}/video-p1.mp4")
+        self.assertIsNotNone(reader)
+        with self.assertRaises(rust_runtime.RustAppStateRejectedError) as blocked:
+            rust_runtime.app_state_request("initialize", state={
+                "session_started_at": 1.0, "session_played_file": "restart.json", "updated_at": 1.0,
+            })
+        self.assertEqual(blocked.exception.kind, "artifact_drain_pending")
+        self.manager.shutdown()
+        self.store.shutdown()
+        self.assertTrue(old["directory"].is_dir())
+        self.assertTrue(self.manager.release_media_reader(reader))
+        self.assertFalse(old["directory"].exists())
+        # Initialize is the real restart boundary; persisted media identities are
+        # invalidated there. Old ABI handles cannot operate on the next owner.
+        self.store = PlaylistStore(self.log_path.parent / "restart.json", self.log_path.parent / "restart-backup.json")
+        self.store.add_session_user("retirement-user")
+        self.manager = CacheManager(self.store, max_cache_items=2)
+        self.store.add_item(self._item("after"), requester_name="retirement-user")
+        new = self._publish("after", b"after")
+        new_reader = self.manager.acquire_media_reader(f"{new['artifact_relative_directory']}/video-p1.mp4")
+        self._evict("after")
+        self.assertFalse(rust_runtime.artifact_lifetime_request("release", owner=old_owner, handle=new_reader)["accepted"])
+        self.assertFalse(self.manager.release_media_reader(reader))
+        self.assertTrue(new["directory"].is_dir())
+        self.assertTrue(self.manager.release_media_reader(new_reader))
+        self.assertFalse(new["directory"].exists())
+        self.assertFalse(old["directory"].exists())
+
+    def test_deletion_failure_remains_pending_for_one_later_trigger(self):
+        self.store.add_item(
+            self._item("song-a"), requester_name="retirement-user"
+        )
+        old = self._publish("song-a", b"old")
+        self.assertTrue(self._claim(self.store.snapshot()))
+        replacement = self._publish("song-a", b"replacement")
+
+        # A real Rust retirement failure, not a mock of removed Python policy.
+        blocked = self.cache_dir / ".retired"
+        blocked.write_bytes(b"unrelated file")
+        self.assertTrue(
+            self.manager.retire_host_playback_program(
+                host_client_id="host-client",
+                playback_generation=old["generation"],
+                item_incarnation_id=old["item_incarnation_id"],
+                artifact_set_id=old["artifact_set_id"],
+            )
+        )
+        self.assertTrue(old["directory"].is_dir())
+        self.assertEqual(blocked.read_bytes(), b"unrelated file")
+        blocked.unlink()
+
+        self.manager.collect_retired_artifacts()
+        self.assertFalse(old["directory"].exists())
+        self.assertTrue(replacement["directory"].is_dir())
+
+
 class CacheManagerBBDownRegressionTest(unittest.TestCase):
     def setUp(self) -> None:
+        # These lifecycle fixtures model an authenticated external-tool session.
+        credential_patch = patch("bilikara.bilibili.cfg.COOKIE", "SESSDATA=synthetic; bili_jct=csrf")
+        credential_patch.start()
+        self.addCleanup(credential_patch.stop)
         self.temp_dir = TemporaryDirectory()
         temp_path = Path(self.temp_dir.name)
         self.cache_dir = temp_path / "cache"
@@ -4142,8 +6583,17 @@ class CacheManagerBBDownRegressionTest(unittest.TestCase):
                     embed_url="https://player.bilibili.com/player.html?aid=123",
                 )
                 self.store.add_item(item, requester_name="cache-test-user")
+                cache_attempt_token = begin_cache_attempt(self.store, item.id)
 
                 with patch.object(manager, "_cache_item", side_effect=RuntimeError("unexpected crash")):
+                    with manager.lock:
+                        manager.pending_ids.add(item.id)
+                        manager.python_worker_download_sources[item.id] = (
+                            DOWNLOAD_SOURCE_BBDOWN
+                        )
+                        manager.python_cache_attempt_tokens[item.id] = (
+                            cache_attempt_token
+                        )
                     manager.tasks.put("song-err")
                     manager.tasks.join()
 
@@ -4169,6 +6619,9 @@ class CacheManagerBBDownRegressionTest(unittest.TestCase):
 
 class CacheManagerDownkyiRegressionTest(unittest.TestCase):
     def setUp(self) -> None:
+        credential_patch = patch("bilikara.bilibili.cfg.COOKIE", "SESSDATA=synthetic; bili_jct=csrf")
+        credential_patch.start()
+        self.addCleanup(credential_patch.stop)
         self.temp_dir = TemporaryDirectory()
         temp_path = Path(self.temp_dir.name)
         self.cache_dir = temp_path / "cache"
@@ -4204,419 +6657,193 @@ class CacheManagerDownkyiRegressionTest(unittest.TestCase):
             video_page=1,
         )
 
-    def test_downkyi_multi_page_audio_resolves_correct_cids_and_urls(self):
-        item = PlaylistItem(
-            id="multi-p-item",
-            original_url="https://www.bilibili.com/video/BV1xx411c7mD",
-            resolved_url="https://www.bilibili.com/video/BV1xx411c7mD?p=1",
-            bvid="BV1xx411c7mD",
-            aid=123,
-            cid=111,
-            page=1,
-            title="Multi P Video",
-            part_title="P1",
-            display_title="Multi P Video",
-            cover_url="",
-            embed_url="",
-            selected_pages=[1, 2, 3],
-            selected_cids=[111, 222, 333],
-            selected_parts=["P1", "P2", "P3"],
-            video_page=1,
-        )
-
-        resolved_cids = []
-
-        def mock_fetch_dash(bvid, cid, avid):
-            resolved_cids.append(cid)
-            return {
-                "video": [{"id": 80, "url": f"video-cid-{cid}.m4s", "backup_urls": []}],
-                "audio": [{"id": 30216, "url": f"audio-cid-{cid}.m4s", "backup_urls": []}],
-            }
-
-        downloaded_tracks = []
-
-        def mock_download_aria2c(item_id, binary_path, ffmpeg_path, target_dir, log_path, urls, out_name, cookie, stage_label, track_key, stream_kind, **_kwargs):
-            downloaded_tracks.append({
-                "urls": urls,
-                "out_name": out_name,
-                "stage_label": stage_label,
-            })
-            return Path(target_dir) / out_name
-
-        with patch("bilikara.cache.effective_bilibili_cookie", return_value="SESSDATA=test"), patch(
-            "bilikara.cache.fetch_dash_playurl", side_effect=mock_fetch_dash
-        ), patch.object(
-            CacheManager, "_download_stream_with_aria2c", side_effect=mock_download_aria2c
-        ):
-            manager = CacheManager(self.store, max_cache_items=3)
-            try:
-                log_path = Path(self.temp_dir.name) / "test.log"
-                dash_streams = manager._resolve_dash_streams(item)
-                result = manager._download_dash_streams_with_aria2c(
-                    item=item,
-                    binary_path=Path("/tools/aria2c"),
-                    ffmpeg_path=Path("/tools/ffmpeg"),
-                    item_dir=self.cache_dir / "multi-p-item",
-                    log_path=log_path,
-                    dash_streams=dash_streams,
-                    video_track={
-                        "key": "video_1",
-                        "page": 1,
-                        "stream_kind": "video",
-                        "label": "视频轨 P1",
-                        "order": 0,
-                    },
-                    audio_tracks=[
-                        {
-                            "key": "audio_1",
-                            "page": 1,
-                            "stream_kind": "audio",
-                            "label": "音轨 P1",
-                            "order": 1,
-                        },
-                        {
-                            "key": "audio_2",
-                            "page": 2,
-                            "stream_kind": "audio",
-                            "label": "音轨 P2",
-                            "order": 2,
-                        },
-                        {
-                            "key": "audio_3",
-                            "page": 3,
-                            "stream_kind": "audio",
-                            "label": "音轨 P3",
-                            "order": 3,
-                        },
-                    ]
-                )
-            finally:
-                manager.shutdown()
-
-        self.assertEqual(resolved_cids, [111, 111, 222, 333])
-        self.assertEqual(len(downloaded_tracks), 4)
-        downloads_by_name = {entry["out_name"]: entry for entry in downloaded_tracks}
-        self.assertEqual(downloads_by_name["video-p1.mp4"]["urls"][0], "video-cid-111.m4s")
-        self.assertEqual(downloads_by_name["audio-p1.m4a"]["urls"][0], "audio-cid-111.m4s")
-        self.assertEqual(downloads_by_name["audio-p2.m4a"]["urls"][0], "audio-cid-222.m4s")
-        self.assertEqual(downloads_by_name["audio-p3.m4a"]["urls"][0], "audio-cid-333.m4s")
-
-        self.assertTrue(log_path.exists())
-        log_content = log_path.read_text(encoding="utf-8")
-        self.assertIn("resolve audio DASH: page=1, cid=111", log_content)
-        self.assertIn("resolve audio DASH: page=2, cid=222", log_content)
-        self.assertIn("resolve audio DASH: page=3, cid=333", log_content)
-        self.assertIn("download audio track: page=1, label=音轨 P1", log_content)
-        self.assertIn("download audio track: page=2, label=音轨 P2", log_content)
-        self.assertIn("download audio track: page=3, label=音轨 P3", log_content)
-
-    def test_downkyi_single_page_regression(self):
-        item = PlaylistItem(
-            id="single-p-item",
-            original_url="https://www.bilibili.com/video/BV1xx411c7mD",
-            resolved_url="https://www.bilibili.com/video/BV1xx411c7mD?p=1",
-            bvid="BV1xx411c7mD",
-            aid=123,
-            cid=111,
-            page=1,
-            title="Single P Video",
-            part_title="P1",
-            display_title="Single P Video",
-            cover_url="",
-            embed_url="",
-            selected_pages=[1],
-            selected_cids=[111],
-            selected_parts=["P1"],
-            video_page=1,
-        )
-
-        resolved_cids = []
-
-        def mock_fetch_dash(bvid, cid, avid):
-            resolved_cids.append(cid)
-            return {
-                "video": [{"id": 80, "url": "video.m4s", "backup_urls": []}],
-                "audio": [{"id": 30216, "url": "audio.m4s", "backup_urls": []}],
-            }
-
-        with patch("bilikara.cache.effective_bilibili_cookie", return_value="SESSDATA=test"), patch(
-            "bilikara.cache.fetch_dash_playurl", side_effect=mock_fetch_dash
-        ), patch.object(
-            CacheManager, "_download_stream_with_aria2c", return_value=Path("/tmp/ok")
-        ):
-            manager = CacheManager(self.store, max_cache_items=3)
-            try:
-                log_path = Path(self.temp_dir.name) / "test.log"
-                dash_streams = manager._resolve_dash_streams(item)
-                result = manager._download_dash_streams_with_aria2c(
-                    item=item,
-                    binary_path=Path("/tools/aria2c"),
-                    ffmpeg_path=Path("/tools/ffmpeg"),
-                    item_dir=self.cache_dir / "single-p-item",
-                    log_path=log_path,
-                    dash_streams=dash_streams,
-                    video_track={"key": "v1", "page": 1, "stream_kind": "video", "label": "V1", "order": 0},
-                    audio_tracks=[{"key": "a1", "page": 1, "stream_kind": "audio", "label": "A1", "order": 1}]
-                )
-            finally:
-                manager.shutdown()
-
-        self.assertEqual(resolved_cids, [111, 111])
-
-    def test_downkyi_validates_finished_track_without_waiting_for_other_downloads(self):
-        item = self._single_downkyi_item("async-validation")
-        video_validated = threading.Event()
-        download_counts = {"video": 0, "audio": 0}
-        audio_steps = []
-
-        def fake_download(_item_id, _binary, _ffmpeg, target_dir, _log, **kwargs):
-            kind = kwargs["stream_kind"]
-            download_counts[kind] += 1
-            if kind == "audio":
-                self.assertTrue(video_validated.wait(2), "audio waited for video validation")
-            attempt = Path(target_dir) / f".attempt-{kind}-{download_counts[kind]}"
-            attempt.mkdir(parents=True)
-            path = attempt / kwargs["out_name"]
-            path.write_bytes(kind.encode("ascii"))
-            return path
-
-        def fake_probe_source(_ffprobe, _ffmpeg, media_path, **_kwargs):
-            self.assertEqual(media_path.read_bytes(), b"audio")
-            audio_steps.append("source-probe")
-            return 120.125
-
-        def fake_normalize(_ffmpeg, _media_path, **kwargs):
-            if kwargs["stream_kind"] == "audio":
-                audio_steps.append("normalize")
-
-        def fake_validate(_ffprobe, _ffmpeg, media_path, **kwargs):
-            context = kwargs["diagnostic_context"]
-            if context["stream_kind"] == "video":
-                video_validated.set()
-                self.assertNotIn("source_audio_duration", context)
-            else:
-                audio_steps.append("validate")
-                self.assertEqual(context["source_audio_duration"], 120.125)
-                self.assertNotIn("expected_duration", context)
-            return {
-                "path": str(media_path),
-                "size": media_path.stat().st_size,
-                "format_name": "mov,mp4,m4a",
-                "duration": 120.0,
-                "start_time": 0.0,
-                "streams": [],
-            }
-
+    def test_downkyi_durl_still_rejects_missing_audio_after_public_adapter(self):
+        from bilikara import bilibili
         with patch.object(CacheManager, "_worker_loop", lambda self: None):
             manager = CacheManager(self.store, max_cache_items=3)
             try:
-                with manager.lock:
-                    manager.desired_ids = {item.id}
-                    manager.ordered_desired_ids = [item.id]
-                with patch.object(manager, "_resolve_dash_streams", return_value={
-                    "audio": [{"url": "audio.m4s", "backup_urls": [], "quality_id": 30280}],
-                }), patch.object(
-                    manager, "_ffprobe_path_for_ffmpeg", return_value=Path("/tools/ffprobe")
-                ), patch.object(
-                    manager, "_download_stream_with_aria2c", side_effect=fake_download
-                ), patch.object(
-                    manager, "_probe_original_audio_duration", side_effect=fake_probe_source
-                ), patch.object(
-                    manager, "_normalize_downkyi_media_file", side_effect=fake_normalize
-                ), patch.object(
-                    manager, "_validate_media_file", side_effect=fake_validate
-                ):
-                    result = manager._download_dash_streams_with_aria2c(
-                        item=item,
-                        binary_path=Path("/tools/aria2c"),
-                        ffmpeg_path=Path("/tools/ffmpeg"),
-                        item_dir=self.cache_dir / item.id,
-                        log_path=Path(self.temp_dir.name) / "async.log",
-                        dash_streams={
-                            "video": [{"url": "video.m4s", "backup_urls": [], "quality_id": 32}],
-                        },
-                        video_track={"key": "video-p1", "page": 1, "stream_kind": "video", "label": "V1", "order": 0},
-                        audio_tracks=[{"key": "audio-p1", "page": 1, "stream_kind": "audio", "label": "A1", "order": 1}],
-                        validate_tracks=True,
-                    )
+                with patch.object(rust_runtime, "_call_runtime_service", return_value={
+                    "video": [{"url": "https://media.example/segment", "backup_urls": [], "order": 2}],
+                    "audio": [], "flac": None, "dolby": None,
+                }), patch.object(bilibili, "effective_bilibili_cookie", return_value=""), patch(
+                    "bilikara.cache.effective_bilibili_cookie", return_value=""
+                ), self.assertRaisesRegex(bilibili.BilibiliError, "未找到符合质量要求的音频流"):
+                    manager._resolve_dash_streams(self._single_downkyi_item())
             finally:
                 manager.shutdown()
 
-        self.assertEqual(set(result), {"video-p1", "audio-p1"})
-        self.assertEqual(download_counts, {"video": 1, "audio": 1})
-        self.assertTrue(video_validated.is_set())
-        self.assertEqual(audio_steps, ["source-probe", "normalize", "validate"])
 
-    def test_downkyi_retries_only_failed_track_and_caps_total_attempts_at_ten(self):
-        item = self._single_downkyi_item("track-retry")
-        download_counts = {"video": 0, "audio": 0}
-        validation_counts = {"video": 0, "audio": 0}
-
-        def fake_download(_item_id, _binary, _ffmpeg, target_dir, _log, **kwargs):
-            kind = kwargs["stream_kind"]
-            download_counts[kind] += 1
-            attempt = Path(target_dir) / f".attempt-{kind}-{download_counts[kind]}"
-            attempt.mkdir(parents=True)
-            path = attempt / kwargs["out_name"]
-            path.write_bytes(kind.encode("ascii"))
-            return path
-
-        def fake_validate(_ffprobe, _ffmpeg, media_path, **kwargs):
-            kind = kwargs["diagnostic_context"]["stream_kind"]
-            validation_counts[kind] += 1
-            if kind == "audio" and validation_counts[kind] == 1:
-                raise DownloadCommandError("audio packet truncated")
-            return {
-                "path": str(media_path),
-                "size": media_path.stat().st_size,
-                "format_name": "mov,mp4,m4a",
-                "duration": 120.0,
-                "start_time": 0.0,
-                "streams": [],
-            }
-
+    def test_rust_native_guest_resolves_dash_and_downgrades_quality_without_python_fallback(self):
+        item = self._single_downkyi_item("native-guest")
+        guest_dash = {
+            "video": [
+                {
+                    "url": "https://media.example/480.m4s",
+                    "backup_urls": [],
+                    "codec_name": "avc",
+                    "quality_id": 32,
+                    "bandwidth": 500_000,
+                },
+                {
+                    "url": "https://media.example/720.m4s",
+                    "backup_urls": [],
+                    "codec_name": "avc",
+                    "quality_id": 64,
+                    "bandwidth": 1_000_000,
+                },
+            ],
+            "audio": [
+                {
+                    "url": "https://media.example/audio.m4s",
+                    "backup_urls": [],
+                    "quality_id": 30280,
+                    "bandwidth": 192_000,
+                }
+            ],
+            "flac": None,
+            "dolby": None,
+        }
         with patch.object(CacheManager, "_worker_loop", lambda self: None), patch(
-            "bilikara.cache.DOWNKYI_TRACK_RETRY_WAIT_SECONDS", 0
-        ):
+            "bilikara.cache.effective_bilibili_cookie", return_value=""
+        ), patch(
+            "bilikara.cache.rust_runtime.fetch_bilibili_dash_playurl",
+            return_value=guest_dash,
+        ) as native_dash, patch(
+            "bilikara.cache.fetch_dash_playurl"
+        ) as python_dash:
             manager = CacheManager(self.store, max_cache_items=3)
             try:
-                with manager.lock:
-                    manager.desired_ids = {item.id}
-                    manager.ordered_desired_ids = [item.id]
-                with patch.object(manager, "_resolve_dash_streams", return_value={
-                    "audio": [{"url": "audio.m4s", "backup_urls": [], "quality_id": 30280}],
-                }), patch.object(
-                    manager, "_ffprobe_path_for_ffmpeg", return_value=Path("/tools/ffprobe")
-                ), patch.object(
-                    manager, "_download_stream_with_aria2c", side_effect=fake_download
-                ), patch.object(
-                    manager, "_probe_original_audio_duration", return_value=120.0
-                ), patch.object(
-                    manager, "_normalize_downkyi_media_file"
-                ), patch.object(
-                    manager, "_validate_media_file", side_effect=fake_validate
-                ):
-                    manager._download_dash_streams_with_aria2c(
-                        item=item,
-                        binary_path=Path("/tools/aria2c"),
-                        ffmpeg_path=Path("/tools/ffmpeg"),
-                        item_dir=self.cache_dir / item.id,
-                        log_path=Path(self.temp_dir.name) / "retry.log",
-                        dash_streams={
-                            "video": [{"url": "video.m4s", "backup_urls": [], "quality_id": 32}],
-                        },
-                        video_track={"key": "video-p1", "page": 1, "stream_kind": "video", "label": "V1", "order": 0},
-                        audio_tracks=[{"key": "audio-p1", "page": 1, "stream_kind": "audio", "label": "A1", "order": 1}],
-                        validate_tracks=True,
-                    )
+                manager.video_quality = "1080P 高清"
+                manager.audio_hires = False
+                selected = manager._resolve_dash_streams(item, native_media=True)
             finally:
                 manager.shutdown()
 
-        self.assertEqual(download_counts, {"video": 1, "audio": 2})
-        self.assertEqual(validation_counts, {"video": 1, "audio": 2})
+        self.assertEqual(native_dash.call_args.kwargs["cookie"], "")
+        self.assertEqual(selected["video"][0]["quality_id"], 64)
+        self.assertEqual(selected["audio"][0]["quality_id"], 30280)
+        python_dash.assert_not_called()
 
-    def test_downkyi_track_failure_stops_after_ten_total_attempts(self):
-        item = self._single_downkyi_item("track-retry-limit")
-        download_counts = {"video": 0, "audio": 0}
+    def test_rust_native_guest_media_download_omits_cookie_header(self):
+        item = self._single_downkyi_item("native-guest-media")
+        captured = {}
 
-        def fake_download(_item_id, _binary, _ffmpeg, target_dir, _log, **kwargs):
-            kind = kwargs["stream_kind"]
-            download_counts[kind] += 1
-            if kind == "audio":
-                raise DownloadCommandError("CDN connection reset")
-            attempt = Path(target_dir) / ".attempt-video"
-            attempt.mkdir(parents=True, exist_ok=True)
-            path = attempt / kwargs["out_name"]
-            path.write_bytes(b"video")
-            return path
+        def fake_download(*, destination, headers, **_kwargs):
+            captured["headers"] = list(headers)
+            destination.write_bytes(b"guest-media")
+            return {"bytes_written": len(b"guest-media"), "candidate_index": 0}
 
         with patch.object(CacheManager, "_worker_loop", lambda self: None), patch(
-            "bilikara.cache.DOWNKYI_TRACK_RETRY_WAIT_SECONDS", 0
+            "bilikara.cache.rust_runtime.download_to_path", side_effect=fake_download
         ):
             manager = CacheManager(self.store, max_cache_items=3)
             try:
-                with manager.lock:
-                    manager.desired_ids = {item.id}
-                    manager.ordered_desired_ids = [item.id]
-                with patch.object(manager, "_resolve_dash_streams", return_value={
-                    "audio": [{"url": "audio.m4s", "backup_urls": [], "quality_id": 30280}],
-                }), patch.object(
-                    manager, "_ffprobe_path_for_ffmpeg", return_value=Path("/tools/ffprobe")
-                ), patch.object(
-                    manager, "_download_stream_with_aria2c", side_effect=fake_download
-                ), patch.object(
-                    manager, "_normalize_downkyi_media_file"
-                ), patch.object(
-                    manager, "_validate_media_file", return_value={
-                        "path": "video", "size": 5, "format_name": "mp4", "duration": 120.0,
-                        "start_time": 0.0, "streams": [],
-                    }
-                ):
-                    with self.assertRaisesRegex(DownloadCommandError, "已尝试 10 次仍失败"):
-                        manager._download_dash_streams_with_aria2c(
-                            item=item,
-                            binary_path=Path("/tools/aria2c"),
-                            ffmpeg_path=Path("/tools/ffmpeg"),
-                            item_dir=self.cache_dir / item.id,
-                            log_path=Path(self.temp_dir.name) / "retry-limit.log",
-                            dash_streams={
-                                "video": [{"url": "video.m4s", "backup_urls": [], "quality_id": 32}],
+                manager._begin_download_progress(
+                    item.id,
+                    [{"key": "video-p1", "label": "视频轨P1", "order": 0}],
+                    cache_attempt_token=1,
+                )
+                result = manager._download_stream_with_rust(
+                    item.id,
+                    self.cache_dir / item.id / "video-p1",
+                    Path(self.temp_dir.name) / "native-guest.log",
+                    urls=["https://media.example/video.m4s"],
+                    out_name="video-p1.mp4",
+                    cookie="",
+                    stage_label="下载视频轨 P1",
+                    track_key="video-p1",
+                    cache_attempt_token=1,
+                    stream_kind="video",
+                )
+            finally:
+                manager.shutdown()
+
+        self.assertTrue(result.is_file())
+        self.assertFalse(any(name.lower() == "cookie" for name, _value in captured["headers"]))
+
+    def test_rust_native_http_status_wrappers_distinguish_access_failures(self):
+        expected = {
+            401: ("authentication", "login/Cookie is invalid or expired"),
+            402: ("unavailable", "unavailable or requires payment"),
+            403: ("forbidden", "media access was forbidden"),
+        }
+        with patch.object(CacheManager, "_worker_loop", lambda self: None):
+            manager = CacheManager(self.store, max_cache_items=3)
+            try:
+                for status, (kind, message) in expected.items():
+                    with self.subTest(status=status), patch(
+                        "bilikara.cache.rust_runtime.download_to_path",
+                        side_effect=rust_runtime.RustDownloadError(
+                            "http_status",
+                            f"HTTP {status}",
+                            response={
+                                "error": {
+                                    "kind": "http_status",
+                                    "http_status": status,
+                                }
                             },
-                            video_track={"key": "video-p1", "page": 1, "stream_kind": "video", "label": "V1", "order": 0},
-                            audio_tracks=[{"key": "audio-p1", "page": 1, "stream_kind": "audio", "label": "A1", "order": 1}],
-                            validate_tracks=True,
-                        )
+                        ),
+                    ):
+                        with self.assertRaises(DownloadCommandError) as raised:
+                            manager._download_stream_with_rust(
+                                f"native-http-{status}",
+                                self.cache_dir / f"native-http-{status}",
+                                Path(self.temp_dir.name) / f"native-http-{status}.log",
+                                urls=["https://media.example/video.m4s"],
+                                out_name="video-p1.mp4",
+                                cookie="",
+                                stage_label="下载视频轨 P1",
+                                track_key="video-p1",
+                                cache_attempt_token=1,
+                                stream_kind="video",
+                            )
+                        self.assertEqual(raised.exception.kind, kind)
+                        self.assertIn(message, str(raised.exception))
+                        self.assertEqual(raised.exception.http_status, status)
             finally:
                 manager.shutdown()
 
-        self.assertEqual(download_counts["audio"], 10)
-        self.assertEqual(download_counts["video"], 1)
+    def test_unknown_api_error_is_not_automatically_terminal(self):
+        unknown = DownloadCommandError("unclassified API failure")
+        unknown.kind = "api"
+        unknown.api_code = -999
+        authentication = DownloadCommandError("not logged in")
+        authentication.kind = "api"
+        authentication.api_code = -101
 
-    def test_downkyi_missing_cid_mapping_fails_clear(self):
-        item = PlaylistItem(
-            id="bad-item",
-            original_url="https://www.bilibili.com/video/BV1xx411c7mD",
-            resolved_url="https://www.bilibili.com/video/BV1xx411c7mD?p=1",
-            bvid="BV1xx411c7mD",
-            aid=123,
-            cid=111,
-            page=1,
-            title="Bad Video",
-            part_title="P1",
-            display_title="Bad Video",
-            cover_url="",
-            embed_url="",
-            selected_pages=[1, 2],
-            selected_cids=[111],
-            selected_parts=["P1", "P2"],
-            video_page=1,
-        )
+        self.assertFalse(CacheManager._is_terminal_track_failure(unknown))
+        self.assertTrue(CacheManager._is_terminal_track_failure(authentication))
 
-        with patch("bilikara.cache.effective_bilibili_cookie", return_value="SESSDATA=test"), patch(
-            "bilikara.cache.fetch_dash_playurl", return_value={
-                "video": [{"url": "video.m4s", "backup_urls": []}],
-                "audio": [{"id": 30216, "url": "audio.m4s", "backup_urls": []}],
-            }
-        ):
-            manager = CacheManager(self.store, max_cache_items=3)
+
+class SourceLoginConsumerGuardTest(unittest.TestCase):
+    def test_source_consumer_hook_and_log_failure_do_not_undo_committed_login(self):
+        from login_service_fixture import LoginFixture
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            manager = CacheManager.__new__(CacheManager)
+            manager.lock = threading.RLock()
+            manager.stop_event = threading.Event()
+            manager.log_dir = root / "logs"
+            hooks = []
+            def failed_hook():
+                hooks.append("refresh")
+                raise RuntimeError("synthetic follow-up failure")
+            manager.on_bbdown_login_success = failed_hook
+            rust_runtime.reset_bilibili_login_status()
             try:
-                log_path = Path(self.temp_dir.name) / "test.log"
-                with self.assertRaisesRegex(RuntimeError, "无法解析 P2 的 cid，不能下载对应音频"):
-                    manager._download_dash_streams_with_aria2c(
-                        item=item,
-                        binary_path=Path("/tools/aria2c"),
-                        ffmpeg_path=Path("/tools/ffmpeg"),
-                        item_dir=self.cache_dir / "bad-item",
-                        log_path=log_path,
-                        dash_streams={"video": [{"url": "video.m4s", "backup_urls": []}], "audio": []},
-                        video_track={"key": "v1", "page": 1, "stream_kind": "video", "label": "V1", "order": 0},
-                        audio_tracks=[
-                            {"key": "a1", "page": 1, "stream_kind": "audio", "label": "A1", "order": 1},
-                            {"key": "a2", "page": 2, "stream_kind": "audio", "label": "A2", "order": 2},
-                        ]
-                    )
+                with patch("bilikara.cache.BB_DOWN_DIR", root), LoginFixture(), patch.object(manager, "_append_log_line", side_effect=OSError("synthetic log failure")):
+                    generation = rust_runtime.desktop_login("start", data_path=str(root / "BBDown.data"), force=False)["generation"]
+                    manager._bbdown_login_worker(generation)
+                    self.assertTrue(manager.bbdown_login_status()["logged_in"])
+                    self.assertTrue((root / "BBDown.data").exists())
+                    manager._bbdown_login_worker(generation)
+                self.assertEqual(hooks, ["refresh"])
+                with patch.object(rust_runtime, "_runtime_lib", None):
+                    with self.assertRaises(rust_runtime.RustRuntimeUnavailableError):
+                        manager.start_bbdown_login()
             finally:
-                manager.shutdown()
+                rust_runtime.desktop_login("logout", data_path=str(root / "BBDown.data"))
+                rust_runtime.reset_bilibili_login_status()
 
 
 if __name__ == "__main__":

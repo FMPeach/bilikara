@@ -1,0 +1,1220 @@
+//! Opt-in native Host transport. Desktop's Python adapter does not start this
+//! listener. HTTP is a projection/command adapter to the process-wide AppState.
+mod announcements;
+mod api;
+mod automatic_volume;
+mod cache;
+mod catalog;
+mod catalog_append;
+pub mod desktop;
+mod desktop_import;
+mod desktop_import_tool;
+#[cfg(windows)]
+pub(crate) mod desktop_process;
+mod diagnostics;
+mod environment;
+mod exports;
+mod files;
+mod internet;
+mod library;
+pub(crate) use library::{LibraryDiagnostic, SourceQueue};
+mod login;
+pub(crate) use login::LoginDiagnostic;
+mod admin;
+mod maintenance;
+mod monthly;
+mod network;
+mod owner_enrichment;
+pub(crate) mod preferences;
+pub(crate) mod ratings;
+pub(crate) mod updates;
+
+use crate::app_state::native_session::{Identity, with_app};
+use axum::{
+    Router,
+    body::{Body, to_bytes},
+    extract::{ConnectInfo, State},
+    http::{HeaderMap, Method, Request, StatusCode},
+    response::{Html, IntoResponse, Response},
+};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use serde_json::{Value, json};
+use std::{
+    net::{SocketAddr, TcpListener},
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+use tokio::{io::AsyncWriteExt, sync::Semaphore};
+
+pub struct Asset {
+    pub bytes: Vec<u8>,
+    pub mime: String,
+}
+pub type AssetSource = Arc<dyn Fn(&str) -> Option<Asset> + Send + Sync>;
+/// Platform rendering only. Receives a validated immutable export specification
+/// and a server-generated private temporary path, never a client-supplied path.
+pub type RemoteExportRenderer = Arc<dyn Fn(&str, &Path) -> Result<(), String> + Send + Sync>;
+
+#[derive(Debug)]
+pub(crate) struct ApiError {
+    pub status: u16,
+    pub code: String,
+    pub message: String,
+    pub extra: Value,
+}
+impl ApiError {
+    pub(crate) fn new(status: u16, code: &str, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            code: code.into(),
+            message: message.into(),
+            extra: json!({}),
+        }
+    }
+    pub(crate) fn invalid(message: impl Into<String>) -> Self {
+        Self::new(400, "invalid_request", message)
+    }
+    fn response(self) -> Response {
+        let mut value = self.extra;
+        if !value.is_object() {
+            value = json!({});
+        }
+        value["ok"] = json!(false);
+        value["error"] = json!(self.message);
+        value["code"] = json!(self.code);
+        json_response(self.status, value)
+    }
+}
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+pub(crate) struct HostContext {
+    directory: PathBuf,
+    cache_root: PathBuf,
+    assets: AssetSource,
+    stop: Arc<AtomicBool>,
+    api_slots: Arc<Semaphore>,
+    export_slots: Arc<Semaphore>,
+    export_renderer: std::sync::OnceLock<RemoteExportRenderer>,
+    port: u16,
+    desktop: bool,
+    bind_address: std::net::Ipv4Addr,
+    allowed_hosts: std::sync::RwLock<Vec<std::net::IpAddr>>,
+    bbdown: Option<crate::cache_runtime::bbdown::Executable>,
+    aria2: std::sync::Mutex<Option<crate::cache_runtime::aria2::Executable>>,
+    aria2_prepare: std::sync::Mutex<()>,
+    shutdown_token: Option<String>,
+    desktop_installation: Option<crate::update_installer::native::Installation>,
+    workers: std::sync::Mutex<Vec<thread::JoinHandle<()>>>,
+}
+
+/// Dropping the handle stops the server and native cache pump. Keep it managed
+/// by the platform shell for the complete foreground Host lifetime.
+pub struct NativeHost {
+    bootstrap_url: String,
+    context: Arc<HostContext>,
+    server: Option<thread::JoinHandle<()>>,
+}
+impl NativeHost {
+    pub fn start(directory: &Path, assets: AssetSource) -> Result<Self, String> {
+        start(directory, assets, false, None).map_err(|error| error.to_string())
+    }
+    pub fn bootstrap_url(&self) -> &str {
+        &self.bootstrap_url
+    }
+    pub fn local_port(&self) -> u16 {
+        self.context.port
+    }
+    /// Trusted shell package metadata, never a version supplied by HTTP/Remote.
+    pub fn set_app_version(&self, version: &str) -> Result<(), String> {
+        if version.is_empty() || version.len() > 128 {
+            return Err("Invalid installed application version".into());
+        }
+        with_app(|app| {
+            app.native().announcements.version = version.to_owned();
+            Ok(())
+        })
+        .map_err(|error| error.to_string())
+    }
+    pub fn set_export_renderer(&self, renderer: RemoteExportRenderer) -> Result<(), String> {
+        // The bootstrap may be checked again; the renderer is installed once.
+        self.context.export_renderer.get_or_init(|| renderer);
+        with_app(|app| {
+            app.native().remote_export_ready = true;
+            app.native().revision += 1;
+            Ok(())
+        })
+        .map_err(|error| error.to_string())
+    }
+}
+impl HostContext {
+    fn aria2(&self) -> Option<crate::cache_runtime::aria2::Executable> {
+        self.aria2.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+    fn prepare_aria2(&self, install: bool) -> Result<(), ApiError> {
+        if !self.desktop {
+            return Err(ApiError::new(
+                501,
+                "cache_source_unavailable",
+                "aria2c is desktop-only",
+            ));
+        }
+        // Serialize preparation without blocking cache/status readers on an
+        // optional external process. Publish only a fully validated executable.
+        let _preparing = self.aria2_prepare.lock().unwrap_or_else(|p| p.into_inner());
+        if self.aria2().is_none() {
+            let executable = crate::cache_runtime::aria2::Executable::prepare(
+                &self.directory.join("tools/aria2c"),
+                std::env::var_os("ARIA2C_PATH")
+                    .filter(|p| !p.is_empty())
+                    .map(PathBuf::from),
+                &[],
+                install,
+                &self.stop,
+            )
+            .map_err(|e| ApiError::new(501, &e.kind, e.message))?;
+            *self.aria2.lock().unwrap_or_else(|p| p.into_inner()) = Some(executable);
+        }
+        with_app(|app| {
+            let session = app.native();
+            if !session.aria2_available {
+                session.aria2_available = true;
+                session.revision += 1;
+            }
+            Ok(())
+        })
+    }
+
+    fn spawn(&self, name: &str, work: impl FnOnce() + Send + 'static) -> std::io::Result<()> {
+        let mut workers = self
+            .workers
+            .lock()
+            .map_err(|_| std::io::Error::other("worker lock"))?;
+        if self.stop.load(Ordering::Acquire) {
+            return Err(std::io::Error::other("Host stopped"));
+        }
+        // Retire completed handles so a long session does not accumulate them.
+        let mut live = Vec::new();
+        for worker in workers.drain(..) {
+            if worker.is_finished() {
+                let _ = worker.join();
+            } else {
+                live.push(worker);
+            }
+        }
+        *workers = live;
+        workers.push(thread::Builder::new().name(name.into()).spawn(work)?);
+        Ok(())
+    }
+}
+impl Drop for NativeHost {
+    fn drop(&mut self) {
+        self.context.stop.store(true, Ordering::Release);
+        let _ = with_app(|app| {
+            app.notify_analysis(true);
+            Ok(())
+        });
+        // Listener, async requests/SSE/media, and blocking HTTP work retire first.
+        if let Some(server) = self.server.take() {
+            let _ = server.join();
+        }
+        let workers = std::mem::take(&mut *self.context.workers.lock().expect("worker lock"));
+        for worker in workers {
+            let _ = worker.join();
+        }
+        // Downloads and HTTP media readers have drained. Release live media
+        // projections before collecting owned artifacts; checkpoint records
+        // already omit cache paths, so queue/history persistence is unaffected.
+        let _ = with_app(|app| {
+            app.native_retire_cache();
+            Ok(())
+        });
+        let media = maintenance::collect(&self.context.cache_root, false);
+        let logs = cache::clear_song_logs(&self.context.directory);
+        if media.is_err() || logs.is_err() {
+            eprintln!("native cache cleanup incomplete; startup will retry");
+        }
+        // AppState remains alive until the owner has dropped this handle.
+    }
+}
+
+pub(crate) fn now() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|v| v.as_secs_f64())
+        .unwrap_or(0.0)
+}
+pub(crate) fn token() -> Result<String, ApiError> {
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes)
+        .map_err(|_| ApiError::new(503, "entropy", "设备无法生成安全的访问凭证"))?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+pub(crate) fn qr_image(value: &str) -> Result<String, ApiError> {
+    access_qr_image(value)
+}
+
+pub(crate) fn access_qr_image(value: &str) -> Result<String, ApiError> {
+    // Access and login cards share the UI's fixed 3px white frame.
+    render_qr(value, false)
+}
+
+fn render_qr(value: &str, quiet_zone: bool) -> Result<String, ApiError> {
+    let code = qrcode::QrCode::new(value).map_err(|_| ApiError::invalid("无法生成二维码"))?;
+    let svg = code
+        .render::<qrcode::render::svg::Color>()
+        .min_dimensions(256, 256)
+        .quiet_zone(quiet_zone)
+        .build();
+    Ok(format!(
+        "data:image/svg+xml;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(svg)
+    ))
+}
+
+fn start(
+    directory: &Path,
+    assets: AssetSource,
+    desktop: bool,
+    shutdown_token: Option<String>,
+) -> Result<NativeHost, ApiError> {
+    let directory = directory
+        .canonicalize()
+        .map_err(|_| ApiError::new(503, "storage", "Host 私有目录不可用"))?;
+    let cache_root = directory.join(if desktop { "cache" } else { "media" });
+    let previous_cache = directory.join("media");
+    if desktop && !cache_root.exists() && previous_cache.exists() {
+        // AppState already holds the data-root lock. Preserve old preview cache
+        // files when restoring the historical desktop directory name.
+        if !std::fs::symlink_metadata(&previous_cache).is_ok_and(|m| m.is_dir()) {
+            return Err(ApiError::new(
+                503,
+                "cache_storage",
+                "旧缓存目录不是普通目录",
+            ));
+        }
+        std::fs::rename(&previous_cache, &cache_root)
+            .map_err(|_| ApiError::new(503, "cache_storage", "无法恢复缓存目录名称"))?;
+    }
+    std::fs::create_dir_all(&cache_root)
+        .map_err(|_| ApiError::new(503, "storage", "无法创建媒体缓存目录"))?;
+    std::fs::create_dir_all(directory.join("logs"))
+        .map_err(|_| ApiError::new(503, "storage", "无法创建诊断目录"))?;
+    // No cache worker/listener exists yet. Old staging files cannot belong to a
+    // live attempt after the validated restart reset.
+    maintenance::collect(&cache_root, true)
+        .map_err(|_| ApiError::new(503, "cache_storage", "无法清理旧媒体缓存"))?;
+    let (listeners, bind_address) = environment::listeners(desktop)?;
+    let port = listeners[0]
+        .local_addr()
+        .map_err(|_| ApiError::invalid("无法确定 Host 端口"))?
+        .port();
+    let host_token = token()?;
+    let state_epoch = token()?;
+    let remote_access = network::remote_access(port, &network::bound_addresses(bind_address))?;
+    let saved_cookie = if desktop {
+        login::load_desktop(&directory)?
+    } else {
+        login::load(&directory)?
+    };
+    let (saved_cookie, cookie_warning) = login::launch_cookie(&directory, saved_cookie);
+    let saved_preferences = preferences::load(&directory, desktop)?;
+    let facts = desktop::update_facts();
+    let saved_announcements = crate::announcements::State::load(
+        &directory,
+        if desktop {
+            facts.version
+        } else {
+            String::new()
+        },
+        if desktop {
+            facts.platform
+        } else {
+            "android".into()
+        },
+    );
+    let bbdown = if desktop {
+        crate::cache_runtime::bbdown::Executable::discover(&directory)
+    } else {
+        None
+    };
+    // Only a selected aria2 backend is a readiness dependency. Probing an
+    // optional aria2 binary launches subprocesses (and may time out); Native
+    // and BBDown users must not wait for those capability checks at startup.
+    let needs_aria2 = desktop && saved_preferences.cache.download_source == "downkyi";
+    let aria2 = if needs_aria2 {
+        crate::cache_runtime::aria2::Executable::prepare(
+            &directory.join("tools/aria2c"),
+            std::env::var_os("ARIA2C_PATH")
+                .filter(|p| !p.is_empty())
+                .map(PathBuf::from),
+            &[],
+            true,
+            &AtomicBool::new(false),
+        )
+        .ok()
+    } else {
+        None
+    };
+    // Seed/migrate configured UP sources before any login-triggered refresh.
+    let recovered_library = library::initialize(&directory)?;
+    library::migrate_pool(&directory)?;
+    library::publish_favorites_timestamp(&directory);
+    // File I/O stays outside AppState: a previous helper's kept outcome.
+    let last_install = desktop
+        .then(|| {
+            let workspaces = desktop::installation()
+                .map(|installation| installation.update_workspace_parent(&directory).to_owned());
+            updates::take_last_result(&directory, workspaces.as_deref())
+        })
+        .flatten();
+    with_app(|app| {
+        app.native_core_snapshot()?;
+        if !app.native().host_token.is_empty() {
+            return Err(ApiError::new(
+                409,
+                "already_started",
+                "原生 Host 服务已启动",
+            ));
+        }
+        let session = app.native();
+        session.desktop = desktop;
+        session.announcements = saved_announcements;
+        if desktop {
+            // One authority for the check-only update loop: the same state the
+            // status route and the SSE projection read.
+            session.updates = updates::UpdateState::desktop(desktop::update_facts(), last_install);
+        }
+        session.bbdown_available = bbdown.is_some();
+        session.aria2_available = aria2.is_some();
+        session.host_token = host_token.clone();
+        session.state_epoch = state_epoch.clone();
+        session.cookie = saved_cookie;
+        session.pending_library_refresh =
+            (!session.cookie.is_empty()).then_some("credential_restore");
+        session.startup_warning = cookie_warning;
+        if recovered_library {
+            session
+                .startup_warning
+                .push_str(" 曲库来源配置损坏，已备份原文件并恢复默认来源");
+        }
+        session.cache_policy = saved_preferences.cache;
+        session.ui_language = saved_preferences.language;
+        session.remote_access = remote_access;
+        Ok(())
+    })?;
+    exports::clean_stale(&directory)?;
+    let context = Arc::new(HostContext {
+        directory,
+        cache_root,
+        assets,
+        stop: Arc::new(AtomicBool::new(false)),
+        api_slots: Arc::new(Semaphore::new(32)),
+        export_slots: Arc::new(Semaphore::new(1)),
+        export_renderer: std::sync::OnceLock::new(),
+        port,
+        desktop,
+        bind_address,
+        allowed_hosts: std::sync::RwLock::new(crate::networking::local_transport_addresses()),
+        shutdown_token,
+        desktop_installation: if desktop {
+            desktop::installation()
+        } else {
+            None
+        },
+        bbdown,
+        aria2: std::sync::Mutex::new(aria2),
+        aria2_prepare: std::sync::Mutex::new(()),
+        workers: std::sync::Mutex::new(Vec::new()),
+    });
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(8)
+        .enable_all()
+        .build()
+        .map_err(|_| ApiError::new(503, "runtime", "无法启动 Host 网络运行时"))?;
+    let worker_context = context.clone();
+    let server = thread::Builder::new()
+        .name("native-host-http".into())
+        .spawn(move || {
+            runtime.block_on(async move {
+                let stop = worker_context.stop.clone();
+                let router = Router::new().fallback(handle).with_state(worker_context);
+                let mut serving = tokio::task::JoinSet::new();
+                for listener in listeners {
+                    let Ok(listener) = tokio::net::TcpListener::from_std(listener) else {
+                        continue;
+                    };
+                    let server = axum::serve(
+                        listener,
+                        router
+                            .clone()
+                            .into_make_service_with_connect_info::<SocketAddr>(),
+                    );
+                    let graceful_stop = stop.clone();
+                    serving.spawn(async move {
+                        server
+                            .with_graceful_shutdown(async move {
+                                while !graceful_stop.load(Ordering::Acquire) {
+                                    tokio::time::sleep(Duration::from_millis(200)).await;
+                                }
+                            })
+                            .await
+                    });
+                }
+                while !stop.load(Ordering::Acquire) && !serving.is_empty() {
+                    if serving.try_join_next().is_some() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                // Give completed responses a bounded drain. A WebView can keep
+                // an SSE/media/body connection open after its window closes.
+                // Runtime drop cancels those async tasks and waits for blocking
+                // requests; the owner joins this thread before shutting AppState.
+                if tokio::time::timeout(Duration::from_secs(2), async {
+                    while serving.join_next().await.is_some() {}
+                })
+                .await
+                .is_err()
+                {
+                    serving.abort_all();
+                    while serving.join_next().await.is_some() {}
+                }
+            })
+        })
+        .map_err(|_| ApiError::new(503, "runtime", "无法创建 Host 服务线程"))?;
+    let mut host = NativeHost {
+        bootstrap_url: format!("http://127.0.0.1:{port}/bootstrap/{host_token}"),
+        context: context.clone(),
+        server: Some(server),
+    };
+    library::start_coordinator(context.clone())?;
+    cache::start_pump(context.clone())?;
+    automatic_volume::configure_capability();
+    automatic_volume::start(context.clone())?;
+    network::start_monitor(&context)?;
+    ratings::start_pump(context.clone())?;
+    if let Err(error) = owner_enrichment::start(context.clone()) {
+        eprintln!(
+            "[native-host] UP metadata enrichment unavailable: {}",
+            error.code
+        );
+    }
+    library::refresh_after_login(&context);
+    if desktop {
+        host.install_desktop_export()?;
+        if !needs_aria2 {
+            let tools_context = context.clone();
+            context
+                .spawn("desktop-aria2-probe", move || {
+                    // No installation/network work for an unselected source.
+                    // prepare_aria2 serializes with an explicit user request.
+                    let _ = tools_context.prepare_aria2(false);
+                })
+                .map_err(|_| ApiError::new(503, "runtime", "无法创建工具检查线程"))?;
+        }
+    }
+    Ok(host)
+}
+
+fn json_response(status: u16, value: Value) -> Response {
+    (
+        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        axum::Json(value),
+    )
+        .into_response()
+}
+fn cookie(headers: &HeaderMap) -> String {
+    headers
+        .get("cookie")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .split(';')
+        .find_map(|entry| entry.trim().strip_prefix("bilikara_native="))
+        .unwrap_or("")
+        .to_owned()
+}
+
+fn validate_host<'a>(
+    headers: &'a HeaderMap,
+    port: u16,
+    allowed: &[std::net::IpAddr],
+) -> Result<&'a str, ApiError> {
+    let host = headers
+        .get("host")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| ApiError::invalid("缺少 Host"))?;
+    let address: SocketAddr = host
+        .parse()
+        .map_err(|_| ApiError::new(403, "host", "只接受设备的本地 IP 地址"))?;
+    if address.port() != port || !(address.ip().is_loopback() || allowed.contains(&address.ip())) {
+        return Err(ApiError::new(403, "host", "无效的 Host 地址"));
+    }
+    Ok(host)
+}
+
+fn validate_origin(
+    headers: &HeaderMap,
+    port: u16,
+    allowed: &[std::net::IpAddr],
+) -> Result<(), ApiError> {
+    let host = validate_host(headers, port, allowed)?;
+    if let Some(origin) = headers.get("origin")
+        && origin.to_str().ok() != Some(&format!("http://{host}"))
+    {
+        return Err(ApiError::new(403, "origin", "不接受跨站请求"));
+    }
+    if headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) == Some("cross-site") {
+        return Err(ApiError::new(403, "origin", "不接受跨站请求"));
+    }
+    Ok(())
+}
+
+fn validate_entry_navigation(headers: &HeaderMap) -> Result<(), ApiError> {
+    // Entry pages allow cross-site top-level navigation, never fetching or
+    // embedding. Older WebViews may omit Fetch Metadata. Host bootstrap still
+    // requires its private token and actual loopback peer independently below;
+    // the open LAN entry only establishes a Remote identity.
+    for (name, expected) in [
+        ("sec-fetch-mode", "navigate"),
+        ("sec-fetch-dest", "document"),
+    ] {
+        if let Some(value) = headers.get(name)
+            && value.to_str().ok() != Some(expected)
+        {
+            return Err(ApiError::new(403, "origin", "启动链接只接受页面导航"));
+        }
+    }
+    Ok(())
+}
+
+async fn handle(
+    State(context): State<Arc<HostContext>>,
+    ConnectInfo(address): ConnectInfo<SocketAddr>,
+    request: Request<Body>,
+) -> Response {
+    let response = match handle_inner(context, address, request).await {
+        Ok(value) => value,
+        Err(error) => error.response(),
+    };
+    let mut response = response;
+    let headers = response.headers_mut();
+    headers.insert("cache-control", "no-store".parse().unwrap());
+    headers.insert("referrer-policy", "no-referrer".parse().unwrap());
+    headers.insert("x-content-type-options", "nosniff".parse().unwrap());
+    headers.insert("x-frame-options", "DENY".parse().unwrap());
+    response
+}
+
+async fn handle_inner(
+    context: Arc<HostContext>,
+    address: SocketAddr,
+    request: Request<Body>,
+) -> Result<Response, ApiError> {
+    // Check DNS-rebinding/port constraints even for the capability entry pages.
+    validate_host(
+        request.headers(),
+        context.port,
+        &context
+            .allowed_hosts
+            .read()
+            .unwrap_or_else(|p| p.into_inner()),
+    )?;
+    if context.stop.load(Ordering::Acquire) {
+        return Err(ApiError::new(503, "stopped", "Host 已停止"));
+    }
+    let method = request.method().clone();
+    if !matches!(method, Method::GET | Method::HEAD | Method::POST) {
+        return Err(ApiError::new(405, "method", "不支持此请求方式"));
+    }
+    let path = request.uri().path().to_owned();
+    let query = request.uri().query().unwrap_or("").to_owned();
+    let identity = Identity {
+        token: cookie(request.headers()),
+        loopback: address.ip().is_loopback(),
+        client: request
+            .headers()
+            .get("x-bilikara-client")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_owned(),
+    };
+    if method == Method::GET && path.starts_with("/bootstrap/") {
+        validate_entry_navigation(request.headers())?;
+        let secret = path.trim_start_matches("/bootstrap/");
+        with_app(|app| {
+            app.native_authorize(
+                &Identity {
+                    token: secret.to_owned(),
+                    loopback: identity.loopback,
+                    client: String::new(),
+                },
+                true,
+            )
+        })?;
+        return Ok(session_entry(host_entry_page(&query)?, secret));
+    }
+    if method == Method::GET && matches!(path.as_str(), "/remote" | "/remote/" | "/remote.html") {
+        validate_entry_navigation(request.headers())?;
+        let device_token = with_app(|app| {
+            // LAN entry is open, as in the Python Host. A device cookie only
+            // binds its Remote identity; it never grants Host authority.
+            // Preserve existing Host/Remote cookies and avoid a refresh loop.
+            if app.native_authorize(&identity, false).is_ok() {
+                Ok(None)
+            } else {
+                app.native_join_remote(&identity.token, token()?).map(Some)
+            }
+        })?;
+        if let Some(device_token) = device_token {
+            return Ok(session_entry(EntryPage::Remote, &device_token));
+        }
+    }
+    // APIs, authenticated assets and media keep the original origin checks.
+    validate_origin(
+        request.headers(),
+        context.port,
+        &context
+            .allowed_hosts
+            .read()
+            .unwrap_or_else(|p| p.into_inner()),
+    )?;
+    if path == "/api/health" && method == Method::GET && identity.loopback {
+        return Ok(json_response(
+            200,
+            json!({"ok":true,"status":"ready","backend":"rust"}),
+        ));
+    }
+    if matches!(
+        path.as_str(),
+        "/api/app/shutdown"
+            | "/api/app/export-status"
+            | "/api/app/update/activate"
+            | "/api/app/update/install"
+            | "/api/app/update/cancel"
+            | "/api/app/bilibili-login/begin"
+            | "/api/app/bilibili-login/complete"
+            | "/api/app/bilibili-login/cancel"
+    ) && method == Method::POST
+        && context.desktop
+    {
+        if !identity.loopback
+            || context.shutdown_token.as_deref().is_none_or(|expected| {
+                request
+                    .headers()
+                    .get("x-bilikara-shutdown-token")
+                    .and_then(|v| v.to_str().ok())
+                    != Some(expected)
+            })
+        {
+            return Err(ApiError::new(403, "shutdown", "关闭凭证无效"));
+        }
+        if path == "/api/app/export-status" {
+            let language = with_app(|app| Ok(app.native().ui_language))?;
+            return Ok(json_response(
+                200,
+                json!({"ok":true,"data":{"active":context.export_slots.available_permits() == 0,"language":language}}),
+            ));
+        }
+        if let Some(operation) = path.strip_prefix("/api/app/bilibili-login/") {
+            let operation = operation.to_owned();
+            let bytes = axum::body::to_bytes(request.into_body(), 20 * 1024)
+                .await
+                .map_err(|_| ApiError::invalid("Invalid login operation"))?;
+            let body: Value = serde_json::from_slice(&bytes)
+                .map_err(|_| ApiError::invalid("Invalid login operation"))?;
+            let result =
+                tokio::task::spawn_blocking(move || login::web_login(&context, &operation, &body))
+                    .await
+                    .map_err(|_| ApiError::invalid("Login operation failed"))??;
+            return Ok(json_response(200, json!({"ok":true,"data":result})));
+        }
+        if path.starts_with("/api/app/update/") {
+            let bytes = axum::body::to_bytes(request.into_body(), 1024)
+                .await
+                .map_err(|_| ApiError::invalid("Invalid update operation"))?;
+            let body: Value = serde_json::from_slice(&bytes)
+                .map_err(|_| ApiError::invalid("Invalid update operation"))?;
+            let result = tokio::task::spawn_blocking(move || {
+                updates::private_desktop(&context, &path, &body)
+            })
+            .await
+            .map_err(|_| ApiError::invalid("Update operation failed"))??;
+            return Ok(json_response(200, json!({"ok":true,"data":result})));
+        }
+        context.stop.store(true, Ordering::Release);
+        let _ = with_app(|app| {
+            app.notify_analysis(true);
+            Ok(())
+        });
+        return Ok(json_response(200, json!({"ok":true})));
+    }
+    let host = with_app(|app| app.native_authorize(&identity, false))?;
+    if path == "/api/events" && method == Method::GET {
+        return event_stream(context, identity, host).await;
+    }
+    if matches!(
+        path.as_str(),
+        "/api/playlist/export" | "/api/history/export"
+    ) && method == Method::GET
+    {
+        return exports::download(context, identity, query).await;
+    }
+    if path.starts_with("/media/") && matches!(method, Method::GET | Method::HEAD) {
+        if !host {
+            return Err(ApiError::new(403, "host_only", "媒体只供 Host 播放"));
+        }
+        return files::media(&context, &path, request.headers(), method == Method::HEAD).await;
+    }
+    if !path.starts_with("/api/") && matches!(method, Method::GET | Method::HEAD) {
+        if matches!(path.as_str(), "/" | "/index.html") && !host {
+            return Err(ApiError::new(403, "host_only", "请使用手机点歌页面"));
+        }
+        return files::asset(&context, &path, method == Method::HEAD);
+    }
+    let permit = context
+        .api_slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| ApiError::new(429, "busy", "Host 请求较多，请稍后重试"))?;
+    let body = if method == Method::POST {
+        if !request
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .starts_with("application/json")
+        {
+            return Err(ApiError::new(415, "content_type", "仅支持 JSON 请求"));
+        }
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(5),
+            to_bytes(request.into_body(), 64 * 1024),
+        )
+        .await
+        .map_err(|_| ApiError::new(408, "timeout", "请求接收超时"))?
+        .map_err(|_| ApiError::new(413, "body_too_large", "请求过大"))?;
+        serde_json::from_slice(&bytes).map_err(|_| ApiError::invalid("JSON 格式无效"))?
+    } else {
+        json!({})
+    };
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        if context.desktop && method == Method::POST && path == "/api/diagnostics/package" {
+            return diagnostics::package(&context, &identity, &body);
+        }
+        let result = api::dispatch(&context, &identity, host, &method, &path, &query, body)?;
+        let mut response = json!({"ok":true,"data":result});
+        if path == "/api/config/cookie" {
+            // Retain the old HTTP response for external clients as well as
+            // the Native data envelope used by current clients.
+            response["message"] = response["data"]["message"].clone();
+        }
+        Ok(json_response(
+            if path == "/api/admin-maintenance/trigger" {
+                202
+            } else {
+                200
+            },
+            response,
+        ))
+    })
+    .await
+    .map_err(|_| ApiError::new(500, "task", "原生请求处理失败"))?
+}
+
+enum EntryPage {
+    Host,
+    LegacyHost,
+    Remote,
+    DisplayIdentifier(String),
+    Controller(u64),
+}
+
+fn host_entry_page(query: &str) -> Result<EntryPage, ApiError> {
+    let parameters = url::form_urlencoded::parse(query.as_bytes()).collect::<Vec<_>>();
+    let pages = parameters
+        .iter()
+        .filter(|(key, _)| key == "page")
+        .collect::<Vec<_>>();
+    let modes = parameters
+        .iter()
+        .filter(|(key, _)| key == "webviewMode")
+        .collect::<Vec<_>>();
+    if !modes.is_empty() {
+        // A fixed presentation choice after the ordinary Host authorization.
+        // No caller-supplied destination, capability or persistent setting.
+        if pages.is_empty() && modes.len() == 1 && modes[0].1 == "legacy" {
+            return Ok(EntryPage::LegacyHost);
+        }
+        return Err(ApiError::invalid("Invalid WebView mode"));
+    }
+    if pages.is_empty() {
+        return Ok(EntryPage::Host);
+    }
+    if pages.len() != 1 {
+        return Err(ApiError::invalid("Invalid Host entry page"));
+    }
+    if pages[0].1 == "controller" {
+        let generations = parameters
+            .iter()
+            .filter(|(key, _)| key == "presentationGeneration")
+            .collect::<Vec<_>>();
+        if generations.len() != 1 {
+            return Err(ApiError::invalid("Invalid presentation generation"));
+        }
+        let generation = generations[0]
+            .1
+            .parse::<u64>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| ApiError::invalid("Invalid presentation generation"))?;
+        return Ok(EntryPage::Controller(generation));
+    }
+    if pages[0].1 != "display-identifier" {
+        return Err(ApiError::invalid("Invalid Host entry page"));
+    }
+    // Only fixed local documents are entry targets. Their presentation-only
+    // parameters are encoded again; no caller-supplied path or HTML is used.
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(
+            parameters
+                .iter()
+                .filter(|(key, _)| matches!(key.as_ref(), "number" | "theme" | "language" | "role"))
+                .map(|(key, value)| (key.as_ref(), value.as_ref())),
+        )
+        .finish();
+    Ok(EntryPage::DisplayIdentifier(query))
+}
+
+fn session_entry(page: EntryPage, token: &str) -> Response {
+    let silent_entry = matches!(
+        &page,
+        EntryPage::DisplayIdentifier(_) | EntryPage::Controller(_)
+    );
+    let (location, lifetime) = match page {
+        EntryPage::Host => ("/".to_owned(), ""),
+        EntryPage::LegacyHost => ("/#bilikara-legacy".to_owned(), ""),
+        // Preserve ordinary Remote recognition when the browser is closed.
+        // This does not extend the lifetime of process-private Host authority.
+        EntryPage::Remote => ("/remote".to_owned(), "; Max-Age=31536000"),
+        EntryPage::DisplayIdentifier(query) => (format!("/display-identifier.html?{query}"), ""),
+        EntryPage::Controller(generation) => (
+            format!("/controller.html?presentationGeneration={generation}"),
+            "",
+        ),
+    };
+    let location = location.replace('&', "&amp;");
+    // Auxiliary windows must not flash entry text. Keep their intermediate document
+    // empty even if a WebView exposes it before the target page finishes loading.
+    let content = if silent_entry {
+        String::new()
+    } else {
+        format!(r#"正在进入 bilikara… <a href="{location}" rel="noreferrer">继续</a>"#)
+    };
+    // A 303 keeps the navigation cross-site and can withhold a Strict cookie
+    // on the redirect target. Commit a local document first, then navigate
+    // within that origin. No token or external resource appears in this
+    // document, and the zero-delay refresh replaces the entry URL.
+    let mut response = Html(format!(
+        r#"<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="refresh" content="0;url={location}"><title>bilikara</title><body>{content}</body></html>"#
+    )).into_response();
+    response.headers_mut().insert(
+        "content-security-policy",
+        "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
+            .parse()
+            .unwrap(),
+    );
+    response.headers_mut().insert(
+        "set-cookie",
+        format!("bilikara_native={token}; Path=/; HttpOnly; SameSite=Strict{lifetime}")
+            .parse()
+            .expect("random token header"),
+    );
+    response
+}
+
+async fn event_stream(
+    context: Arc<HostContext>,
+    identity: Identity,
+    host: bool,
+) -> Result<Response, ApiError> {
+    struct LanConnection(Option<String>);
+    impl Drop for LanConnection {
+        fn drop(&mut self) {
+            if let Some(key) = &self.0 {
+                let _ = with_app(|app| {
+                    app.native_close_lan_connection(key);
+                    Ok(())
+                });
+            }
+        }
+    }
+    let connection = LanConnection(with_app(|app| app.native_open_lan_connection(&identity))?);
+    let (reader, mut writer) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        let _connection = connection;
+        let mut last_revision = None;
+        while !context.stop.load(Ordering::Acquire) {
+            // Register before reading state so a commit during the snapshot or
+            // response write cannot be missed. Slow clients still have a timeout.
+            let changed = crate::app_state::native_session::state_changes().notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let identity = identity.clone();
+            let value = tokio::task::spawn_blocking(move || {
+                with_app(|app| {
+                    app.native_authorize(&identity, false)?;
+                    app.native_sse_frame(host)
+                })
+            })
+            .await;
+            let Ok(Ok((current_revision, cached_frame))) = value else {
+                break;
+            };
+            let revision = Some(current_revision);
+            let frame = if revision == last_revision {
+                // Named heartbeat reaches EventSource listeners; an SSE
+                // comment alone cannot detect a silently stalled connection.
+                format!(
+                    "event: heartbeat\ndata: {{\"state_revision\":{}}}\n\n",
+                    current_revision
+                )
+            } else {
+                last_revision = revision;
+                cached_frame.to_string()
+            };
+            if !matches!(
+                tokio::time::timeout(Duration::from_secs(5), writer.write_all(frame.as_bytes()))
+                    .await,
+                Ok(Ok(()))
+            ) {
+                break;
+            }
+            tokio::select! {
+                _ = changed => {},
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+            }
+        }
+    });
+    Ok((
+        [
+            ("content-type", "text/event-stream"),
+            ("cache-control", "no-cache, no-transform"),
+        ],
+        Body::from_stream(tokio_util::io::ReaderStream::new(reader)),
+    )
+        .into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_identifier_entry_is_fixed_local_and_keeps_strict_session_cookie() {
+        let query = "page=display-identifier&number=2&theme=dark&language=ja&role=audience&next=https%3A%2F%2Fevil.test";
+        let page = host_entry_page(query).unwrap();
+        let EntryPage::DisplayIdentifier(parameters) = &page else {
+            panic!("identifier target required")
+        };
+        assert_eq!(parameters, "number=2&theme=dark&language=ja&role=audience");
+        let response = session_entry(page, "private-host");
+        let cookie = response.headers()["set-cookie"].to_str().unwrap();
+        assert_eq!(
+            cookie,
+            "bilikara_native=private-host; Path=/; HttpOnly; SameSite=Strict"
+        );
+        let body = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(axum::body::to_bytes(response.into_body(), 4096))
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(html.contains(
+            "url=/display-identifier.html?number=2&amp;theme=dark&amp;language=ja&amp;role=audience"
+        ));
+        assert!(!html.contains("private-host"));
+        assert!(!html.contains("evil.test"));
+        assert!(html.contains("<body></body>"));
+        assert!(!html.contains("正在进入"));
+        assert!(!html.contains("<a "));
+        assert!(matches!(host_entry_page("").unwrap(), EntryPage::Host));
+        for invalid in [
+            "page=https://evil.test",
+            "page=/controller.html",
+            "page=display-identifier&page=display-identifier",
+        ] {
+            assert!(host_entry_page(invalid).is_err());
+        }
+        let EntryPage::DisplayIdentifier(encoded) =
+            host_entry_page("page=display-identifier&role=%22%3E%3Cscript%3E").unwrap()
+        else {
+            panic!("identifier target required")
+        };
+        assert_eq!(encoded, "role=%22%3E%3Cscript%3E");
+    }
+
+    #[test]
+    fn controller_entry_is_silent_fixed_local_and_requires_one_valid_generation() {
+        let page = host_entry_page(
+            "page=controller&presentationGeneration=42&next=https%3A%2F%2Fevil.test",
+        )
+        .unwrap();
+        let response = session_entry(page, "private-host");
+        assert_eq!(
+            response.headers()["set-cookie"],
+            "bilikara_native=private-host; Path=/; HttpOnly; SameSite=Strict"
+        );
+        let body = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(axum::body::to_bytes(response.into_body(), 4096))
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(html.contains("url=/controller.html?presentationGeneration=42"));
+        assert!(html.contains("<body></body>"));
+        assert!(!html.contains("private-host"));
+        assert!(!html.contains("evil.test"));
+        for invalid in [
+            "page=controller",
+            "page=controller&presentationGeneration=0",
+            "page=controller&presentationGeneration=-1",
+            "page=controller&presentationGeneration=18446744073709551616",
+            "page=controller&presentationGeneration=1&presentationGeneration=2",
+            "page=controller&presentationGeneration=1&page=display-identifier",
+            "page=controller&presentationGeneration=%22%3E%3Cscript%3E",
+        ] {
+            assert!(host_entry_page(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn legacy_entry_keeps_the_host_cookie_and_a_fixed_local_mode_destination() {
+        let response = session_entry(
+            host_entry_page("webviewMode=legacy").unwrap(),
+            "private-host",
+        );
+        assert_eq!(
+            response.headers()["set-cookie"],
+            "bilikara_native=private-host; Path=/; HttpOnly; SameSite=Strict"
+        );
+        let body = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(axum::body::to_bytes(response.into_body(), 4096))
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(html.contains("url=/#bilikara-legacy"));
+        assert!(html.contains("href=\"/#bilikara-legacy\""));
+        assert!(!html.contains("private-host"));
+        for invalid in [
+            "webviewMode=unknown",
+            "webviewMode=legacy&webviewMode=legacy",
+            "page=controller&presentationGeneration=1&webviewMode=legacy",
+            "webviewMode=https://evil.invalid",
+            "webviewMode=%22%3E%3Cscript%3E",
+        ] {
+            assert!(host_entry_page(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn only_remote_entry_cookies_survive_browser_session_close() {
+        let remote = session_entry(EntryPage::Remote, "remote-device");
+        let cookie = remote.headers()["set-cookie"].to_str().unwrap();
+        assert!(cookie.contains("Max-Age=31536000"));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("SameSite=Strict"));
+        assert!(!cookie.contains("Secure"), "LAN HTTP remains supported");
+        let host = session_entry(EntryPage::Host, "private-host");
+        let cookie = host.headers()["set-cookie"].to_str().unwrap();
+        assert!(!cookie.contains("Max-Age"));
+        assert!(!cookie.contains("Expires"));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        for response in [host, remote] {
+            let body = runtime
+                .block_on(axum::body::to_bytes(response.into_body(), 4096))
+                .unwrap();
+            let html = std::str::from_utf8(&body).unwrap();
+            assert!(html.contains("正在进入 bilikara…"));
+            assert!(html.contains(">继续</a>"));
+        }
+    }
+    #[test]
+    fn rejects_dns_rebinding_and_foreign_origins() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "127.0.0.1:4567".parse().unwrap());
+        assert!(validate_origin(&headers, 4567, &[]).is_ok());
+        headers.insert("origin", "https://evil.test".parse().unwrap());
+        assert!(validate_origin(&headers, 4567, &[]).is_err());
+        headers.remove("origin");
+        headers.insert("host", "evil.test:4567".parse().unwrap());
+        assert!(validate_origin(&headers, 4567, &[]).is_err());
+        headers.insert("host", "127.0.0.1:9999".parse().unwrap());
+        assert!(validate_origin(&headers, 4567, &[]).is_err());
+    }
+    #[test]
+    fn advertised_public_link_local_and_cgnat_addresses_accept_remote_entry() {
+        for ip in ["203.0.113.7", "169.254.20.1", "100.64.2.3", "192.168.1.2"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("host", format!("{ip}:4567").parse().unwrap());
+            assert!(
+                validate_origin(&headers, 4567, &[ip.parse().unwrap()]).is_ok(),
+                "{ip}"
+            );
+            headers.insert("host", "198.51.100.99:4567".parse().unwrap());
+            assert!(validate_origin(&headers, 4567, &[]).is_err());
+        }
+    }
+    #[test]
+    fn entry_accepts_only_document_navigation_when_metadata_is_present() {
+        let mut headers = HeaderMap::new();
+        assert!(validate_entry_navigation(&headers).is_ok());
+        headers.insert("sec-fetch-site", "cross-site".parse().unwrap());
+        headers.insert("sec-fetch-mode", "navigate".parse().unwrap());
+        headers.insert("sec-fetch-dest", "document".parse().unwrap());
+        assert!(validate_entry_navigation(&headers).is_ok());
+        for dest in ["iframe", "frame", "image", "empty"] {
+            headers.insert("sec-fetch-dest", dest.parse().unwrap());
+            assert!(validate_entry_navigation(&headers).is_err());
+        }
+        headers.insert("sec-fetch-dest", "document".parse().unwrap());
+        for mode in ["cors", "no-cors", "same-origin"] {
+            headers.insert("sec-fetch-mode", mode.parse().unwrap());
+            assert!(validate_entry_navigation(&headers).is_err());
+        }
+    }
+    #[test]
+    fn remote_qr_is_local_not_an_external_service() {
+        let url = "http://192.168.1.2:1234/remote";
+        let image = access_qr_image(url).unwrap();
+        assert!(image.starts_with("data:image/svg+xml;base64,"));
+        let svg = base64::engine::general_purpose::STANDARD
+            .decode(image.split_once(',').unwrap().1)
+            .unwrap();
+        let expected = qrcode::QrCode::new(url)
+            .unwrap()
+            .render::<qrcode::render::svg::Color>()
+            .min_dimensions(256, 256)
+            .quiet_zone(false)
+            .build();
+        assert_eq!(String::from_utf8(svg).unwrap(), expected);
+        assert_eq!(
+            image,
+            qr_image(url).unwrap(),
+            "Login and access codes share the UI-provided quiet zone"
+        );
+    }
+}

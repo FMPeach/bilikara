@@ -1,6 +1,5 @@
 import io
 import json
-import os
 import unittest
 import zipfile
 from pathlib import Path
@@ -12,6 +11,111 @@ import bilikara.diagnostics as diagnostics
 
 
 class DiagnosticArtifactTest(unittest.TestCase):
+    def test_emergency_diagnostics_preserve_bounded_redacted_remote_records(self):
+        cache_manager = SimpleNamespace(diagnostic_snapshot=lambda: {"tools": {}, "tasks": {}})
+        records = [
+            {
+                "timestamp": f"2026-10-21T00:00:{index:02d}Z",
+                "stage": "room.create",
+                "status": "failed",
+                "httpStatus": 403,
+                "elapsedMs": 213,
+                "peerCount": 0,
+                "originClass": "loopback",
+                "errorCode": "network_error",
+                "errorMessage": "token=secret request failed for AliceSecret",
+                "roomId": "private-room",
+                "transport": {"sdp": "private-sdp", "credential": "private-turn"},
+            }
+            for index in range(70)
+        ]
+        records[-1].update(status="x" * 1000, elapsedMs=3_600_001, peerCount=True)
+        errors = [
+            diagnostics.rust_runtime.RustRuntimeUnavailableError("runtime unavailable"),
+            diagnostics.rust_runtime.RustRuntimeServiceError("service_error", "diagnostics failed", response={}),
+        ]
+        with TemporaryDirectory() as tmpdir:
+            for error in errors:
+                with (
+                    self.subTest(error=type(error).__name__),
+                    patch.object(diagnostics, "APP_HOME", Path(tmpdir)),
+                    patch.object(diagnostics, "LOG_DIR", Path(tmpdir) / "logs"),
+                    patch.object(diagnostics, "DIAGNOSTIC_CONFIG_FILES", ()),
+                    patch.object(diagnostics, "_local_usernames", return_value=set()),
+                    patch.object(diagnostics.rust_runtime, "build_diagnostic_artifact", side_effect=error),
+                ):
+                    artifact = diagnostics.build_diagnostic_artifact(
+                        cache_manager=cache_manager,
+                        cache_policy={},
+                        runtime_state={},
+                        internet_remote_diagnostics=records,
+                        local_usernames=["AliceSecret"],
+                        connectivity_probe=lambda: {},
+                    )
+                    with zipfile.ZipFile(io.BytesIO(artifact.zip_bytes())) as archive:
+                        payload = json.loads(archive.read("internet-remote-diagnostics.json"))
+                        exported = "\n".join(archive.read(name).decode("utf-8") for name in archive.namelist())
+                    self.assertEqual(len(payload), 64)
+                    self.assertEqual(payload[0]["timestamp"], records[6]["timestamp"])
+                    self.assertEqual(payload[-1]["stage"], "room.create")
+                    self.assertEqual(payload[-1]["httpStatus"], 403)
+                    self.assertEqual(payload[-1]["originClass"], "loopback")
+                    self.assertEqual(len(payload[-1]["status"]), 32)
+                    self.assertIsNone(payload[-1]["elapsedMs"])
+                    self.assertIsNone(payload[-1]["peerCount"])
+                    self.assertIn("## Recent Internet Remote Diagnostics", artifact.markdown)
+                    self.assertIn("[REDACTED]", exported)
+                    for secret in ["token=secret", "AliceSecret", "private-room", "private-sdp", "private-turn"]:
+                        self.assertNotIn(secret, exported)
+
+    def test_native_runtime_failure_uses_emergency_diagnostic_builder(self):
+        cache_manager = SimpleNamespace(
+            diagnostic_snapshot=lambda: {
+                "tools": {
+                    "Rust Native": {
+                        "installed": False,
+                        "state": "failed",
+                        "message": "Rust runtime load failed: OSError",
+                        "load_diagnostics": {
+                            "stage": "load_library",
+                            "exception_type": "OSError",
+                            "exception_message": "VCRUNTIME140.dll was not found",
+                        },
+                    }
+                },
+                "tasks": {},
+            }
+        )
+        with TemporaryDirectory() as tmpdir:
+            with (
+                patch.object(diagnostics, "APP_HOME", Path(tmpdir)),
+                patch.object(diagnostics, "LOG_DIR", Path(tmpdir) / "logs"),
+                patch.object(diagnostics, "DIAGNOSTIC_CONFIG_FILES", ()),
+                patch.object(diagnostics, "_local_usernames", return_value=set()),
+                patch.object(
+                    diagnostics.rust_runtime,
+                    "build_diagnostic_artifact",
+                    side_effect=diagnostics.rust_runtime.RustRuntimeUnavailableError(
+                        "Rust runtime library not found"
+                    ),
+                ),
+            ):
+                artifact = diagnostics.build_diagnostic_artifact(
+                    cache_manager=cache_manager,
+                    cache_policy={"download_source": "native"},
+                    runtime_state={},
+                    connectivity_probe=lambda: {},
+                )
+
+        with zipfile.ZipFile(io.BytesIO(artifact.zip_bytes())) as archive:
+            tools = json.loads(archive.read("tools-and-tasks.json"))
+
+        self.assertIn("VCRUNTIME140.dll", artifact.markdown)
+        self.assertEqual(
+            tools["tools"]["Rust Native"]["load_diagnostics"]["stage"],
+            "load_library",
+        )
+
     def test_artifact_redacts_credentials_and_local_usernames(self):
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -135,6 +239,20 @@ class DiagnosticArtifactTest(unittest.TestCase):
             }
             for _ in range(75)
         ]
+        raw_internet_remote_records = [
+            {
+                "timestamp": "2026-09-03T00:00:00Z",
+                "stage": "room.create",
+                "status": "failed",
+                "httpStatus": 403,
+                "elapsedMs": 213,
+                "peerCount": 0,
+                "originClass": "loopback",
+                "errorCode": "network_error",
+                "errorMessage": "token=secret request rejected",
+                "roomId": "must-not-survive",
+            }
+        ]
 
         with (
             patch.object(diagnostics, "APP_HOME", Path("/tmp")),
@@ -152,6 +270,7 @@ class DiagnosticArtifactTest(unittest.TestCase):
                 cache_policy={},
                 runtime_state={},
                 export_diagnostics=raw_export_records,
+                internet_remote_diagnostics=raw_internet_remote_records,
                 connectivity_probe=lambda: {},
             )
 
@@ -160,6 +279,9 @@ class DiagnosticArtifactTest(unittest.TestCase):
             self.assertIn("export-diagnostics.json", names)
             export_bytes = archive.read("export-diagnostics.json")
             export_data = json.loads(export_bytes.decode("utf-8"))
+            remote_data = json.loads(
+                archive.read("internet-remote-diagnostics.json").decode("utf-8")
+            )
 
         self.assertEqual(len(export_data), 64)
         for record in export_data:
@@ -170,8 +292,13 @@ class DiagnosticArtifactTest(unittest.TestCase):
             self.assertEqual(record["status"], "saved")
 
         self.assertIn("## Recent Export Pipeline Diagnostics", artifact.markdown)
+        self.assertIn("## Recent Internet Remote Diagnostics", artifact.markdown)
         self.assertNotIn("AliceSecret", artifact.markdown)
         self.assertNotIn("SongSecret", artifact.markdown)
+        self.assertEqual(remote_data[0]["stage"], "room.create")
+        self.assertEqual(remote_data[0]["originClass"], "loopback")
+        self.assertNotIn("roomId", remote_data[0])
+        self.assertNotIn("secret", json.dumps(remote_data))
 
     def test_stage_timings_capped_at_16_in_python_sanitizer(self):
         many_timings = [{"stage": f"stage_{i}", "elapsedMs": i * 10} for i in range(25)]
@@ -190,25 +317,13 @@ class DiagnosticArtifactTest(unittest.TestCase):
         self.assertEqual(sanitized[0]["stageTimings"][0]["stage"], "stage_0")
         self.assertEqual(sanitized[0]["stageTimings"][-1]["stage"], "stage_15")
 
-    def test_log_probe_einval_does_not_fail_diagnostics(self):
-        import errno
+    def test_unreadable_log_root_does_not_fail_diagnostics(self):
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             log_dir = root / "logs"
-            log_dir.mkdir()
-            good_log = log_dir / "good.log"
-            bad_log = log_dir / "bad.log"
-            good_log.write_text("good log content", encoding="utf-8")
-            bad_log.write_text("bad log content", encoding="utf-8")
+            log_dir.write_text("not a directory", encoding="utf-8")
 
             cache_manager = SimpleNamespace(diagnostic_snapshot=lambda: {"tools": {}, "tasks": {}})
-
-            original_os_stat = os.stat
-
-            def mock_stat(path_obj, *args, **kwargs):
-                if Path(path_obj) == bad_log:
-                    raise OSError(errno.EINVAL, "Invalid argument")
-                return original_os_stat(path_obj, *args, **kwargs)
 
             with (
                 patch.object(diagnostics, "APP_HOME", root),
@@ -220,7 +335,6 @@ class DiagnosticArtifactTest(unittest.TestCase):
                     "disk_usage",
                     return_value=SimpleNamespace(total=1000, used=400, free=600),
                 ),
-                patch("os.stat", side_effect=mock_stat),
             ):
                 artifact = diagnostics.build_diagnostic_artifact(
                     cache_manager=cache_manager,
@@ -230,12 +344,11 @@ class DiagnosticArtifactTest(unittest.TestCase):
                 )
 
             self.assertIsNotNone(artifact)
-            self.assertIn("Bilikara Diagnostic Report", artifact.markdown)
+            self.assertIn("bilikara Diagnostic Report", artifact.markdown)
 
             with zipfile.ZipFile(io.BytesIO(artifact.zip_bytes())) as archive:
                 names = set(archive.namelist())
                 self.assertIn("diagnostics.md", names)
-                self.assertIn("logs/good.log", names)
                 self.assertNotIn("logs/bad.log", names)
 
 

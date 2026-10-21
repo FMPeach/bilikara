@@ -4,10 +4,8 @@ import json
 import os
 import platform as platform_module
 import re
-import shlex
 import shutil
 import socket
-import stat
 import subprocess
 import sys
 import threading
@@ -15,11 +13,10 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-import zipfile
 from pathlib import Path, PureWindowsPath
 from typing import Any, Callable
 
-from . import rust_backend
+from . import rust_backend, rust_runtime
 from .config import (
     APP_HOME,
     APP_RELEASE_API,
@@ -374,7 +371,7 @@ def is_newer_version(latest_version: object, current_version: object) -> bool:
     return latest_key > current_key
 
 
-def _fetch_release_json_once(url: str) -> object:
+def _py_fetch_release_json_once(url: str) -> object:
     request = urllib.request.Request(
         url,
         headers={
@@ -390,6 +387,28 @@ def _fetch_release_json_once(url: str) -> object:
     except urllib.error.URLError as exc:
         reason = getattr(exc, "reason", None)
         if isinstance(reason, (TimeoutError, socket.timeout)):
+            raise RuntimeError(APP_UPDATE_TIMEOUT_ERROR) from exc
+        raise RuntimeError(APP_UPDATE_NETWORK_ERROR) from exc
+
+
+def _fetch_release_json_once(url: str) -> object:
+    try:
+        return rust_runtime.json_http_request(
+            "GET",
+            url,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "bilikara-update-check",
+            },
+            timeout=APP_UPDATE_TIMEOUT_SECONDS,
+        )
+    except rust_runtime.RustRuntimeUnavailableError:
+        return rust_backend.python_fallback(
+            "fetch_release_json",
+            lambda: _py_fetch_release_json_once(url),
+        )
+    except rust_runtime.RustRuntimeServiceError as exc:
+        if exc.kind == "timeout":
             raise RuntimeError(APP_UPDATE_TIMEOUT_ERROR) from exc
         raise RuntimeError(APP_UPDATE_NETWORK_ERROR) from exc
 
@@ -968,6 +987,17 @@ def is_auto_update_supported(
     return os.getenv("BILIKARA_ALLOW_SOURCE_UPDATE", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _validated_release_url(value: object) -> str:
+    candidate = str(value or "").strip()
+    try:
+        parsed = urllib.parse.urlsplit(candidate)
+    except ValueError:
+        return APP_RELEASES_URL
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return APP_RELEASES_URL
+    return candidate
+
+
 def check_for_update(
     *,
     current_version: str = APP_VERSION,
@@ -1123,7 +1153,7 @@ def _safe_version_dir(version: object) -> str:
     return _safe_filename(version, fallback="latest").removesuffix(".zip")
 
 
-def _download_url_to_path(
+def _py_download_url_to_path(
     url: str,
     destination: Path,
     *,
@@ -1168,16 +1198,42 @@ def _download_url_to_path(
     return downloaded, total
 
 
-def _safe_extract_zip(zip_path: Path, destination: Path) -> Path:
-    destination.mkdir(parents=True, exist_ok=True)
-    destination_root = destination.resolve()
-    with zipfile.ZipFile(zip_path) as archive:
-        for member in archive.infolist():
-            member_path = (destination / member.filename).resolve()
-            if member_path != destination_root and not str(member_path).startswith(str(destination_root) + os.sep):
-                raise AppUpdateError("更新包路径不安全，已停止安装")
-        archive.extractall(destination)
-    return destination
+def _download_url_to_path(
+    url: str,
+    destination: Path,
+    *,
+    expected_size: int = 0,
+    on_progress: Callable[[int, int], None] | None = None,
+) -> tuple[int, int]:
+    try:
+        result = rust_runtime.download_to_path(
+            urls=[url],
+            destination=destination,
+            headers=[
+                ("Accept", "application/octet-stream"),
+                ("User-Agent", "bilikara-auto-update"),
+            ],
+            on_progress=on_progress,
+            connect_timeout_ms=APP_UPDATE_DOWNLOAD_TIMEOUT_SECONDS * 1000,
+            request_timeout_ms=APP_UPDATE_DOWNLOAD_TIMEOUT_SECONDS * 1000,
+        )
+    except rust_runtime.RustRuntimeUnavailableError:
+        return rust_backend.python_fallback(
+            "download_update_asset",
+            lambda: _py_download_url_to_path(
+                url,
+                destination,
+                expected_size=expected_size,
+                on_progress=on_progress,
+            ),
+        )
+    except rust_runtime.RustDownloadError as exc:
+        if exc.kind in {"timeout", "connect_timeout"}:
+            raise RuntimeError(APP_UPDATE_TIMEOUT_ERROR) from exc
+        raise RuntimeError(APP_UPDATE_NETWORK_ERROR) from exc
+    downloaded = int(result.get("bytes_written") or 0)
+    total = max(downloaded, int(expected_size or 0))
+    return downloaded, total
 
 
 def _current_macos_app_path(executable_path: Path | None = None) -> Path | None:
@@ -1195,30 +1251,6 @@ def _current_install_root(*, target: dict[str, str], executable_path: Path | Non
         if app_path is not None:
             return app_path
     return executable_path.parent
-
-
-def _find_windows_payload_root(extract_dir: Path, executable_name: str) -> Path:
-    direct = extract_dir / executable_name
-    if direct.exists():
-        return extract_dir
-    matches = sorted(extract_dir.rglob(executable_name), key=lambda item: len(item.parts))
-    if matches:
-        return matches[0].parent
-    exe_matches = sorted(extract_dir.rglob("*.exe"), key=lambda item: len(item.parts))
-    if exe_matches:
-        return exe_matches[0].parent
-    raise AppUpdateError("更新包里没有找到 Windows 可执行文件")
-
-
-def _find_macos_payload_app(extract_dir: Path, current_app_name: str) -> Path:
-    preferred = sorted(extract_dir.rglob(current_app_name), key=lambda item: len(item.parts)) if current_app_name else []
-    for item in preferred:
-        if item.suffix == ".app" and item.is_dir():
-            return item
-    apps = sorted(extract_dir.rglob("*.app"), key=lambda item: len(item.parts))
-    if apps:
-        return apps[0]
-    raise AppUpdateError("更新包里没有找到 macOS App")
 
 
 def _coerce_positive_pid(value: object) -> int | None:
@@ -1291,64 +1323,8 @@ exit /b 0
         handle.write(script)
     return ["cmd", "/c", str(script_path)]
 
-def _write_macos_restart_script(
-    script_path: Path,
-    *,
-    source_app: Path,
-    destination_app: Path,
-    pid: int,
-) -> list[str]:
-    script = f"""#!/bin/sh
-set -u
-PID={pid}
-SRC={shlex.quote(str(source_app))}
-DST={shlex.quote(str(destination_app))}
-BACKUP="${{DST}}.previous-update"
-while kill -0 "$PID" 2>/dev/null; do
-  sleep 1
-done
-rm -rf "$BACKUP"
-if [ -d "$DST" ]; then
-  mv "$DST" "$BACKUP" || exit 1
-fi
-ditto "$SRC" "$DST"
-STATUS=$?
-if [ "$STATUS" -eq 0 ]; then
-  rm -rf "$BACKUP"
-  open "$DST"
-  exit 0
-fi
-rm -rf "$DST"
-if [ -d "$BACKUP" ]; then
-  mv "$BACKUP" "$DST"
-  open "$DST"
-fi
-exit "$STATUS"
-"""
-    script_path.write_text(script, encoding="utf-8")
-    script_path.chmod(script_path.stat().st_mode | stat.S_IXUSR)
-    return ["/bin/sh", str(script_path)]
-
-
 def _launch_restart_helper(command: list[str]) -> None:
-    popen_kwargs = {
-        "shell": False,
-        "stdin": subprocess.DEVNULL,
-        "stdout": subprocess.DEVNULL,
-        "stderr": subprocess.DEVNULL,
-        "close_fds": True,
-    }
-    if os.name == "nt":
-        creationflags = 0
-        creationflags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        creationflags |= getattr(subprocess, "DETACHED_PROCESS", 0)
-        subprocess.Popen(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
-            command, creationflags=creationflags, **popen_kwargs
-        )
-    else:
-        subprocess.Popen(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
-            command, start_new_session=True, **popen_kwargs
-        )
+    rust_runtime.launch_update_helper(command)
 
 
 class AppUpdateManager:
@@ -1378,22 +1354,37 @@ class AppUpdateManager:
         self.frozen = frozen
         self._lock = threading.RLock()
         self._thread: threading.Thread | None = None
+        self._operation_kind: str | None = None
+        self._operation_generation = 0
         self._last_progress_notify = 0.0
         self._status: dict[str, Any] = {
             "state": "idle",
+            "operation": "",
             "busy": False,
             "message": "",
             "error": "",
             "current_version": self.current_version,
             "latest_version": "",
             "release_url": APP_RELEASES_URL,
+            "release_name": "",
             "asset_name": "",
+            "asset_available": False,
             "downloaded_bytes": 0,
             "total_bytes": 0,
             "progress": 0.0,
             "include_preview": False,
             "update_action": UPDATE_ACTION_NONE,
             "update_reason": "",
+            "update_installable": False,
+            "update_available": False,
+            "switch_to_release_available": False,
+            "eligible_update": False,
+            "auto_update_supported": False,
+            "platform_auto_update_supported": is_auto_update_supported(
+                target=self.target,
+                frozen=self.frozen,
+            ),
+            "requires_recheck": False,
             "platform": dict(self.target),
             "supported": is_auto_update_supported(target=self.target, frozen=self.frozen),
             "updated_at": time.time(),
@@ -1403,23 +1394,247 @@ class AppUpdateManager:
         with self._lock:
             return dict(self._status)
 
+    def check(self, *, include_preview: bool = False) -> dict[str, Any]:
+        selected_channel = bool(include_preview)
+        should_notify = False
+        with self._lock:
+            if self._operation_kind == "install":
+                return dict(self._status)
+            if self._operation_kind == "check":
+                if bool(self._status.get("include_preview")) == selected_channel:
+                    return dict(self._status)
+                self._operation_generation += 1
+                self._set_status_locked(
+                    "checking",
+                    operation="check",
+                    busy=True,
+                    message="更新频道已更改，当前检查完成后请重新检查。",
+                    error="",
+                    include_preview=selected_channel,
+                    requires_recheck=True,
+                    update_action=UPDATE_ACTION_NONE,
+                    update_reason="channel_changed",
+                    update_installable=False,
+                    update_available=False,
+                    switch_to_release_available=False,
+                    eligible_update=False,
+                    auto_update_supported=False,
+                    asset_name="",
+                    asset_available=False,
+                    downloaded_bytes=0,
+                    total_bytes=0,
+                    progress=0.0,
+                )
+                should_notify = True
+                snapshot = dict(self._status)
+            else:
+                self._operation_kind = "check"
+                self._operation_generation += 1
+                generation = self._operation_generation
+                self._set_status_locked(
+                    "checking",
+                    operation="check",
+                    busy=True,
+                    message="正在检查更新...",
+                    error="",
+                    include_preview=selected_channel,
+                    requires_recheck=False,
+                    update_action=UPDATE_ACTION_NONE,
+                    update_reason="",
+                    update_installable=False,
+                    update_available=False,
+                    switch_to_release_available=False,
+                    eligible_update=False,
+                    auto_update_supported=False,
+                    asset_name="",
+                    asset_available=False,
+                    downloaded_bytes=0,
+                    total_bytes=0,
+                    progress=0.0,
+                )
+                self._thread = threading.Thread(
+                    target=self._run_check,
+                    kwargs={
+                        "include_preview": selected_channel,
+                        "generation": generation,
+                    },
+                    daemon=True,
+                    name="bilikara-app-update-check",
+                )
+                self._thread.start()
+                should_notify = True
+                snapshot = dict(self._status)
+        if should_notify:
+            self._notify_status_change()
+        return snapshot
+
+    def _check_result_fields(
+        self,
+        update: object,
+        *,
+        include_preview: bool,
+    ) -> dict[str, Any]:
+        if not isinstance(update, dict):
+            raise AppUpdateError("更新检查返回了无效结果")
+        if bool(update.get("include_preview")) != bool(include_preview):
+            raise AppUpdateError("更新检查返回了错误的更新频道")
+        asset = update.get("update_asset")
+        asset = asset if isinstance(asset, dict) else None
+        asset_name = str(asset.get("name") or "") if asset else ""
+        asset_url = str(asset.get("browser_download_url") or "") if asset else ""
+        update_available = bool(update.get("update_available"))
+        switch_to_release_available = bool(update.get("switch_to_release_available"))
+        eligible_update = update_available or switch_to_release_available
+        return {
+            "message": str(update.get("message") or ""),
+            "error": "",
+            "current_version": normalize_version_tag(update.get("current_version"))
+            or self.current_version,
+            "latest_version": normalize_version_tag(update.get("latest_version")),
+            "release_url": _validated_release_url(update.get("release_url")),
+            "release_name": str(update.get("release_name") or update.get("latest_version") or ""),
+            "asset_name": asset_name,
+            "asset_available": bool(asset_name and asset_url),
+            "include_preview": bool(include_preview),
+            "update_action": str(update.get("update_action") or UPDATE_ACTION_NONE),
+            "update_reason": str(update.get("update_reason") or ""),
+            "update_installable": bool(update.get("update_installable")),
+            "update_available": update_available,
+            "switch_to_release_available": switch_to_release_available,
+            "eligible_update": eligible_update,
+            "auto_update_supported": bool(update.get("auto_update_supported")),
+            "platform_auto_update_supported": bool(
+                update.get("platform_auto_update_supported")
+            ),
+            "requires_recheck": False,
+            "downloaded_bytes": 0,
+            "total_bytes": 0,
+            "progress": 0.0,
+        }
+
+    def _run_check(self, *, include_preview: bool, generation: int) -> None:
+        try:
+            update = self.release_checker(
+                current_version=self.current_version,
+                include_preview=include_preview,
+            )
+            fields = self._check_result_fields(
+                update,
+                include_preview=include_preview,
+            )
+        except Exception as exc:  # noqa: BLE001
+            message = str(exc) or "检查更新失败"
+            with self._lock:
+                if self._operation_kind != "check":
+                    return
+                if generation != self._operation_generation:
+                    self._operation_kind = None
+                    self._set_status_locked(
+                        "idle",
+                        operation="check",
+                        busy=False,
+                        message="更新频道已更改，请重新检查。",
+                        error="",
+                        requires_recheck=True,
+                        update_action=UPDATE_ACTION_NONE,
+                        update_reason="channel_changed",
+                        update_installable=False,
+                        update_available=False,
+                        switch_to_release_available=False,
+                        eligible_update=False,
+                        auto_update_supported=False,
+                        asset_name="",
+                        asset_available=False,
+                    )
+                else:
+                    self._operation_kind = None
+                    self._set_status_locked(
+                        "failed",
+                        operation="check",
+                        busy=False,
+                        message=message,
+                        error=message,
+                        requires_recheck=False,
+                        update_action=UPDATE_ACTION_NONE,
+                        update_reason="check_failed",
+                        update_installable=False,
+                        update_available=False,
+                        switch_to_release_available=False,
+                        eligible_update=False,
+                        auto_update_supported=False,
+                        asset_name="",
+                        asset_available=False,
+                    )
+            self._notify_status_change()
+            return
+
+        with self._lock:
+            if self._operation_kind != "check":
+                return
+            if generation != self._operation_generation:
+                self._operation_kind = None
+                self._set_status_locked(
+                    "idle",
+                    operation="check",
+                    busy=False,
+                    message="更新频道已更改，请重新检查。",
+                    error="",
+                    requires_recheck=True,
+                    update_action=UPDATE_ACTION_NONE,
+                    update_reason="channel_changed",
+                    update_installable=False,
+                    update_available=False,
+                    switch_to_release_available=False,
+                    eligible_update=False,
+                    auto_update_supported=False,
+                    asset_name="",
+                    asset_available=False,
+                )
+            else:
+                self._operation_kind = None
+                self._set_status_locked(
+                    "available" if fields["eligible_update"] else "idle",
+                    operation="check",
+                    busy=False,
+                    **fields,
+                )
+        self._notify_status_change()
+
     def start(self, *, include_preview: bool = False, restart: bool = True) -> dict[str, Any]:
         with self._lock:
-            if str(self._status.get("state") or "") in APP_UPDATE_BUSY_STATES:
+            if self._operation_kind is not None:
                 return dict(self._status)
+            self._operation_kind = "install"
+            self._operation_generation += 1
+            generation = self._operation_generation
             self._set_status_locked(
                 "checking",
+                operation="install",
                 busy=True,
                 message="正在检查更新...",
                 error="",
                 include_preview=bool(include_preview),
+                requires_recheck=False,
+                update_action=UPDATE_ACTION_NONE,
+                update_reason="",
+                update_installable=False,
+                update_available=False,
+                switch_to_release_available=False,
+                eligible_update=False,
+                auto_update_supported=False,
+                asset_name="",
+                asset_available=False,
                 downloaded_bytes=0,
                 total_bytes=0,
                 progress=0.0,
             )
             self._thread = threading.Thread(
                 target=self._run,
-                kwargs={"include_preview": bool(include_preview), "restart": bool(restart)},
+                kwargs={
+                    "include_preview": bool(include_preview),
+                    "restart": bool(restart),
+                    "generation": generation,
+                },
                 daemon=True,
                 name="bilikara-app-update",
             )
@@ -1428,14 +1643,18 @@ class AppUpdateManager:
         self._notify_status_change()
         return snapshot
 
-    def _run(self, *, include_preview: bool, restart: bool) -> None:
+    def _run(self, *, include_preview: bool, restart: bool, generation: int) -> None:
         try:
             update = self.release_checker(
                 current_version=self.current_version,
                 include_preview=include_preview,
             )
+            projection = self._check_result_fields(
+                update,
+                include_preview=include_preview,
+            )
             latest_version = normalize_version_tag(update.get("latest_version"))
-            release_url = str(update.get("release_url") or APP_RELEASES_URL)
+            release_url = _validated_release_url(update.get("release_url"))
             update_action = str(update.get("update_action") or "")
             update_reason = str(update.get("update_reason") or "")
             update_needed = _is_update_decision_installable(
@@ -1446,27 +1665,22 @@ class AppUpdateManager:
             if not update_needed:
                 self._set_status(
                     "idle",
+                    operation="install",
                     busy=False,
-                    message=str(update.get("message") or "当前已是最新版本。"),
-                    latest_version=latest_version,
-                    release_url=release_url,
-                    include_preview=include_preview,
-                    update_action=update_action or UPDATE_ACTION_NONE,
-                    update_reason=update_reason,
+                    **projection,
                 )
                 return
 
             if not is_auto_update_supported(target=self.target, frozen=self.frozen):
                 self._set_status(
                     "unsupported",
+                    operation="install",
                     busy=False,
-                    message=APP_UPDATE_UNSUPPORTED_ERROR,
-                    error=APP_UPDATE_UNSUPPORTED_ERROR,
-                    latest_version=latest_version,
-                    release_url=release_url,
-                    include_preview=include_preview,
-                    update_action=update_action,
-                    update_reason=update_reason,
+                    **{
+                        **projection,
+                        "message": APP_UPDATE_UNSUPPORTED_ERROR,
+                        "error": APP_UPDATE_UNSUPPORTED_ERROR,
+                    },
                 )
                 return
 
@@ -1474,14 +1688,13 @@ class AppUpdateManager:
             if not asset:
                 self._set_status(
                     "unsupported",
+                    operation="install",
                     busy=False,
-                    message=APP_UPDATE_NO_ASSET_ERROR,
-                    error=APP_UPDATE_NO_ASSET_ERROR,
-                    latest_version=latest_version,
-                    release_url=release_url,
-                    include_preview=include_preview,
-                    update_action=update_action,
-                    update_reason=update_reason,
+                    **{
+                        **projection,
+                        "message": APP_UPDATE_NO_ASSET_ERROR,
+                        "error": APP_UPDATE_NO_ASSET_ERROR,
+                    },
                 )
                 return
 
@@ -1494,11 +1707,10 @@ class AppUpdateManager:
             update_dir.mkdir(parents=True, exist_ok=True)
             archive_path = update_dir / asset_name
             extract_dir = update_dir / "extracted"
-            if extract_dir.exists():
-                shutil.rmtree(extract_dir)
 
             self._set_status(
                 "downloading",
+                operation="install",
                 busy=True,
                 message=f"正在下载更新包 {asset_name}",
                 latest_version=latest_version,
@@ -1510,6 +1722,14 @@ class AppUpdateManager:
                 include_preview=include_preview,
                 update_action=update_action,
                 update_reason=update_reason,
+                update_installable=projection["update_installable"],
+                update_available=projection["update_available"],
+                switch_to_release_available=projection["switch_to_release_available"],
+                eligible_update=projection["eligible_update"],
+                auto_update_supported=projection["auto_update_supported"],
+                platform_auto_update_supported=projection["platform_auto_update_supported"],
+                asset_available=projection["asset_available"],
+                release_name=projection["release_name"],
             )
             downloaded, total = self._download_update_archive(
                 asset_url,
@@ -1519,16 +1739,21 @@ class AppUpdateManager:
             )
             self._set_status(
                 "installing",
+                operation="install",
                 busy=True,
                 message="更新包已下载，正在准备安装...",
                 downloaded_bytes=downloaded,
                 total_bytes=total or expected_size,
                 progress=1.0 if (total or expected_size or downloaded) else 0.0,
             )
-            _safe_extract_zip(archive_path, extract_dir)
-            command = self._prepare_restart_helper(update_dir=update_dir, extract_dir=extract_dir)
+            command = self._prepare_restart_helper(
+                update_dir=update_dir,
+                extract_dir=extract_dir,
+                archive_path=archive_path,
+            )
             self._set_status(
                 "restarting" if restart else "idle",
+                operation="install",
                 busy=bool(restart),
                 message="更新已准备完成，正在重启服务..." if restart else "更新包已准备完成。",
                 progress=1.0,
@@ -1541,10 +1766,19 @@ class AppUpdateManager:
             message = str(exc) or "自动更新失败"
             self._set_status(
                 "failed",
+                operation="install",
                 busy=False,
                 message=message,
                 error=message,
             )
+        finally:
+            with self._lock:
+                if (
+                    self._operation_kind == "install"
+                    and generation == self._operation_generation
+                    and str(self._status.get("state") or "") != "restarting"
+                ):
+                    self._operation_kind = None
 
     def _download_update_archive(
         self,
@@ -1590,36 +1824,34 @@ class AppUpdateManager:
             progress=(max(0, int(downloaded or 0)) / max(1, int(total or 0))) if total else 0.0,
         )
 
-    def _prepare_restart_helper(self, *, update_dir: Path, extract_dir: Path) -> list[str]:
+    def _prepare_restart_helper(
+        self,
+        *,
+        update_dir: Path,
+        extract_dir: Path,
+        archive_path: Path,
+    ) -> list[str]:
         pid = os.getpid()
         target_platform = str(self.target.get("platform") or "")
         install_root = _current_install_root(target=self.target, executable_path=self.executable_path)
         script_suffix = ".cmd" if target_platform == "windows" else ".sh"
         script_path = update_dir / f"apply-bilikara-update{script_suffix}"
-        if target_platform == "windows":
-            executable_name = self.executable_path.name or "bilikara.exe"
-            launch_executable_name = _restart_launch_executable_name(self.executable_path)
-            source_root = _find_windows_payload_root(extract_dir, executable_name)
-            return _write_windows_restart_script(
-                script_path,
-                source_root=source_root,
-                destination_root=install_root,
-                executable_name=executable_name,
-                launch_executable_name=launch_executable_name,
-                wait_pids=_restart_wait_pids(pid),
-            )
-        if target_platform == "macos":
-            current_app = install_root if install_root.suffix == ".app" else _current_macos_app_path(self.executable_path)
-            if current_app is None:
-                raise AppUpdateError("无法定位当前 macOS App")
-            source_app = _find_macos_payload_app(extract_dir, current_app.name)
-            return _write_macos_restart_script(
-                script_path,
-                source_app=source_app,
-                destination_app=current_app,
-                pid=pid,
-            )
-        raise AppUpdateError(APP_UPDATE_UNSUPPORTED_ERROR)
+        if target_platform not in APP_UPDATE_SUPPORTED_PLATFORMS:
+            raise AppUpdateError(APP_UPDATE_UNSUPPORTED_ERROR)
+        return rust_runtime.prepare_update_install(
+            {
+                "platform": target_platform,
+                "archive_path": str(archive_path),
+                "extract_dir": str(extract_dir),
+                "script_path": str(script_path),
+                "install_root": str(install_root),
+                "executable_name": self.executable_path.name or "bilikara.exe",
+                "launch_executable_name": _restart_launch_executable_name(
+                    self.executable_path
+                ),
+                "wait_pids": _restart_wait_pids(pid),
+            }
+        )
 
     def _set_status(self, state: str, **fields: Any) -> None:
         with self._lock:

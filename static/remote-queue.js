@@ -8,14 +8,104 @@
     return;
   }
 
+  // Queue/history own bounded scroll regions; unlike request cards they do
+  // not use document scrolling. Reserve a gap only while they overflow.
+  if (typeof ResizeObserver === "function" && typeof MutationObserver === "function") {
+    for (const list of [elements.queueList, elements.historyList]) {
+      if (!list) continue;
+      let frame = 0;
+      const measure = () => {
+        frame = 0;
+        if (list.clientHeight > 0) list.classList.toggle("has-scroll-inset", list.scrollHeight > list.clientHeight + 1);
+      };
+      const schedule = () => { if (!frame) frame = requestAnimationFrame(measure); };
+      new ResizeObserver(schedule).observe(list);
+      new MutationObserver(records => {
+        if (records.some(record => record.target === list
+          || [...record.addedNodes, ...record.removedNodes].some(node => node.nodeType === 1))) schedule();
+      }).observe(list, { childList: true, subtree: true });
+      document.fonts?.ready.then(schedule);
+      schedule();
+    }
+  }
+
   state.dragItemId = "";
   state.dragTargetId = "";
   state.dragTargetAfter = false;
   state.dragPointerId = null;
   state.dragMoved = false;
 
+  // A queue rerender replaces buttons while their requests may still be in
+  // flight. Keep admission by logical action, and restore every painted button.
+  const pendingQueueActions = new Map();
+
+  function queueActionKey(action, itemId) {
+    return JSON.stringify([state.data?.state_epoch, action, itemId]);
+  }
+
+  function syncQueueActionBusy(button, buttons = pendingQueueActions.get(
+    queueActionKey(button.dataset.action, button.dataset.id),
+  )) {
+    if (!buttons) {
+      return;
+    }
+    if (!buttons.has(button)) {
+      buttons.set(button, button.disabled);
+    }
+    button.disabled = true;
+    button.setAttribute("aria-busy", "true");
+  }
+
   const dragScrollThresholdPx = 56;
   const dragScrollStepPx = 18;
+  const dragActivationDistancePx = 6;
+  let dragStartX = 0;
+  let dragStartY = 0;
+  let suppressDragClick = false;
+
+  const dragHandleRestoreDelayMs = 5000;
+  let activeDragHandleId = "";
+  let dragHandleRestoreTimer = null;
+
+  function clearDragHandleRestoreTimer() {
+    if (dragHandleRestoreTimer !== null) {
+      window.clearTimeout(dragHandleRestoreTimer);
+      dragHandleRestoreTimer = null;
+    }
+  }
+
+  function syncQueueDragHandles() {
+    elements.queueList.querySelectorAll("[data-drag-handle]").forEach((handle) => {
+      handle.classList.toggle("is-drag-ready", Boolean(activeDragHandleId)
+        && handle.closest(".queue-item")?.dataset.id === activeDragHandleId);
+    });
+  }
+
+  function restoreQueueDragHandle() {
+    clearDragHandleRestoreTimer();
+    const handle = elements.queueList.querySelector("[data-drag-handle].is-drag-ready");
+    if (handle?.getAttribute("aria-expanded") === "true") {
+      hideRemoteContextualInfo(handle.closest(".info-trigger-wrap"));
+    }
+    activeDragHandleId = "";
+    syncQueueDragHandles();
+  }
+
+  function scheduleDragHandleRestore() {
+    clearDragHandleRestoreTimer();
+    if (!activeDragHandleId || state.dragItemId) return;
+    dragHandleRestoreTimer = window.setTimeout(restoreQueueDragHandle, dragHandleRestoreDelayMs);
+  }
+
+  function activateQueueDragHandle(itemId) {
+    activeDragHandleId = itemId;
+    syncQueueDragHandles();
+    scheduleDragHandleRestore();
+  }
+
+  let renderedQueue = [];
+  let renderedQueueVersion = "";
+  let dragQueue = null;
 
   renderQueue = function renderQueueWithActions(playlist) {
     if (state.dragItemId) {
@@ -23,14 +113,34 @@
       return;
     }
 
+    renderedQueue = playlist;
+    renderedQueueVersion = state.data?.queue_version || "";
+    if (activeDragHandleId && !playlist.some((item) => item.id === activeDragHandleId)) {
+      restoreQueueDragHandle();
+    }
+    const signature = JSON.stringify({
+      language: state.language,
+      hasCurrentItem: Boolean(state.data?.current_item),
+      playlist: playlist.map(queueRenderSignatureForItem),
+    });
+    if (signature === state.queueRenderSignature) {
+      renderQueueCacheStatus(playlist);
+      elements.queueList.querySelectorAll("button[data-action]").forEach((button) => {
+        syncQueueActionBusy(button);
+      });
+      syncQueueDragHandles();
+      return;
+    }
+    state.queueRenderSignature = signature;
+
     elements.queueList.replaceChildren();
     if (!playlist.length) {
       if (typeof createQueueEmptyNode === "function" && typeof t === "function") {
-        elements.queueList.appendChild(createQueueEmptyNode(t("remote.queueEmpty")));
+        elements.queueList.appendChild(createQueueEmptyNode());
       } else {
         const emptyNode = document.createElement("div");
         emptyNode.className = "queue-empty";
-        emptyNode.textContent = "remote.queueEmpty";
+        emptyNode.textContent = typeof t === "function" ? t("list.emptyTitle") : "list.emptyTitle";
         elements.queueList.appendChild(emptyNode);
       }
       return;
@@ -69,6 +179,10 @@
       }
       node.querySelectorAll("button[data-action]").forEach((button) => {
         button.dataset.id = item.id;
+        if (button.dataset.action === "retry-cache") {
+          button.dataset.itemIncarnationId = item.item_incarnation_id;
+        }
+        syncQueueActionBusy(button);
       });
       if (state.openQueueMenuId === item.id) {
         const menu = node.querySelector(".menu-content");
@@ -79,6 +193,7 @@
       }
       elements.queueList.appendChild(node);
     });
+    syncQueueDragHandles();
   };
 
   function clearDropIndicators() {
@@ -106,7 +221,7 @@
 
   function syncDropIndicators() {
     clearDropIndicators();
-    if (!state.dragItemId) {
+    if (!state.dragItemId || !state.dragMoved) {
       return;
     }
 
@@ -174,14 +289,17 @@
     return Math.max(0, Math.min(targetIndex, playlist.length - 1));
   }
 
-  async function reorderQueue(itemId, index) {
-    state.data = await apiPost("/api/playlist/reorder", { item_id: itemId, index });
+  async function reorderQueue(itemId, index, queueVersion) {
+    applyStateSnapshot(await apiPost("/api/playlist/reorder", { item_id: itemId, index, expected_queue_version: queueVersion }), { forceRender: true });
     setFormMessage(typeof t === "function" ? t("remote.queueOrderUpdated") : "remote.queueOrderUpdated");
     render();
   }
 
-  async function handleQueueAction(action, itemId) {
+  async function handleQueueAction(action, itemId, itemIncarnationId, button = null) {
     if (!itemId) {
+      return;
+    }
+    if (action === "retry-cache" && !itemIncarnationId) {
       return;
     }
 
@@ -203,13 +321,22 @@
       },
       "retry-cache": {
         url: "/api/cache/retry",
-        payload: { item_id: itemId, force: true },
+        payload: {
+          item_id: itemId,
+          expected_item_incarnation_id: itemIncarnationId,
+          force: true,
+        },
         message: typeof t === "function" ? t("cache.retryStarted") : "cache.retryStarted",
       },
     };
 
     const target = actionMap[action];
     if (!target) {
+      return;
+    }
+
+    const actionKey = queueActionKey(action, itemId);
+    if (pendingQueueActions.has(actionKey) || button?.getAttribute("aria-busy") === "true") {
       return;
     }
 
@@ -224,12 +351,31 @@
       }
     }
 
+    const busyButtons = new Map();
+    pendingQueueActions.set(actionKey, busyButtons);
+    if (button) {
+      syncQueueActionBusy(button, busyButtons);
+    }
     try {
-      state.data = await apiPost(target.url, target.payload);
+      if (action === "retry-cache") {
+        const outcome = await apiPostExactStateCommand(target.url, target.payload);
+        render();
+        if (outcome.commandApplied) {
+          setFormMessage(target.message);
+        }
+        return;
+      }
+      applyStateSnapshot(await apiPost(target.url, target.payload), { forceRender: true });
       setFormMessage(target.message);
       render();
     } catch (error) {
       setFormMessage(error.message, true);
+    } finally {
+      pendingQueueActions.delete(actionKey);
+      busyButtons.forEach((originallyDisabled, busyButton) => {
+        busyButton.disabled = originallyDisabled;
+        busyButton.removeAttribute("aria-busy");
+      });
     }
   }
 
@@ -246,15 +392,20 @@
       return;
     }
 
-    event.preventDefault();
+    clearDragHandleRestoreTimer();
+    // Touch already has touch-action:none and selection/callout suppression.
+    // Cancelling its pointerdown also suppresses the tap's click on WebKit.
+    if (event.pointerType !== "touch") event.preventDefault();
     state.dragItemId = item.dataset.id || "";
+    dragQueue = { playlist: renderedQueue, version: renderedQueueVersion };
     state.dragTargetId = "";
     state.dragTargetAfter = false;
     state.dragPointerId = event.pointerId;
     state.dragMoved = false;
-    elements.queueList.classList.add("drag-active");
+    dragStartX = event.clientX;
+    dragStartY = event.clientY;
+    suppressDragClick = false;
     handle.setPointerCapture?.(event.pointerId);
-    syncDropIndicators();
   }
 
   async function finishDrag(pointerId) {
@@ -263,10 +414,13 @@
     }
 
     const draggedId = state.dragItemId;
-    const playlist = Array.isArray(state.data?.playlist) ? state.data.playlist : [];
+    const playlist = dragQueue?.playlist || [];
+    const queueVersion = dragQueue?.version || "";
     const sourceIndex = playlist.findIndex((item) => item.id === draggedId);
     const targetIndex = reorderTargetIndex(playlist, draggedId);
+    suppressDragClick = state.dragMoved;
     clearDragState();
+    scheduleDragHandleRestore();
 
     if (sourceIndex === -1 || targetIndex === -1 || sourceIndex === targetIndex) {
       render();
@@ -278,6 +432,7 @@
       openReorderConfirmSheet({
         itemId: draggedId,
         targetIndex,
+        queueVersion,
         title: draggedItem?.display_title || "",
       });
       render();
@@ -285,14 +440,24 @@
     }
 
     try {
-      await reorderQueue(draggedId, targetIndex);
+      await reorderQueue(draggedId, targetIndex, queueVersion);
     } catch (error) {
       setFormMessage(error.message, true);
     }
   }
 
-  elements.queueViewButton.addEventListener("click", clearDragState);
-  elements.historyViewButton.addEventListener("click", clearDragState);
+  const resetQueueDragFeedback = () => {
+    clearDragState();
+    restoreQueueDragHandle();
+  };
+  elements.queueViewButton.addEventListener("click", resetQueueDragFeedback);
+  elements.historyViewButton.addEventListener("click", resetQueueDragFeedback);
+
+  document.addEventListener("click", (event) => {
+    if (activeDragHandleId && !event.target.closest("[data-drag-handle]")) {
+      restoreQueueDragHandle();
+    }
+  });
 
   elements.queueList.addEventListener("click", async (event) => {
     const button = event.target.closest("button[data-action]");
@@ -328,7 +493,12 @@
         state.openQueueMenuId = null;
       }
     }
-    await handleQueueAction(button.dataset.action, button.dataset.id);
+    await handleQueueAction(
+      button.dataset.action,
+      button.dataset.id,
+      button.dataset.itemIncarnationId,
+      button,
+    );
   });
 
   elements.queueList.addEventListener("pointerdown", (event) => {
@@ -339,13 +509,45 @@
     beginDrag(handle, event);
   });
 
+  // Native text selection/callouts can take over a held touch before it moves.
+  // Limit suppression to the drag target; song text remains selectable.
+  for (const type of ["selectstart", "contextmenu"]) {
+    elements.queueList.addEventListener(type, (event) => {
+      if (event.target.closest("[data-drag-handle]")) {
+        event.preventDefault();
+      }
+    });
+  }
+
+  // A tap reaches the shared click-to-open help handler. A completed drag must
+  // not also open help from the synthetic click following pointerup.
+  elements.queueList.addEventListener("click", (event) => {
+    const handle = event.target.closest("[data-drag-handle]");
+    if (!handle) return;
+    if (event.detail !== 0 && suppressDragClick) {
+      suppressDragClick = false;
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
+    activateQueueDragHandle(handle.closest(".queue-item")?.dataset.id || "");
+  }, true);
+
   document.addEventListener("pointermove", (event) => {
     if (!state.dragItemId || state.dragPointerId !== event.pointerId) {
       return;
     }
 
     event.preventDefault();
-    state.dragMoved = true;
+    if (!state.dragMoved) {
+      if (Math.hypot(event.clientX - dragStartX, event.clientY - dragStartY) < dragActivationDistancePx) {
+        return;
+      }
+      state.dragMoved = true;
+      activateQueueDragHandle(state.dragItemId);
+      closeRemoteContextualInfo();
+      elements.queueList.classList.add("drag-active");
+    }
     maybeAutoScrollQueue(event.clientY);
     updateDragTarget(event.clientX, event.clientY);
   }, { passive: false });
@@ -354,7 +556,11 @@
     await finishDrag(event.pointerId);
   });
 
-  document.addEventListener("pointercancel", async (event) => {
-    await finishDrag(event.pointerId);
+  document.addEventListener("pointercancel", (event) => {
+    if (state.dragPointerId !== event.pointerId) return;
+    suppressDragClick = true;
+    clearDragState();
+    scheduleDragHandleRestore();
+    render();
   });
 })();

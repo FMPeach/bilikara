@@ -1,299 +1,125 @@
 # bilikara
 
----
+`bilikara` 是一个支持 Bilibili 与 YouTube 视频的卡拉 OK 点歌平台。主要由 OpenAI Codex 协助设计与实现，并经过人工整理、验证与迭代。
 
-`bilikara` 是一个基于 B 站卡拉 OK 视频的点歌平台。主要由 OpenAI Codex 协助设计与实现，并经过人工整理、验证与迭代。
+[下载桌面版](https://github.com/VZRXS/bilikara/releases) · [开始使用](#开始使用) · [快速说明与常见问题](docs/quick-start.md) · [开发文档](#开发)
 
-> [!IMPORTANT]
-> **Rust 后端迁移说明**
->
-> bilikara 正在从现有 Python Host 逐步迁移到 Rust 后端。自 v0.7 起，新增后端功能与业务规则只在 Rust 侧实现；Python 层进入维护模式，不再承接新增后端功能，仅保留当前运行所需的 I/O、兼容与迁移职责，并处理影响正常使用的必要缺陷。
->
-> v0.7 仍是 Rust 规则核心、Python 运行编排与 Tauri 桌面壳并存的过渡架构，并非纯 Rust 后端。详细边界与后续计划请参阅 [Rust 业务规则迁移计划](docs/rust-business-rule-migration-plan.md)。
-
-<p align="center">
-  <img src="images/host.png" alt="Host 界面" width="700"><br>
-  <sub>Host 界面</sub>
-</p>
-
-<table>
-  <tr>
-    <td align="center" valign="top" width="33%">
-      <img src="images/remote_top.png" alt="移动端控制台上半部分" width="170"><br>
-      <sub>移动端控制台</sub>
-    </td>
-    <td align="center" valign="top" width="33%">
-      <img src="images/remote_bottom.png" alt="移动端控制台下半部分" width="170"><br>
-      <sub>移动端控制台 (cont.)</sub>
-    </td>
-    <td align="center" valign="top" width="33%">
-      <img src="images/remote_control_panel.png" alt="移动端播放控制面板" width="170"><br>
-      <sub>移动端播放控制面板</sub>
-    </td>
-  </tr>
-</table>
-
-## 当前版本功能
-
-### 核心播放与缓存
-
-- 通过 B 站视频链接或 BV 号加入点歌列表（支持链接指定分 p），后台自动进入本地缓存流程
-- 本地播放基于 BBDown 和 FFmpeg 缓存媒体，浏览器端使用分离视频 / 音频播放器同步播放
-- 支持毫秒级音画延迟补偿、独立音量控制、静音，以及 -6 ~ +6 key 的音调调整（切歌时自动复位）
-- 音量、音画延迟、切歌延迟等播放器设置会本地记忆并在重新打开后恢复
-- 可设置 1 ~ 5 秒切歌延迟；切歌时显示过渡画面，包含即将播放、倒计时和后续点歌列表
-- 多分 p 视频自动判断有效分 p，自动缓存多音轨，可随时切换；切换时会同步当前播放进度与播放状态
-- 加入点歌列表后自动后台缓存，缓存失败 / 长时间无变化显示重试按钮，并支持一键重试
-- 缓存限制：最多只自动缓存前 1 ~ 5 首，默认 3 首，防止磁盘占用过大；服务关闭后自动清空缓存目录
-- bilikara 自行生成 B 站登录二维码并轮询登录结果；确认后会将登录凭据以 UTF-8 明文、分号分隔的 Cookie 文本保存到 `<应用数据目录>/tools/bbdown/BBDown.data`，供 BBDown 下载时使用（**安全提示：** 该文件未加密，请妥善保护本机账户访问权限）
-
-### 列表、历史与导出
-
-- 点歌列表中展示当前播放、缓存状态和完成标记
-- 支持切歌、移除、拖拽排序、顶歌到下一首等控制操作
-- 本地保留歌单和播放器设置备份，重新打开后自动恢复，支持手动清空备份
-- 保留点歌历史记录（次数、时间、点歌人），支持从历史记录中快速重新点歌，也可删除单曲在历史记录和本场记录中的条目
-- 维护本次点歌记录：同一首歌在本次已点过时，加入前会弹窗确认
-- 在历史记录页面可以导出本场记录或全部历史为 CSV 或 PNG 歌单图片；图片每页歌曲数可选 50 ~ 200 首；PNG 优先使用应用内置的 Source Han Sans，使中文、日文、拉丁字符和数字排版更一致，不支持的符号和 emoji 仍会使用后备字体
-- 自动保存对应视频的 UP 主信息，悬停列表或历史记录时可显示完整歌名与 UP 主信息
-- 按场次单独保存“本次已唱”记录（JSON 格式），便于扩展读取接口
-- 设置本场用户，可通过拖拽或列表排序管理点歌人顺序
-
-<p align="center">
-  <img src="images/playlist_export.png" alt="歌单导出图片" width="600"><br>
-  <sub>歌单导出图片</sub>
-</p>
-
-### 试试运气（Gatcha 自定义卡池）
-
-- 试试运气（Gatcha）：内置 27 位初始 UP 主 UID，用户可按需自由添加其他 B 站 UID
-- 自定义拉取：系统自动增量拉取关注 UP 主符合卡拉 OK 筛选条件（如带伴奏、KTV 等关键词）的稿件，并写入本地索引
-- 关注浏览：支持按 UID 浏览本地索引的所有已收录稿件，方便按 UP 主点歌
-- 收藏夹支持：输入 B 站 UID 即可拉取其公开收藏夹列表，预览并选择需要的收藏夹稿件导入本地索引
-- 手动更新：支持一键全量刷新各 UID 的稿件列表，并自动将新增 BV 号同步上传共建共享曲库
-
-### 共享曲库（Cloudflare D1 后端）
-
-- 共享曲库共建：多用户点歌与拉取收藏夹时，新增的 BV 号自动去重汇总上传，实现曲库共建
-- 远程搜索：快速搜索共享曲库中已收录的丰富稿件
-- 分类索引浏览：
-  - 按作品名 / 歌手名首字母（或假名）索引快速定位浏览
-  - 按前端内置的约 40 个主题类别（热血、百合、VOCALOID、偶像、异世界等）进行浏览，并附带专属类别封面图
-  - 按已导入的收藏夹目录浏览对应稿件
-- LLM 数据自动标注：曲库定期使用大语言模型（LLM）对稿件进行标签（Tag）和拼音读音（Yomi）的智能化标注，大幅提升首字母定位与类别浏览体验
-
-### 评价系统（Rating）
-
-- 对已播放的歌曲支持进行 1 ~ 5 星匿名评分
-- 评分数据提交至远程 D1 数据库并自动同步至 Google Sheets 备份，在云端计算稿件的平均分
-- 在远程搜索和历史结果中展示评分人数与平均分
-
-<p align="center">
-  <img src="images/rating.png" alt="评分界面" width="220"><br>
-  <sub>评分界面</sub>
-</p>
-
-### 控制、设置与界面体验
-
-- 同一局域网内手机端控制台支持：
-  - 查看和调整点歌列表
-  - 远程暂停 / 播放、前后跳转 15 秒、切歌
-  - 切换音轨、调节音量、音画延迟、升降 key
-- 移动端控制面板：
-  - 播放控制收纳到悬浮球中，不干扰主页浏览
-- 新点歌提示：Host 端全屏播放中收到新请求时，会在左上角弹出提示
-- 服务设置：
-  - 查看缓存占用，调整自动缓存数量
-  - 调整默认清晰度、Hi-Res 优先、切歌延迟
-  - 管理 BBDown 登录
-  - Host 本机可在高级服务设置中选择下一次媒体处理使用的 Rust 或 Python 引擎
-  - 数据清理、重新缓存 / 重置播放器和应用更新检查；更新检查默认选择正式版，可按需开启预览版
-  - 可复制经过脱敏的诊断 Markdown，并生成可下载的诊断包；诊断采集会限制日志与导出记录范围，并遮蔽凭据和本地用户名
-  - 源码脚本运行时，更新检查会跳转 GitHub Releases 页面；打包版运行时会自动下载更新并重启服务
-- 界面设置：
-  - 布局：基础 / 完整
-  - 主题：浅橙 / 黑橙 / 黑蓝主题
-  - 语言：中文（zh）/ 英文（en）/ 日文（ja）
-  - Host 和 Remote 会分别记忆偏好
-
-<table>
-  <tr>
-    <td align="center" valign="top" width="50%">
-      <img src="images/server_settings.png" alt="服务设置" width="240"><br>
-      <sub>服务设置</sub>
-    </td>
-    <td align="center" valign="top" width="50%">
-      <img src="images/ui_settings.png" alt="界面设置" width="320"><br>
-      <sub>界面设置</sub>
-    </td>
-  </tr>
-</table>
-
-<table>
-  <tr>
-    <td align="center" width="50%">
-      <img src="images/transition.png" alt="切歌过渡画面" width="420"><br>
-      <sub>切歌过渡画面</sub>
-    </td>
-    <td align="center" width="50%">
-      <img src="images/incoming_request.png" alt="新点歌提示" width="420"><br>
-      <sub>新点歌提示</sub>
-    </td>
-  </tr>
-</table>
-
-## 启动
-
-**桌面版（Tauri）**
-
-带 tag 的发布版会通过 GitHub Actions 打包；在 Releases 下载对应平台的压缩包后，优先运行桌面入口：
-
-- Windows：`bilikara-desktop.exe`
-- macOS：`Bilikara-Desktop.app`
+> [!NOTE]
+> 自 v0.8.0 系列起提供 Android Host 测试版 APK。后续计划推出 Android 正式版及 iOS 版，具体版本与时间待定。
+> Android 版要求 WebView 111 及以上，Android 14 及以上系统通常满足要求；兼容模式最低适配 WebView 83（Android 11 初始版本）。实际兼容性取决于设备的 WebView。
 
 > [!IMPORTANT]
-> **macOS 首次启动**
->
-> 如果首次打开 `Bilikara-Desktop.app` 时 macOS 提示无法验证开发者或无法检查 App 是否包含恶意软件，请先关闭该提示，然后：
->
-> 1. 打开「系统设置」→「隐私与安全性」。
-> 2. 向下滚动到「安全性」，找到有关 Bilikara 被阻止打开的提示。
-> 3. 点击「仍要打开」。
-> 4. 如系统要求，输入当前账户的登录密码进行确认。
-> 5. 警告再次出现后，点击「打开」即可启动 Bilikara。
->
-> 「仍要打开」选项只会在尝试启动 App 后出现。完成一次授权后，之后可以正常双击启动。
+> **从 v0.8.0-preview.2 及更早版本升级时，请下载对应系统与架构的完整包，并保留旧数据。** 简要步骤见 [升级说明](docs/upgrading.md)。
 
-桌面入口由 Tauri 提供窗口壳，启动时会自动拉起 Python 后端服务并打开 Host 界面；关闭桌面窗口后会请求后端退出并清理本次运行的缓存。
+<p align="center">
+  <img src="images/host.png" alt="Host 主界面：左侧播放，右侧点歌队列与工作区导航" width="1000"><br>
+  <sub>电脑播放与管理，手机参与点歌</sub>
+</p>
 
-**后端 / 浏览器模式**
+## 开始使用
 
-打包产物中也会保留 Python 后端可执行文件；后端包本身可直接使用，不依赖 Tauri 桌面壳。直接运行后端时，会自动打开系统浏览器进入 Host 界面。发布包中的后端入口通常是：
+1. 桌面端从 [Releases](https://github.com/VZRXS/bilikara/releases) 下载并解压对应平台的完整包，Windows 打开 `bilikara-desktop.exe`，macOS 打开 `bilikara-desktop.app`；Android 端安装与设备架构匹配的测试版 APK。
+2. 在「本场用户」添加参与者，选择点歌人，再粘贴 Bilibili / YouTube 视频链接或 BV / av 号；也可搜索和浏览曲库。缓存完成后开始播放。
+3. 手机与电脑连接同一网络，打开电脑右上角「手机点歌」并扫码。异地使用时，先创建公网房间，再通过公网入口和房间密码连接。
 
-- Windows：运行 `bilikara.exe`
-- macOS：运行 `bilikara.app`
+> [!NOTE]
+> **macOS 首次打开被系统拦截时**，先尝试打开 App，再前往「系统设置 → 隐私与安全性 → 安全性」，找到 bilikara 并点击「仍要打开」，按系统提示确认。完成一次授权后即可正常启动。
 
-**从源码启动**
+手机连接、来源拉取、轮转排序和旧场次导出等具体用法见 [快速说明与常见问题](docs/quick-start.md)。
+公网网页能打开仍不保证设备间可连接；连接阶段、网络限制和管理员可选 TURN 见 [公网 Remote 网络说明](docs/internet-remote-network.md)。
 
-```bash
-python start_bilikara.py
-```
+## 找歌与点歌
 
-或（Ubuntu）
+- **快速点歌**：支持 Bilibili 链接、BV / av 号、b23.tv 分享文案及常见 YouTube 单视频链接；可点歌或顶到下一首。
+- **搜索与发现**：搜索共享曲库或本地曲库，按类别、作品名、歌手浏览；点击封面查看歌曲详情。
+- **来源与试试运气**：按 UID 拉取 UP 主稿件、收藏夹等元数据，供来源、本地搜索与试试运气共用；共享曲库、类别和歌手浏览使用在线共享数据库。拉取任务排队处理，失败可重试；Host 可在拉取期间多选、调整来源顺序和移除本地来源，详见[来源管理](docs/source-management.md)。
+- **分 P 与音轨**：选择视频画面和音频轨道，播放时随时切换原唱、伴奏等音轨。
 
-```bash
-./start_bilikara.sh
-```
+<p align="center">
+  <img src="images/remote_search.png" alt="手机搜索共享曲库，点击封面查看详情并点歌" width="280"><br>
+  <sub>搜索共享曲库</sub>
+</p>
 
-无论使用后端可执行文件还是源码脚本，启动后默认优先尝试 `http://127.0.0.1:8080`；如果默认端口被占用，会自动尝试后续端口。打开的本地页面全部关闭后，服务会在几秒内自动退出。
+<p align="center">
+  <img src="images/host_categories.png" alt="Host 发现页：类别封面列表可向下滚动" width="1000"><br>
+  <sub>发现 → 类别：向下滚动浏览更多主题</sub>
+</p>
 
-**提示：** Host 会先依据系统路由选择推荐的局域网 IPv4，再从结构化网卡信息中排列可用的备用地址；容器网桥、虚拟网卡和隧道会被降级，但在它们是唯一可用路径时仍可作为后备。复杂路由、VPN 或多网卡环境不保证总能自动选中正确地址，请在手机访问提示中尝试备用 URL，或通过 `BILIKARA_HOST` 手动指定监听地址。
+## 手机控制
 
-## 本地打包
+扫码并选择本场身份后，手机可以点歌、调整队列和控制播放。轻点编号可查看拖动提示，按住编号或手柄上下拖动，松手后提交；也可使用歌曲右侧菜单移除或顶歌。队列被其他设备改动时会提示重新拖动。
 
-项目现在分为两层打包：Python 后端包和 Tauri 桌面壳。
+<p align="center">
+  <img src="images/remote_top.png" alt="手机快速点歌与队列" width="280"><br>
+  <sub>点歌与管理队列</sub>
+</p>
 
-**Python 后端包**
+点击或上划底部播放栏展开控制抽屉，可暂停、重唱、切歌、前后跳转 15 秒、切换音轨，或调整音量、音画延迟和升降调。竖屏长按切歌向左展开重唱，松手后点选，或拖到重唱后松手执行；横屏直接显示重唱。进度条第一次点按显示拖拽球，再次点按或拖动才定位。**从抽屉右上角「评价」进入视频打分**，为已播放的歌曲选择 1～5 星。抽屉手势与控件优先级见[快速说明](docs/quick-start.md#如何使用播放抽屉与进度条)。
 
-构建时需要本地安装 Python。打包后得到的后端可执行文件本身就是完整的浏览器模式应用，会调用系统浏览器打开 Host 界面。
+<p align="center">
+  <img src="images/remote_control_panel.png" alt="播放控制抽屉：音轨、进度、音量、音画延迟与升降调" width="280"><br>
+  <sub>播放控制</sub>
+</p>
 
-- Windows：`build_windows.bat`
-- macOS：`build_macos.command`
+## 组织一场点歌
 
-它们会自动安装 `PyInstaller` 并生成打包产物到 `dist/`：
+电脑的「本场用户」定义轮转顺序，支持多选、批量拖动和删除，以及改名。改名同步到绑定同一身份的手机；已有歌曲、历史与导出保留点歌时的名字，之后点的歌使用新名字。Remote 可以修改自己的名字，整场名单由电脑管理，避免多人误操作。
 
-- Windows 通常会生成 `dist/bilikara/`，其中的 `bilikara.exe` 可直接双击运行
-- macOS 会生成 `dist/bilikara.app`，可直接双击运行
+普通点歌按用户轮转；「顶歌」放到下一首，「立即播放」会替换当前节目，拖动排序保留人工安排。需要恢复轮转时使用「重新排序」。重新打开软件时，选择继续上一场可保留队列；关闭提示或等待倒计时结束会开新一场，旧场次记录仍保留。
 
-**Tauri 桌面壳**
+## 历史与歌单导出
 
-构建 Tauri 桌面壳需要安装 Node.js 24 或更高版本，以及 Rust 工具链。Node.js 24 仅是构建 / CI 基线，不是最终用户运行已打包应用的要求。仓库提供 `.nvmrc`，使用 nvm 时可先运行 `nvm use`。开发模式可运行：
+历史记录保留点过的歌曲，方便重新点歌。Host 和已登记身份的本地 Remote 可在 **「历史记录 → 导出」** 选择本场已播放记录、按日期归档的指定场次，或累计点歌历史，保存为 CSV 或歌单图片；多页图片打包为 ZIP。结束一场并重新打开后仍可选择旧场次。指定场次只包含该场的记录，不混入更早场次。公网 Remote 不支持歌单导出。
 
-```bash
-npm ci
-npm run dev
-```
+<p align="center">
+  <img src="images/playlist_export.png" alt="仅导出所选场次的示例歌单" width="600">
+</p>
 
-构建桌面壳可运行：
+## 全屏与双屏播放
 
-```bash
-npm ci
-npm run build
-```
+单屏可直接全屏播放；连接电视或投影仪后，在右上角「双屏显示」中选择观众屏，电脑保留点歌与播放控制。可点击「识别屏幕」查看各屏编号。观众屏和全屏画面均可显示手机点歌二维码，其他人随时扫码加入；收到新点歌时，左上角会显示歌曲提示。
 
-CI 的正式打包流程会先构建 Python 后端包，再构建 Tauri 桌面壳，并把桌面入口放进最终发布包：Windows 为 `bilikara-desktop.exe`，macOS 为 `Bilikara-Desktop.app`。
+**双屏模式需在系统显示设置中选择「扩展」，不能使用「复制」或镜像模式。** Windows 可按 `Win + P` 选择「扩展」。
 
-补充说明：
+<p align="center">
+  <img src="images/fullscreen.png" alt="全屏播放与右上角手机点歌二维码" width="960"><br>
+  <sub>全屏播放与扫码入口；双屏的连接与设置见快速说明</sub>
+</p>
 
-- 打包后的应用会把静态页面资源封装进应用内部
-- 发布包元数据中的发布者 / CompanyName 设置为 `VZRXS`；Windows 安全提示中的“已验证发布者”仍需要代码签名证书
-- Tauri 桌面壳 `bilikara-desktop.exe` 会通过 `scripts/sign_windows.ps1` 签名；CI 可配置 `WINDOWS_SIGN_CERTIFICATE_BASE64` + `WINDOWS_SIGN_CERTIFICATE_PASSWORD`，也可改用 `WINDOWS_SIGN_CERTIFICATE_PATH` 或 `WINDOWS_SIGN_CERTIFICATE_THUMBPRINT`，未配置证书时会跳过签名并继续显示未知发布者
-- 打包后的 `data/`、日志、缓存和工具文件默认都会写到可写运行目录；macOS 使用 `~/Library/Application Support/bilikara/`，Windows 使用包内 `runtime/`；可通过 `BILIKARA_HOME` 指定其他目录
-- 打包脚本会把经过验证的 `ffmpeg` / `ffprobe` 和按目标架构固定为 1.6.3 的 `BBDown` 放进不可变 vendor；运行时以复制方式安装到 `tools/bbdown/`
-- Tauri 桌面壳启动后会拉起同目录或相邻目录里的 Python 后端包；开发模式下会回退到 `python start_bilikara.py`
-- 当前 Tauri 桌面版采用类似 sidecar 的 Python 后端进程方案；长期规划中，会考虑逐步将更适合桌面集成、进程管理和跨平台适配的能力迁移到 Rust / Tauri 侧
-- Windows 和 macOS 的最终包通常需要在各自系统上分别构建；也就是说，Windows 包最好在 Windows 上打，macOS 包最好在 macOS 上打
-- Windows 打包脚本会依次尝试 `py`、`python`、`python3`；如果都不存在，需要先安装 Python 3
-- 如需排查后端打包版启动问题，可使用 `python build_bundle.py --console` 生成带控制台窗口的调试包
+## 设置与维护
 
-架构与版本规划文档：
+「运行设置」可扫码登录 Bilibili、选择清晰度与下载器、调整缓存数量和切歌延迟；「设置」可切换中英日语言、三种主题，以及检查更新、查看公告和导出诊断信息。
 
-- [版本路线图](docs/version-roadmap.md)
-- [Rust 业务规则迁移计划](docs/rust-business-rule-migration-plan.md)
-- [移动 Host 与共享 Rust 架构](docs/mobile-host-rust-architecture.md)
-- [原生工具迁移清单](docs/rust-native-utility-inventory.md)
+原生 Host 会保留自动检查与预览版选择；开启自动检查后，每次启动检查一次，已有更新操作时等待结束后补查。详见[升级与更新说明](docs/upgrading.md)。
 
-## 可选环境变量
+<p align="center">
+  <img src="images/server_settings.png" alt="当前 Host 运行设置：Rust Native、1080P 高帧率与 Bilibili 登录二维码" width="1000"><br>
+  <sub>运行设置与扫码登录</sub>
+</p>
 
-- `BILIKARA_HOST`：监听地址；脚本启动默认 `0.0.0.0`，Windows 打包版默认优先使用探测到的局域网 IPv4，失败时回退到 `0.0.0.0`
-- `BILIKARA_PORT`：监听端口，默认 `8080`
-- `BILIKARA_HOME`：自定义应用数据目录；不设置时，打包版默认写入应用目录内的 `runtime/`
-- `BILIKARA_MAX_CACHE_ITEMS`：自动缓存窗口大小，默认 `3`
-- `BILIKARA_BILIBILI_COOKIE`：用于 BBDown 下载会员清晰度或受限内容的 cookie
-- `BB_DOWN_PATH`：自定义本地 `BBDown` 可执行文件路径
-- `FFMPEG_PATH`：自定义本地 `ffmpeg` 可执行文件路径
-- `ARIA2C_PATH`：自定义实验性 DownKyi 下载源使用的 `aria2c` 可执行文件路径
-- `BILIKARA_STARTUP_LOG`：设为 `1` 时，启动日志会写入 `runtime/data/logs/startup.log`，用于排查打包版启动问题
-- `BILIKARA_RUST_STRICT_EQUIVALENCE`：设为 `1` 时，对已迁移能力同时运行 Rust 与 Python 参考实现并比较规范结果；仅建议用于测试、CI 和开发诊断
-- `BILIKARA_RUST_TIMING_DIAGNOSTICS`：设为 `1` 时，在后端状态中聚合 Rust FFI、JSON、Python 回退和严格等价检查耗时；默认关闭且不会逐调用打印日志
+<p align="center">
+  <img src="images/ui_settings.png" alt="Host 设置页：语言、主题、更新与维护" width="1000"><br>
+  <sub>语言、外观与维护</sub>
+</p>
 
-## 技术说明
+- 歌曲会提前缓存，失败后可重试；退出后清理播放缓存，歌单和播放器设置会保留。
+- 默认使用内置 Rust Native，也可选择 BBDown 或 DownKyi / aria2c。Bilibili 登录二维码过期后自动刷新，凭据保存在本机，请勿分享登录凭据或完整数据目录。
+- HiRes 与清晰度都在新建下载任务时生效，不会中断正在下载的任务或自动重下已缓存歌曲。可选的[自动音量实验](docs/automatic-volume.md)默认关闭，须由 Host 明确设定基准。
+- 遇到播放或启动问题，可在设置中导出诊断包。Windows 数据位于应用旁的 `runtime/data/`；macOS 位于 `~/Library/Application Support/bilikara/data/`。
 
-- 前端使用原生 HTML/CSS/JS，无需前端构建步骤；Node.js 仅用于构建 Tauri 桌面壳
-- Python Host 使用 Python 标准库 HTTP 服务，并继续负责 HTTP、I/O、持久化、下载和运行编排
-- Rust 提供有类型的业务规则核心；新增后端功能与业务规则按 v0.7 的迁移边界在 Rust 侧实现
-- 桌面版使用 Tauri v2 / Rust 作为窗口壳，负责启动后端、承载本地 WebView，并在窗口关闭时请求后端退出
-- 当前桌面壳不是纯 Rust 后端：它会启动一个类似 sidecar 的 Python 后端进程，后端仍负责 HTTP API、缓存、下载和状态管理
-- Tauri 开发配置指向 `http://127.0.0.1:8080`，实际启动时会以 `--no-browser --headless --port 0` 拉起后端，并在收到 `bilikara.ready` 事件后跳转到真实本地地址
-- 播放流程以本地缓存和本地媒体播放为主，缓存媒体由 `BBDown` 下载并由 `FFmpeg` 处理
-- 打包版会优先使用已验证的运行时 `BBDown`；缺失、损坏或显式修复时，从应用内固定 vendor 原子恢复，不检查 GitHub 最新版本
-- 启动后也会在后台准备 `FFmpeg`，并把可用版本同步到应用目录内的 `runtime/tools/bbdown/`
-- Windows 打包版会以隐藏进程方式调用 `BBDown`，避免点歌时弹出命令行窗口
-- 手机访问 URL 的首选地址来自系统路由决定的源 IPv4；其他活动物理网卡地址可作为备用，虚拟和隧道地址会被降级
-- `BBDown` 下载日志会写到应用数据目录下的 `data/logs/bbdown/`
-- 本次已唱记录会单独写入 `data/played_sessions/played-YYYY-MM-DD_HH-MM-SS-ffffff.json`
-- 如果 `BBDown` 返回“请尝试升级到最新版本后重试”这类提示，打包版会从内置固定版本重新修复一次本地 BBDown 并重试当前下载
-- DownKyi / aria2c 仍是实验性、非默认下载源；只在用户明确选择并确认后准备。macOS 打包版读取仓库内按架构锁定的 URL/SHA-256 元数据，并从项目工具镜像下载由手动 Tool Assets 工作流从固定官方源码构建的便携版本；普通应用 CI 不会重建或重新发布 aria2c，无 Homebrew 时也不会因此退回手动安装
-- 如果当前歌曲已经缓存完成，前端会使用浏览器里的分离视频 / 音频播放器播放本地文件
-- 本地播放时，视频与音频流会分开同步，用来支持独立的音画延迟补偿、音量控制、静音和升降 key
-- Host 页面和手机端控制台会共享同一套播放器设置，包括音画延迟、音量、静音状态和音调调整
-- 歌单 CSV 由后端直接生成；歌单图片导出依赖 Pillow，并带有多字体 fallback 以尽量处理特殊符号和多语言标题
-- 备份会保存歌单和播放器设置，不保存缓存媒体文件；恢复后会重新进入自动缓存流程
+## 开发
 
-## 注意
+桌面版使用 Rust 后端与 Tauri 窗口，Host / Remote 共用网页界面。构建步骤、依赖和运行参数集中在以下文档：
 
-- 本地缓存依赖运行环境能访问 B 站；打包版首次准备 BBDown 不需要网络。用户选择实验性 DownKyi 时，自动准备 aria2c 需要访问项目工具镜像，Homebrew 仅作为 macOS 可用时的后备路线
-- 音画延迟补偿、音量控制、静音、远程暂停 / 跳转 / 切换音轨、升降 key 等能力依赖本地缓存媒体和浏览器媒体能力
-- 图片导出需要 Pillow；打包依赖中已包含 Pillow，脚本运行环境如果缺失则只能导出 CSV
-- `FFmpeg` 状态会显示在右上角 `BBDown` 展开面板中，方便定位“BBDown 已就绪但混流失败”这类问题
-- 如果 Windows 后端打包版出现启动异常或页面打不开，可先尝试 `python build_bundle.py --console`，或设置 `BILIKARA_STARTUP_LOG=1` 收集启动日志
-- Tauri 桌面入口会设置 `BILIKARA_LAUNCH_MODE=tauri` 和 `BILIKARA_STARTUP_LOG=1`，桌面启动问题通常可先查看 `runtime/data/logs/startup.log`
-- 为了让本地播放支持拖动和快进，后端对缓存媒体实现了 `Range` 请求支持
+- [原生桌面与本地构建](docs/native-desktop.md) · [macOS 开发包验收](docs/macos_testing.md)
+- [媒体依赖与打包](media-libav/PACKAGING.md) · [构建工作流](.github/workflows/ci-bundle.yml)
+- [版本路线图](docs/version-roadmap.md) · [共享曲库](docs/shared-catalog.md)
+- [Source 开发与兼容边界](docs/source-compatibility.md)
 
 ## 致谢
 
-- https://github.com/nilaoda/BBDown
-- https://github.com/FFmpeg/FFmpeg
+- [BBDown](https://github.com/nilaoda/BBDown)
+- [FFmpeg](https://github.com/FFmpeg/FFmpeg)
 
 ## License 与使用边界
 

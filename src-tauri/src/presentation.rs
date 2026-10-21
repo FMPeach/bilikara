@@ -1,0 +1,4397 @@
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{
+    Mutex,
+    atomic::{AtomicU64, Ordering},
+};
+use std::time::Duration;
+use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder, webview::PageLoadEvent};
+
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::Devices::Display::{
+    DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+    DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EMBEDDED,
+    DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EMBEDDED,
+    DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TARGET_DEVICE_NAME,
+    DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QDC_ONLY_ACTIVE_PATHS,
+    QueryDisplayConfig,
+};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
+
+const STATE_EVENT: &str = "bilikara-presentation-state";
+const HOST_COMPOSITION_EVENT: &str = "bilikara-presentation-host-composition";
+const HOST_COMMAND_EVENT: &str = "bilikara-presentation-host-command";
+const PLAYBACK_STATE_EVENT: &str = "bilikara-presentation-playback-state";
+const OUTPUT_STATE_EVENT: &str = "bilikara-presentation-output-state";
+const OUTPUT_REQUEST_EVENT: &str = "bilikara-presentation-output-request";
+// The scene and two QR data URIs fit well inside this bound; it only keeps an
+// oversized relay out of the audience WebView.
+const MAX_OUTPUT_STATE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_PENDING_COMMANDS: usize = 32;
+const MAX_SAFE_JS_INTEGER: u64 = 9_007_199_254_740_991;
+const MAX_MEDIA_SECONDS: f64 = 7.0 * 24.0 * 60.0 * 60.0;
+const MAX_VOLUME_PERCENT: u16 = 500;
+const CONTROLLER_WIDTH: f64 = 1200.0;
+const CONTROLLER_HEIGHT: f64 = 800.0;
+const ACTIVATION_READY_TIMEOUT: Duration = Duration::from_secs(10);
+const RECOVERY_FINALIZATION_TIMEOUT: Duration = Duration::from_secs(5);
+const DISPLAY_IDENTIFIER_WINDOW_PREFIX: &str = "display-identifier-";
+const DISPLAY_IDENTIFIER_WIDTH: f64 = 128.0;
+const DISPLAY_IDENTIFIER_HEIGHT: f64 = 128.0;
+const DISPLAY_IDENTIFIER_MARGIN: f64 = 24.0;
+const DISPLAY_IDENTIFIER_LIFETIME: Duration = Duration::from_secs(3);
+const MAX_DISPLAY_IDENTIFIER_WINDOWS: usize = 16;
+static DISPLAY_IDENTIFIER_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct MonitorGeometry {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
+
+impl MonitorGeometry {
+    fn from_monitor(monitor: &tauri::window::Monitor) -> Self {
+        Self {
+            x: monitor.position().x,
+            y: monitor.position().y,
+            width: monitor.size().width,
+            height: monitor.size().height,
+        }
+    }
+
+    fn identity_suffix(self) -> String {
+        format!("{}:{}:{}:{}", self.x, self.y, self.width, self.height)
+    }
+
+    fn same_origin(self, other: Self) -> bool {
+        self.x == other.x && self.y == other.y
+    }
+
+    fn intersects(self, other: Self) -> bool {
+        let self_right = i64::from(self.x) + i64::from(self.width);
+        let self_bottom = i64::from(self.y) + i64::from(self.height);
+        let other_right = i64::from(other.x) + i64::from(other.width);
+        let other_bottom = i64::from(other.y) + i64::from(other.height);
+        i64::from(self.x) < other_right
+            && self_right > i64::from(other.x)
+            && i64::from(self.y) < other_bottom
+            && self_bottom > i64::from(other.y)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NativeDisplayMetadata {
+    id: String,
+    name: String,
+    built_in: bool,
+    mirrored: bool,
+    identity_stable: bool,
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn display_source_is_mirrored(active_path_count: usize, resolved_target_count: usize) -> bool {
+    active_path_count != 1 || resolved_target_count != 1
+}
+
+#[derive(Clone, Debug)]
+struct DisplayCandidate {
+    monitor: tauri::window::Monitor,
+    geometry: MonitorGeometry,
+    base_id: String,
+    name: String,
+    built_in: bool,
+    identity_stable: bool,
+    mirrored: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DisplayIdentityQuality {
+    Stable,
+    Unstable,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PresentationDisplay {
+    pub id: String,
+    pub name: String,
+    pub position_x: i32,
+    pub position_y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub scale_factor: f64,
+    pub built_in: bool,
+    pub controller: bool,
+    pub primary: bool,
+    pub selectable: bool,
+    pub mirrored: bool,
+    pub identity_stable: bool,
+    pub identity_quality: DisplayIdentityQuality,
+}
+
+#[derive(Clone, Debug)]
+struct PresentationDisplayRecord {
+    display: PresentationDisplay,
+    monitor: tauri::window::Monitor,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PresentationDisplayInfo {
+    pub monitor_count: usize,
+    pub displays: Vec<PresentationDisplay>,
+    pub controller_display_id: Option<String>,
+    pub recommended_display_id: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PresentationMode {
+    #[default]
+    SingleScreen,
+    LocalDualScreen,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PresentationPhase {
+    #[default]
+    Inactive,
+    Activating,
+    Active,
+    Recovering,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PlaybackAuthorityIdentity {
+    #[default]
+    Host,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MediaRendererOwner {
+    #[default]
+    Host,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PresentationRecoveryReason {
+    User,
+    DisplayDisconnected,
+    ControllerClosed,
+    ActivationFailed,
+    CommandFailed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PresentationSession {
+    pub mode: PresentationMode,
+    pub phase: PresentationPhase,
+    pub generation: u64,
+    pub selected_output_display_id: Option<String>,
+    pub controller_display_id: Option<String>,
+    pub host_ready: bool,
+    pub controller_ready: bool,
+    pub last_accepted_command_sequence: u64,
+    pub last_applied_command_sequence: u64,
+    pub playback_authority: PlaybackAuthorityIdentity,
+    pub media_renderer_owner: MediaRendererOwner,
+    pub recovery_reason: Option<PresentationRecoveryReason>,
+}
+
+impl Default for PresentationSession {
+    fn default() -> Self {
+        Self {
+            mode: PresentationMode::SingleScreen,
+            phase: PresentationPhase::Inactive,
+            generation: 0,
+            selected_output_display_id: None,
+            controller_display_id: None,
+            host_ready: true,
+            controller_ready: false,
+            last_accepted_command_sequence: 0,
+            last_applied_command_sequence: 0,
+            playback_authority: PlaybackAuthorityIdentity::Host,
+            media_renderer_owner: MediaRendererOwner::Host,
+            recovery_reason: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct HostWindowPlacement {
+    position: tauri::PhysicalPosition<i32>,
+    size: tauri::PhysicalSize<u32>,
+    decorations: bool,
+    resizable: bool,
+    fullscreen: bool,
+    maximized: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum HostComposition {
+    Combined,
+    StageOnly,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum ControllerCommand {
+    Play,
+    Pause,
+    SeekRelative {
+        delta_seconds: f64,
+        expected_playback_generation: u64,
+    },
+    SeekAbsolute {
+        target_seconds: f64,
+        expected_playback_generation: u64,
+    },
+    NextTrack {
+        expected_playback_generation: u64,
+    },
+    SetVolume {
+        volume_percent: u16,
+        muted: bool,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ControllerCommandRequest {
+    generation: u64,
+    sequence: u64,
+    command: ControllerCommand,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControllerCommandEnvelope {
+    generation: u64,
+    sequence: u64,
+    target: PlaybackAuthorityIdentity,
+    command: ControllerCommand,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControllerCommandAccepted {
+    generation: u64,
+    sequence: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ControllerPlaybackState {
+    pub revision: u64,
+    pub playback_generation: Option<u64>,
+    pub item_identity: Option<String>,
+    pub title: String,
+    pub paused: bool,
+    pub current_time_seconds: f64,
+    pub duration_seconds: Option<f64>,
+    pub volume_percent: u16,
+    pub muted: bool,
+    pub can_skip: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControllerPlaybackStateEnvelope {
+    generation: u64,
+    sequence: u64,
+    state: ControllerPlaybackState,
+}
+
+#[derive(Clone, Debug)]
+struct PlaybackStatePublication {
+    envelope: ControllerPlaybackStateEnvelope,
+    previous_state: Option<ControllerPlaybackStateEnvelope>,
+    previous_sequence: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PresentationStateEvent {
+    session: PresentationSession,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HostCompositionEvent {
+    generation: u64,
+    composition: HostComposition,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OutputRequestEvent {
+    generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeLifecycleOwner {
+    Activation(u64),
+    Recovery(u64),
+}
+
+#[derive(Clone, Debug)]
+struct RecoveryClaim {
+    session: PresentationSession,
+    started: bool,
+    owns_native_lifecycle: bool,
+}
+
+#[derive(Default)]
+struct PresentationRuntime {
+    session: PresentationSession,
+    host_placement: Option<HostWindowPlacement>,
+    host_relocated: bool,
+    playback_state: Option<ControllerPlaybackStateEnvelope>,
+    playback_state_sequence: u64,
+    pending_commands: VecDeque<ControllerCommandEnvelope>,
+    in_flight_command_sequence: Option<u64>,
+    placement_prepared: bool,
+    activation_published: bool,
+    activation_attempt_generation: Option<u64>,
+    native_lifecycle_owner: Option<NativeLifecycleOwner>,
+    host_window_restored: bool,
+    activation_finalization_claimed: bool,
+    shutting_down: bool,
+}
+
+#[derive(Default)]
+pub struct PresentationState {
+    runtime: Mutex<PresentationRuntime>,
+}
+
+impl PresentationState {
+    fn lock_runtime(&self) -> Result<std::sync::MutexGuard<'_, PresentationRuntime>, String> {
+        self.runtime
+            .lock()
+            .map_err(|_| "presentation session lock is poisoned".to_string())
+    }
+
+    pub fn snapshot(&self) -> Result<PresentationSession, String> {
+        Ok(self.lock_runtime()?.session.clone())
+    }
+
+    fn begin_activation(
+        &self,
+        selected_display_id: String,
+        controller_display_id: String,
+        host_placement: HostWindowPlacement,
+        host_relocated: bool,
+    ) -> Result<PresentationSession, String> {
+        let mut runtime = self.lock_runtime()?;
+        if runtime.activation_attempt_generation.is_some() {
+            return Err("a presentation activation attempt is still in flight".to_string());
+        }
+        if runtime.native_lifecycle_owner.is_some() {
+            return Err("a presentation native lifecycle transition is still active".to_string());
+        }
+        if runtime.session.phase != PresentationPhase::Inactive {
+            return Err("a presentation transition is already active".to_string());
+        }
+        if runtime.shutting_down {
+            return Err("the application is shutting down".to_string());
+        }
+        let generation = next_sequence(runtime.session.generation, "presentation generation")?;
+        runtime.session = PresentationSession {
+            mode: PresentationMode::LocalDualScreen,
+            phase: PresentationPhase::Activating,
+            generation,
+            selected_output_display_id: Some(selected_display_id),
+            controller_display_id: Some(controller_display_id),
+            host_ready: false,
+            controller_ready: false,
+            last_accepted_command_sequence: 0,
+            last_applied_command_sequence: 0,
+            playback_authority: PlaybackAuthorityIdentity::Host,
+            media_renderer_owner: MediaRendererOwner::Host,
+            recovery_reason: None,
+        };
+        runtime.host_placement = Some(host_placement);
+        runtime.host_relocated = host_relocated;
+        runtime.playback_state = None;
+        runtime.playback_state_sequence = 0;
+        runtime.pending_commands.clear();
+        runtime.in_flight_command_sequence = None;
+        runtime.placement_prepared = false;
+        runtime.activation_published = false;
+        runtime.activation_attempt_generation = Some(generation);
+        runtime.native_lifecycle_owner = Some(NativeLifecycleOwner::Activation(generation));
+        runtime.host_window_restored = false;
+        runtime.activation_finalization_claimed = false;
+        Ok(runtime.session.clone())
+    }
+
+    fn mark_placement_prepared(&self, generation: u64) -> Result<PresentationSession, String> {
+        let mut runtime = self.lock_runtime()?;
+        if runtime.session.generation != generation
+            || runtime.session.phase != PresentationPhase::Activating
+            || runtime.native_lifecycle_owner != Some(NativeLifecycleOwner::Activation(generation))
+        {
+            return Err("presentation placement generation is stale".to_string());
+        }
+        runtime.placement_prepared = true;
+        Ok(runtime.session.clone())
+    }
+
+    fn mark_ready(
+        &self,
+        generation: u64,
+        role: WindowRole,
+    ) -> Result<(PresentationSession, bool), String> {
+        let mut runtime = self.lock_runtime()?;
+        if runtime.session.generation != generation
+            || runtime.session.phase != PresentationPhase::Activating
+        {
+            return Err("presentation readiness generation is stale".to_string());
+        }
+        match role {
+            WindowRole::Host => runtime.session.host_ready = true,
+            WindowRole::Controller => runtime.session.controller_ready = true,
+        }
+        let should_finalize = claim_activation_finalization(&mut runtime);
+        Ok((runtime.session.clone(), should_finalize))
+    }
+
+    fn mark_activation_published(
+        &self,
+        generation: u64,
+    ) -> Result<(PresentationSession, bool), String> {
+        let mut runtime = self.lock_runtime()?;
+        if runtime.session.generation != generation
+            || runtime.session.phase != PresentationPhase::Activating
+            || !runtime.placement_prepared
+            || runtime.native_lifecycle_owner != Some(NativeLifecycleOwner::Activation(generation))
+        {
+            return Err("presentation activation publication is stale".to_string());
+        }
+        if runtime.activation_published {
+            return Err("presentation activation was already published".to_string());
+        }
+        runtime.activation_published = true;
+        let should_finalize = claim_activation_finalization(&mut runtime);
+        Ok((runtime.session.clone(), should_finalize))
+    }
+
+    fn complete_activation(&self, generation: u64) -> Result<PresentationSession, String> {
+        let mut runtime = self.lock_runtime()?;
+        if runtime.session.generation != generation
+            || runtime.session.phase != PresentationPhase::Activating
+            || !runtime.session.host_ready
+            || !runtime.session.controller_ready
+            || !runtime.placement_prepared
+            || !runtime.activation_published
+            || !runtime.activation_finalization_claimed
+            || runtime.native_lifecycle_owner != Some(NativeLifecycleOwner::Activation(generation))
+        {
+            return Err("presentation activation is not ready to complete".to_string());
+        }
+        runtime.session.phase = PresentationPhase::Active;
+        runtime.activation_published = false;
+        runtime.activation_finalization_claimed = false;
+        if runtime.activation_attempt_generation != Some(generation) {
+            runtime.native_lifecycle_owner = None;
+        }
+        Ok(runtime.session.clone())
+    }
+
+    fn finish_activation_attempt(&self, generation: u64) -> Result<Option<u64>, String> {
+        let mut runtime = self.lock_runtime()?;
+        if runtime.activation_attempt_generation != Some(generation) {
+            return Err("presentation activation attempt is stale".to_string());
+        }
+        runtime.activation_attempt_generation = None;
+        if runtime.session.phase == PresentationPhase::Recovering {
+            let recovery_generation = runtime.session.generation;
+            runtime.native_lifecycle_owner =
+                Some(NativeLifecycleOwner::Recovery(recovery_generation));
+            return Ok(Some(recovery_generation));
+        }
+        if runtime.native_lifecycle_owner == Some(NativeLifecycleOwner::Activation(generation)) {
+            runtime.native_lifecycle_owner = None;
+        }
+        Ok(None)
+    }
+
+    fn ensure_activation_native_owner(&self, generation: u64) -> Result<(), String> {
+        let runtime = self.lock_runtime()?;
+        if runtime.session.generation != generation
+            || runtime.session.phase != PresentationPhase::Activating
+            || runtime.native_lifecycle_owner != Some(NativeLifecycleOwner::Activation(generation))
+        {
+            return Err("presentation activation native lifecycle is stale".to_string());
+        }
+        Ok(())
+    }
+
+    fn ensure_active_generation(&self, generation: u64) -> Result<(), String> {
+        let runtime = self.lock_runtime()?;
+        if runtime.session.generation != generation
+            || runtime.session.phase != PresentationPhase::Active
+        {
+            return Err("presentation active generation is stale".to_string());
+        }
+        Ok(())
+    }
+
+    fn ensure_output_generation(&self, generation: u64) -> Result<(), String> {
+        let runtime = self.lock_runtime()?;
+        if runtime.session.generation != generation
+            || runtime.session.mode != PresentationMode::LocalDualScreen
+            || !matches!(
+                runtime.session.phase,
+                PresentationPhase::Activating | PresentationPhase::Active
+            )
+        {
+            return Err("presentation output generation is stale".to_string());
+        }
+        Ok(())
+    }
+
+    fn begin_recovery(
+        &self,
+        expected_generation: Option<u64>,
+        reason: PresentationRecoveryReason,
+    ) -> Result<RecoveryClaim, String> {
+        let mut runtime = self.lock_runtime()?;
+        if let Some(expected_generation) = expected_generation
+            && runtime.session.generation != expected_generation
+        {
+            return Err("presentation recovery generation is stale".to_string());
+        }
+        if runtime.session.phase == PresentationPhase::Inactive {
+            return Ok(RecoveryClaim {
+                session: runtime.session.clone(),
+                started: false,
+                owns_native_lifecycle: false,
+            });
+        }
+        if runtime.session.phase == PresentationPhase::Recovering {
+            return Ok(RecoveryClaim {
+                session: runtime.session.clone(),
+                started: false,
+                owns_native_lifecycle: matches!(
+                    runtime.native_lifecycle_owner,
+                    Some(NativeLifecycleOwner::Recovery(generation))
+                        if generation == runtime.session.generation
+                ),
+            });
+        }
+        let previous_generation = runtime.session.generation;
+        let activation_attempt_in_flight =
+            runtime.activation_attempt_generation == Some(previous_generation);
+        let generation = next_sequence(runtime.session.generation, "presentation generation")?;
+        runtime.session.phase = PresentationPhase::Recovering;
+        runtime.session.generation = generation;
+        runtime.session.host_ready = false;
+        runtime.session.controller_ready = false;
+        runtime.session.last_accepted_command_sequence = 0;
+        runtime.session.last_applied_command_sequence = 0;
+        runtime.session.recovery_reason = Some(reason);
+        runtime.playback_state = None;
+        runtime.playback_state_sequence = 0;
+        runtime.pending_commands.clear();
+        runtime.in_flight_command_sequence = None;
+        runtime.placement_prepared = false;
+        runtime.activation_published = false;
+        runtime.host_window_restored = false;
+        runtime.activation_finalization_claimed = false;
+        if activation_attempt_in_flight {
+            runtime.native_lifecycle_owner =
+                Some(NativeLifecycleOwner::Activation(previous_generation));
+        } else {
+            runtime.native_lifecycle_owner = Some(NativeLifecycleOwner::Recovery(generation));
+        }
+        Ok(RecoveryClaim {
+            session: runtime.session.clone(),
+            started: true,
+            owns_native_lifecycle: !activation_attempt_in_flight,
+        })
+    }
+
+    fn ensure_recovery_native_owner(&self, generation: u64) -> Result<(), String> {
+        let runtime = self.lock_runtime()?;
+        if runtime.session.generation != generation
+            || runtime.session.phase != PresentationPhase::Recovering
+            || runtime.activation_attempt_generation.is_some()
+            || runtime.native_lifecycle_owner != Some(NativeLifecycleOwner::Recovery(generation))
+        {
+            return Err("presentation recovery native lifecycle is stale".to_string());
+        }
+        Ok(())
+    }
+
+    fn mark_recovery_host_ready(&self, generation: u64) -> Result<PresentationSession, String> {
+        let mut runtime = self.lock_runtime()?;
+        if runtime.session.generation != generation
+            || runtime.session.phase != PresentationPhase::Recovering
+        {
+            return Err("presentation recovery generation is stale".to_string());
+        }
+        runtime.session.host_ready = true;
+        Ok(runtime.session.clone())
+    }
+
+    fn recovery_placement(&self, generation: u64) -> Result<Option<HostWindowPlacement>, String> {
+        let runtime = self.lock_runtime()?;
+        if runtime.session.generation != generation
+            || runtime.session.phase != PresentationPhase::Recovering
+        {
+            return Err("presentation recovery generation is stale".to_string());
+        }
+        Ok(runtime.host_placement.clone())
+    }
+
+    fn recovery_host_was_relocated(&self, generation: u64) -> Result<bool, String> {
+        let runtime = self.lock_runtime()?;
+        if runtime.session.generation != generation
+            || runtime.session.phase != PresentationPhase::Recovering
+        {
+            return Err("presentation recovery generation is stale".to_string());
+        }
+        Ok(runtime.host_relocated)
+    }
+
+    fn host_window_restored(&self, generation: u64) -> Result<bool, String> {
+        let runtime = self.lock_runtime()?;
+        if runtime.session.generation != generation
+            || runtime.session.phase != PresentationPhase::Recovering
+        {
+            return Err("presentation recovery generation is stale".to_string());
+        }
+        Ok(runtime.host_window_restored)
+    }
+
+    fn mark_host_window_restored(&self, generation: u64) -> Result<(), String> {
+        let mut runtime = self.lock_runtime()?;
+        if runtime.session.generation != generation
+            || runtime.session.phase != PresentationPhase::Recovering
+        {
+            return Err("presentation recovery generation is stale".to_string());
+        }
+        runtime.host_window_restored = true;
+        Ok(())
+    }
+
+    fn complete_recovery(&self, generation: u64) -> Result<PresentationSession, String> {
+        let mut runtime = self.lock_runtime()?;
+        if runtime.session.generation != generation
+            || runtime.session.phase != PresentationPhase::Recovering
+            || !runtime.session.host_ready
+            || !runtime.host_window_restored
+            || runtime.activation_attempt_generation.is_some()
+            || runtime.native_lifecycle_owner != Some(NativeLifecycleOwner::Recovery(generation))
+        {
+            return Err("presentation recovery generation is stale".to_string());
+        }
+        let reason = runtime.session.recovery_reason;
+        Ok(reset_runtime_to_inactive(&mut runtime, generation, reason))
+    }
+
+    fn force_complete_recovery(&self, generation: u64) -> Result<PresentationSession, String> {
+        let mut runtime = self.lock_runtime()?;
+        if runtime.session.generation != generation
+            || runtime.session.phase != PresentationPhase::Recovering
+            || runtime.activation_attempt_generation.is_some()
+            || runtime.native_lifecycle_owner != Some(NativeLifecycleOwner::Recovery(generation))
+        {
+            return Err("presentation recovery generation is stale".to_string());
+        }
+        let reason = runtime.session.recovery_reason;
+        Ok(reset_runtime_to_inactive(&mut runtime, generation, reason))
+    }
+
+    fn enqueue_command(
+        &self,
+        request: ControllerCommandRequest,
+    ) -> Result<(ControllerCommandAccepted, Option<ControllerCommandEnvelope>), String> {
+        validate_controller_command(&request.command)?;
+        let mut runtime = self.lock_runtime()?;
+        if runtime.session.generation != request.generation
+            || runtime.session.phase != PresentationPhase::Active
+        {
+            return Err("controller command generation is stale".to_string());
+        }
+        if runtime.pending_commands.len() >= MAX_PENDING_COMMANDS {
+            return Err("the Controller command queue is full".to_string());
+        }
+        let expected_sequence = next_sequence(
+            runtime.session.last_accepted_command_sequence,
+            "controller command sequence",
+        )?;
+        if request.sequence != expected_sequence {
+            return Err("controller command sequence is stale or out of order".to_string());
+        }
+        runtime.session.last_accepted_command_sequence = request.sequence;
+        let envelope = ControllerCommandEnvelope {
+            generation: request.generation,
+            sequence: request.sequence,
+            target: PlaybackAuthorityIdentity::Host,
+            command: request.command,
+        };
+        runtime.pending_commands.push_back(envelope.clone());
+        let emit = if runtime.in_flight_command_sequence.is_none() {
+            runtime.in_flight_command_sequence = Some(envelope.sequence);
+            Some(envelope)
+        } else {
+            None
+        };
+        Ok((
+            ControllerCommandAccepted {
+                generation: request.generation,
+                sequence: request.sequence,
+            },
+            emit,
+        ))
+    }
+
+    fn acknowledge_command(
+        &self,
+        generation: u64,
+        sequence: u64,
+    ) -> Result<(PresentationSession, Option<ControllerCommandEnvelope>), String> {
+        let mut runtime = self.lock_runtime()?;
+        if runtime.session.generation != generation
+            || runtime.session.phase != PresentationPhase::Active
+        {
+            return Err("controller command generation is stale".to_string());
+        }
+        let expected_sequence = next_sequence(
+            runtime.session.last_applied_command_sequence,
+            "controller command sequence",
+        )?;
+        let queue_head = runtime
+            .pending_commands
+            .front()
+            .map(|command| command.sequence);
+        if sequence != expected_sequence
+            || queue_head != Some(sequence)
+            || runtime.in_flight_command_sequence != Some(sequence)
+        {
+            return Err("controller command acknowledgement is stale or out of order".to_string());
+        }
+        runtime.pending_commands.pop_front();
+        runtime.session.last_applied_command_sequence = sequence;
+        runtime.in_flight_command_sequence = runtime
+            .pending_commands
+            .front()
+            .map(|command| command.sequence);
+        Ok((
+            runtime.session.clone(),
+            runtime.pending_commands.front().cloned(),
+        ))
+    }
+
+    fn publish_playback_state(
+        &self,
+        generation: u64,
+        candidate: ControllerPlaybackState,
+    ) -> Result<PlaybackStatePublication, String> {
+        validate_playback_state(&candidate)?;
+        let mut runtime = self.lock_runtime()?;
+        if runtime.session.generation != generation
+            || !matches!(
+                runtime.session.phase,
+                PresentationPhase::Activating | PresentationPhase::Active
+            )
+        {
+            return Err("controller playback state generation is stale".to_string());
+        }
+        if runtime
+            .playback_state
+            .as_ref()
+            .is_some_and(|current| current.state.revision >= candidate.revision)
+        {
+            return Err("controller playback state revision is stale".to_string());
+        }
+        let previous_sequence = runtime.playback_state_sequence;
+        let previous_state = runtime.playback_state.clone();
+        runtime.playback_state_sequence =
+            next_sequence(previous_sequence, "Controller playback state sequence")?;
+        let envelope = ControllerPlaybackStateEnvelope {
+            generation,
+            sequence: runtime.playback_state_sequence,
+            state: candidate,
+        };
+        runtime.playback_state = Some(envelope.clone());
+        Ok(PlaybackStatePublication {
+            envelope,
+            previous_state,
+            previous_sequence,
+        })
+    }
+
+    fn rollback_playback_state(
+        &self,
+        publication: &PlaybackStatePublication,
+    ) -> Result<(), String> {
+        let mut runtime = self.lock_runtime()?;
+        if runtime.session.generation != publication.envelope.generation
+            || runtime.playback_state.as_ref() != Some(&publication.envelope)
+            || runtime.playback_state_sequence != publication.envelope.sequence
+        {
+            return Err("Controller playback state reservation was superseded".to_string());
+        }
+        runtime.playback_state = publication.previous_state.clone();
+        runtime.playback_state_sequence = publication.previous_sequence;
+        Ok(())
+    }
+
+    fn playback_state(
+        &self,
+        generation: u64,
+    ) -> Result<Option<ControllerPlaybackStateEnvelope>, String> {
+        let runtime = self.lock_runtime()?;
+        if runtime.session.generation != generation
+            || !matches!(
+                runtime.session.phase,
+                PresentationPhase::Activating | PresentationPhase::Active
+            )
+        {
+            return Err("controller playback state generation is stale".to_string());
+        }
+        Ok(runtime.playback_state.clone())
+    }
+
+    fn mark_shutting_down(&self) {
+        if let Ok(mut runtime) = self.runtime.lock() {
+            runtime.shutting_down = true;
+            let generation = next_sequence(runtime.session.generation, "presentation generation")
+                .unwrap_or(MAX_SAFE_JS_INTEGER);
+            runtime.session = inactive_session(generation, runtime.session.recovery_reason);
+            runtime.host_placement = None;
+            runtime.host_relocated = false;
+            runtime.playback_state = None;
+            runtime.playback_state_sequence = 0;
+            runtime.pending_commands.clear();
+            runtime.in_flight_command_sequence = None;
+            runtime.placement_prepared = false;
+            runtime.activation_published = false;
+            runtime.activation_attempt_generation = None;
+            runtime.native_lifecycle_owner = None;
+            runtime.host_window_restored = false;
+            runtime.activation_finalization_claimed = false;
+        }
+    }
+
+    fn is_shutting_down(&self) -> bool {
+        self.runtime
+            .lock()
+            .map(|runtime| runtime.shutting_down)
+            .unwrap_or(true)
+    }
+
+    pub(crate) fn allows_manual_fullscreen(&self) -> bool {
+        self.runtime
+            .lock()
+            .map(|runtime| {
+                !runtime.shutting_down && runtime.session.phase == PresentationPhase::Inactive
+            })
+            .unwrap_or(false)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WindowRole {
+    Host,
+    Controller,
+}
+
+fn trace_presentation(
+    _app: &tauri::AppHandle,
+    generation: Option<u64>,
+    stage: &str,
+    detail: impl AsRef<str>,
+) {
+    crate::desktop_diagnostics::append_desktop_diagnostic(
+        "presentation_trace",
+        format!(
+            "generation={} stage={} thread={:?} {}",
+            generation
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            stage,
+            std::thread::current().id(),
+            detail.as_ref()
+        ),
+    );
+}
+
+struct ActivationAttemptGuard<'a> {
+    state: &'a PresentationState,
+    generation: u64,
+    finished: bool,
+}
+
+impl<'a> ActivationAttemptGuard<'a> {
+    fn new(state: &'a PresentationState, generation: u64) -> Self {
+        Self {
+            state,
+            generation,
+            finished: false,
+        }
+    }
+
+    fn finish(mut self) -> Result<Option<u64>, String> {
+        let result = self.state.finish_activation_attempt(self.generation);
+        self.finished = result.is_ok();
+        result
+    }
+}
+
+impl Drop for ActivationAttemptGuard<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.state.finish_activation_attempt(self.generation);
+        }
+    }
+}
+
+fn claim_activation_finalization(runtime: &mut PresentationRuntime) -> bool {
+    let generation = runtime.session.generation;
+    let native_lifecycle_available = match runtime.native_lifecycle_owner {
+        None => true,
+        Some(NativeLifecycleOwner::Activation(owner_generation)) => owner_generation == generation,
+        Some(NativeLifecycleOwner::Recovery(_)) => false,
+    };
+    let should_finalize = runtime.session.host_ready
+        && runtime.session.controller_ready
+        && runtime.placement_prepared
+        && runtime.activation_published
+        && !runtime.activation_finalization_claimed
+        && native_lifecycle_available;
+    if should_finalize {
+        runtime.activation_finalization_claimed = true;
+        runtime.native_lifecycle_owner = Some(NativeLifecycleOwner::Activation(generation));
+    }
+    should_finalize
+}
+
+fn next_sequence(current: u64, label: &str) -> Result<u64, String> {
+    let next = current
+        .checked_add(1)
+        .ok_or_else(|| format!("{label} is exhausted"))?;
+    if next > MAX_SAFE_JS_INTEGER {
+        return Err(format!("{label} exceeds JavaScript's safe integer range"));
+    }
+    Ok(next)
+}
+
+fn inactive_session(
+    generation: u64,
+    recovery_reason: Option<PresentationRecoveryReason>,
+) -> PresentationSession {
+    PresentationSession {
+        generation,
+        recovery_reason,
+        ..PresentationSession::default()
+    }
+}
+
+fn reset_runtime_to_inactive(
+    runtime: &mut PresentationRuntime,
+    generation: u64,
+    recovery_reason: Option<PresentationRecoveryReason>,
+) -> PresentationSession {
+    runtime.session = inactive_session(generation, recovery_reason);
+    runtime.host_placement = None;
+    runtime.host_relocated = false;
+    runtime.playback_state = None;
+    runtime.playback_state_sequence = 0;
+    runtime.pending_commands.clear();
+    runtime.in_flight_command_sequence = None;
+    runtime.placement_prepared = false;
+    runtime.activation_published = false;
+    runtime.native_lifecycle_owner = None;
+    runtime.host_window_restored = false;
+    runtime.activation_finalization_claimed = false;
+    runtime.session.clone()
+}
+
+fn validate_controller_command(command: &ControllerCommand) -> Result<(), String> {
+    match command {
+        ControllerCommand::SeekRelative {
+            delta_seconds,
+            expected_playback_generation,
+        } if !delta_seconds.is_finite()
+            || *delta_seconds == 0.0
+            || delta_seconds.abs() > 600.0
+            || *expected_playback_generation == 0
+            || *expected_playback_generation > MAX_SAFE_JS_INTEGER =>
+        {
+            Err("controller relative seek is out of bounds".to_string())
+        }
+        ControllerCommand::SeekAbsolute {
+            target_seconds,
+            expected_playback_generation,
+        } if !target_seconds.is_finite()
+            || !(0.0..=MAX_MEDIA_SECONDS).contains(target_seconds)
+            || *expected_playback_generation == 0
+            || *expected_playback_generation > MAX_SAFE_JS_INTEGER =>
+        {
+            Err("controller seek position is out of bounds".to_string())
+        }
+        ControllerCommand::NextTrack {
+            expected_playback_generation,
+        } if *expected_playback_generation == 0
+            || *expected_playback_generation > MAX_SAFE_JS_INTEGER =>
+        {
+            Err("controller Next playback target is invalid".to_string())
+        }
+        ControllerCommand::SetVolume { volume_percent, .. }
+            if *volume_percent > MAX_VOLUME_PERCENT =>
+        {
+            Err("controller volume is out of bounds".to_string())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_playback_state(candidate: &ControllerPlaybackState) -> Result<(), String> {
+    if candidate.revision == 0
+        || candidate
+            .playback_generation
+            .is_some_and(|generation| generation == 0 || generation > MAX_SAFE_JS_INTEGER)
+        || candidate
+            .item_identity
+            .as_ref()
+            .is_some_and(|identity| identity.len() > 256)
+        || candidate.title.len() > 1024
+        || !candidate.current_time_seconds.is_finite()
+        || !(0.0..=MAX_MEDIA_SECONDS).contains(&candidate.current_time_seconds)
+        || candidate.duration_seconds.is_some_and(|duration| {
+            !duration.is_finite() || !(0.0..=MAX_MEDIA_SECONDS).contains(&duration)
+        })
+        || candidate.volume_percent > MAX_VOLUME_PERCENT
+    {
+        return Err("controller playback state is invalid".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn wide_string(value: &[u16]) -> String {
+    let length = value
+        .iter()
+        .position(|character| *character == 0)
+        .unwrap_or(value.len());
+    String::from_utf16_lossy(&value[..length])
+}
+
+#[cfg(target_os = "windows")]
+fn windows_display_metadata() -> Result<HashMap<String, Vec<NativeDisplayMetadata>>, String> {
+    let mut metadata: HashMap<String, Vec<NativeDisplayMetadata>> = HashMap::new();
+    let mut source_path_counts: HashMap<String, usize> = HashMap::new();
+    for _ in 0..3 {
+        let mut path_count = 0;
+        let mut mode_count = 0;
+        // SAFETY: The Win32 API fills counts through valid mutable pointers.
+        let size_result = unsafe {
+            GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut path_count, &mut mode_count)
+        };
+        if size_result != 0 {
+            return Err(format!(
+                "Windows display metadata sizing failed with code {size_result}"
+            ));
+        }
+        let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
+        let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); mode_count as usize];
+        // SAFETY: Both buffers have the capacities returned immediately above.
+        let query_result = unsafe {
+            QueryDisplayConfig(
+                QDC_ONLY_ACTIVE_PATHS,
+                &mut path_count,
+                paths.as_mut_ptr(),
+                &mut mode_count,
+                modes.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        if query_result == ERROR_INSUFFICIENT_BUFFER {
+            continue;
+        }
+        if query_result != 0 {
+            return Err(format!(
+                "Windows display metadata query failed with code {query_result}"
+            ));
+        }
+        let active_paths = paths.iter().take(path_count as usize).collect::<Vec<_>>();
+        let mut raw_source_path_counts: HashMap<(i32, u32, u32), usize> = HashMap::new();
+        for path in &active_paths {
+            let source_key = (
+                path.sourceInfo.adapterId.HighPart,
+                path.sourceInfo.adapterId.LowPart,
+                path.sourceInfo.id,
+            );
+            *raw_source_path_counts.entry(source_key).or_default() += 1;
+        }
+        for path in active_paths {
+            let raw_source_key = (
+                path.sourceInfo.adapterId.HighPart,
+                path.sourceInfo.adapterId.LowPart,
+                path.sourceInfo.id,
+            );
+            let active_path_count = raw_source_path_counts
+                .get(&raw_source_key)
+                .copied()
+                .unwrap_or_default();
+            let mut source = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
+            source.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+            source.header.size = std::mem::size_of_val(&source) as u32;
+            source.header.adapterId = path.sourceInfo.adapterId;
+            source.header.id = path.sourceInfo.id;
+            // SAFETY: source begins with a fully initialized DISPLAYCONFIG header.
+            if unsafe { DisplayConfigGetDeviceInfo(&mut source.header) } != 0 {
+                continue;
+            }
+            let source_name = wide_string(&source.viewGdiDeviceName);
+            if source_name.is_empty() {
+                continue;
+            }
+            let source_key = source_name.to_ascii_lowercase();
+            source_path_counts
+                .entry(source_key.clone())
+                .and_modify(|count| *count = (*count).max(active_path_count))
+                .or_insert(active_path_count);
+            let mut target = DISPLAYCONFIG_TARGET_DEVICE_NAME::default();
+            target.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+            target.header.size = std::mem::size_of_val(&target) as u32;
+            target.header.adapterId = path.targetInfo.adapterId;
+            target.header.id = path.targetInfo.id;
+            // SAFETY: target follows the same initialized packet contract.
+            if unsafe { DisplayConfigGetDeviceInfo(&mut target.header) } != 0 {
+                continue;
+            }
+            let device_path = wide_string(&target.monitorDevicePath);
+            if device_path.is_empty() {
+                continue;
+            }
+            let friendly_name = wide_string(&target.monitorFriendlyDeviceName);
+            metadata
+                .entry(source_key)
+                .or_default()
+                .push(NativeDisplayMetadata {
+                    id: format!("windows-device-path:{}", device_path.to_ascii_lowercase()),
+                    name: friendly_name,
+                    built_in: matches!(
+                        path.targetInfo.outputTechnology,
+                        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL
+                            | DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EMBEDDED
+                            | DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EMBEDDED
+                    ),
+                    mirrored: false,
+                    identity_stable: true,
+                });
+        }
+        for (source_key, entries) in &mut metadata {
+            entries.sort_by(|left, right| left.id.cmp(&right.id));
+            entries.dedup_by(|left, right| left.id == right.id);
+            let mirrored = display_source_is_mirrored(
+                source_path_counts
+                    .get(source_key)
+                    .copied()
+                    .unwrap_or_default(),
+                entries.len(),
+            );
+            for entry in entries {
+                entry.mirrored = mirrored;
+                entry.identity_stable = !mirrored;
+            }
+        }
+        return Ok(metadata);
+    }
+    Err("Windows display topology changed during discovery".to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_display_uuid(display_id: u32) -> Result<String, String> {
+    use core_foundation::base::TCFType;
+    use core_foundation::uuid::{CFUUID, CFUUIDGetUUIDBytes, CFUUIDRef};
+
+    #[link(name = "ApplicationServices", kind = "framework")]
+    unsafe extern "C" {
+        fn CGDisplayCreateUUIDFromDisplayID(display: u32) -> CFUUIDRef;
+    }
+
+    // SAFETY: CoreGraphics owns the display identifier and returns a retained UUID.
+    let reference = unsafe { CGDisplayCreateUUIDFromDisplayID(display_id) };
+    if reference.is_null() {
+        return Err("macOS display UUID is unavailable".to_string());
+    }
+    // SAFETY: reference follows Core Foundation's create rule and is non-null.
+    let uuid = unsafe { CFUUID::wrap_under_create_rule(reference) };
+    // SAFETY: uuid is a valid retained CFUUID for this call.
+    let bytes = unsafe { CFUUIDGetUUIDBytes(uuid.as_concrete_TypeRef()) };
+    Ok(format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes.byte0,
+        bytes.byte1,
+        bytes.byte2,
+        bytes.byte3,
+        bytes.byte4,
+        bytes.byte5,
+        bytes.byte6,
+        bytes.byte7,
+        bytes.byte8,
+        bytes.byte9,
+        bytes.byte10,
+        bytes.byte11,
+        bytes.byte12,
+        bytes.byte13,
+        bytes.byte14,
+        bytes.byte15,
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn collect_macos_screen_details() -> Result<HashMap<String, (String, f64)>, String> {
+    use objc2::{MainThreadMarker, msg_send};
+    use objc2_app_kit::NSScreen;
+    use objc2_foundation::NSString;
+
+    let marker = MainThreadMarker::new()
+        .ok_or_else(|| "macOS display names must be read on the AppKit main thread".to_string())?;
+    let key = NSString::from_str("NSScreenNumber");
+    let mut details = HashMap::new();
+    for screen in NSScreen::screens(marker).iter() {
+        let description = screen.deviceDescription();
+        let Some(value) = description.objectForKey(&key) else {
+            continue;
+        };
+        // SAFETY: NSScreenNumber is documented as an NSNumber-compatible value.
+        let display_id: usize = unsafe { msg_send![&*value, unsignedIntegerValue] };
+        let uuid = macos_display_uuid(display_id as u32)?;
+        let frame = screen.frame();
+        let backing_frame = screen.convertRectToBacking(frame);
+        let scale = if frame.size.width > 0.0 {
+            backing_frame.size.width / frame.size.width
+        } else {
+            1.0
+        };
+        details.insert(uuid, (screen.localizedName().to_string(), scale));
+    }
+    Ok(details)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_screen_details(app: &tauri::AppHandle) -> Result<HashMap<String, (String, f64)>, String> {
+    if objc2::MainThreadMarker::new().is_some() {
+        return collect_macos_screen_details();
+    }
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    app.run_on_main_thread(move || {
+        let _ = sender.send(collect_macos_screen_details());
+    })
+    .map_err(|error| error.to_string())?;
+    receiver
+        .recv_timeout(Duration::from_secs(2))
+        .map_err(|_| "timed out while reading macOS display names".to_string())?
+}
+
+#[cfg(target_os = "macos")]
+fn macos_metadata_for_monitor(
+    monitor: &tauri::window::Monitor,
+    screen_details: &HashMap<String, (String, f64)>,
+) -> Result<NativeDisplayMetadata, String> {
+    use core_graphics::display::CGDisplay;
+
+    let target_geometry = MonitorGeometry::from_monitor(monitor);
+    let active = CGDisplay::active_displays()
+        .map_err(|error| format!("macOS display discovery failed with code {error}"))?;
+    let mut matches = Vec::new();
+    for display_id in active {
+        let display = CGDisplay::new(display_id);
+        let uuid = macos_display_uuid(display_id)?;
+        let Some((localized_name, scale)) = screen_details.get(&uuid) else {
+            continue;
+        };
+        let bounds = display.bounds();
+        let geometry = MonitorGeometry {
+            x: (bounds.origin.x * *scale).round() as i32,
+            y: (bounds.origin.y * *scale).round() as i32,
+            width: (display.pixels_wide() as f64 * *scale).round() as u32,
+            height: (display.pixels_high() as f64 * *scale).round() as u32,
+        };
+        if geometry == target_geometry {
+            matches.push(NativeDisplayMetadata {
+                id: format!("macos-uuid:{uuid}"),
+                name: localized_name.clone(),
+                built_in: display.is_builtin(),
+                mirrored: display.is_in_mirror_set(),
+                identity_stable: true,
+            });
+        }
+    }
+    if matches.is_empty() {
+        return Err(format!(
+            "macOS display identity is unavailable at {}",
+            target_geometry.identity_suffix()
+        ));
+    }
+    matches.sort_by(|left, right| left.id.cmp(&right.id));
+    let ambiguous = matches.len() != 1;
+    let mut selected = matches.remove(0);
+    if ambiguous {
+        selected.mirrored = true;
+        selected.identity_stable = false;
+    }
+    Ok(selected)
+}
+
+fn native_metadata_for_monitors(
+    main_window: &tauri::WebviewWindow,
+    monitors: &[tauri::window::Monitor],
+) -> Result<Vec<Option<NativeDisplayMetadata>>, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = main_window;
+        let metadata = windows_display_metadata()?;
+        Ok(monitors
+            .iter()
+            .map(|monitor| {
+                let key = monitor
+                    .name()
+                    .map(|name| name.to_ascii_lowercase())
+                    .unwrap_or_default();
+                let entries = metadata.get(&key)?;
+                entries.first().cloned()
+            })
+            .collect())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let screen_details = macos_screen_details(main_window.app_handle())?;
+        Ok(monitors
+            .iter()
+            .map(|monitor| macos_metadata_for_monitor(monitor, &screen_details).ok())
+            .collect())
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let _ = main_window;
+        Ok(vec![None; monitors.len()])
+    }
+}
+
+fn matching_monitor_index(
+    monitors: &[tauri::window::Monitor],
+    target: Option<&tauri::window::Monitor>,
+) -> Option<usize> {
+    let target = target?;
+    let target_geometry = MonitorGeometry::from_monitor(target);
+    let target_name = target.name().map(String::as_str).unwrap_or_default();
+    monitors
+        .iter()
+        .position(|candidate| {
+            MonitorGeometry::from_monitor(candidate) == target_geometry
+                && candidate.name().map(String::as_str).unwrap_or_default() == target_name
+        })
+        .or_else(|| {
+            monitors
+                .iter()
+                .position(|candidate| MonitorGeometry::from_monitor(candidate) == target_geometry)
+        })
+}
+
+fn readable_display_name(value: &str) -> String {
+    let trimmed = value.trim();
+    if let Some(suffix) = trimmed.strip_prefix(r"\\.\DISPLAY")
+        && !suffix.is_empty()
+        && suffix.chars().all(|character| character.is_ascii_digit())
+    {
+        return format!("Display {suffix}");
+    }
+    trimmed.to_string()
+}
+
+fn candidate_identity(
+    monitor: &tauri::window::Monitor,
+    native: Option<&NativeDisplayMetadata>,
+) -> (String, String, bool) {
+    let platform_name =
+        readable_display_name(monitor.name().map(String::as_str).unwrap_or_default());
+    if let Some(native) = native {
+        let name = if native.name.trim().is_empty() {
+            if native.built_in {
+                "Built-in display".to_string()
+            } else {
+                platform_name
+            }
+        } else {
+            readable_display_name(&native.name)
+        };
+        return (native.id.clone(), name, native.identity_stable);
+    }
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    {
+        let geometry = MonitorGeometry::from_monitor(monitor);
+        (
+            format!("unavailable:{}", geometry.identity_suffix()),
+            platform_name,
+            false,
+        )
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let geometry = MonitorGeometry::from_monitor(monitor);
+        (
+            format!("unsupported:{}", geometry.identity_suffix()),
+            platform_name,
+            false,
+        )
+    }
+}
+
+fn discover_display_records(
+    main_window: &tauri::WebviewWindow,
+) -> Result<Vec<PresentationDisplayRecord>, String> {
+    let monitors = main_window
+        .available_monitors()
+        .map_err(|error| error.to_string())?;
+    let primary_monitor = main_window
+        .primary_monitor()
+        .map_err(|error| error.to_string())?;
+    let primary_index = matching_monitor_index(&monitors, primary_monitor.as_ref());
+    let current_monitor = main_window
+        .current_monitor()
+        .map_err(|error| error.to_string())?;
+    let current_index = matching_monitor_index(&monitors, current_monitor.as_ref());
+    let native_metadata = native_metadata_for_monitors(main_window, &monitors)?;
+    let mut candidates = monitors
+        .into_iter()
+        .zip(native_metadata)
+        .map(|(monitor, native)| {
+            let geometry = MonitorGeometry::from_monitor(&monitor);
+            let (base_id, name, identity_stable) = candidate_identity(&monitor, native.as_ref());
+            DisplayCandidate {
+                monitor,
+                geometry,
+                base_id,
+                name,
+                built_in: native.as_ref().is_some_and(|metadata| metadata.built_in),
+                identity_stable,
+                mirrored: native.as_ref().is_some_and(|metadata| metadata.mirrored),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let mut id_counts = HashMap::new();
+    let mut origin_counts = HashMap::new();
+    let mut name_counts = HashMap::new();
+    for candidate in &candidates {
+        *id_counts.entry(candidate.base_id.clone()).or_insert(0usize) += 1;
+        *origin_counts
+            .entry((candidate.geometry.x, candidate.geometry.y))
+            .or_insert(0usize) += 1;
+        *name_counts
+            .entry(candidate.name.to_ascii_lowercase())
+            .or_insert(0usize) += 1;
+    }
+    let controller_geometry = current_index.map(|index| candidates[index].geometry);
+    let controller_has_alternative = candidates.iter().enumerate().any(|(index, candidate)| {
+        current_index != Some(index)
+            && candidate.identity_stable
+            && !candidate.mirrored
+            && controller_geometry
+                .map(|geometry| !candidate.geometry.intersects(geometry))
+                .unwrap_or(false)
+    });
+
+    Ok(candidates
+        .drain(..)
+        .enumerate()
+        .map(|(index, candidate)| {
+            let duplicate_id = id_counts.get(&candidate.base_id).copied().unwrap_or(1) > 1;
+            let id = if duplicate_id {
+                format!(
+                    "{}@{}",
+                    candidate.base_id,
+                    candidate.geometry.identity_suffix()
+                )
+            } else {
+                candidate.base_id.clone()
+            };
+            let identity_stable = candidate.identity_stable && !duplicate_id;
+            let duplicate_origin = origin_counts
+                .get(&(candidate.geometry.x, candidate.geometry.y))
+                .copied()
+                .unwrap_or(1)
+                > 1;
+            let controller = current_index == Some(index);
+            let mirrors_controller = controller_geometry
+                .map(|geometry| candidate.geometry.same_origin(geometry))
+                .unwrap_or(true);
+            let mirrored =
+                candidate.mirrored || duplicate_origin || (!controller && mirrors_controller);
+            let mut name = if candidate.name.trim().is_empty() {
+                format!("Display {}", index + 1)
+            } else {
+                candidate.name
+            };
+            if name_counts
+                .get(&name.to_ascii_lowercase())
+                .copied()
+                .unwrap_or(1)
+                > 1
+            {
+                let suffix = id.rsplit([':', '-']).next().unwrap_or(&id);
+                let start = suffix.len().saturating_sub(8);
+                name = format!("{name} · {}", &suffix[start..]);
+            }
+            PresentationDisplayRecord {
+                display: PresentationDisplay {
+                    id,
+                    name,
+                    position_x: candidate.geometry.x,
+                    position_y: candidate.geometry.y,
+                    width: candidate.geometry.width,
+                    height: candidate.geometry.height,
+                    scale_factor: candidate.monitor.scale_factor(),
+                    built_in: candidate.built_in,
+                    controller,
+                    primary: primary_index == Some(index),
+                    selectable: identity_stable
+                        && !mirrored
+                        && (!controller || controller_has_alternative),
+                    mirrored,
+                    identity_stable,
+                    identity_quality: if identity_stable {
+                        DisplayIdentityQuality::Stable
+                    } else {
+                        DisplayIdentityQuality::Unstable
+                    },
+                },
+                monitor: candidate.monitor,
+            }
+        })
+        .collect())
+}
+
+fn display_info(records: &[PresentationDisplayRecord]) -> PresentationDisplayInfo {
+    PresentationDisplayInfo {
+        monitor_count: records.len(),
+        displays: records
+            .iter()
+            .map(|record| record.display.clone())
+            .collect(),
+        controller_display_id: records
+            .iter()
+            .find(|record| record.display.controller)
+            .map(|record| record.display.id.clone()),
+        recommended_display_id: records
+            .iter()
+            .find(|record| record.display.selectable && !record.display.controller)
+            .or_else(|| records.iter().find(|record| record.display.selectable))
+            .map(|record| record.display.id.clone()),
+    }
+}
+
+fn normalized_display_identifier_theme(value: &str) -> &'static str {
+    match value {
+        "dark" => "dark",
+        "blue" => "blue",
+        _ => "light",
+    }
+}
+
+fn normalized_display_identifier_language(value: &str) -> &'static str {
+    match value {
+        "en" => "en",
+        "ja" => "ja",
+        _ => "zh",
+    }
+}
+
+fn validate_display_identifier_order(
+    available_ids: &[String],
+    requested_ids: &[String],
+) -> Result<Vec<usize>, String> {
+    if requested_ids.is_empty() || requested_ids.len() > MAX_DISPLAY_IDENTIFIER_WINDOWS {
+        return Err("the display identifier request has an invalid size".to_string());
+    }
+    if requested_ids.len() != available_ids.len() {
+        return Err("the display topology changed; refresh the display list".to_string());
+    }
+    let mut seen = HashSet::new();
+    requested_ids
+        .iter()
+        .map(|requested_id| {
+            if !seen.insert(requested_id.as_str()) {
+                return Err("the display identifier request contains a duplicate".to_string());
+            }
+            available_ids
+                .iter()
+                .position(|available_id| available_id == requested_id)
+                .ok_or_else(|| "the display topology changed; refresh the display list".to_string())
+        })
+        .collect()
+}
+
+fn display_identifier_url(
+    host: &tauri::WebviewWindow,
+    number: usize,
+    theme: &str,
+    language: &str,
+    role: &str,
+) -> Result<tauri::Url, String> {
+    let mut url = host.url().map_err(|error| error.to_string())?;
+    if crate::backend_process::parsed_http_origin(url.as_str()).is_none() {
+        return Err("the Host is not using the local bilikara origin".to_string());
+    }
+    url.set_path("/display-identifier.html");
+    url.set_query(None);
+    url.set_fragment(None);
+    url.query_pairs_mut()
+        .append_pair("number", &number.to_string())
+        .append_pair("theme", theme)
+        .append_pair("language", language)
+        .append_pair("role", role);
+    Ok(url)
+}
+
+fn display_identifier_margin_offset(
+    work_area_extent: u32,
+    window_extent: u32,
+    scale_factor: f64,
+) -> i32 {
+    let available = work_area_extent.saturating_sub(window_extent);
+    let requested = (DISPLAY_IDENTIFIER_MARGIN * scale_factor).round().max(0.0) as u32;
+    requested.min(available) as i32
+}
+
+fn native_window_entry_url(
+    mut url: tauri::Url,
+    host_cookie: Option<&str>,
+) -> Result<tauri::Url, String> {
+    if let Some(cookie) = host_cookie {
+        let page = match url.path() {
+            "/display-identifier.html" => "display-identifier",
+            "/controller.html" => "controller",
+            _ => return Err("invalid native window entry page".to_string()),
+        };
+        let token = cookie
+            .strip_prefix("bilikara_native=")
+            .filter(|token| {
+                !token.is_empty()
+                    && token
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+            })
+            .ok_or_else(|| "invalid native Host credential".to_string())?;
+        // A new WebView's initial navigation may not send the Strict Host
+        // cookie, even when it shares a data store. Commit the authenticated
+        // entry document first, then navigate to the fixed window document.
+        url.set_path(&format!("/bootstrap/{token}"));
+        url.query_pairs_mut().append_pair("page", page);
+    }
+    Ok(url)
+}
+
+fn close_display_identifier_labels(app: &tauri::AppHandle, labels: &[String]) {
+    for label in labels {
+        if let Some(window) = app.get_webview_window(label) {
+            let _ = window.close();
+        }
+    }
+}
+
+fn close_display_identifier_windows(app: &tauri::AppHandle) {
+    let labels = app
+        .webview_windows()
+        .keys()
+        .filter(|label| label.starts_with(DISPLAY_IDENTIFIER_WINDOW_PREFIX))
+        .cloned()
+        .collect::<Vec<_>>();
+    close_display_identifier_labels(app, &labels);
+}
+
+fn create_display_identifier_window(
+    app: &tauri::AppHandle,
+    host: &tauri::WebviewWindow,
+    record: &PresentationDisplayRecord,
+    number: usize,
+    generation: u64,
+    theme: &str,
+    language: &str,
+) -> Result<String, String> {
+    let role = if record.display.controller {
+        "host"
+    } else if record.display.selectable {
+        "audience"
+    } else {
+        "unavailable"
+    };
+    let target = display_identifier_url(host, number, theme, language, role)?;
+    let host_cookie = app
+        .state::<crate::backend_process::BackendProcess>()
+        .host_cookie();
+    let url = native_window_entry_url(target, host_cookie.as_deref())?;
+    let allowed_origin = url.clone();
+    let work_area = record.monitor.work_area();
+    let scale_factor = record.monitor.scale_factor().clamp(0.5, 8.0);
+    let width =
+        ((DISPLAY_IDENTIFIER_WIDTH * scale_factor).round() as u32).min(work_area.size.width.max(1));
+    let height = ((DISPLAY_IDENTIFIER_HEIGHT * scale_factor).round() as u32)
+        .min(work_area.size.height.max(1));
+    let position = tauri::PhysicalPosition::new(
+        work_area
+            .position
+            .x
+            .saturating_add(display_identifier_margin_offset(
+                work_area.size.width,
+                width,
+                scale_factor,
+            )),
+        work_area
+            .position
+            .y
+            .saturating_add(display_identifier_margin_offset(
+                work_area.size.height,
+                height,
+                scale_factor,
+            )),
+    );
+    let size = tauri::PhysicalSize::new(width, height);
+    let label = format!("{DISPLAY_IDENTIFIER_WINDOW_PREFIX}{generation}-{number}");
+    let builder = WebviewWindowBuilder::new(app, &label, WebviewUrl::External(url));
+    #[cfg(windows)]
+    let builder = builder.data_directory(crate::desktop_storage::webview_directory(app.config())?);
+    #[cfg(windows)]
+    let builder =
+        builder.additional_browser_args(crate::desktop_storage::WINDOWS_WEBVIEW_BROWSER_ARGS);
+    let window = builder
+        .on_navigation(move |candidate| {
+            crate::backend_process::window_origin_authorized(
+                candidate.as_str(),
+                allowed_origin.as_str(),
+            )
+        })
+        .on_page_load(move |window, payload| {
+            if payload.event() == PageLoadEvent::Finished
+                && payload.url().path() == "/display-identifier.html"
+            {
+                let _ = window.set_size(size);
+                let _ = window.set_position(position);
+                let _ = window.show();
+                let _ = window.set_ignore_cursor_events(true);
+            }
+        })
+        .title(format!("bilikara Display {number}"))
+        .visible(false)
+        .decorations(false)
+        .resizable(false)
+        .maximizable(false)
+        .minimizable(false)
+        .closable(false)
+        .focused(false)
+        .focusable(false)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .transparent(true)
+        .shadow(false)
+        .background_color(tauri::window::Color(0, 0, 0, 0))
+        .inner_size(DISPLAY_IDENTIFIER_WIDTH, DISPLAY_IDENTIFIER_HEIGHT)
+        .build()
+        .map_err(|error| error.to_string())?;
+    let _ = window.set_size(size);
+    let _ = window.set_position(position);
+    // GTK needs a realized GdkWindow before applying the input region. Hidden
+    // Linux windows get their pass-through region after show() in page load.
+    #[cfg(not(target_os = "linux"))]
+    let _ = window.set_ignore_cursor_events(true);
+    Ok(label)
+}
+
+#[tauri::command]
+pub(crate) async fn show_presentation_display_identifiers(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    backend: tauri::State<'_, crate::backend_process::BackendProcess>,
+    state: tauri::State<'_, PresentationState>,
+    display_ids: Vec<String>,
+    theme: String,
+    language: String,
+) -> Result<(), String> {
+    authorize_window(&window, &backend, &["main"])?;
+    if state.snapshot()?.phase != PresentationPhase::Inactive {
+        return Err("display identifiers are unavailable during presentation".to_string());
+    }
+    let generation = DISPLAY_IDENTIFIER_GENERATION
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1);
+    let identifier_host = window.clone();
+    // Converting GTK monitor handles reads GDK geometry. Perform that work on
+    // the UI thread rather than the asynchronous command worker.
+    let records =
+        run_on_main_thread_with_result(&app, generation, "identify-displays", move || {
+            discover_display_records(&identifier_host)
+        })?;
+    let available_ids = records
+        .iter()
+        .map(|record| record.display.id.clone())
+        .collect::<Vec<_>>();
+    let order = validate_display_identifier_order(&available_ids, &display_ids)?;
+    let theme = normalized_display_identifier_theme(&theme);
+    let language = normalized_display_identifier_language(&language);
+    close_display_identifier_windows(&app);
+    let mut labels = Vec::with_capacity(order.len());
+    let mut seen_origins = HashSet::new();
+    for (order_index, record_index) in order.into_iter().enumerate() {
+        let record = &records[record_index];
+        let origin = (record.display.position_x, record.display.position_y);
+        if !seen_origins.insert(origin) {
+            continue;
+        }
+        match create_display_identifier_window(
+            &app,
+            &window,
+            record,
+            order_index + 1,
+            generation,
+            theme,
+            language,
+        ) {
+            Ok(label) => labels.push(label),
+            Err(error) => {
+                close_display_identifier_labels(&app, &labels);
+                return Err(error);
+            }
+        }
+    }
+    let expiry_app = app.clone();
+    let expiry_labels = labels.clone();
+    // Keep the invocation pending until the numbered windows close, so the
+    // Host's existing asynchronous guard covers their complete display time.
+    tauri::async_runtime::spawn_blocking(move || {
+        std::thread::sleep(DISPLAY_IDENTIFIER_LIFETIME);
+        close_display_identifier_labels(&expiry_app, &expiry_labels);
+    })
+    .await
+    .map_err(|error| {
+        close_display_identifier_labels(&app, &labels);
+        format!("failed to finish display identifier cleanup: {error}")
+    })?;
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) fn dismiss_presentation_display_identifiers(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    backend: tauri::State<'_, crate::backend_process::BackendProcess>,
+) -> Result<(), String> {
+    authorize_window(&window, &backend, &["main"])?;
+    close_display_identifier_windows(&app);
+    Ok(())
+}
+
+fn capture_host_placement(window: &tauri::WebviewWindow) -> Result<HostWindowPlacement, String> {
+    Ok(HostWindowPlacement {
+        position: window.outer_position().map_err(|error| error.to_string())?,
+        size: window.inner_size().map_err(|error| error.to_string())?,
+        decorations: window.is_decorated().map_err(|error| error.to_string())?,
+        resizable: window.is_resizable().map_err(|error| error.to_string())?,
+        fullscreen: window.is_fullscreen().map_err(|error| error.to_string())?,
+        maximized: window.is_maximized().map_err(|error| error.to_string())?,
+    })
+}
+
+fn run_activation_window_mutation(
+    app: &tauri::AppHandle,
+    state: &PresentationState,
+    generation: u64,
+    action: &str,
+    operation: impl FnOnce() -> tauri::Result<()>,
+) -> Result<(), String> {
+    trace_presentation(
+        app,
+        Some(generation),
+        "window_mutation_begin",
+        format!("action={action}"),
+    );
+    let result = (|| {
+        state.ensure_activation_native_owner(generation)?;
+        operation().map_err(|error| format!("{action}: {error}"))
+    })();
+    trace_presentation(
+        app,
+        Some(generation),
+        "window_mutation_end",
+        format!(
+            "action={} status={}",
+            action,
+            if result.is_ok() { "ok" } else { "error" }
+        ),
+    );
+    result
+}
+
+fn place_host_for_activation(
+    app: &tauri::AppHandle,
+    window: &tauri::WebviewWindow,
+    monitor: &tauri::window::Monitor,
+    placement: &HostWindowPlacement,
+    state: &PresentationState,
+    generation: u64,
+) -> Result<(), String> {
+    let work = monitor.work_area();
+    let width = placement.size.width.min(work.size.width);
+    let height = placement.size.height.min(work.size.height);
+    let x = work.position.x + (work.size.width.saturating_sub(width) / 2) as i32;
+    let y = work.position.y + (work.size.height.saturating_sub(height) / 2) as i32;
+    run_activation_window_mutation(app, state, generation, "leave fullscreen", || {
+        window.set_fullscreen(false)
+    })?;
+    run_activation_window_mutation(app, state, generation, "unminimize Host", || {
+        window.unminimize()
+    })?;
+    run_activation_window_mutation(app, state, generation, "unmaximize Host", || {
+        window.unmaximize()
+    })?;
+    run_activation_window_mutation(app, state, generation, "position Host", || {
+        window.set_position(tauri::PhysicalPosition::new(x, y))
+    })?;
+    run_activation_window_mutation(app, state, generation, "resize Host", || {
+        window.set_size(tauri::PhysicalSize::new(width, height))
+    })?;
+    if placement.maximized || placement.fullscreen {
+        run_activation_window_mutation(app, state, generation, "maximize Host", || {
+            window.maximize()
+        })?;
+    }
+    run_activation_window_mutation(app, state, generation, "show Host", || window.show())?;
+    run_activation_window_mutation(app, state, generation, "focus Host", || window.set_focus())
+}
+
+fn collect_recovery_window_mutation(
+    state: &PresentationState,
+    generation: u64,
+    action: &str,
+    operation: impl FnOnce() -> tauri::Result<()>,
+    errors: &mut Vec<String>,
+) {
+    if let Err(error) = state
+        .ensure_recovery_native_owner(generation)
+        .and_then(|_| operation().map_err(|error| error.to_string()))
+    {
+        errors.push(format!("{action}: {error}"));
+    }
+}
+
+fn visible_restore_placement(
+    original: &HostWindowPlacement,
+    monitors: &[MonitorGeometry],
+    primary_work_area: Option<(tauri::PhysicalPosition<i32>, tauri::PhysicalSize<u32>)>,
+) -> (tauri::PhysicalPosition<i32>, tauri::PhysicalSize<u32>, bool) {
+    let original_geometry = MonitorGeometry {
+        x: original.position.x,
+        y: original.position.y,
+        width: original.size.width,
+        height: original.size.height,
+    };
+    if monitors
+        .iter()
+        .any(|monitor| original_geometry.intersects(*monitor))
+    {
+        return (original.position, original.size, true);
+    }
+    let Some((work_position, work_size)) = primary_work_area else {
+        return (original.position, original.size, false);
+    };
+    let width = original.size.width.max(640).min(work_size.width);
+    let height = original.size.height.max(480).min(work_size.height);
+    let x = work_position.x + (work_size.width.saturating_sub(width) / 2) as i32;
+    let y = work_position.y + (work_size.height.saturating_sub(height) / 2) as i32;
+    (
+        tauri::PhysicalPosition::new(x, y),
+        tauri::PhysicalSize::new(width, height),
+        false,
+    )
+}
+
+fn restore_host_window(
+    window: &tauri::WebviewWindow,
+    placement: &HostWindowPlacement,
+    preserve_original_fullscreen: bool,
+    state: &PresentationState,
+    generation: u64,
+) -> Result<(), String> {
+    state.ensure_recovery_native_owner(generation)?;
+    let monitors = window
+        .available_monitors()
+        .map_err(|error| error.to_string())?;
+    let primary = window
+        .primary_monitor()
+        .map_err(|error| error.to_string())?;
+    let monitor_geometries = monitors
+        .iter()
+        .map(MonitorGeometry::from_monitor)
+        .collect::<Vec<_>>();
+    let primary_work_area = primary.as_ref().map(|monitor| {
+        let work = monitor.work_area();
+        (work.position, work.size)
+    });
+    let (position, size, original_is_visible) =
+        visible_restore_placement(placement, &monitor_geometries, primary_work_area);
+    let mut errors = Vec::new();
+    collect_recovery_window_mutation(
+        state,
+        generation,
+        "leave fullscreen",
+        || window.set_fullscreen(false),
+        &mut errors,
+    );
+    collect_recovery_window_mutation(
+        state,
+        generation,
+        "leave maximized state",
+        || window.unmaximize(),
+        &mut errors,
+    );
+    collect_recovery_window_mutation(
+        state,
+        generation,
+        "restore decorations",
+        || window.set_decorations(placement.decorations),
+        &mut errors,
+    );
+    collect_recovery_window_mutation(
+        state,
+        generation,
+        "restore resizable state",
+        || window.set_resizable(placement.resizable),
+        &mut errors,
+    );
+    collect_recovery_window_mutation(
+        state,
+        generation,
+        "restore position",
+        || window.set_position(position),
+        &mut errors,
+    );
+    collect_recovery_window_mutation(
+        state,
+        generation,
+        "restore size",
+        || window.set_size(size),
+        &mut errors,
+    );
+    collect_recovery_window_mutation(
+        state,
+        generation,
+        "show Host",
+        || window.show(),
+        &mut errors,
+    );
+    if preserve_original_fullscreen && original_is_visible {
+        if placement.maximized {
+            collect_recovery_window_mutation(
+                state,
+                generation,
+                "restore maximized state",
+                || window.maximize(),
+                &mut errors,
+            );
+        }
+        if placement.fullscreen {
+            collect_recovery_window_mutation(
+                state,
+                generation,
+                "restore fullscreen state",
+                || window.set_fullscreen(true),
+                &mut errors,
+            );
+        }
+    }
+    collect_recovery_window_mutation(
+        state,
+        generation,
+        "focus Host",
+        || window.set_focus(),
+        &mut errors,
+    );
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+fn controller_url(host: &tauri::WebviewWindow, generation: u64) -> Result<tauri::Url, String> {
+    let mut url = host.url().map_err(|error| error.to_string())?;
+    if crate::backend_process::parsed_http_origin(url.as_str()).is_none() {
+        return Err("the Host is not using the local bilikara origin".to_string());
+    }
+    url.set_path("/controller.html");
+    url.set_query(Some(&format!("presentationGeneration={generation}")));
+    url.set_fragment(None);
+    Ok(url)
+}
+
+fn create_controller_window(
+    app: &tauri::AppHandle,
+    host: &tauri::WebviewWindow,
+    generation: u64,
+) -> Result<tauri::WebviewWindow, String> {
+    if app.get_webview_window("controller").is_some() {
+        return Err("the Controller window already exists".to_string());
+    }
+    let target = controller_url(host, generation)?;
+    let host_cookie = app
+        .state::<crate::backend_process::BackendProcess>()
+        .host_cookie();
+    let url = native_window_entry_url(target, host_cookie.as_deref())?;
+    let allowed_origin = url.clone();
+    let builder = WebviewWindowBuilder::new(app, "controller", WebviewUrl::External(url));
+    #[cfg(windows)]
+    let builder = builder.data_directory(crate::desktop_storage::webview_directory(app.config())?);
+    #[cfg(windows)]
+    let builder =
+        builder.additional_browser_args(crate::desktop_storage::WINDOWS_WEBVIEW_BROWSER_ARGS);
+    builder
+        .on_navigation(move |candidate| {
+            crate::backend_process::window_origin_authorized(
+                candidate.as_str(),
+                allowed_origin.as_str(),
+            )
+        })
+        .title("bilikara Stage")
+        .visible(false)
+        .decorations(false)
+        .resizable(false)
+        .focused(false)
+        .inner_size(CONTROLLER_WIDTH, CONTROLLER_HEIGHT)
+        .build()
+        .map_err(|error| error.to_string())
+}
+
+fn place_controller_for_activation(
+    app: &tauri::AppHandle,
+    controller: &tauri::WebviewWindow,
+    target: &tauri::window::Monitor,
+    state: &PresentationState,
+    generation: u64,
+) -> Result<(), String> {
+    let position = *target.position();
+    let size = *target.size();
+    run_activation_window_mutation(app, state, generation, "resize output window", || {
+        controller.set_size(size)
+    })?;
+    run_activation_window_mutation(app, state, generation, "position output window", || {
+        controller.set_position(position)
+    })?;
+    run_activation_window_mutation(app, state, generation, "fullscreen output window", || {
+        controller.set_fullscreen(true)
+    })
+}
+
+pub(crate) fn authorize_window(
+    window: &tauri::WebviewWindow,
+    backend: &crate::backend_process::BackendProcess,
+    allowed_labels: &[&str],
+) -> Result<(), String> {
+    if !allowed_labels.contains(&window.label()) {
+        return Err("this window is not authorized for the presentation command".to_string());
+    }
+    let backend_url = backend
+        .backend_url()
+        .map_err(|()| "the backend address lock is unavailable".to_string())?
+        .ok_or_else(|| "the local backend is not ready".to_string())?;
+    let window_url = window.url().map_err(|error| error.to_string())?;
+    if !crate::backend_process::window_origin_authorized(window_url.as_str(), &backend_url) {
+        return Err("the window origin is not authorized".to_string());
+    }
+    Ok(())
+}
+
+fn emit_state(app: &tauri::AppHandle, session: &PresentationSession) -> Result<(), String> {
+    let payload = PresentationStateEvent {
+        session: session.clone(),
+    };
+    app.emit_to("main", STATE_EVENT, &payload)
+        .map_err(|error| error.to_string())?;
+    if app.get_webview_window("controller").is_some() {
+        app.emit_to("controller", STATE_EVENT, &payload)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn emit_composition(
+    app: &tauri::AppHandle,
+    generation: u64,
+    composition: HostComposition,
+) -> Result<(), String> {
+    app.emit_to(
+        "main",
+        HOST_COMPOSITION_EVENT,
+        HostCompositionEvent {
+            generation,
+            composition,
+        },
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn emit_host_command(
+    app: &tauri::AppHandle,
+    command: &ControllerCommandEnvelope,
+) -> Result<(), String> {
+    app.emit_to("main", HOST_COMMAND_EVENT, command)
+        .map_err(|error| error.to_string())
+}
+
+fn emit_playback_state(
+    app: &tauri::AppHandle,
+    playback_state: &ControllerPlaybackStateEnvelope,
+) -> Result<(), String> {
+    if app.get_webview_window("controller").is_none() {
+        return Ok(());
+    }
+    app.emit_to("controller", PLAYBACK_STATE_EVENT, playback_state)
+        .map_err(|error| error.to_string())
+}
+
+fn validate_output_state(envelope: &serde_json::Value, generation: u64) -> Result<(), String> {
+    let object = envelope
+        .as_object()
+        .ok_or_else(|| "presentation output state must be an object".to_string())?;
+    if object.get("type").and_then(serde_json::Value::as_str) != Some("master-state") {
+        return Err("presentation output state has an unsupported type".to_string());
+    }
+    if envelope["payload"]["scene"]["generation"].as_u64() != Some(generation) {
+        return Err("presentation output state belongs to another generation".to_string());
+    }
+    let size = serde_json::to_vec(envelope)
+        .map_err(|error| error.to_string())?
+        .len();
+    if size > MAX_OUTPUT_STATE_BYTES {
+        return Err("presentation output state is too large".to_string());
+    }
+    Ok(())
+}
+
+fn close_controller(app: &tauri::AppHandle) -> Result<(), String> {
+    if let Some(controller) = app.get_webview_window("controller") {
+        controller.close().map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn close_controller_for_recovery(
+    app: &tauri::AppHandle,
+    state: &PresentationState,
+    generation: u64,
+) -> Result<(), String> {
+    state.ensure_recovery_native_owner(generation)?;
+    close_controller(app)
+}
+
+fn restore_recovery_window(
+    app: &tauri::AppHandle,
+    state: &PresentationState,
+    generation: u64,
+    preserve_original_window_mode: bool,
+) -> Result<(), String> {
+    if state.host_window_restored(generation)? && !preserve_original_window_mode {
+        return Ok(());
+    }
+    if !state.recovery_host_was_relocated(generation)? {
+        return state.mark_host_window_restored(generation);
+    }
+    let host = app
+        .get_webview_window("main")
+        .ok_or_else(|| "main window is unavailable".to_string())?;
+    let placement = state
+        .recovery_placement(generation)?
+        .ok_or_else(|| "the original Host placement is unavailable".to_string())?;
+    restore_host_window(
+        &host,
+        &placement,
+        preserve_original_window_mode,
+        state,
+        generation,
+    )?;
+    state.mark_host_window_restored(generation)
+}
+
+fn finalize_recovery(
+    app: &tauri::AppHandle,
+    state: &PresentationState,
+    generation: u64,
+) -> Result<PresentationSession, String> {
+    trace_presentation(
+        app,
+        Some(generation),
+        "recovery_finalize_begin",
+        "forced=false",
+    );
+    state.ensure_recovery_native_owner(generation)?;
+    let session = state.snapshot()?;
+    if session.generation != generation || session.phase != PresentationPhase::Recovering {
+        return Err("presentation recovery generation is stale".to_string());
+    }
+    let preserve_original_window_mode = !matches!(
+        session.recovery_reason,
+        Some(PresentationRecoveryReason::DisplayDisconnected)
+    );
+    let restore_error =
+        restore_recovery_window(app, state, generation, preserve_original_window_mode).err();
+    trace_presentation(
+        app,
+        Some(generation),
+        "recovery_restore_end",
+        format!(
+            "forced=false status={}",
+            if restore_error.is_none() {
+                "ok"
+            } else {
+                "error"
+            }
+        ),
+    );
+    let close_error = close_controller_for_recovery(app, state, generation).err();
+    trace_presentation(
+        app,
+        Some(generation),
+        "recovery_controller_close_end",
+        format!(
+            "forced=false status={}",
+            if close_error.is_none() { "ok" } else { "error" }
+        ),
+    );
+    if let Some(restore_error) = restore_error {
+        let mut errors = vec![restore_error];
+        errors.extend(close_error);
+        return Err(errors.join("; "));
+    }
+    let inactive = state.complete_recovery(generation)?;
+    let state_error = emit_state(app, &inactive).err();
+    let errors = [close_error, state_error]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    if errors.is_empty() {
+        Ok(inactive)
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+fn force_finalize_recovery(
+    app: &tauri::AppHandle,
+    state: &PresentationState,
+    generation: u64,
+) -> Result<PresentationSession, String> {
+    trace_presentation(
+        app,
+        Some(generation),
+        "recovery_finalize_begin",
+        "forced=true",
+    );
+    state.ensure_recovery_native_owner(generation)?;
+    let session = state.snapshot()?;
+    if session.generation != generation || session.phase != PresentationPhase::Recovering {
+        return Err("presentation recovery generation is stale".to_string());
+    }
+    let preserve_original_window_mode = !matches!(
+        session.recovery_reason,
+        Some(PresentationRecoveryReason::DisplayDisconnected)
+    );
+    let composition_error = state
+        .ensure_recovery_native_owner(generation)
+        .and_then(|_| emit_composition(app, generation, HostComposition::Combined))
+        .err();
+    let restore_error =
+        restore_recovery_window(app, state, generation, preserve_original_window_mode).err();
+    trace_presentation(
+        app,
+        Some(generation),
+        "recovery_restore_end",
+        format!(
+            "forced=true status={}",
+            if restore_error.is_none() {
+                "ok"
+            } else {
+                "error"
+            }
+        ),
+    );
+    let close_error = close_controller_for_recovery(app, state, generation).err();
+    trace_presentation(
+        app,
+        Some(generation),
+        "recovery_controller_close_end",
+        format!(
+            "forced=true status={}",
+            if close_error.is_none() { "ok" } else { "error" }
+        ),
+    );
+    let inactive = state.force_complete_recovery(generation)?;
+    let state_error = emit_state(app, &inactive).err();
+    let errors = [composition_error, restore_error, close_error, state_error]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    if errors.is_empty() {
+        Ok(inactive)
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+fn start_recovery_finalization_deadline(app: tauri::AppHandle, generation: u64) {
+    std::thread::spawn(move || {
+        std::thread::sleep(RECOVERY_FINALIZATION_TIMEOUT);
+        let state = app.state::<PresentationState>();
+        let Ok(session) = state.snapshot() else {
+            return;
+        };
+        if session.generation != generation || session.phase != PresentationPhase::Recovering {
+            return;
+        }
+        let callback_app = app.clone();
+        let dispatcher = app.clone();
+        if let Err(error) = dispatcher.run_on_main_thread(move || {
+            let state = callback_app.state::<PresentationState>();
+            if let Err(error) = force_finalize_recovery(&callback_app, &state, generation) {
+                eprintln!(
+                    "Forced presentation recovery generation {generation} completed with errors: {error}"
+                );
+            }
+        }) {
+            let state = app.state::<PresentationState>();
+            let _ = state.force_complete_recovery(generation);
+            eprintln!("Failed to schedule forced presentation recovery: {error}");
+        }
+    });
+}
+
+fn begin_recovery_transaction(
+    app: &tauri::AppHandle,
+    state: &PresentationState,
+    expected_generation: u64,
+    reason: PresentationRecoveryReason,
+) -> Result<PresentationSession, String> {
+    let claim = state.begin_recovery(Some(expected_generation), reason)?;
+    trace_presentation(
+        app,
+        Some(claim.session.generation),
+        "recovery_claimed",
+        format!(
+            "reason={reason:?} started={} owns_native_lifecycle={}",
+            claim.started, claim.owns_native_lifecycle
+        ),
+    );
+    if !claim.started || !claim.owns_native_lifecycle {
+        return Ok(claim.session);
+    }
+    let recovering = claim.session;
+    start_recovery_finalization_deadline(app.clone(), recovering.generation);
+    trace_presentation(
+        app,
+        Some(recovering.generation),
+        "recovery_restore_begin",
+        "forced=false initial=true",
+    );
+    let restore_error = restore_recovery_window(app, state, recovering.generation, false).err();
+    trace_presentation(
+        app,
+        Some(recovering.generation),
+        "recovery_restore_end",
+        format!(
+            "forced=false initial=true status={}",
+            if restore_error.is_none() {
+                "ok"
+            } else {
+                "error"
+            }
+        ),
+    );
+    let state_error = state
+        .ensure_recovery_native_owner(recovering.generation)
+        .and_then(|_| emit_state(app, &recovering))
+        .err();
+    let composition_error = state
+        .ensure_recovery_native_owner(recovering.generation)
+        .and_then(|_| emit_composition(app, recovering.generation, HostComposition::Combined))
+        .err();
+    let errors = [restore_error, state_error, composition_error]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    if errors.is_empty() {
+        Ok(recovering)
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+fn recover_after_activation_failure(
+    app: &tauri::AppHandle,
+    state: &PresentationState,
+    generation: u64,
+    error: impl AsRef<str>,
+) -> String {
+    match begin_recovery_transaction(
+        app,
+        state,
+        generation,
+        PresentationRecoveryReason::ActivationFailed,
+    ) {
+        Ok(_) => error.as_ref().to_string(),
+        Err(recovery_error) => format!(
+            "{}; activation recovery failed: {recovery_error}",
+            error.as_ref()
+        ),
+    }
+}
+
+fn deliver_main_thread_operation_result<T>(
+    sender: std::sync::mpsc::SyncSender<Result<T, String>>,
+    result: Result<T, String>,
+    completion_diagnostic: impl FnOnce(bool),
+) {
+    let succeeded = result.is_ok();
+    let _ = sender.send(result);
+    completion_diagnostic(succeeded);
+}
+
+fn run_on_main_thread_with_result<T: Send + 'static>(
+    app: &tauri::AppHandle,
+    generation: u64,
+    operation_name: &'static str,
+    operation: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    // In pinned Tauri 2.11, `#[command(async)]` runs this command body through
+    // `async_runtime::spawn`. Only that worker waits; the main-thread closure never waits on it.
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    trace_presentation(
+        app,
+        Some(generation),
+        "main_thread_schedule_begin",
+        format!("operation={operation_name}"),
+    );
+    let callback_app = app.clone();
+    app.run_on_main_thread(move || {
+        trace_presentation(
+            &callback_app,
+            Some(generation),
+            "main_thread_operation_begin",
+            format!("operation={operation_name}"),
+        );
+        let result = operation();
+        deliver_main_thread_operation_result(sender, result, |succeeded| {
+            trace_presentation(
+                &callback_app,
+                Some(generation),
+                "main_thread_operation_end",
+                format!(
+                    "operation={} status={}",
+                    operation_name,
+                    if succeeded { "ok" } else { "error" }
+                ),
+            );
+        });
+    })
+    .map_err(|error| format!("failed to schedule presentation lifecycle work: {error}"))?;
+    trace_presentation(
+        app,
+        Some(generation),
+        "main_thread_result_wait_begin",
+        format!("operation={operation_name}"),
+    );
+    let result = receiver
+        .recv()
+        .map_err(|error| format!("presentation lifecycle work did not return a result: {error}"))?;
+    trace_presentation(
+        app,
+        Some(generation),
+        "main_thread_result_wait_end",
+        format!(
+            "operation={} status={}",
+            operation_name,
+            if result.is_ok() { "ok" } else { "error" }
+        ),
+    );
+    result
+}
+
+#[tauri::command]
+pub(crate) fn get_presentation_displays(
+    window: tauri::WebviewWindow,
+    backend: tauri::State<'_, crate::backend_process::BackendProcess>,
+) -> Result<PresentationDisplayInfo, String> {
+    authorize_window(&window, &backend, &["main"])?;
+    let records = discover_display_records(&window)?;
+    Ok(display_info(&records))
+}
+
+#[tauri::command]
+pub(crate) fn get_presentation_session(
+    window: tauri::WebviewWindow,
+    backend: tauri::State<'_, crate::backend_process::BackendProcess>,
+    state: tauri::State<'_, PresentationState>,
+) -> Result<PresentationSession, String> {
+    authorize_window(&window, &backend, &["main", "controller"])?;
+    state.snapshot()
+}
+
+// Controller construction must not run inline in the WebView IPC callback. Tauri documents
+// WebviewWindowBuilder as deadlocking on Windows from synchronous commands/event handlers.
+#[tauri::command(async)]
+pub(crate) fn activate_local_presentation(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    backend: tauri::State<'_, crate::backend_process::BackendProcess>,
+    state: tauri::State<'_, PresentationState>,
+    display_id: String,
+    host_display_id: Option<String>,
+) -> Result<PresentationSession, String> {
+    trace_presentation(
+        &app,
+        None,
+        "activation_command_begin",
+        format!("window={}", window.label()),
+    );
+    authorize_window(&window, &backend, &["main"])?;
+    let requested_display_id = display_id.trim();
+    if requested_display_id.is_empty() || requested_display_id.len() > 1024 {
+        return Err("a valid presentation display must be selected".to_string());
+    }
+    let records = discover_display_records(&window)?;
+    let target = records
+        .iter()
+        .find(|record| record.display.id == requested_display_id && record.display.selectable)
+        .cloned()
+        .ok_or_else(|| "the selected presentation display is unavailable".to_string())?;
+    let current_host = records
+        .iter()
+        .find(|record| record.display.controller)
+        .cloned()
+        .ok_or_else(|| "the current Host display is unavailable".to_string())?;
+    let requested_host_display_id = host_display_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if requested_host_display_id.is_some_and(|value| value.len() > 1024) {
+        return Err("the Host display identity is invalid".to_string());
+    }
+    let host_target = if target.display.id == current_host.display.id {
+        let alternatives = records
+            .iter()
+            .filter(|record| {
+                record.display.id != target.display.id
+                    && record.display.identity_stable
+                    && !record.display.mirrored
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let selected = requested_host_display_id
+            .and_then(|requested| {
+                alternatives
+                    .iter()
+                    .find(|record| record.display.id == requested)
+                    .cloned()
+            })
+            .or_else(|| {
+                alternatives
+                    .iter()
+                    .find(|record| record.display.built_in)
+                    .cloned()
+            });
+        Some(selected.ok_or_else(|| {
+            "the Host destination display must be confirmed before using its current display for output"
+                .to_string()
+        })?)
+    } else {
+        None
+    };
+    close_display_identifier_windows(&app);
+    let placement = capture_host_placement(&window)?;
+    let activating = state.begin_activation(
+        target.display.id.clone(),
+        host_target
+            .as_ref()
+            .map(|record| record.display.id.clone())
+            .unwrap_or_else(|| current_host.display.id.clone()),
+        placement.clone(),
+        host_target.is_some(),
+    )?;
+    trace_presentation(
+        &app,
+        Some(activating.generation),
+        "activation_state_begun",
+        format!("display_count={}", records.len()),
+    );
+    let activation_attempt = ActivationAttemptGuard::new(&state, activating.generation);
+    trace_presentation(
+        &app,
+        Some(activating.generation),
+        "controller_build_begin",
+        "",
+    );
+    let controller_result = create_controller_window(&app, &window, activating.generation);
+    trace_presentation(
+        &app,
+        Some(activating.generation),
+        "controller_build_end",
+        format!(
+            "status={}",
+            if controller_result.is_ok() {
+                "ok"
+            } else {
+                "error"
+            }
+        ),
+    );
+    let activation_result = controller_result
+        .map_err(|error| format!("failed to create Controller: {error}"))
+        .and_then(|controller| {
+            let lifecycle_app = app.clone();
+            let host = window.clone();
+            let target_monitor = target.monitor.clone();
+            let host_target_monitor = host_target.map(|record| record.monitor);
+            let selected_display_id = target.display.id.clone();
+            let placement = placement.clone();
+            let activating = activating.clone();
+            run_on_main_thread_with_result(&app, activating.generation, "activate", move || {
+                let state = lifecycle_app.state::<PresentationState>();
+                state.ensure_activation_native_owner(activating.generation)?;
+                place_controller_for_activation(
+                    &lifecycle_app,
+                    &controller,
+                    &target_monitor,
+                    &state,
+                    activating.generation,
+                )?;
+                if let Some(host_monitor) = host_target_monitor.as_ref() {
+                    place_host_for_activation(
+                        &lifecycle_app,
+                        &host,
+                        host_monitor,
+                        &placement,
+                        &state,
+                        activating.generation,
+                    )?;
+                }
+                state.ensure_activation_native_owner(activating.generation)?;
+                let placement_is_valid = discover_display_records(&host)
+                    .map_err(|error| format!("failed to verify presentation placement: {error}"))?
+                    .iter()
+                    .any(|record| {
+                        record.display.id == selected_display_id && record.display.selectable
+                    });
+                if !placement_is_valid {
+                    return Err(
+                        "the selected presentation display changed during placement".to_string()
+                    );
+                }
+                let activating = state
+                    .mark_placement_prepared(activating.generation)
+                    .map_err(|error| format!("failed to commit presentation placement: {error}"))?;
+                run_activation_window_mutation(
+                    &lifecycle_app,
+                    &state,
+                    activating.generation,
+                    "show Controller",
+                    || controller.show(),
+                )?;
+                state.ensure_activation_native_owner(activating.generation)?;
+                emit_state(&lifecycle_app, &activating)
+                    .map_err(|error| format!("failed to publish activating state: {error}"))?;
+                state.ensure_activation_native_owner(activating.generation)?;
+                emit_composition(
+                    &lifecycle_app,
+                    activating.generation,
+                    HostComposition::StageOnly,
+                )
+                .map_err(|error| format!("failed to publish Stage-only composition: {error}"))?;
+                let (_, should_finalize) =
+                    state
+                        .mark_activation_published(activating.generation)
+                        .map_err(|error| format!("failed to publish activation: {error}"))?;
+                start_generation_watchers(
+                    lifecycle_app.clone(),
+                    activating.generation,
+                    selected_display_id,
+                );
+                complete_activation_if_ready(
+                    &lifecycle_app,
+                    &state,
+                    activating.generation,
+                    should_finalize,
+                )
+            })
+        });
+    let settled = settle_activation_attempt(
+        &app,
+        &state,
+        activating.generation,
+        activation_attempt,
+        activation_result,
+    );
+    trace_presentation(
+        &app,
+        Some(activating.generation),
+        "activation_command_end",
+        format!("status={}", if settled.is_ok() { "ok" } else { "error" }),
+    );
+    settled
+}
+
+fn settle_activation_attempt(
+    app: &tauri::AppHandle,
+    state: &PresentationState,
+    generation: u64,
+    activation_attempt: ActivationAttemptGuard<'_>,
+    result: Result<PresentationSession, String>,
+) -> Result<PresentationSession, String> {
+    let mut error = result.as_ref().err().cloned();
+    if error.is_some()
+        && let Ok(session) = state.snapshot()
+        && session.generation == generation
+        && matches!(
+            session.phase,
+            PresentationPhase::Activating | PresentationPhase::Active
+        )
+        && let Err(recovery_error) = state.begin_recovery(
+            Some(generation),
+            PresentationRecoveryReason::ActivationFailed,
+        )
+    {
+        let message = format!("activation recovery claim failed: {recovery_error}");
+        error = Some(match error {
+            Some(error) => format!("{error}; {message}"),
+            None => message,
+        });
+    }
+    let deferred_recovery = match activation_attempt.finish() {
+        Ok(deferred_recovery) => deferred_recovery,
+        Err(settlement_error) => {
+            let message = format!("activation attempt settlement failed: {settlement_error}");
+            error = Some(match error {
+                Some(error) => format!("{error}; {message}"),
+                None => message,
+            });
+            None
+        }
+    };
+    if let Some(recovery_generation) = deferred_recovery {
+        let recovery_app = app.clone();
+        if let Err(recovery_error) = run_on_main_thread_with_result(
+            app,
+            recovery_generation,
+            "deferred_recovery",
+            move || {
+                let state = recovery_app.state::<PresentationState>();
+                force_finalize_recovery(&recovery_app, &state, recovery_generation)
+            },
+        ) {
+            let message = format!("deferred activation recovery failed: {recovery_error}");
+            error = Some(match error {
+                Some(error) => format!("{error}; {message}"),
+                None => message,
+            });
+        } else if error.is_none() {
+            error = Some("presentation activation was interrupted before it settled".to_string());
+        }
+    }
+    match error {
+        Some(error) => Err(error),
+        None => result,
+    }
+}
+
+fn complete_activation_if_ready(
+    app: &tauri::AppHandle,
+    state: &PresentationState,
+    generation: u64,
+    should_finalize: bool,
+) -> Result<PresentationSession, String> {
+    if !should_finalize {
+        return state.snapshot();
+    }
+    let result = (|| {
+        state.ensure_activation_native_owner(generation)?;
+        let host = app
+            .get_webview_window("main")
+            .ok_or_else(|| "main window is unavailable".to_string())?;
+        let session = state.snapshot()?;
+        let selected_id = session
+            .selected_output_display_id
+            .as_deref()
+            .ok_or_else(|| "the presentation display identity is unavailable".to_string())?;
+        state.ensure_activation_native_owner(generation)?;
+        let target_is_still_valid = discover_display_records(&host)?.iter().any(|record| {
+            record.display.id == selected_id
+                && record.display.identity_stable
+                && !record.display.mirrored
+        });
+        if !target_is_still_valid {
+            return Err("the selected presentation display changed before activation".to_string());
+        }
+        let active = state.complete_activation(generation)?;
+        emit_state(app, &active)
+            .map_err(|error| format!("failed to publish active presentation state: {error}"))?;
+        state.ensure_active_generation(generation)?;
+        host.set_focus()
+            .map_err(|error| format!("failed to focus Host: {error}"))?;
+        Ok(active)
+    })();
+    result.map_err(|error| recover_after_activation_failure(app, state, generation, error))
+}
+
+fn run_activation_readiness_step<T>(
+    should_finalize: bool,
+    operation: impl FnOnce() -> Result<T, String>,
+    recover: impl FnOnce(String) -> String,
+) -> Result<T, String> {
+    operation().map_err(|error| {
+        if should_finalize {
+            recover(error)
+        } else {
+            error
+        }
+    })
+}
+
+#[tauri::command]
+pub(crate) fn mark_presentation_host_ready(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    backend: tauri::State<'_, crate::backend_process::BackendProcess>,
+    state: tauri::State<'_, PresentationState>,
+    generation: u64,
+    composition: HostComposition,
+) -> Result<PresentationSession, String> {
+    authorize_window(&window, &backend, &["main"])?;
+    match composition {
+        HostComposition::StageOnly => {
+            let (ready, should_finalize) = state.mark_ready(generation, WindowRole::Host)?;
+            run_activation_readiness_step(
+                should_finalize,
+                || {
+                    emit_state(&app, &ready)
+                        .map_err(|error| format!("failed to publish Host readiness: {error}"))
+                },
+                |error| recover_after_activation_failure(&app, &state, generation, error),
+            )?;
+            complete_activation_if_ready(&app, &state, generation, should_finalize)
+        }
+        HostComposition::Combined => {
+            let ready = state.mark_recovery_host_ready(generation)?;
+            let state_error = emit_state(&app, &ready).err();
+            let finalization = finalize_recovery(&app, &state, generation);
+            match (state_error, finalization) {
+                (None, result) => result,
+                (Some(error), Ok(_)) => Err(error),
+                (Some(error), Err(finalization_error)) => {
+                    Err(format!("{error}; {finalization_error}"))
+                }
+            }
+        }
+    }
+}
+
+#[tauri::command]
+pub(crate) fn mark_presentation_controller_ready(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    backend: tauri::State<'_, crate::backend_process::BackendProcess>,
+    state: tauri::State<'_, PresentationState>,
+    generation: u64,
+) -> Result<PresentationSession, String> {
+    authorize_window(&window, &backend, &["controller"])?;
+    let (ready, should_finalize) = state.mark_ready(generation, WindowRole::Controller)?;
+    run_activation_readiness_step(
+        should_finalize,
+        || {
+            emit_state(&app, &ready)
+                .map_err(|error| format!("failed to publish Controller readiness: {error}"))?;
+            if let Some(playback_state) = state
+                .playback_state(generation)
+                .map_err(|error| format!("failed to read Controller playback readiness: {error}"))?
+            {
+                emit_playback_state(&app, &playback_state).map_err(|error| {
+                    format!("failed to publish Controller playback readiness: {error}")
+                })?;
+            }
+            Ok(())
+        },
+        |error| recover_after_activation_failure(&app, &state, generation, error),
+    )?;
+    complete_activation_if_ready(&app, &state, generation, should_finalize)
+}
+
+// Registered legacy Controller -> Host channel. Neither shipped window
+// capability grants it, and the audience Controller does not invoke it.
+// Registration is retained; this does not promise future interactive controls.
+#[tauri::command]
+pub(crate) fn send_presentation_command(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    backend: tauri::State<'_, crate::backend_process::BackendProcess>,
+    state: tauri::State<'_, PresentationState>,
+    request: ControllerCommandRequest,
+) -> Result<ControllerCommandAccepted, String> {
+    authorize_window(&window, &backend, &["controller"])?;
+    let generation = request.generation;
+    let (accepted, command_to_emit) = state.enqueue_command(request)?;
+    let publish_result = emit_state(&app, &state.snapshot()?).and_then(|_| {
+        command_to_emit
+            .as_ref()
+            .map_or(Ok(()), |command| emit_host_command(&app, command))
+    });
+    if let Err(error) = publish_result {
+        let recovery = begin_recovery_transaction(
+            &app,
+            &state,
+            generation,
+            PresentationRecoveryReason::CommandFailed,
+        )
+        .err();
+        return Err(match recovery {
+            Some(recovery) => format!(
+                "failed to publish Controller command: {error}; recovery failed: {recovery}"
+            ),
+            None => format!("failed to publish Controller command: {error}"),
+        });
+    }
+    Ok(accepted)
+}
+
+#[tauri::command]
+pub(crate) fn acknowledge_presentation_command(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    backend: tauri::State<'_, crate::backend_process::BackendProcess>,
+    state: tauri::State<'_, PresentationState>,
+    generation: u64,
+    sequence: u64,
+) -> Result<PresentationSession, String> {
+    authorize_window(&window, &backend, &["main"])?;
+    let (session, next_command) = state.acknowledge_command(generation, sequence)?;
+    let publish_result = emit_state(&app, &session).and_then(|_| {
+        next_command
+            .as_ref()
+            .map_or(Ok(()), |command| emit_host_command(&app, command))
+    });
+    if let Err(error) = publish_result {
+        let recovery = begin_recovery_transaction(
+            &app,
+            &state,
+            generation,
+            PresentationRecoveryReason::CommandFailed,
+        )
+        .err();
+        return Err(match recovery {
+            Some(recovery) => format!(
+                "failed to publish queued Controller command: {error}; recovery failed: {recovery}"
+            ),
+            None => format!("failed to publish queued Controller command: {error}"),
+        });
+    }
+    Ok(session)
+}
+
+#[tauri::command]
+pub(crate) fn publish_presentation_playback_state(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    backend: tauri::State<'_, crate::backend_process::BackendProcess>,
+    state: tauri::State<'_, PresentationState>,
+    generation: u64,
+    playback_state: ControllerPlaybackState,
+) -> Result<ControllerPlaybackStateEnvelope, String> {
+    authorize_window(&window, &backend, &["main"])?;
+    let publication = state.publish_playback_state(generation, playback_state)?;
+    if let Err(error) = emit_playback_state(&app, &publication.envelope) {
+        let rollback_error = state.rollback_playback_state(&publication).err();
+        return Err(match rollback_error {
+            Some(rollback_error) => format!(
+                "failed to publish Controller playback state: {error}; rollback failed: {rollback_error}"
+            ),
+            None => format!("failed to publish Controller playback state: {error}"),
+        });
+    }
+    Ok(publication.envelope)
+}
+
+// Browser channels between the Host and audience WebViews are not guaranteed
+// to share storage. Relay the Host's output through the shell, the channel both
+// windows already use for session state; the controller validates each envelope.
+#[tauri::command]
+pub(crate) fn publish_presentation_output_state(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    backend: tauri::State<'_, crate::backend_process::BackendProcess>,
+    state: tauri::State<'_, PresentationState>,
+    generation: u64,
+    envelope: serde_json::Value,
+) -> Result<(), String> {
+    authorize_window(&window, &backend, &["main"])?;
+    validate_output_state(&envelope, generation)?;
+    state.ensure_output_generation(generation)?;
+    if app.get_webview_window("controller").is_none() {
+        return Ok(());
+    }
+    app.emit_to("controller", OUTPUT_STATE_EVENT, &envelope)
+        .map_err(|error| format!("failed to relay presentation output state: {error}"))
+}
+
+// A newly loaded audience page asks the Host to replay its current output state.
+#[tauri::command]
+pub(crate) fn request_presentation_output_state(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    backend: tauri::State<'_, crate::backend_process::BackendProcess>,
+    state: tauri::State<'_, PresentationState>,
+    generation: u64,
+) -> Result<(), String> {
+    authorize_window(&window, &backend, &["controller"])?;
+    state.ensure_output_generation(generation)?;
+    app.emit_to(
+        "main",
+        OUTPUT_REQUEST_EVENT,
+        OutputRequestEvent { generation },
+    )
+    .map_err(|error| format!("failed to request presentation output state: {error}"))
+}
+
+// Geometry is platform diagnostics, not player state or a command authority.
+// Validate the audience origin/generation before querying native window facts;
+// the existing bounded log queue keeps disk I/O off the IPC/GUI path.
+#[tauri::command]
+pub(crate) async fn record_presentation_video_geometry(
+    window: tauri::WebviewWindow,
+    backend: tauri::State<'_, crate::backend_process::BackendProcess>,
+    state: tauri::State<'_, PresentationState>,
+    generation: u64,
+    geometry: crate::presentation_geometry::VideoGeometry,
+) -> Result<(), String> {
+    authorize_window(&window, &backend, &["controller"])?;
+    state.ensure_output_generation(generation)?;
+    geometry.validate()?;
+    let inner = window
+        .inner_size()
+        .ok()
+        .map(|size| [size.width, size.height]);
+    let outer = window
+        .outer_size()
+        .ok()
+        .map(|size| [size.width, size.height]);
+    let scale = window.scale_factor().ok();
+    crate::desktop_diagnostics::append_desktop_diagnostic(
+        "presentation_video_geometry",
+        serde_json::json!({
+            "generation": generation,
+            "geometry": geometry,
+            "nativeWindow": { "innerPhysicalSize": inner, "outerPhysicalSize": outer, "scaleFactor": scale },
+        }).to_string(),
+    );
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) fn deactivate_local_presentation(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    backend: tauri::State<'_, crate::backend_process::BackendProcess>,
+    state: tauri::State<'_, PresentationState>,
+    generation: u64,
+) -> Result<PresentationSession, String> {
+    authorize_window(&window, &backend, &["main", "controller"])?;
+    begin_recovery_transaction(&app, &state, generation, PresentationRecoveryReason::User)
+}
+
+pub(crate) fn handle_controller_destroyed(app: &tauri::AppHandle) {
+    let state = app.state::<PresentationState>();
+    if state.is_shutting_down() {
+        trace_presentation(
+            app,
+            None,
+            "controller_destroyed_ignored",
+            "reason=app_shutting_down",
+        );
+        return;
+    }
+    let Ok(session) = state.snapshot() else {
+        trace_presentation(
+            app,
+            None,
+            "controller_destroyed_ignored",
+            "reason=state_unavailable",
+        );
+        return;
+    };
+    trace_presentation(
+        app,
+        Some(session.generation),
+        "controller_destroyed",
+        format!("phase={:?}", session.phase),
+    );
+    if matches!(
+        session.phase,
+        PresentationPhase::Activating | PresentationPhase::Active
+    ) && let Err(error) = begin_recovery_transaction(
+        app,
+        &state,
+        session.generation,
+        PresentationRecoveryReason::ControllerClosed,
+    ) {
+        eprintln!("Failed to recover after Controller closed: {error}");
+    }
+}
+
+pub(crate) fn prepare_app_shutdown(app: &tauri::AppHandle) {
+    let state = app.state::<PresentationState>();
+    let generation = state.snapshot().ok().map(|session| session.generation);
+    trace_presentation(app, generation, "app_shutdown_begin", "");
+    state.mark_shutting_down();
+    close_display_identifier_windows(app);
+    let close_result = close_controller(app);
+    trace_presentation(
+        app,
+        generation,
+        "app_shutdown_controller_close_end",
+        format!(
+            "status={}",
+            if close_result.is_ok() { "ok" } else { "error" }
+        ),
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn selected_display_still_available(
+    _host: &tauri::WebviewWindow,
+    selected_id: &str,
+) -> Result<bool, String> {
+    use core_graphics::display::CGDisplay;
+
+    let active = CGDisplay::active_displays()
+        .map_err(|error| format!("macOS display discovery failed with code {error}"))?;
+    let main_display_id = CGDisplay::main().id;
+    for display_id in active {
+        let display = CGDisplay::new(display_id);
+        if display_id == main_display_id || display.is_in_mirror_set() {
+            continue;
+        }
+        let uuid = macos_display_uuid(display_id)?;
+        if selected_id == format!("macos-uuid:{uuid}") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn selected_display_still_available(
+    host: &tauri::WebviewWindow,
+    selected_id: &str,
+) -> Result<bool, String> {
+    Ok(discover_display_records(host)?
+        .iter()
+        .any(|record| record.display.id == selected_id && record.display.selectable))
+}
+
+fn schedule_generation_recovery(
+    app: tauri::AppHandle,
+    generation: u64,
+    reason: PresentationRecoveryReason,
+) {
+    let dispatcher = app.clone();
+    if let Err(error) = dispatcher.run_on_main_thread(move || {
+        let state = app.state::<PresentationState>();
+        if let Err(error) = begin_recovery_transaction(&app, &state, generation, reason) {
+            eprintln!("Failed to recover presentation generation {generation}: {error}");
+        }
+    }) {
+        eprintln!("Failed to schedule presentation recovery: {error}");
+    }
+}
+
+fn start_generation_watchers(app: tauri::AppHandle, generation: u64, selected_display_id: String) {
+    let timeout_app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(ACTIVATION_READY_TIMEOUT);
+        let state = timeout_app.state::<PresentationState>();
+        let Ok(session) = state.snapshot() else {
+            return;
+        };
+        if session.generation == generation && session.phase == PresentationPhase::Activating {
+            schedule_generation_recovery(
+                timeout_app,
+                generation,
+                PresentationRecoveryReason::ActivationFailed,
+            );
+        }
+    });
+
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+            let state = app.state::<PresentationState>();
+            if state.is_shutting_down() {
+                break;
+            }
+            let Ok(session) = state.snapshot() else {
+                continue;
+            };
+            if session.generation != generation
+                || !matches!(
+                    session.phase,
+                    PresentationPhase::Activating | PresentationPhase::Active
+                )
+            {
+                break;
+            }
+            let Some(host) = app.get_webview_window("main") else {
+                continue;
+            };
+            let still_available = match selected_display_still_available(
+                &host,
+                &selected_display_id,
+            ) {
+                Ok(still_available) => still_available,
+                Err(error) => {
+                    eprintln!(
+                        "Presentation display discovery failed; recovering the current generation: {error}"
+                    );
+                    false
+                }
+            };
+            if !still_available {
+                schedule_generation_recovery(
+                    app,
+                    generation,
+                    PresentationRecoveryReason::DisplayDisconnected,
+                );
+                break;
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ActivationAttemptGuard, ControllerCommand, ControllerCommandRequest,
+        ControllerPlaybackState, HostWindowPlacement, MAX_OUTPUT_STATE_BYTES, MAX_PENDING_COMMANDS,
+        MAX_SAFE_JS_INTEGER, MediaRendererOwner, MonitorGeometry, PlaybackAuthorityIdentity,
+        PresentationMode, PresentationPhase, PresentationRecoveryReason, PresentationSession,
+        PresentationState, WindowRole, deliver_main_thread_operation_result,
+        display_identifier_margin_offset, display_source_is_mirrored, native_window_entry_url,
+        next_sequence, readable_display_name, run_activation_readiness_step,
+        validate_controller_command, validate_display_identifier_order, validate_output_state,
+        validate_playback_state, visible_restore_placement,
+    };
+    use crate::desktop_diagnostics::{RuntimeDesktopDiagnosticEnqueue, RuntimeDesktopDiagnostics};
+    use std::cell::RefCell;
+
+    #[test]
+    fn identifier_navigation_bootstraps_native_cookie_before_loading_its_document() {
+        let target = tauri::Url::parse("http://127.0.0.1:4567/display-identifier.html?number=2&theme=dark&language=ja&role=audience").unwrap();
+        let entry =
+            native_window_entry_url(target.clone(), Some("bilikara_native=private-token")).unwrap();
+        assert_eq!(entry.origin(), target.origin());
+        assert_eq!(entry.path(), "/bootstrap/private-token");
+        let query = entry
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(query["page"], "display-identifier");
+        assert_eq!(query["number"], "2");
+        assert_eq!(query["theme"], "dark");
+        assert_eq!(query["language"], "ja");
+        assert_eq!(query["role"], "audience");
+        assert_eq!(
+            native_window_entry_url(target.clone(), None).unwrap(),
+            target
+        );
+        for invalid in [
+            "",
+            "bilikara_native=",
+            "bilikara_native=token/other",
+            "other=token",
+        ] {
+            assert!(native_window_entry_url(target.clone(), Some(invalid)).is_err());
+        }
+    }
+
+    #[test]
+    fn controller_navigation_bootstraps_its_own_session_and_preserves_generation() {
+        let target =
+            tauri::Url::parse("http://127.0.0.1:4567/controller.html?presentationGeneration=42")
+                .unwrap();
+        let entry =
+            native_window_entry_url(target.clone(), Some("bilikara_native=private-token")).unwrap();
+        assert_eq!(entry.origin(), target.origin());
+        assert_eq!(entry.path(), "/bootstrap/private-token");
+        let query = entry
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(query["page"], "controller");
+        assert_eq!(query["presentationGeneration"], "42");
+        assert_eq!(
+            native_window_entry_url(target, None).unwrap().path(),
+            "/controller.html"
+        );
+        assert!(
+            native_window_entry_url(
+                tauri::Url::parse("http://127.0.0.1:4567/remote").unwrap(),
+                Some("bilikara_native=private-token"),
+            )
+            .is_err()
+        );
+    }
+
+    fn host_placement() -> HostWindowPlacement {
+        HostWindowPlacement {
+            position: tauri::PhysicalPosition::new(100, 200),
+            size: tauri::PhysicalSize::new(1024, 768),
+            decorations: true,
+            resizable: true,
+            fullscreen: false,
+            maximized: false,
+        }
+    }
+
+    #[test]
+    fn windows_display_names_are_readable() {
+        assert_eq!(readable_display_name(r"\\.\DISPLAY1"), "Display 1");
+        assert_eq!(readable_display_name(r"\\.\DISPLAY2"), "Display 2");
+        assert_eq!(readable_display_name("ASUS MB16AC"), "ASUS MB16AC");
+    }
+
+    #[test]
+    fn display_identifier_order_accepts_only_the_current_unique_topology() {
+        let available = vec![
+            "builtin".to_string(),
+            "desk".to_string(),
+            "projector".to_string(),
+        ];
+        let requested = vec![
+            "projector".to_string(),
+            "builtin".to_string(),
+            "desk".to_string(),
+        ];
+        assert_eq!(
+            validate_display_identifier_order(&available, &requested)
+                .expect("the current topology can be reordered by stable id"),
+            vec![2, 0, 1]
+        );
+        assert!(
+            validate_display_identifier_order(
+                &available,
+                &[
+                    "builtin".to_string(),
+                    "builtin".to_string(),
+                    "projector".to_string()
+                ],
+            )
+            .is_err()
+        );
+        assert!(
+            validate_display_identifier_order(
+                &available,
+                &[
+                    "builtin".to_string(),
+                    "missing".to_string(),
+                    "projector".to_string()
+                ],
+            )
+            .is_err()
+        );
+        assert!(validate_display_identifier_order(&available, &[]).is_err());
+    }
+
+    #[test]
+    fn display_identifier_uses_a_bounded_top_left_margin() {
+        assert_eq!(display_identifier_margin_offset(1920, 128, 1.0), 24);
+        assert_eq!(display_identifier_margin_offset(3840, 256, 2.0), 48);
+        assert_eq!(display_identifier_margin_offset(140, 128, 1.0), 12);
+        assert_eq!(display_identifier_margin_offset(128, 128, 1.0), 0);
+    }
+
+    fn begin_state() -> (PresentationState, u64) {
+        let state = PresentationState::default();
+        let session = state
+            .begin_activation(
+                "display:audience".to_string(),
+                "display:primary".to_string(),
+                host_placement(),
+                false,
+            )
+            .expect("activation should begin");
+        (state, session.generation)
+    }
+
+    fn active_state() -> (PresentationState, u64) {
+        let (state, generation) = begin_state();
+        state
+            .mark_ready(generation, WindowRole::Controller)
+            .expect("early Controller readiness should be recorded");
+        state
+            .mark_placement_prepared(generation)
+            .expect("placement should be prepared");
+        state
+            .mark_activation_published(generation)
+            .expect("activation should be published");
+        let (_, should_finalize) = state
+            .mark_ready(generation, WindowRole::Host)
+            .expect("Host readiness should be accepted");
+        assert!(should_finalize);
+        state
+            .complete_activation(generation)
+            .expect("activation should complete");
+        state
+            .finish_activation_attempt(generation)
+            .expect("activation command should settle");
+        (state, generation)
+    }
+
+    #[test]
+    fn presentation_success_result_precedes_full_completion_diagnostic() {
+        let (diagnostic_sender, _diagnostic_receiver) = std::sync::mpsc::sync_channel(1);
+        let diagnostics = RuntimeDesktopDiagnostics::from_sender(diagnostic_sender);
+        assert_eq!(
+            diagnostics.enqueue("occupied", "record"),
+            RuntimeDesktopDiagnosticEnqueue::Enqueued
+        );
+        let (result_sender, result_receiver) = std::sync::mpsc::sync_channel(1);
+        let delivered_result = RefCell::new(None);
+        let completion_outcome = RefCell::new(None);
+
+        deliver_main_thread_operation_result(result_sender, Ok(42_u32), |succeeded| {
+            assert!(succeeded);
+            *delivered_result.borrow_mut() = result_receiver.try_recv().ok();
+            *completion_outcome.borrow_mut() = Some(diagnostics.enqueue("completion", "status=ok"));
+        });
+
+        assert_eq!(*delivered_result.borrow(), Some(Ok(42_u32)));
+        assert_eq!(
+            *completion_outcome.borrow(),
+            Some(RuntimeDesktopDiagnosticEnqueue::DroppedFull)
+        );
+    }
+
+    #[test]
+    fn presentation_failure_result_precedes_disconnected_completion_diagnostic() {
+        let (diagnostic_sender, diagnostic_receiver) = std::sync::mpsc::sync_channel(1);
+        drop(diagnostic_receiver);
+        let diagnostics = RuntimeDesktopDiagnostics::from_sender(diagnostic_sender);
+        let (result_sender, result_receiver) = std::sync::mpsc::sync_channel(1);
+        let delivered_result = RefCell::new(None);
+        let completion_outcome = RefCell::new(None);
+
+        deliver_main_thread_operation_result(
+            result_sender,
+            Err::<(), _>("native mutation failed".to_string()),
+            |succeeded| {
+                assert!(!succeeded);
+                *delivered_result.borrow_mut() = result_receiver.try_recv().ok();
+                *completion_outcome.borrow_mut() =
+                    Some(diagnostics.enqueue("completion", "status=error"));
+            },
+        );
+
+        assert_eq!(
+            *delivered_result.borrow(),
+            Some(Err("native mutation failed".to_string()))
+        );
+        assert_eq!(
+            *completion_outcome.borrow(),
+            Some(RuntimeDesktopDiagnosticEnqueue::DroppedDisconnected)
+        );
+    }
+
+    #[test]
+    fn default_session_has_one_host_authority_and_renderer() {
+        let session = PresentationSession::default();
+        assert_eq!(session.mode, PresentationMode::SingleScreen);
+        assert_eq!(session.phase, PresentationPhase::Inactive);
+        assert_eq!(session.playback_authority, PlaybackAuthorityIdentity::Host);
+        assert_eq!(session.media_renderer_owner, MediaRendererOwner::Host);
+        assert!(session.host_ready);
+        assert!(!session.controller_ready);
+    }
+
+    #[test]
+    fn activation_waits_for_placement_and_both_generation_bound_roles() {
+        let (state, generation) = begin_state();
+        let (controller_ready, finalize) = state
+            .mark_ready(generation, WindowRole::Controller)
+            .expect("Controller readiness should be accepted");
+        assert!(controller_ready.controller_ready);
+        assert!(!controller_ready.host_ready);
+        assert!(!finalize);
+        state
+            .mark_placement_prepared(generation)
+            .expect("placement should be accepted");
+        state
+            .mark_activation_published(generation)
+            .expect("activation publication should be accepted");
+        let (both_ready, finalize) = state
+            .mark_ready(generation, WindowRole::Host)
+            .expect("Host readiness should be accepted");
+        assert!(both_ready.host_ready && both_ready.controller_ready);
+        assert!(finalize);
+        let active = state
+            .complete_activation(generation)
+            .expect("ready activation should complete");
+        assert_eq!(active.phase, PresentationPhase::Active);
+    }
+
+    #[test]
+    fn stale_readiness_does_not_mutate_the_session() {
+        let (state, generation) = begin_state();
+        assert!(state.mark_ready(generation + 1, WindowRole::Host).is_err());
+        assert!(!state.snapshot().expect("snapshot").host_ready);
+    }
+
+    #[test]
+    fn output_relay_accepts_only_the_current_dual_screen_generation() {
+        assert!(
+            PresentationState::default()
+                .ensure_output_generation(0)
+                .is_err()
+        );
+        let (state, generation) = begin_state();
+        state
+            .ensure_output_generation(generation)
+            .expect("an activating audience may receive output state");
+        assert!(state.ensure_output_generation(generation + 1).is_err());
+        let (state, generation) = active_state();
+        state
+            .ensure_output_generation(generation)
+            .expect("an active audience may receive output state");
+        assert!(state.ensure_output_generation(generation - 1).is_err());
+        state
+            .begin_recovery(Some(generation), PresentationRecoveryReason::User)
+            .expect("recovery should begin");
+        assert!(state.ensure_output_generation(generation).is_err());
+    }
+
+    #[test]
+    fn output_relay_carries_only_bounded_master_state_for_its_generation() {
+        let envelope = |generation: u64, qr_image: &str| {
+            serde_json::json!({
+                "protocol": 1, "type": "master-state", "senderId": "host", "sequence": 1,
+                "payload": {"scene": {"generation": generation}, "remoteAccess": {"qr_image": qr_image}},
+            })
+        };
+        validate_output_state(&envelope(7, "data:image/svg+xml;base64,AA"), 7)
+            .expect("the current generation's master state should relay");
+        assert!(validate_output_state(&envelope(6, ""), 7).is_err());
+        assert!(validate_output_state(&serde_json::json!("master-state"), 7).is_err());
+        let mut readiness = envelope(7, "");
+        readiness["type"] = serde_json::json!("output-ready");
+        assert!(validate_output_state(&readiness, 7).is_err());
+        let oversized = "A".repeat(MAX_OUTPUT_STATE_BYTES);
+        assert!(validate_output_state(&envelope(7, &oversized), 7).is_err());
+    }
+
+    #[test]
+    fn final_host_readiness_publication_failure_starts_recovery() {
+        let (state, generation) = begin_state();
+        state
+            .mark_placement_prepared(generation)
+            .expect("placement should be prepared");
+        state
+            .mark_activation_published(generation)
+            .expect("activation should be published");
+        state
+            .mark_ready(generation, WindowRole::Controller)
+            .expect("Controller readiness should be accepted");
+        let (_, should_finalize) = state
+            .mark_ready(generation, WindowRole::Host)
+            .expect("Host readiness should claim finalization");
+        let result = run_activation_readiness_step(
+            should_finalize,
+            || Err::<(), _>("Host readiness emission failed".to_string()),
+            |error| {
+                state
+                    .begin_recovery(
+                        Some(generation),
+                        PresentationRecoveryReason::ActivationFailed,
+                    )
+                    .expect("claimed emission failure should begin recovery");
+                error
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            state.snapshot().expect("snapshot").phase,
+            PresentationPhase::Recovering
+        );
+    }
+
+    #[test]
+    fn final_controller_readiness_publication_failure_starts_recovery() {
+        let (state, generation) = begin_state();
+        state
+            .mark_placement_prepared(generation)
+            .expect("placement should be prepared");
+        state
+            .mark_activation_published(generation)
+            .expect("activation should be published");
+        state
+            .mark_ready(generation, WindowRole::Host)
+            .expect("Host readiness should be accepted");
+        let (_, should_finalize) = state
+            .mark_ready(generation, WindowRole::Controller)
+            .expect("Controller readiness should claim finalization");
+        let result = run_activation_readiness_step(
+            should_finalize,
+            || Err::<(), _>("Controller playback emission failed".to_string()),
+            |error| {
+                state
+                    .begin_recovery(
+                        Some(generation),
+                        PresentationRecoveryReason::ActivationFailed,
+                    )
+                    .expect("claimed emission failure should begin recovery");
+                error
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            state.snapshot().expect("snapshot").phase,
+            PresentationPhase::Recovering
+        );
+    }
+
+    #[test]
+    fn readiness_before_activation_publication_completes_exactly_once() {
+        let (state, generation) = begin_state();
+        let (_, controller_finalize) = state
+            .mark_ready(generation, WindowRole::Controller)
+            .expect("early Controller readiness should be accepted");
+        let (_, host_finalize) = state
+            .mark_ready(generation, WindowRole::Host)
+            .expect("early Host readiness should be accepted");
+        assert!(!controller_finalize);
+        assert!(!host_finalize);
+        state
+            .mark_placement_prepared(generation)
+            .expect("placement should be accepted after readiness");
+        let (_, publication_finalize) = state
+            .mark_activation_published(generation)
+            .expect("publication should claim finalization");
+        assert!(publication_finalize);
+        let active = state
+            .complete_activation(generation)
+            .expect("published ready activation should complete");
+        assert_eq!(active.phase, PresentationPhase::Active);
+        assert!(state.complete_activation(generation).is_err());
+    }
+
+    #[test]
+    fn recovered_attempt_cannot_overlap_until_original_command_settles() {
+        let (state, generation) = begin_state();
+        let attempt = ActivationAttemptGuard::new(&state, generation);
+        let recovery = state
+            .begin_recovery(
+                Some(generation),
+                PresentationRecoveryReason::ActivationFailed,
+            )
+            .expect("activation recovery should begin");
+        let recovering = recovery.session;
+        assert!(recovery.started);
+        assert!(!recovery.owns_native_lifecycle);
+        assert!(state.ensure_activation_native_owner(generation).is_err());
+        assert!(
+            state
+                .ensure_recovery_native_owner(recovering.generation)
+                .is_err()
+        );
+        assert!(
+            state
+                .force_complete_recovery(recovering.generation)
+                .is_err()
+        );
+        assert!(
+            state
+                .begin_activation(
+                    "display:other".to_string(),
+                    "display:primary".to_string(),
+                    host_placement(),
+                    false,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            attempt.finish().expect("activation command should settle"),
+            Some(recovering.generation)
+        );
+        state
+            .mark_host_window_restored(recovering.generation)
+            .expect("recovery placement should be restored");
+        let inactive = state
+            .force_complete_recovery(recovering.generation)
+            .expect("settled activation should allow recovery to finish");
+        assert_eq!(inactive.phase, PresentationPhase::Inactive);
+        assert!(
+            state
+                .begin_activation(
+                    "display:other".to_string(),
+                    "display:primary".to_string(),
+                    host_placement(),
+                    false,
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn recovery_claim_revokes_stale_activation_publication_and_native_mutation() {
+        let (state, generation) = begin_state();
+        let attempt = ActivationAttemptGuard::new(&state, generation);
+        let recovery = state
+            .begin_recovery(
+                Some(generation),
+                PresentationRecoveryReason::ControllerClosed,
+            )
+            .expect("Controller destruction should claim one recovery");
+        assert!(recovery.started);
+        assert!(!recovery.owns_native_lifecycle);
+        let duplicate = state
+            .begin_recovery(
+                Some(recovery.session.generation),
+                PresentationRecoveryReason::ControllerClosed,
+            )
+            .expect("duplicate Controller destruction should observe existing recovery");
+        assert!(!duplicate.started);
+        assert!(state.mark_placement_prepared(generation).is_err());
+        assert!(state.mark_activation_published(generation).is_err());
+        assert!(state.ensure_activation_native_owner(generation).is_err());
+        assert_eq!(
+            attempt.finish().expect("stale activation should settle"),
+            Some(recovery.session.generation)
+        );
+        assert!(
+            state
+                .ensure_recovery_native_owner(recovery.session.generation)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn finalization_and_recovery_cannot_both_claim_native_ownership() {
+        let (state, generation) = begin_state();
+        state
+            .mark_placement_prepared(generation)
+            .expect("placement should be prepared");
+        state
+            .mark_activation_published(generation)
+            .expect("activation should be published");
+        state
+            .finish_activation_attempt(generation)
+            .expect("initial activation command should settle");
+        state
+            .mark_ready(generation, WindowRole::Host)
+            .expect("Host readiness should be accepted");
+        let (_, should_finalize) = state
+            .mark_ready(generation, WindowRole::Controller)
+            .expect("Controller readiness should claim finalization");
+        assert!(should_finalize);
+        assert!(state.ensure_activation_native_owner(generation).is_ok());
+        let recovery = state
+            .begin_recovery(
+                Some(generation),
+                PresentationRecoveryReason::ControllerClosed,
+            )
+            .expect("recovery should supersede unstarted finalization");
+        assert!(recovery.started);
+        assert!(recovery.owns_native_lifecycle);
+        assert!(state.ensure_activation_native_owner(generation).is_err());
+        assert!(state.complete_activation(generation).is_err());
+        assert!(
+            state
+                .ensure_recovery_native_owner(recovery.session.generation)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn ordinary_activation_error_guard_clears_after_settlement() {
+        let (state, generation) = begin_state();
+        let attempt = ActivationAttemptGuard::new(&state, generation);
+        let recovery = state
+            .begin_recovery(
+                Some(generation),
+                PresentationRecoveryReason::ActivationFailed,
+            )
+            .expect("ordinary activation failure should claim recovery");
+        let recovery_generation = attempt
+            .finish()
+            .expect("ordinary activation failure should settle")
+            .expect("settlement should transfer recovery ownership");
+        assert_eq!(recovery_generation, recovery.session.generation);
+        state
+            .force_complete_recovery(recovery_generation)
+            .expect("ordinary activation failure should converge to inactive");
+        assert!(
+            state
+                .begin_activation(
+                    "display:other".to_string(),
+                    "display:primary".to_string(),
+                    host_placement(),
+                    false,
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn partially_resolved_windows_clone_group_is_mirrored() {
+        assert!(display_source_is_mirrored(2, 1));
+        assert!(display_source_is_mirrored(1, 0));
+        assert!(!display_source_is_mirrored(1, 1));
+    }
+
+    #[test]
+    fn commands_are_fifo_ordered_and_ack_releases_only_the_next_command() {
+        let (state, generation) = active_state();
+        let (first, first_emit) = state
+            .enqueue_command(ControllerCommandRequest {
+                generation,
+                sequence: 1,
+                command: ControllerCommand::Play,
+            })
+            .expect("first command should enqueue");
+        let (second, second_emit) = state
+            .enqueue_command(ControllerCommandRequest {
+                generation,
+                sequence: 2,
+                command: ControllerCommand::Pause,
+            })
+            .expect("second command should enqueue");
+        assert_eq!(first.sequence, 1);
+        assert_eq!(second.sequence, 2);
+        assert_eq!(
+            first_emit.expect("first emits").target,
+            PlaybackAuthorityIdentity::Host
+        );
+        assert!(second_emit.is_none());
+        assert!(
+            state
+                .enqueue_command(ControllerCommandRequest {
+                    generation,
+                    sequence: 2,
+                    command: ControllerCommand::NextTrack {
+                        expected_playback_generation: 41,
+                    },
+                })
+                .is_err()
+        );
+        let (session, next) = state
+            .acknowledge_command(generation, 1)
+            .expect("first acknowledgement should release second");
+        assert_eq!(session.last_applied_command_sequence, 1);
+        assert_eq!(next.expect("second command should emit").sequence, 2);
+        assert!(state.acknowledge_command(generation, 1).is_err());
+        assert!(
+            state
+                .enqueue_command(ControllerCommandRequest {
+                    generation: generation + 1,
+                    sequence: 3,
+                    command: ControllerCommand::NextTrack {
+                        expected_playback_generation: 41,
+                    },
+                })
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn fifo_preserves_each_program_relative_command_target() {
+        let (state, generation) = active_state();
+        let (_, first_emit) = state
+            .enqueue_command(ControllerCommandRequest {
+                generation,
+                sequence: 1,
+                command: ControllerCommand::SeekRelative {
+                    delta_seconds: 15.0,
+                    expected_playback_generation: 41,
+                },
+            })
+            .expect("first exact command should enqueue");
+        let (_, second_emit) = state
+            .enqueue_command(ControllerCommandRequest {
+                generation,
+                sequence: 2,
+                command: ControllerCommand::NextTrack {
+                    expected_playback_generation: 42,
+                },
+            })
+            .expect("second exact command should enqueue");
+        assert_eq!(
+            first_emit.expect("first command should emit").command,
+            ControllerCommand::SeekRelative {
+                delta_seconds: 15.0,
+                expected_playback_generation: 41,
+            }
+        );
+        assert!(second_emit.is_none());
+
+        let (_, released) = state
+            .acknowledge_command(generation, 1)
+            .expect("acknowledgement should release the next FIFO entry");
+        assert_eq!(
+            released.expect("second command should release").command,
+            ControllerCommand::NextTrack {
+                expected_playback_generation: 42,
+            }
+        );
+    }
+
+    #[test]
+    fn command_queue_is_bounded() {
+        let (state, generation) = active_state();
+        for sequence in 1..=MAX_PENDING_COMMANDS as u64 {
+            state
+                .enqueue_command(ControllerCommandRequest {
+                    generation,
+                    sequence,
+                    command: ControllerCommand::Pause,
+                })
+                .expect("queue capacity should be accepted");
+        }
+        assert!(
+            state
+                .enqueue_command(ControllerCommandRequest {
+                    generation,
+                    sequence: MAX_PENDING_COMMANDS as u64 + 1,
+                    command: ControllerCommand::Pause,
+                })
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn controller_payloads_are_bounded_and_finite() {
+        assert!(validate_controller_command(&ControllerCommand::Play).is_ok());
+        assert!(
+            validate_controller_command(&ControllerCommand::SetVolume {
+                volume_percent: 500,
+                muted: false,
+            })
+            .is_ok()
+        );
+        assert!(
+            validate_controller_command(&ControllerCommand::SeekAbsolute {
+                target_seconds: 12.5,
+                expected_playback_generation: 41,
+            })
+            .is_ok()
+        );
+        assert!(
+            validate_controller_command(&ControllerCommand::SeekAbsolute {
+                target_seconds: f64::NAN,
+                expected_playback_generation: 41,
+            })
+            .is_err()
+        );
+        assert!(
+            validate_controller_command(&ControllerCommand::SeekRelative {
+                delta_seconds: 601.0,
+                expected_playback_generation: 41,
+            })
+            .is_err()
+        );
+        assert!(
+            validate_controller_command(&ControllerCommand::SetVolume {
+                volume_percent: 501,
+                muted: false,
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn controller_command_json_uses_camel_case_fields() {
+        let cases = [
+            (
+                serde_json::json!({
+                    "type": "seekRelative",
+                    "deltaSeconds": -15.0,
+                    "expectedPlaybackGeneration": 41
+                }),
+                ControllerCommand::SeekRelative {
+                    delta_seconds: -15.0,
+                    expected_playback_generation: 41,
+                },
+            ),
+            (
+                serde_json::json!({
+                    "type": "seekAbsolute",
+                    "targetSeconds": 55.0,
+                    "expectedPlaybackGeneration": 41
+                }),
+                ControllerCommand::SeekAbsolute {
+                    target_seconds: 55.0,
+                    expected_playback_generation: 41,
+                },
+            ),
+            (
+                serde_json::json!({
+                    "type": "nextTrack",
+                    "expectedPlaybackGeneration": 41
+                }),
+                ControllerCommand::NextTrack {
+                    expected_playback_generation: 41,
+                },
+            ),
+            (
+                serde_json::json!({
+                    "type": "setVolume",
+                    "volumePercent": 375,
+                    "muted": false
+                }),
+                ControllerCommand::SetVolume {
+                    volume_percent: 375,
+                    muted: false,
+                },
+            ),
+        ];
+
+        for (payload, expected) in cases {
+            let request: ControllerCommandRequest = serde_json::from_value(serde_json::json!({
+                "generation": 7,
+                "sequence": 1,
+                "command": payload.clone()
+            }))
+            .expect("camelCase Controller request should deserialize");
+            assert_eq!(request.command, expected);
+            assert_eq!(
+                serde_json::to_value(request.command).expect("Controller command should serialize"),
+                payload
+            );
+        }
+
+        assert!(
+            serde_json::from_value::<ControllerCommand>(serde_json::json!({
+                "type": "seekAbsolute",
+                "target_seconds": 55.0
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ControllerCommand>(serde_json::json!({
+                "type": "nextTrack"
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn playback_state_is_generation_and_revision_bound() {
+        let (state, generation) = begin_state();
+        let candidate = ControllerPlaybackState {
+            revision: 1,
+            playback_generation: Some(41),
+            item_identity: Some("song-1".to_string()),
+            title: "Song".to_string(),
+            paused: false,
+            current_time_seconds: 1.5,
+            duration_seconds: Some(120.0),
+            volume_percent: 500,
+            muted: false,
+            can_skip: true,
+        };
+        assert!(validate_playback_state(&candidate).is_ok());
+        let mut invalid = candidate.clone();
+        invalid.volume_percent = 501;
+        assert!(validate_playback_state(&invalid).is_err());
+        state
+            .publish_playback_state(generation, candidate.clone())
+            .expect("first state should publish");
+        assert!(state.publish_playback_state(generation, candidate).is_err());
+    }
+
+    #[test]
+    fn failed_playback_publication_can_roll_back_without_consuming_revision_or_sequence() {
+        let (state, generation) = begin_state();
+        let candidate = ControllerPlaybackState {
+            revision: 1,
+            playback_generation: Some(41),
+            item_identity: Some("song-1".to_string()),
+            title: "Song".to_string(),
+            paused: true,
+            current_time_seconds: 0.0,
+            duration_seconds: Some(120.0),
+            volume_percent: 80,
+            muted: false,
+            can_skip: true,
+        };
+        let publication = state
+            .publish_playback_state(generation, candidate.clone())
+            .expect("playback state should reserve a publication");
+        assert_eq!(publication.envelope.sequence, 1);
+        state
+            .rollback_playback_state(&publication)
+            .expect("failed emission should roll back its reservation");
+        let retried = state
+            .publish_playback_state(generation, candidate)
+            .expect("the same revision should be retryable after rollback");
+        assert_eq!(retried.envelope.sequence, 1);
+    }
+
+    #[test]
+    fn recovery_advances_generation_and_never_selects_a_fallback_display() {
+        let (state, generation) = active_state();
+        let recovery = state
+            .begin_recovery(
+                Some(generation),
+                PresentationRecoveryReason::DisplayDisconnected,
+            )
+            .expect("recovery should begin");
+        let recovering = recovery.session;
+        assert!(recovery.started);
+        assert!(recovery.owns_native_lifecycle);
+        assert_eq!(recovering.phase, PresentationPhase::Recovering);
+        assert_eq!(recovering.generation, generation + 1);
+        assert_eq!(
+            recovering.selected_output_display_id.as_deref(),
+            Some("display:audience")
+        );
+        assert!(state.acknowledge_command(generation, 1).is_err());
+        state
+            .mark_recovery_host_ready(recovering.generation)
+            .expect("combined composition should be ready");
+        state
+            .mark_host_window_restored(recovering.generation)
+            .expect("Host placement should be restored");
+        let inactive = state
+            .complete_recovery(recovering.generation)
+            .expect("recovery should complete");
+        assert_eq!(inactive.phase, PresentationPhase::Inactive);
+        assert_eq!(inactive.selected_output_display_id, None);
+        assert_eq!(
+            inactive.recovery_reason,
+            Some(PresentationRecoveryReason::DisplayDisconnected)
+        );
+    }
+
+    #[test]
+    fn forced_recovery_completion_clears_session_without_host_readiness() {
+        let (state, generation) = active_state();
+        let recovery = state
+            .begin_recovery(
+                Some(generation),
+                PresentationRecoveryReason::ControllerClosed,
+            )
+            .expect("recovery should begin");
+        let recovering = recovery.session;
+        assert!(recovery.started);
+        assert!(recovery.owns_native_lifecycle);
+        assert!(!recovering.host_ready);
+        let inactive = state
+            .force_complete_recovery(recovering.generation)
+            .expect("the bounded recovery deadline must converge the state");
+        assert_eq!(inactive.phase, PresentationPhase::Inactive);
+        assert_eq!(inactive.selected_output_display_id, None);
+        assert_eq!(
+            inactive.recovery_reason,
+            Some(PresentationRecoveryReason::ControllerClosed)
+        );
+        assert!(
+            state
+                .mark_recovery_host_ready(recovering.generation)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn invalid_original_placement_is_centered_on_primary() {
+        let placement = HostWindowPlacement {
+            position: tauri::PhysicalPosition::new(4000, 0),
+            ..host_placement()
+        };
+        let primary = MonitorGeometry {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let (position, size, original_visible) = visible_restore_placement(
+            &placement,
+            std::slice::from_ref(&primary),
+            Some((
+                tauri::PhysicalPosition::new(0, 0),
+                tauri::PhysicalSize::new(1920, 1040),
+            )),
+        );
+        assert!(!original_visible);
+        assert_eq!(size, placement.size);
+        assert_eq!(position, tauri::PhysicalPosition::new(448, 136));
+    }
+
+    #[test]
+    fn mirrored_and_adjacent_geometry_are_distinct_policies() {
+        let primary = MonitorGeometry {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let mirrored = MonitorGeometry {
+            x: 0,
+            y: 0,
+            width: 1280,
+            height: 720,
+        };
+        let adjacent = MonitorGeometry {
+            x: 1920,
+            y: 0,
+            width: 2560,
+            height: 1440,
+        };
+        assert!(primary.same_origin(mirrored));
+        assert!(!primary.same_origin(adjacent));
+    }
+
+    #[test]
+    fn counters_never_wrap_or_exceed_javascript_safe_integers() {
+        assert_eq!(
+            next_sequence(MAX_SAFE_JS_INTEGER - 1, "counter").expect("last safe value"),
+            MAX_SAFE_JS_INTEGER
+        );
+        assert!(next_sequence(MAX_SAFE_JS_INTEGER, "counter").is_err());
+        assert!(next_sequence(u64::MAX, "counter").is_err());
+    }
+
+    #[test]
+    fn manual_fullscreen_is_allowed_only_while_inactive() {
+        let state = PresentationState::default();
+        assert!(state.allows_manual_fullscreen());
+        state
+            .begin_activation(
+                "display:audience".to_string(),
+                "display:primary".to_string(),
+                host_placement(),
+                false,
+            )
+            .expect("activation should begin");
+        assert!(!state.allows_manual_fullscreen());
+    }
+}

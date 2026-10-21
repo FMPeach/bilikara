@@ -1,0 +1,842 @@
+//! Desktop-only operational adapter. No scheduler, credentials store, installer,
+//! media policy or publication authority lives here.
+use super::*;
+use std::ffi::OsString;
+use std::process::Command;
+
+/// Recognize only the HTTP status in .NET's failure diagnostic. Raw download
+/// output can contain credentials or signed URLs and must never leave this parser.
+#[derive(Default)]
+struct HttpFailure {
+    pending: Vec<u8>,
+    truncated: bool,
+    status: Option<u16>,
+}
+impl HttpFailure {
+    fn consume(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            if matches!(byte, b'\r' | b'\n') {
+                self.line();
+                self.pending.clear();
+                self.truncated = false;
+            } else if self.pending.len() < 1024 {
+                self.pending.push(byte);
+            } else {
+                self.truncated = true;
+            }
+        }
+    }
+    fn line(&mut self) {
+        if self.truncated || self.status.is_some() {
+            return;
+        }
+        let line = self.pending.trim_ascii();
+        for marker in [
+            b"net_http_message_not_success_statuscode_reason,".as_slice(),
+            b"Response status code does not indicate success:".as_slice(),
+        ] {
+            let Some(value) = line.strip_prefix(marker) else {
+                continue;
+            };
+            let value = value.trim_ascii_start();
+            if value.len() >= 4
+                && value[..3].iter().all(u8::is_ascii_digit)
+                && matches!(value[3], b',' | b' ' | b'(')
+            {
+                let status = u16::from(value[0] - b'0') * 100
+                    + u16::from(value[1] - b'0') * 10
+                    + u16::from(value[2] - b'0');
+                if (400..600).contains(&status) {
+                    self.status = Some(status);
+                }
+            }
+        }
+    }
+}
+
+fn supervise(
+    command: Command,
+    cancel: &AtomicBool,
+    timeout: Duration,
+    capture: bool,
+    progress: impl FnMut(),
+) -> Result<Vec<u8>, CacheRuntimeError> {
+    let output = Mutex::new([HttpFailure::default(), HttpFailure::default()]);
+    let result = super::child::supervise(
+        command,
+        cancel,
+        timeout,
+        capture,
+        progress,
+        &|stderr, bytes| {
+            output.lock().unwrap_or_else(|p| p.into_inner())[usize::from(stderr)].consume(bytes)
+        },
+        "BBDown",
+    );
+    let mut output = output.into_inner().unwrap_or_else(|p| p.into_inner());
+    for stream in &mut output {
+        stream.line();
+    }
+    result.map_err(|mut error| {
+        if error.kind == "tool_exit"
+            && let Some(status) = output[0].status.or(output[1].status)
+        {
+            error.message = format!("BBDown source request rejected (HTTP {status}); check login and source access, then retry");
+            error.status_code = Some(status);
+        }
+        error
+    })
+}
+
+// BBDown writes independent track/segment files. Report observed media bytes
+// without parsing console text (which may contain cookies or signed URLs).
+fn downloaded_bytes(directory: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| {
+            let Ok(kind) = entry.file_type() else {
+                return 0;
+            };
+            if kind.is_dir() {
+                return downloaded_bytes(&entry.path());
+            }
+            if !kind.is_file() {
+                return 0;
+            }
+            let path = entry.path();
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            let extension = path
+                .extension()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_ascii_lowercase();
+            if matches!(
+                extension.as_str(),
+                "mp4" | "m4a" | "m4s" | "flac" | "webm" | "ts" | "tmp" | "temp"
+            ) || name.chars().all(|c| c.is_ascii_digit())
+            {
+                entry.metadata().map(|m| m.len()).unwrap_or(0)
+            } else {
+                0
+            }
+        })
+        .fold(0, u64::saturating_add)
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct Executable(PathBuf);
+
+impl Executable {
+    #[cfg(test)]
+    pub(super) fn fixture(path: PathBuf) -> Self {
+        Self(path)
+    }
+
+    /// Trusted Host configuration only; never deserialize this from an API/FFI.
+    #[cfg(feature = "native-host")]
+    pub(crate) fn discover(directory: &Path) -> Option<Self> {
+        if let Some(path) = std::env::var_os("BB_DOWN_PATH").filter(|v| !v.is_empty()) {
+            return Self::check(PathBuf::from(path)); // explicit missing override fails closed
+        }
+        let name = if cfg!(windows) {
+            "BBDown.exe"
+        } else {
+            "BBDown"
+        };
+        let mut candidates = vec![directory.join("tools/bbdown").join(name)];
+        if let Some(home) = std::env::var_os("BILIKARA_HOME") {
+            candidates.push(PathBuf::from(home).join("tools/bbdown").join(name));
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            for root in exe.ancestors().skip(1).take(4) {
+                for relative in [
+                    "vendor",
+                    "_internal/vendor",
+                    "Resources/vendor",
+                    "tools/bbdown",
+                ] {
+                    candidates.push(root.join(relative).join(name));
+                }
+            }
+        }
+        candidates.into_iter().find_map(Self::check)
+    }
+
+    pub(super) fn check(path: PathBuf) -> Option<Self> {
+        if !cfg!(any(
+            target_os = "windows",
+            target_os = "linux",
+            target_os = "macos"
+        )) {
+            return None; // Mobile never admits a sidecar executable.
+        }
+        if !path.is_absolute() || !path.is_file() {
+            return None;
+        }
+        let path = path.canonicalize().ok()?;
+        // Offline capability check, bounded and supervised. No provider request.
+        let mut command = Command::new(&path);
+        command.arg("--help");
+        let help = supervise(
+            command,
+            &AtomicBool::new(false),
+            Duration::from_secs(5),
+            true,
+            || {},
+        )
+        .ok()?;
+        let help = String::from_utf8_lossy(&help);
+        if ![
+            "BBDown version 1.6.3",
+            "--skip-mux",
+            "--skip-subtitle",
+            "--skip-cover",
+            "--skip-ai",
+            "--video-only",
+            "--audio-only",
+            "--audio-ascending",
+            "--work-dir",
+            "--file-pattern",
+            "--config-file",
+        ]
+        .iter()
+        .all(|flag| help.contains(flag))
+        {
+            return None;
+        }
+        Some(Self(path))
+    }
+}
+
+fn arguments(job: &CacheJobSpec, track: &TrackSpec, directory: &Path) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec![
+        format!("https://www.bilibili.com/video/{}", job.bvid).into(),
+        "-p".into(),
+        track.page.page.to_string().into(),
+    ];
+    if track.kind == ExpectedMediaKind::Video {
+        let policy = decide_quality_policy(&QualityPolicyRequest {
+            raw_quality: job.video_quality.clone(),
+            raw_cap: job.avc_quality_cap.clone(),
+            choice_index: None,
+        });
+        args.extend([
+            "-q".into(),
+            policy
+                .bbdown_quality_order
+                .iter()
+                .map(|q| q.label())
+                .collect::<Vec<_>>()
+                .join(",")
+                .into(),
+        ]);
+        if !matches!(
+            job.executor,
+            Executor::Bbdown {
+                force_avc: false,
+                ..
+            }
+        ) {
+            args.extend(["-e".into(), "avc".into()]);
+        }
+    } else if !job.audio_hires {
+        args.push("--audio-ascending".into());
+    }
+    args.extend([
+        "--work-dir".into(),
+        directory.as_os_str().to_owned(),
+        "--file-pattern".into(),
+        track.key.clone().into(),
+        "--skip-mux".into(),
+        "--skip-subtitle".into(),
+        "--skip-cover".into(),
+        "--skip-ai".into(),
+        if track.kind == ExpectedMediaKind::Video {
+            "--video-only".into()
+        } else {
+            "--audio-only".into()
+        },
+        // Do not inherit a BBDown.config enabling a muxer or aria2c.
+        "--config-file".into(),
+        directory.join("empty.config").into(),
+    ]);
+    // Always pass the P02 snapshot, using a noncredential separator when empty, rather than letting BBDown
+    // pick up a credential file beside a bundled/installed executable.
+    args.extend([
+        "-c".into(),
+        if job.cookie.is_empty() {
+            ";".into()
+        } else {
+            job.cookie.clone().into()
+        },
+    ]);
+    args
+}
+
+// BBDown 1.6.3 skip-mux output may be in its CID subdirectory. Require exactly
+// one nonempty regular media file in this track's private directory; never guess
+// the largest file, follow symlinks, or consume an adjacent attempt's output.
+fn output(directory: &Path) -> Result<PathBuf, CacheRuntimeError> {
+    let mut directories = vec![(directory.to_path_buf(), 0)];
+    let mut media = Vec::new();
+    let mut count = 0;
+    while let Some((dir, depth)) = directories.pop() {
+        for entry in fs::read_dir(dir)
+            .map_err(|_| CacheRuntimeError::new("io", "BBDown output unreadable"))?
+        {
+            let entry =
+                entry.map_err(|_| CacheRuntimeError::new("io", "BBDown output unreadable"))?;
+            count += 1;
+            let meta = fs::symlink_metadata(entry.path())
+                .map_err(|_| CacheRuntimeError::new("io", "BBDown output unreadable"))?;
+            if count > 512 || meta.file_type().is_symlink() || (meta.is_dir() && depth >= 4) {
+                return Err(CacheRuntimeError::new(
+                    "media_contract_violation",
+                    "BBDown output escaped the bounded track contract",
+                ));
+            }
+            if meta.is_dir() {
+                directories.push((entry.path(), depth + 1));
+            } else if meta.is_file()
+                && matches!(
+                    entry.path().extension().and_then(|s| s.to_str()),
+                    Some("mp4" | "m4a" | "aac" | "flac" | "m4s")
+                )
+            {
+                if meta.len() == 0 {
+                    return Err(CacheRuntimeError::new(
+                        "invalid_media",
+                        "BBDown output is empty",
+                    ));
+                }
+                media.push(entry.path());
+            }
+        }
+    }
+    match media.len() {
+        0 => Err(CacheRuntimeError::new(
+            "source_missing",
+            "BBDown exited without a required media track",
+        )),
+        1 => Ok(media.remove(0)),
+        _ => Err(CacheRuntimeError::new(
+            "media_contract_violation",
+            "BBDown produced ambiguous track outputs",
+        )),
+    }
+}
+
+pub(super) fn run_track(
+    executable: &Executable,
+    shared: &Arc<SharedRuntime>,
+    job: &QueuedJob,
+    track: &TrackSpec,
+    cancel: &Arc<AtomicBool>,
+) -> Result<TrackResult, CacheRuntimeError> {
+    if let Some(message) = crate::desktop_login::download_login_error("bbdown", &job.spec.cookie) {
+        append_log(&job.spec.log_file, "download_login_required source=bbdown");
+        return Err(CacheRuntimeError::new("authentication", message));
+    }
+    append_log(
+        &job.spec.log_file,
+        "download_credentials_loaded source=bbdown (attempt login; credentials redacted)",
+    );
+    // Reuse the Native resolver/rankers only as a supported-DASH preflight.
+    // BBDown owns the transfer. In particular reject non-DASH segmented input
+    // before BBDown's legacy segment merger can try a media CLI.
+    emit_track_progress(shared, job, track, "resolving", 1, (0, 0));
+    resolve_track_stream(&job.spec, track)?;
+    let directory = job
+        .spec
+        .cache_root
+        .join(".staging")
+        .join(&job.reservation.item_incarnation_id)
+        .join(&job.reservation.artifact_set_id)
+        .join(&track.key);
+    fs::create_dir(&directory)
+        .map_err(|_| CacheRuntimeError::new("io", "Cannot create BBDown track directory"))?;
+    fs::write(directory.join("empty.config"), b"")
+        .map_err(|_| CacheRuntimeError::new("io", "Cannot isolate BBDown configuration"))?;
+    let mut command = Command::new(&executable.0);
+    command
+        .args(arguments(&job.spec, track, &directory))
+        .current_dir(&directory)
+        .env("PATH", "");
+    emit_track_progress(shared, job, track, "downloading", 1, (0, 0));
+    let mut last_progress = Instant::now();
+    supervise(command, cancel, Duration::from_secs(3600), false, || {
+        if last_progress.elapsed() >= Duration::from_secs(1) {
+            emit_track_progress(
+                shared,
+                job,
+                track,
+                "downloading",
+                1,
+                (downloaded_bytes(&directory), 0),
+            );
+            last_progress = Instant::now();
+        }
+    })?;
+    let source = output(&directory)?;
+    // Inspect the actual codec: BBDown names FLAC-in-MP4 audio .m4a too.
+    let inspection = crate::media_routing::inspect(
+        &crate::media_routing::InspectRequest {
+            schema_version: 1,
+            operation: crate::media_routing::Operation::Metadata,
+            source: source.clone(),
+            expected_kind: track.kind,
+            container_hint: None,
+            compatibility: None,
+        },
+        cancel,
+        &|| false,
+    )
+    .map_err(|e| CacheRuntimeError::new(e.kind, e.message))?;
+    let codec = match inspection {
+        crate::media_routing::Inspection::Completed { metadata, .. } => metadata
+            .streams
+            .first()
+            .and_then(|stream| stream.codec.clone()),
+        crate::media_routing::Inspection::Compatibility { .. } => {
+            // The same retained Rust MP4 probe used by Native normalization.
+            // There is no CLI compatibility execution in this Host.
+            Some(
+                crate::media_backend::probe_media(&crate::media_backend::MediaPathRequest {
+                    schema_version: 1,
+                    source: source.clone(),
+                    expected_kind: track.kind,
+                })
+                .map_err(|e| {
+                    CacheRuntimeError::new(
+                        e.kind.as_str(),
+                        "BBDown output failed native media inspection",
+                    )
+                })?
+                .codec,
+            )
+        }
+    };
+    let flac = codec.as_deref() == Some("flac");
+    let extension = if flac {
+        "flac"
+    } else if track.kind == ExpectedMediaKind::Video {
+        "mp4"
+    } else {
+        "m4a"
+    };
+    let final_name = format!("{}.{}", track.key, extension);
+    let (destination, probe) = if default_passthrough(&job.spec, track.kind, codec.as_deref()) {
+        // Preserve default Host's accepted MP4 codecs outside the copy-remux
+        // profiles, using its existing validator and unchanged track bytes.
+        let metadata = validate_default_track(&job.spec, track, &source, cancel)?;
+        (source, TrackValidation::Inspected(metadata))
+    } else {
+        let destination = directory.join(format!("normalized-{final_name}"));
+        let probe = normalize_track(&job.spec, track, &source, &destination, cancel)?;
+        (destination, TrackValidation::Normalized(probe))
+    };
+    emit_track_progress(
+        shared,
+        job,
+        track,
+        "ready",
+        1,
+        (probe.file_bytes(), probe.file_bytes()),
+    );
+    Ok(TrackResult {
+        spec: track.clone(),
+        temporary_path: destination,
+        final_name,
+        probe,
+    })
+}
+
+pub(super) fn preflight_audio(
+    dash: &crate::bilibili_service::BilibiliDashResult,
+) -> Result<BilibiliStream, CacheRuntimeError> {
+    use bilikara_rust::{
+        PreferredAudioSource, PreferredAudioSourceRequest, PreferredAudioSourceSelection,
+        PreferredRegularAudioCandidate, select_preferred_audio_source,
+    };
+    // Establish supported DASH input only. BBDown owns its bandwidth ordering
+    // and the captured --audio-ascending preference, including Dolby-only input.
+    let selection = select_preferred_audio_source(&PreferredAudioSourceRequest {
+        audio_hires: true,
+        regular_candidates: (0..dash.audio.len())
+            .map(|original_index| PreferredRegularAudioCandidate { original_index })
+            .collect(),
+        flac_available: dash.flac.is_some(),
+        dolby_available: dash.dolby.is_some(),
+    })
+    .map_err(|_| CacheRuntimeError::new("selection", "invalid audio stream selection"))?;
+    let selected = match selection {
+        PreferredAudioSourceSelection::Selected {
+            preferred_source: PreferredAudioSource::Dolby,
+            ..
+        } => dash.dolby.as_ref(),
+        PreferredAudioSourceSelection::Selected {
+            preferred_source: PreferredAudioSource::Flac,
+            ..
+        } => dash.flac.as_ref(),
+        PreferredAudioSourceSelection::Selected {
+            selected_regular_index: Some(index),
+            ..
+        } => dash.audio.get(index),
+        _ => None,
+    };
+    selected
+        .cloned()
+        .ok_or_else(|| CacheRuntimeError::new("selection", "no audio stream is available"))
+}
+
+pub(super) fn default_passthrough(
+    job: &CacheJobSpec,
+    kind: ExpectedMediaKind,
+    codec: Option<&str>,
+) -> bool {
+    let force_avc = match job.executor {
+        Executor::Bbdown { force_avc, .. } | Executor::Downkyi { force_avc, .. } => force_avc,
+        _ => return false,
+    };
+    match kind {
+        ExpectedMediaKind::Video => !force_avc && matches!(codec, Some("hevc" | "av1")),
+        ExpectedMediaKind::Audio => codec == Some("eac3"),
+    }
+}
+
+pub(super) fn validate_default_track(
+    job: &CacheJobSpec,
+    track: &TrackSpec,
+    source: &Path,
+    cancel: &AtomicBool,
+) -> Result<crate::media_routing::Metadata, CacheRuntimeError> {
+    use crate::media_routing::{InspectRequest, Inspection, Operation};
+    let inspection = crate::media_routing::inspect(
+        &InspectRequest {
+            schema_version: 1,
+            operation: Operation::Validate,
+            source: source.into(),
+            expected_kind: track.kind,
+            container_hint: Some("mp4".into()),
+            compatibility: None,
+        },
+        cancel,
+        &|| false,
+    )
+    .map_err(|e| CacheRuntimeError::new(e.kind, e.message))?;
+    let Inspection::Completed {
+        metadata,
+        diagnostic,
+    } = inspection
+    else {
+        return Err(CacheRuntimeError::new(
+            "unavailable",
+            "Desktop source track requires the packaged media validator",
+        ));
+    };
+    append_log(
+        &job.log_file,
+        &format!("media_diagnostic: {}", json!(diagnostic)),
+    );
+    let stream = metadata.streams.first();
+    let duration = stream
+        .and_then(|s| s.duration_seconds)
+        .or(metadata.duration_seconds);
+    if metadata.inspection_level != "packet_scan"
+        || metadata.container != "mov,mp4,m4a,3gp,3g2,mj2"
+        || metadata.size == 0
+        || !default_passthrough(job, track.kind, stream.and_then(|s| s.codec.as_deref()))
+        || !duration.is_some_and(|d| d.is_finite() && d >= 1.0)
+    {
+        return Err(CacheRuntimeError::new(
+            "invalid_media",
+            "Desktop source output failed the validated MP4 track contract",
+        ));
+    }
+    Ok(metadata)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn job() -> CacheJobSpec {
+        serde_json::from_value(json!({"item_id":"a", "item_incarnation_id":"incarnation", "bvid":"BV1xx411c7mD", "video_page":2,
+            "pages":[{"page":2,"cid":22},{"page":1,"cid":11}], "cache_root":"/tmp/cache", "log_file":"/tmp/log",
+            "cookie":"SESSDATA=synthetic secret; bili_jct=synthetic", "video_quality":"1080P 高清", "avc_quality_cap":"480P 清晰"})).unwrap()
+    }
+    #[test]
+    fn typed_arguments_capture_pages_quality_cookie_and_skip_mux_without_cli() {
+        let job = job();
+        let tracks = track_specs(&job).unwrap();
+        let directory = std::env::temp_dir().join("BBDown 空 path");
+        let args = arguments(&job, &tracks[0], &directory);
+        let pairs = |key: &str| args.windows(2).find(|p| p[0] == key).unwrap()[1].clone();
+        assert_eq!(pairs("-p"), "2");
+        assert_eq!(pairs("--work-dir"), directory.as_os_str());
+        assert_eq!(pairs("-c"), job.cookie.as_str());
+        assert_eq!(pairs("-e"), "avc");
+        let policy = decide_quality_policy(&QualityPolicyRequest {
+            raw_quality: job.video_quality.clone(),
+            raw_cap: job.avc_quality_cap.clone(),
+            choice_index: None,
+        });
+        assert_eq!(
+            pairs("-q"),
+            policy
+                .bbdown_quality_order
+                .iter()
+                .map(|q| q.label())
+                .collect::<Vec<_>>()
+                .join(",")
+                .as_str()
+        );
+        assert!(args.contains(&"--skip-mux".into()));
+        assert!(args.contains(&"--video-only".into()));
+        assert!(!args.iter().any(|a| a.to_string_lossy().contains("ffmpeg")
+            || a.to_string_lossy().contains("ffprobe")
+            || a.to_string_lossy().contains("aria2")));
+        assert_eq!(
+            tracks.iter().map(|t| t.key.as_str()).collect::<Vec<_>>(),
+            ["video-p2", "audio-p2", "audio-p1"]
+        );
+        assert!(arguments(&job, &tracks[1], &directory).contains(&"--audio-ascending".into()));
+        let mut hires = job.clone();
+        hires.audio_hires = true;
+        hires.cookie.clear();
+        let args = arguments(&hires, &tracks[1], &directory);
+        assert!(!args.contains(&"--audio-ascending".into()));
+        assert_eq!(args.last().unwrap(), ";"); // blocks BBDown's adjacent credential fallback
+    }
+    #[test]
+    fn wire_cannot_select_a_desktop_executor() {
+        assert!(matches!(job().executor, Executor::Native));
+        let mut wire = json!({"item_id":"a","item_incarnation_id":"b","bvid":"BV1xx411c7mD","video_page":1,"pages":[],"cache_root":"/tmp/c","log_file":"/tmp/l"});
+        wire["executor"] = json!({"bbdown":"/arbitrary/program"});
+        assert!(serde_json::from_value::<CacheJobSpec>(wire).is_err());
+    }
+    #[test]
+    fn default_host_codec_intent_is_captured_without_changing_native_host_defaults() {
+        let mut spec = job();
+        let tracks = track_specs(&spec).unwrap();
+        let directory = PathBuf::from("/owned/track");
+        // Native Host keeps its existing AVC behavior.
+        assert!(arguments(&spec, &tracks[0], &directory).contains(&"avc".into()));
+        spec.executor = Executor::Bbdown {
+            executable: Executable::fixture(PathBuf::from("/trusted/BBDown")),
+            force_avc: false,
+        };
+        assert!(!arguments(&spec, &tracks[0], &directory).contains(&"-e".into()));
+        assert!(default_passthrough(
+            &spec,
+            ExpectedMediaKind::Video,
+            Some("hevc")
+        ));
+        assert!(default_passthrough(
+            &spec,
+            ExpectedMediaKind::Video,
+            Some("av1")
+        ));
+        assert!(default_passthrough(
+            &spec,
+            ExpectedMediaKind::Audio,
+            Some("eac3")
+        ));
+        assert!(!default_passthrough(
+            &spec,
+            ExpectedMediaKind::Audio,
+            Some("unknown")
+        ));
+        if let Executor::Bbdown { force_avc, .. } = &mut spec.executor {
+            *force_avc = true;
+        }
+        assert!(!default_passthrough(
+            &spec,
+            ExpectedMediaKind::Video,
+            Some("hevc")
+        ));
+        assert!(default_passthrough(
+            &spec,
+            ExpectedMediaKind::Audio,
+            Some("eac3")
+        ));
+        spec.executor = Executor::Bbdown {
+            executable: Executable::fixture(PathBuf::from("/trusted/BBDown")),
+            force_avc: true,
+        };
+        assert!(arguments(&spec, &tracks[0], &directory).contains(&"avc".into()));
+        assert!(default_passthrough(
+            &spec,
+            ExpectedMediaKind::Audio,
+            Some("eac3")
+        ));
+    }
+    #[test]
+    fn output_requires_one_owned_nonempty_file() {
+        let root = std::env::temp_dir().join(format!(
+            "bbdown-output-{}-{}",
+            std::process::id(),
+            ATTEMPT_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        assert_eq!(output(&root).unwrap_err().kind, "source_missing");
+        fs::write(root.join("audio.m4a"), b"").unwrap();
+        assert_eq!(output(&root).unwrap_err().kind, "invalid_media");
+        fs::write(root.join("audio.m4a"), b"must still pass media validation").unwrap();
+        assert_eq!(output(&root).unwrap(), root.join("audio.m4a"));
+        fs::write(root.join("extra.mp4"), b"ambiguous").unwrap();
+        assert_eq!(output(&root).unwrap_err().kind, "media_contract_violation");
+        fs::remove_file(root.join("extra.mp4")).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join("audio.m4a"), root.join("link.m4a")).unwrap();
+            assert_eq!(output(&root).unwrap_err().kind, "media_contract_violation");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn supervisor_drains_redacts_cancels_reaps_and_bounds_help() {
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "printf credential-secret; printf credential-secret >&2; exit 9",
+        ]);
+        let error = supervise(
+            command,
+            &AtomicBool::new(false),
+            Duration::from_secs(2),
+            false,
+            || {},
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, "tool_exit");
+        assert!(!error.message.contains("credential-secret"));
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "yes output | head -c 200000"]);
+        assert_eq!(
+            supervise(
+                command,
+                &AtomicBool::new(false),
+                Duration::from_secs(2),
+                true,
+                || {}
+            )
+            .unwrap()
+            .len(),
+            65536
+        );
+        let cancel = AtomicBool::new(false);
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 30"]);
+        let start = Instant::now();
+        let error = supervise(command, &cancel, Duration::from_secs(2), false, || {
+            cancel.store(true, Ordering::Release)
+        })
+        .unwrap_err();
+        assert_eq!(error.kind, "cancelled");
+        assert!(start.elapsed() < Duration::from_secs(2));
+        let error = supervise(
+            Command::new("/nonexistent/bbdown"),
+            &AtomicBool::new(false),
+            Duration::from_secs(1),
+            false,
+            || {},
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, "unavailable");
+        assert!(Executable::check(PathBuf::from("/bin/true")).is_none());
+    }
+
+    #[test]
+    fn http_failures_are_bounded_split_safe_and_do_not_expose_tool_output() {
+        for line in [
+            b"net_http_message_not_success_statuscode_reason, 412, Precondition Failed\r\n"
+                .as_slice(),
+            b"Response status code does not indicate success: 412 (Precondition Failed).\n"
+                .as_slice(),
+        ] {
+            for split in 0..=line.len() {
+                let mut parser = HttpFailure::default();
+                parser.consume(&line[..split]);
+                parser.consume(&line[split..]);
+                parser.line();
+                assert_eq!(parser.status, Some(412));
+            }
+        }
+        for line in [
+            "https://private.invalid/?token=secret&status=412",
+            "Cookie: SESSDATA=secret; status=412",
+            "net_http_message_not_success_statuscode_reason, 4120, fake",
+            "net_http_message_not_success_statuscode_reason, 200, OK",
+            "Response status code does not indicate success: 412secret",
+        ] {
+            let mut parser = HttpFailure::default();
+            parser.consume(line.as_bytes());
+            parser.line();
+            assert_eq!(parser.status, None);
+        }
+        let mut parser = HttpFailure::default();
+        parser.consume(b"net_http_message_not_success_statuscode_reason, 412, ");
+        parser.consume(&vec![b'x'; 16_384]);
+        assert_eq!(parser.pending.len(), 1024);
+        parser.consume(b"\nResponse status code does not indicate success: 403 (Forbidden).");
+        parser.line();
+        assert_eq!(parser.status, Some(403));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_child_reports_only_http_status_and_preserves_cancellation() {
+        for stderr in [false, true] {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", if stderr {
+                "printf 'credential-secret\\nResponse status code does not indicate success: 412 (Precondition Failed).' >&2; exit 1"
+            } else {
+                "printf 'credential-secret\\nnet_http_message_not_success_statuscode_reason, 412, Precondition Failed\\n'; exit 1"
+            }]);
+            let error = supervise(
+                command,
+                &AtomicBool::new(false),
+                Duration::from_secs(2),
+                false,
+                || {},
+            )
+            .unwrap_err();
+            assert_eq!(error.kind, "tool_exit");
+            assert_eq!(error.status_code, Some(412));
+            assert_eq!(
+                error.message,
+                "BBDown source request rejected (HTTP 412); check login and source access, then retry"
+            );
+            assert!(!error.message.contains("credential-secret"));
+        }
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf 'net_http_message_not_success_statuscode_reason, 412, Precondition Failed\\n'; sleep 30"]);
+        let error = supervise(
+            command,
+            &AtomicBool::new(false),
+            Duration::from_millis(300),
+            false,
+            || {},
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, "tool_timeout");
+        assert_eq!(error.status_code, None);
+
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf 'net_http_message_not_success_statuscode_reason, 412, Precondition Failed\\n'; sleep 30"]);
+        let cancel = AtomicBool::new(false);
+        let start = Instant::now();
+        let error = supervise(command, &cancel, Duration::from_secs(2), false, || {
+            if start.elapsed() >= Duration::from_millis(200) {
+                cancel.store(true, Ordering::Release);
+            }
+        })
+        .unwrap_err();
+        assert_eq!(error.kind, "cancelled");
+        assert_eq!(error.status_code, None);
+    }
+}

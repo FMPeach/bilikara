@@ -3,14 +3,20 @@
     "windows": [
       {
         "label": "main",
+        "url": "desktop-startup.html",
         "fullscreen": false,
-        "height": 768,
+        "height": 700,
+        "minWidth": 700,
+        "minHeight": 600,
         "resizable": true,
         "title": "bilikara",
         "width": 1024,
         "visible": false,
         "dragDropEnabled": false,
-        "create": false
+        "create": false,
+        "decorations": true,
+        "hiddenTitle": true,
+        "titleBarStyle": "Overlay"
       }
     ]
   }

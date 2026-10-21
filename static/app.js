@@ -1,5 +1,11 @@
+let playbackRestartMenu = null;
+// Keep range focus cues for keyboard use without leaving them after touch input.
+document.addEventListener("pointerdown", () => {
+  document.documentElement.dataset.hostInputModality = "pointer";
+}, true);
 const pollIntervalMs = 1000;
 const bannerAutoHideMs = 5000;
+const backupBannerMotionMs = 360;
 const stalledRetrySeconds = 5;
 const localPlayerSyncIntervalMs = 120;
 const localPlayerDriftToleranceSeconds = 0.045;
@@ -12,30 +18,36 @@ const localPlayerSeekSettlePollMs = 50;
 const localPlayerSeekSettleMaxMs = 1400;
 const splitPlaybackStartupWatchdogMs = 3000;
 const tauriMediaSessionPositionUpdateMs = 1000;
+const playerStatusMaxSeconds = 7 * 24 * 60 * 60;
 const mediaPlayPromisesInFlight = new WeakSet();
 const audioVariantSwitchDebounceMs = 350;
 const playerSettingsEchoSuppressMs = 1800;
 const playerClickDelayMs = 220;
 const playerControlsAutoHideMs = 5000;
-const listFlipFallbackPaddingMs = 80;
 const defaultSongAdvanceDelaySeconds = 3;
 const maxSongAdvanceDelaySeconds = 30;
-const appUpdateCheckTimeoutMs = 10000;
+const appUpdateCheckTimeoutMs = 30000;
 const avDelayRequestTimeoutMs = 8000;
 const fullscreenRequestToastMs = 4200;
-const fullscreenRequestToastFadeMs = 500;
 const localAdvanceOverlayFadeMs = 500;
 const localAdvanceOverlayMaxRows = 5;
-const larkSearchTableCount = 5;
 const smokeTestBypassPlayerFullscreen = new URLSearchParams(window.location.search)
   .has("bilikara_smoke_bypass_fullscreen");
 const developerModeRequesterName = "VZRXS";
 const projectUrl = "https://github.com/VZRXS/bilikara";
 const searchResultItemByElement = new WeakMap();
 let searchDetailController = null;
-let searchModalCloseTimer = 0;
 
 function openExternalUrl(url) {
+  if (document.documentElement?.dataset?.hostPlatform === "desktop") {
+    globalThis.BilikaraDesktopPlatform?.openExternal(url).catch((error) => setAppMessage(error.message, true));
+    return;
+  }
+  if (document.documentElement?.dataset?.nativeHost === "true" && document.documentElement?.dataset?.hostPlatform !== "desktop") {
+    // External-link integration is deferred; never navigate the player away.
+    setAppMessage("Android Beta：请在另一台设备打开链接，保持本机播放页面在前台。");
+    return;
+  }
   if (window.__TAURI__) {
     apiPost("/api/app/open-url", { url }).catch((err) => {
       console.error("Failed to open URL via backend:", err);
@@ -44,6 +56,16 @@ function openExternalUrl(url) {
   } else {
     window.open(url, "_blank");
   }
+}
+
+function openRemoteAccessLink(event) {
+  const link = event?.currentTarget;
+  const url = String(link?.href || "").trim();
+  if (!url.startsWith("http://") && !url.startsWith("https://")) {
+    return;
+  }
+  event.preventDefault();
+  openExternalUrl(url);
 }
 const developerTagResetFieldKeys = [
   "tag_1",
@@ -81,8 +103,8 @@ const developerDeletePreferredFieldKeys = [
 const storageKeys = {
   playerVolume: "bilikara.player.volume",
   playerMuted: "bilikara.player.muted",
-  layoutMode: "bilikara.layout.mode",
   language: "bilikara.ui.language",
+  updateAutomatic: "bilikara.update.automatic",
   updatePreview: "bilikara.update.preview",
   theme: "bilikara.ui.theme",
 };
@@ -91,36 +113,46 @@ const state = {
   clientId: createClientId(),
   disconnectSent: false,
   data: null,
+  hasValidStateResponse: false,
   lastPollRenderSignature: "",
   currentTitleRenderSignature: "",
   listHeaderRenderSignature: "",
   requesterSelectRenderSignature: "",
   sessionUsersRenderSignature: "",
   remoteAccessRenderSignature: "",
+  remoteAccessFailure: null,
+  remoteAccessRequestSequence: 0,
+  remoteAccessOutcomeSequence: 0,
+  remoteAccessQrFailure: "",
+  statePollInFlight: false,
+  internetRemoteDisplay: null,
   cacheSettingsRenderSignature: "",
   bbdownLoginRenderSignature: "",
-  searchCookieFaceRenderSignature: "",
   gatchaUidFaceRenderSignature: "",
-  gatchaTaskLastMessageSignature: "",
+  gatchaUidLastToastSignature: "",
   confirmPopoverRenderSignature: "",
-  gatchaTaskWatchStartedAt: Date.now() / 1000,
   historyRenderSignature: "",
   playlistEmptyRenderSignature: "",
   cacheSliderRenderSignature: "",
   advanceDelaySliderRenderSignature: "",
   advanceDelaySaving: false,
+  advanceDelayDraftValue: null,
+  advanceDelayQueuedValue: null,
+  advanceDelaySubmittedValue: null,
+  advanceDelayRequestSequence: 0,
+  advanceDelayActiveRequestSequence: 0,
   cachePolicyControlRenderSignature: "",
   playerFullscreenButtonRenderSignature: "",
   volumeControlsRenderSignature: "",
   queueCurrentRenderSignature: "",
   audioVariantBarRenderSignature: "",
-  playerSignature: "",
-  playerContext: null,
+  hostPlaybackSession: null,
+  pendingHostPlaybackProgramReconciliation: null,
+  hostPlaybackBootstrapRestartPending: true,
+  pageHidePlaybackRestartRequired: false,
+  pageHiddenPlaybackGeneration: null,
+  pageRestoreRestartInFlight: false,
   audioContext: null,
-  localPlayerSyncTimer: null,
-  localPlayerStartupTimer: null,
-  localPlaybackStartupWatchdogTimer: null,
-  localPlayerEventCleanups: [],
   localPlayerRequestedRate: 1,
   localPlayerSyncLastSeekAt: 0,
   localPlayerSyncLastAction: "",
@@ -129,27 +161,47 @@ const state = {
   localVideoDeferredRecovery: false,
   localAudioPlaybackBlocked: false,
   localVideoPlaybackBlocked: false,
-  localPlaybackStartState: "idle",
   localPlaybackStartGeneration: 0,
   localPlaybackStartPromisesSettled: false,
   localPlaybackEndHandled: false,
   localPlayerControlsHideTimer: null,
   localPlayerControlsHideGeneration: 0,
-  webKitAudioStarvationTimer: null,
   localWebKitStartRetryDone: false,
-  listView: "queue",
-  listStageView: "",
-  listFlipTimer: null,
-  listFlipFrame: null,
-  listFlipGeneration: 0,
-  listFlipTransitionCleanup: null,
+  stageControlTrayOpen: false,
+  stageControlInlineCollapsed: false,
+  stageMeasuredPresentationActive: false,
+  stageControlTrayDirection: "up",
+  stageControlTrayFocusHandler: null,
+  stageResizeObserver: null,
+  stageMeasureFrame: null,
+  topControlPopoverPositionFrame: null,
+  playbackTooltipPositionFrame: null,
+  queueScrollResizeObserver: null,
+  queueScrollMeasureFrame: null,
+  openRowMenuTrigger: null,
+  playedSessionsLoaded: false,
+  playedSessionsLoadPromise: null,
   cacheSettingsOpen: false,
-  cacheAdvancedOpen: false,
-  displaySettingsOpen: false,
+  remoteQrPinned: false,
+  playerFullscreenRemotePinned: false,
+  playerFullscreenLastPointerType: "",
+  playerFullscreenTransitioning: false,
+  playerFullscreenRevision: 0,
+  playerFullscreenInteraction: null,
+  presentationSettingsOpen: false,
+  presentationDisplayRefreshTimer: null,
+  presentationDisplayRefreshPending: false,
+  presentationIdentifiersBusy: false,
   cacheLimitSaving: false,
+  cacheLimitDraftValue: null,
+  cacheLimitQueuedValue: null,
+  cacheLimitSubmittedValue: null,
+  cacheLimitRequestSequence: 0,
+  cacheLimitActiveRequestSequence: 0,
   cachePolicySaving: false,
   diagnosticsBusy: false,
   diagnosticsCopyController: null,
+  applicationRestartInFlight: false,
   avOffsetSaving: false,
   volumeSaveSeq: 0,
   playerSettingsEchoSuppressUntil: 0,
@@ -159,6 +211,7 @@ const state = {
   audioVariantSwitchTimer: null,
   audioVariantBarExpanded: false,
   audioVariantBarItemId: "",
+  audioVariantPopoverDirection: "down",
   backupBannerShown: false,
   backupBannerDismissed: false,
   backupBannerMode: "",
@@ -170,6 +223,8 @@ const state = {
   backupBannerRemainingMs: bannerAutoHideMs,
   backupBannerPaused: false,
   backupDismissHover: false,
+  backupBannerMotionFrame: null,
+  backupBannerMotionTimer: null,
   localAdvanceInFlight: false,
   localAdvanceDelayTimer: null,
   localAdvanceCountdownTimer: null,
@@ -177,7 +232,6 @@ const state = {
   localAdvanceDelayStartAt: 0,
   localAdvanceDelayDeadline: 0,
   localAdvanceOverlayDurationMs: 0,
-  localAdvanceOverlayMode: "",
   localAdvanceOverlayPrimaryItem: null,
   localAdvanceOverlayFollowItems: null,
   localAdvanceOverlayTotalCount: null,
@@ -190,55 +244,101 @@ const state = {
   localAdvanceDelayToken: 0,
   localAdvanceDelayItemId: "",
   localShouldBePlaying: false,
-  localSeekResumePending: false,
-  localSeekSettling: false,
-  localSeekResumeAfterSettle: false,
-  localSeekSettleStartedAt: 0,
-  localSeekSettleTimer: null,
-  localSeekSettleCallback: null,
   localPlayerVolume: 1,
   localPlayerMuted: false,
   pendingPlaybackRestore: null,
   lastAppliedPlayerControlSeq: 0,
-  lastReportedPlayerStatusSignature: "",
-  lastPlayerStatusHeartbeatAt: 0,
   tauriMediaSessionOwner: null,
   lastTauriMediaSessionPositionAt: 0,
-  playerFrameClickTimer: null,
   dragItemId: "",
+  immediateDeferTransition: null,
   dragTargetId: "",
   dragTargetAfter: false,
   confirmIntent: null,
   bindingIntent: null,
   gatchaFavlistIntent: null,
-  poolConfigData: null,
+  poolConfigOpener: null,
+  poolConfigRequester: "",
+  startupWarningSeen: "",
+  bilikaraSecretOpener: null,
+  developerTagResetOpener: null,
+  ratingPromptOpener: null,
+  poolConfigAccepted: null,
+  poolConfigDraft: null,
+  poolConfigLoading: false,
   poolConfigSaving: false,
+  poolConfigOpenGeneration: 0,
+  poolConfigLoadSequence: 0,
+  poolConfigSaveSequence: 0,
+  poolConfigMessage: "",
+  poolConfigMessageIsError: false,
   developerMode: false,
   bilikaraSecret: "",
   bilikaraSecretVerifying: false,
   developerTagResetItem: null,
   developerTagResetAction: "",
   developerTagResetSaving: false,
+  requestWorkspaceExpansion: null,
   retryActivityById: {},
   gatchaCandidate: null,
-  searchCookieVisible: false,
-  searchLarkVisible: true,
+  gatchaView: "idle",
+  gatchaDrawBusy: false,
+  gatchaDrawSequence: 0,
+  gatchaDrawControlId: "gatcha-button",
+  gatchaDrawError: "",
+  gatchaMessage: "",
+  gatchaMessageIsError: false,
+  gatchaRequestBusy: false,
+  gatchaScrollTop: 0,
+  requestSubview: "quick",
+  focusedRequestSubview: "quick",
+  searchMode: "shared",
+  focusedSearchMode: "shared",
+  discoverMode: "categories",
+  focusedDiscoverMode: "categories",
+  sourcesMode: "uids",
+  focusedSourcesMode: "uids",
+  catalogAdvancedTool: "",
+  requestScrollPositions: {
+    search: { shared: 0, local: 0 },
+    discover: { categories: 0, name: 0, artist: 0 },
+    sources: { uids: 0, favorites: 0 },
+  },
+  requestScrollRestoring: false,
+  requestScrollRestoreToken: 0,
+  sourceParentScrollPositions: { followed: 0, favorites: 0 },
+  sourceItemScrollPositions: { followed: 0, favorites: 0 },
+  searchModeState: {
+    shared: { draft: "", submitted: "", items: [], error: "", message: "", seq: 0 },
+    local: { draft: "", submitted: "", items: [], error: "", message: "", seq: 0 },
+  },
+  requestDetailSelections: {
+    shared: { selectedKey: "", origin: null, focusElement: null, closedForNavigation: false },
+    local: { selectedKey: "", origin: null, focusElement: null, closedForNavigation: false },
+    categories: { selectedKey: "", origin: null, focusElement: null, closedForNavigation: false },
+    name: { selectedKey: "", origin: null, focusElement: null, closedForNavigation: false },
+    artist: { selectedKey: "", origin: null, focusElement: null, closedForNavigation: false },
+    followed: { selectedKey: "", origin: null, focusElement: null, closedForNavigation: false },
+    favorites: { selectedKey: "", origin: null, focusElement: null, closedForNavigation: false },
+  },
+  activeRequestDetailOriginKey: "",
   larkSearchLoading: false,
   larkSearchSeq: 0,
-  searchStageView: "",
-  searchStageAngle: 0,
-  searchFlipTimer: null,
-  searchFlipFrame: null,
   followBrowseData: null,
   followBrowseSelectedUid: "",
   followBrowseLoading: false,
+  followBrowseSeq: 0,
+  followBrowseQuery: "",
   followBrowseRenderSignature: "",
   favlistBrowseData: null,
   favlistBrowseSelectedFolderId: "",
   favlistBrowseLoading: false,
+  favlistBrowseSeq: 0,
+  favlistBrowseQuery: "",
   favlistBrowseRenderSignature: "",
   favlistBrowseReloadTimer: null,
   d1BrowseKind: "",
+  d1BrowseLevel: "alphabet",
   d1BrowseLetter: "",
   d1BrowseTag: "",
   d1BrowseLocale: "",
@@ -246,19 +346,30 @@ const state = {
   d1BrowseData: null,
   d1BrowseLoading: false,
   d1BrowseSeq: 0,
+  d1BrowseError: "",
+  d1BrowseModes: {
+    name: {
+      level: "alphabet", letter: "", tag: "", locale: "", query: "", data: null,
+      tagData: null, itemData: null, loading: false, seq: 0, error: "",
+      scrollPositions: { alphabet: 0, tags: 0, items: 0 },
+    },
+    artist: {
+      level: "alphabet", letter: "", tag: "", locale: "", query: "", data: null,
+      tagData: null, itemData: null, loading: false, seq: 0, error: "",
+      scrollPositions: { alphabet: 0, tags: 0, items: 0 },
+    },
+  },
+  categoryBrowseLevel: "home",
   categoryBrowseSelectedId: "",
   categoryBrowseQuery: "",
   categoryBrowseItems: [],
   categoryBrowseOffset: 0,
   categoryBrowseHasMore: false,
   categoryBrowseLoading: false,
-  playbackSelectorAuthorized: false,
-  playbackSelectorCapability: null,
-  playbackSelectorCapabilityRevision: -1,
-  playbackSelectorCapabilityRequestId: 0,
-  playbackSelectorSaving: false,
   categoryBrowseSeq: 0,
   categoryBrowseError: "",
+  categoryBrowseLoaded: false,
+  categoryBrowseScrollPositions: { home: 0, detail: 0 },
   pendingReviewItems: [],
   pendingReviewTotal: 0,
   pendingReviewExportCount: 0,
@@ -268,12 +379,34 @@ const state = {
   pendingReviewSeq: 0,
   pendingReviewMessage: "",
   pendingReviewError: "",
-  gatchaUidVisible: false,
+  blacklistItems: [],
+  blacklistTotal: 0,
+  blacklistOffset: 0,
+  blacklistLimit: 20,
+  blacklistHasMore: false,
+  blacklistQuery: "",
+  blacklistLoaded: false,
+  blacklistLoading: false,
+  blacklistSeq: 0,
+  blacklistMessage: "",
+  blacklistError: "",
+  maintenanceJobRunning: "",
+  maintenanceJobMessage: "",
+  maintenanceJobError: "",
   gatchaUidSaving: false,
   gatchaRefreshSaving: false,
   gatchaFavlistSaving: false,
   bbdownLoginRequesting: false,
-  updateChecking: false,
+  bbdownExpiredRetryHandled: false,
+  updateAutomaticEnabled: true,
+  updateAutomaticAttemptedChannels: new Set(),
+  startupUpdateCheckScheduled: false,
+  updatePreferenceSaveInFlight: false,
+  updatePreferencesHydration: null,
+  updateCheckRequestInFlight: false,
+  manualUpdateCheck: null,
+  reportedLastInstall: "",
+  updateManualVisibleChannel: "",
   updatePreviewEnabled: false,
   ratingPromptElement: null,
   ratingPromptItem: null,
@@ -282,22 +415,129 @@ const state = {
   ratingPromptItemId: "",
   ratingPromptBvid: "",
   ratingPromptScore: 5,
+  ratingPromptScoreDirty: false,
+  ratingPromptSubmissionKey: "",
   ratingPromptSubmitted: false,
   ratingPromptSeenPlayIds: new Set(),
   ratingSubmittedKeys: new Set(),
+  ratingPendingKeys: new Set(),
+  ratingQueuedKeys: new Set(),
+  ratingSavedScores: new Map(),
   ratingOptOut: false,
   appToastTimer: null,
-  fullscreenRequestToastTimer: null,
-  fullscreenRequestToastHideTimer: null,
-  layoutMode: "full",
+  presentationSession: {
+    mode: "singleScreen",
+    phase: "inactive",
+    generation: 0,
+    selectedOutputDisplayId: "",
+    controllerDisplayId: "",
+    hostReady: true,
+    controllerReady: false,
+    lastAcceptedCommandSequence: 0,
+    lastAppliedCommandSequence: 0,
+    playbackAuthority: "host",
+    mediaRendererOwner: "host",
+    recoveryReason: "",
+  },
+  presentationDisplayInfo: null,
+  presentationDisplayError: "",
+  presentationSelectedDisplayId: "",
+  presentationSelectedHostDisplayId: "",
+  presentationSelectionInitialized: false,
+  presentationControlBusy: false,
+  presentationDisplayBusy: false,
+  presentationOutputRenderSignature: "",
+  presentationSceneKey: "",
+  presentationSceneRevision: 0,
+  presentationPlaybackRevision: 0,
+  presentationPlaybackPublishSignature: "",
+  presentationPlaybackPublishPromise: null,
+  presentationCommandApplyPromise: Promise.resolve(),
+  presentationLastAppliedCommandSequence: 0,
+  presentationAppliedComposition: "combined",
+  presentationCompositionGeneration: 0,
+  presentationHostReadyKey: "",
+  presentationListenersReady: false,
+  presentationUnlisteners: [],
+  presentationCursorHideTimer: null,
+  presentationOutputChannel: null,
+  presentationOutputSenderId: `host-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`,
+  presentationOutputSequence: 0,
+  presentationOutputRelayPending: null,
+  presentationOutputRelayInFlight: false,
+  presentationHostControlBusy: false,
+  presentationHostProgressScrubbing: false,
+  presentationHostAnnouncementKey: "",
+  presentationHostAnnouncementModel: null,
+  activeHostWorkspace: "request",
+  focusedHostWorkspace: "request",
+  hostWorkspaceOverlayOpen: false,
+  hostNarrowToolSheetActive: false,
+  hostWorkspaceTransition: null,
+  hostWorkspaceTransitionTimer: null,
+  hostWorkspaceScrollPositions: {
+    queue: 0,
+    request: 0,
+    random: 0,
+    users: 0,
+    settings: 0,
+  },
   language: "zh",
   translations: {},
   translationsLoaded: false,
   theme: "light",
 };
 
+function legacyPlaybackStartStateForSession(session = state.hostPlaybackSession) {
+  const phase = String(session?.phase || "");
+  if (phase === "starting") {
+    return "starting";
+  }
+  if (phase === "playing" || phase === "paused") {
+    return "established";
+  }
+  if (phase === "needs-user-gesture") {
+    return "needs-user-gesture";
+  }
+  if (phase === "failed") {
+    return "startup-failed";
+  }
+  if (
+    phase === "requested"
+    || phase === "binding"
+    || phase === "ready-paused"
+    || phase === "start-retry-wait"
+  ) {
+    return "pending";
+  }
+  return "idle";
+}
+
+function setHostPlaybackSessionPhase(session, phase) {
+  if (!session) {
+    return false;
+  }
+  session.phase = phase;
+  return true;
+}
+
+Object.defineProperty(state, "localPlaybackStartState", {
+  configurable: false,
+  enumerable: true,
+  get() {
+    return legacyPlaybackStartStateForSession();
+  },
+});
+
 const elements = {
   appShell: document.getElementById("app-shell"),
+  topbar: document.querySelector(".topbar"),
+  hostContentRegion: document.querySelector(".host-content-region"),
+  leftColumn: document.querySelector(".left-column"),
+  hostWorkspaceRegion: document.getElementById("host-workspace-region"),
+  hostWorkspaceButtons: document.querySelectorAll("[data-host-workspace]"),
+  hostWorkspacePanels: document.querySelectorAll("[data-host-workspace-panel]"),
+  hostWorkspaceBackdrop: document.getElementById("host-workspace-backdrop"),
   developerModeTrigger: document.getElementById("developer-mode-trigger"),
   serviceStatusIndicator: document.getElementById("service-status-indicator"),
   playbackModeSummary: document.getElementById("playback-mode-summary"),
@@ -306,8 +546,6 @@ const elements = {
   cacheSettings: document.getElementById("cache-settings"),
   cacheSettingsToggle: document.getElementById("cache-settings-toggle"),
   cachePanel: document.getElementById("cache-panel"),
-  cacheAdvancedInlineView: document.getElementById("cache-advanced-inline-view"),
-  cachePanelAdvancedTrigger: document.getElementById("cache-panel-advanced-trigger"),
   cacheUsageDetail: document.getElementById("cache-usage-detail"),
   cachePanelVersion: document.getElementById("cache-panel-version"),
   bbdownStatusRow: document.getElementById("bbdown-status-row"),
@@ -316,34 +554,71 @@ const elements = {
   bbdownLoginQrImage: document.getElementById("bbdown-login-qr-image"),
   bbdownLoginQrText: document.getElementById("bbdown-login-qr-text"),
   bbdownLoginMessage: document.getElementById("bbdown-login-message"),
+  bbdownLoginLink: document.getElementById("bbdown-login-link"),
   bbdownLoginRefresh: document.getElementById("bbdown-login-refresh"),
-  ffmpegStatusRow: document.getElementById("ffmpeg-status-row"),
-  bbdownPanelStatusIndicator: document.getElementById("bbdown-panel-status-indicator"),
-  ffmpegPanelStatusIndicator: document.getElementById("ffmpeg-panel-status-indicator"),
   cacheLimitSlider: document.getElementById("cache-limit-slider"),
   cacheLimitScale: document.getElementById("cache-limit-scale"),
   advanceDelaySlider: document.getElementById("advance-delay-slider"),
   advanceDelayScale: document.getElementById("advance-delay-scale"),
   cacheQualitySelect: document.getElementById("cache-quality-select"),
   cacheDownloadSourceSelect: document.getElementById("cache-download-source-select"),
-  playbackSelectorContainer: document.getElementById("playback-selector-container"),
-  playbackSelectorSelect: document.getElementById("playback-selector-select"),
-  playbackSelectorHint: document.getElementById("playback-selector-hint"),
   cacheHiresCheckbox: document.getElementById("cache-hires-checkbox"),
   resetOffsetCheckbox: document.getElementById("reset-offset-checkbox"),
   dataResetButton: document.getElementById("data-reset-button"),
   currentCacheRetryButton: document.getElementById("current-cache-retry-button"),
   playerResetButton: document.getElementById("player-reset-button"),
   updatePreviewCheckbox: document.getElementById("update-preview-checkbox"),
+  updateAutomaticCheckbox: document.getElementById("update-automatic-checkbox"),
   updateCheckButton: document.getElementById("update-check-button"),
+  settingsUpdateIndicator: document.getElementById("settings-update-indicator"),
+  appUpdateRow: document.getElementById("app-update-row"),
+  appUpdateStatus: document.getElementById("app-update-status"),
+  updateCancelButton: document.getElementById("update-cancel-button"),
+  updateVersionBadge: document.getElementById("update-version-badge"),
+  applicationRestartRow: document.getElementById("application-restart-row"),
+  applicationRestartButton: document.getElementById("application-restart-button"),
   diagnosticCopyButton: document.getElementById("diagnostic-copy-button"),
   diagnosticPackageButton: document.getElementById("diagnostic-package-button"),
   currentTitle: document.getElementById("current-title"),
+  currentTitleText: document.getElementById("current-title-text"),
   playerPanel: document.querySelector(".player-panel"),
   playerFrame: document.getElementById("player-frame"),
+  presentationHostAnnouncement: document.getElementById("presentation-host-announcement"),
+  presentationHostControls: document.getElementById("presentation-host-controls"),
+  presentationHostBack: document.getElementById("presentation-host-back"),
+  presentationHostPlay: document.getElementById("presentation-host-play"),
+  presentationHostForward: document.getElementById("presentation-host-forward"),
+  presentationHostProgress: document.getElementById("presentation-host-progress"),
+  presentationHostCurrentTime: document.getElementById("presentation-host-current-time"),
+  presentationHostDuration: document.getElementById("presentation-host-duration"),
+  presentationHostNext: document.getElementById("presentation-host-next"),
+  playerFullscreenControl: document.getElementById("player-fullscreen-control"),
   playerFullscreenButton: document.getElementById("player-fullscreen-button"),
+  androidFullscreenRemoteButton: document.getElementById("android-fullscreen-remote-button"),
+  playerFullscreenLabel: document.getElementById("player-fullscreen-label"),
+  playerFullscreenRemotePopover: document.getElementById("player-fullscreen-remote-popover"),
+  playerFullscreenRemoteQrImage: document.getElementById("player-fullscreen-remote-qr-image"),
+  playerFullscreenRemoteQrPlaceholder: document.getElementById("player-fullscreen-remote-qr-placeholder"),
+  playerFullscreenRemoteUrl: document.getElementById("player-fullscreen-remote-url"),
+  playerFullscreenRemoteUrlHint: document.getElementById("player-fullscreen-remote-url-hint"),
+  playerFullscreenPublicRoom: document.getElementById("player-fullscreen-public-room"),
+  playerFullscreenPublicQrImage: document.getElementById("player-fullscreen-public-qr-image"),
+  playerFullscreenPublicQrPlaceholder: document.getElementById("player-fullscreen-public-qr-placeholder"),
+  playerFullscreenPublicPassword: document.getElementById("player-fullscreen-public-password"),
+  playerFullscreenPublicMeta: document.getElementById("player-fullscreen-public-meta"),
+  playerFullscreenPublicConnectionCount: document.getElementById("player-fullscreen-public-connection-count"),
+  stageControlsToggle: document.getElementById("stage-controls-toggle"),
+  stageControlsClose: document.getElementById("stage-controls-close"),
+  stageControlBackdrop: document.getElementById("stage-control-backdrop"),
+  stageControlTray: document.getElementById("stage-control-tray"),
+  stageExtendedControls: document.getElementById("stage-extended-controls"),
   fullscreenRequestToast: document.getElementById("fullscreen-request-toast"),
+  presentationFeedback: document.getElementById("presentation-feedback"),
+  audioVariantAnchor: document.getElementById("audio-variant-anchor"),
   audioVariantBar: document.getElementById("audio-variant-bar"),
+  audioVariantToggle: document.getElementById("audio-variant-toggle"),
+  audioVariantBackdrop: document.getElementById("audio-variant-backdrop"),
+  audioVariantPopover: document.getElementById("audio-variant-popover"),
   avSyncPanel: document.getElementById("av-sync-panel"),
   avOffsetInput: document.getElementById("av-offset-input"),
   avOffsetResetButton: document.getElementById("av-offset-reset-button"),
@@ -359,6 +634,8 @@ const elements = {
   keyShiftResetButton: document.getElementById("key-shift-reset-button"),
   addForm: document.getElementById("add-form"),
   requesterSelect: document.getElementById("requester-select"),
+  requesterEmptyButton: document.getElementById("requester-empty-button"),
+  requestSessionUserNotice: document.getElementById("request-session-user-notice"),
   urlInput: document.getElementById("url-input"),
   formMessage: document.getElementById("form-message"),
   appToast: document.getElementById("app-toast"),
@@ -377,6 +654,7 @@ const elements = {
   playlist: document.getElementById("playlist"),
   historyList: document.getElementById("history-list"),
   queueCount: document.getElementById("queue-count"),
+  historyCount: document.getElementById("history-count"),
   queueCurrent: document.getElementById("queue-current"),
   queueCurrentProgressBadge: document.getElementById("queue-current-progress-badge"),
   queueCurrentIconWrap: document.getElementById("queue-current-icon-wrap"),
@@ -387,17 +665,26 @@ const elements = {
   queueCurrentRetry: document.getElementById("queue-current-retry"),
   listStage: document.getElementById("list-stage"),
   modeSwitch: document.getElementById("mode-switch"),
-  displaySettings: document.getElementById("display-settings"),
-  displaySettingsToggle: document.getElementById("display-settings-toggle"),
-  displaySettingsPanel: document.getElementById("display-settings-panel"),
-  displayLayoutSummary: document.getElementById("display-layout-summary"),
-  layoutModeSwitch: document.getElementById("layout-mode-switch"),
+  presentationSettings: document.getElementById("presentation-settings"),
+  presentationSettingsToggle: document.getElementById("presentation-settings-toggle"),
+  presentationSettingsPanel: document.getElementById("presentation-settings-panel"),
+  presentationOutputButton: document.getElementById("presentation-output-button"),
+  presentationOutputStatus: document.getElementById("presentation-output-status"),
+  presentationOutputSummary: document.getElementById("presentation-output-summary"),
+  presentationOutputMeta: document.getElementById("presentation-output-meta"),
+  presentationStateDot: document.getElementById("presentation-state-dot"),
+  presentationDisplayList: document.getElementById("presentation-display-list"),
+  presentationHostTargetSection: document.getElementById("presentation-host-target-section"),
+  presentationHostTargetSummary: document.getElementById("presentation-host-target-summary"),
+  presentationHostDisplayList: document.getElementById("presentation-host-display-list"),
+  presentationIdentifyButton: document.getElementById("presentation-identify-button"),
+  presentationRefreshButton: document.getElementById("presentation-refresh-button"),
   languageSwitch: document.getElementById("language-switch"),
   themeSwitch: document.getElementById("theme-switch"),
   nextButton: document.getElementById("next-button"),
+  openRatingButton: document.getElementById("open-rating-button"),
   queueNextButton: document.getElementById("queue-next-button"),
   resortPlaylistButton: document.getElementById("resort-playlist-button"),
-  historyToggleButton: document.getElementById("history-toggle-button"),
   clearPlaylistButton: document.getElementById("clear-playlist-button"),
   historyExportButton: document.getElementById("history-export-button"),
   clearHistoryButton: document.getElementById("clear-history-button"),
@@ -409,11 +696,12 @@ const elements = {
   confirmPageSize: document.getElementById("confirm-page-size"),
   confirmPageSizeNote: document.getElementById("confirm-page-size-note"),
   confirmCancel: document.getElementById("confirm-cancel"),
+  confirmClose: document.getElementById("confirm-close"),
+  confirmTitle: document.getElementById("confirm-title"),
   confirmSecondary: document.getElementById("confirm-secondary"),
   confirmOk: document.getElementById("confirm-ok"),
   bindingModal: document.getElementById("binding-modal"),
   bindingModalBackdrop: document.getElementById("binding-modal-backdrop"),
-  bindingModalText: document.getElementById("binding-modal-text"),
   bindingVideoOptions: document.getElementById("binding-video-options"),
   bindingAudioOptions: document.getElementById("binding-audio-options"),
   bindingModalClose: document.getElementById("binding-modal-close"),
@@ -432,6 +720,7 @@ const elements = {
   poolConfigModalCancel: document.getElementById("gatcha-pool-config-modal-cancel"),
   poolConfigModalReset: document.getElementById("gatcha-pool-config-modal-reset"),
   poolConfigModalSave: document.getElementById("gatcha-pool-config-modal-save"),
+  poolConfigSourceList: document.getElementById("gatcha-pool-source-list"),
   poolConfigWeightSlider: document.getElementById("gatcha-pool-weight-slider"),
   poolConfigWeightLabel: document.getElementById("gatcha-pool-weight-label"),
   poolConfigUidOptions: document.getElementById("gatcha-pool-uid-options"),
@@ -452,15 +741,42 @@ const elements = {
   remotePopoverQrPlaceholder: document.getElementById("remote-popover-qr-placeholder"),
   remotePopoverUrlLink: document.getElementById("remote-popover-url-link"),
   remotePopoverUrlHint: document.getElementById("remote-popover-url-hint"),
-  searchPanel: document.getElementById("search-panel"),
-  searchExpandButton: document.getElementById("search-expand-button"),
-  searchCardContent: document.getElementById("search-card-content"),
-  searchModal: document.getElementById("search-modal"),
-  searchModalBackdrop: document.getElementById("search-modal-backdrop"),
-  searchModalClose: document.getElementById("search-modal-close"),
-  searchModalPlaceholder: document.getElementById("search-modal-content-placeholder"),
+  remotePopoverCopyLink: document.getElementById("remote-popover-copy-link"),
+  internetRemoteUrlLink: document.getElementById("internet-remote-url"),
+  internetRemoteCopyLink: document.getElementById("internet-remote-copy-link"),
+  windowDragRegion: document.getElementById("window-drag-region"),
+  windowControls: document.getElementById("window-controls"),
+  windowMinimize: document.getElementById("window-minimize"),
+  windowMaximize: document.getElementById("window-maximize"),
+  windowClose: document.getElementById("window-close"),
+  remoteMiniControl: document.getElementById("remote-mini-control"),
+  remoteMiniTrigger: document.getElementById("remote-mini-trigger"),
+  remoteMiniPopover: document.getElementById("remote-mini-popover"),
+  requestWorkspace: document.getElementById("host-workspace-request"),
+  requestWorkspaceExpand: document.getElementById("request-workspace-expand"),
+  requestWorkspaceCollapse: document.getElementById("request-workspace-collapse"),
+  requestWorkspaceModal: document.getElementById("request-workspace-modal"),
+  requestWorkspaceModalCard: document.getElementById("request-workspace-modal-card"),
+  requestWorkspaceModalBackdrop: document.getElementById("request-workspace-modal-backdrop"),
+  requestSubviewButtons: document.querySelectorAll("[data-request-view]"),
+  requestSubviewPanels: document.querySelectorAll("[data-request-panel]"),
+  searchModeButtons: document.querySelectorAll("[data-search-mode]"),
+  searchModePanels: document.querySelectorAll("[data-search-panel]"),
+  discoverModeButtons: document.querySelectorAll("[data-discover-mode]"),
+  discoverModePanels: document.querySelectorAll("[data-discover-panel]"),
+  discoverCategoriesPanel: document.getElementById("request-discover-categories"),
+  discoverNamePanel: document.getElementById("request-discover-name"),
+  discoverArtistPanel: document.getElementById("request-discover-artist"),
+  catalogAdvancedMenu: document.getElementById("catalog-advanced-menu"),
+  catalogAdvancedView: document.getElementById("catalog-advanced-view"),
+  catalogAdvancedContent: document.getElementById("catalog-advanced-content"),
+  catalogAdvancedBack: document.getElementById("catalog-advanced-back"),
+  catalogToolButtons: document.querySelectorAll("[data-catalog-tool]"),
+  sourcesModeButtons: document.querySelectorAll("[data-sources-mode]"),
+  sourcesModePanels: document.querySelectorAll("[data-sources-panel]"),
+  sourcesFollowedScroll: document.getElementById("request-sources-followed-scroll"),
+  sourcesFavoritesScroll: document.getElementById("request-sources-favorites-scroll"),
   favlistBrowserView: document.getElementById("favlist-browser-view"),
-  searchModalOtherView: document.getElementById("search-modal-other-view"),
   bilikaraSecretModal: document.getElementById("bilikara-secret-modal"),
   bilikaraSecretBackdrop: document.getElementById("bilikara-secret-backdrop"),
   bilikaraSecretClose: document.getElementById("bilikara-secret-close"),
@@ -479,32 +795,27 @@ const elements = {
   developerTagResetText: document.getElementById("developer-tag-reset-text"),
   developerTagResetFields: document.getElementById("developer-tag-reset-fields"),
   developerTagResetNote: document.getElementById("developer-tag-reset-note"),
-  searchSidebarItems: document.querySelectorAll(".search-sidebar-item"),
-  searchOriginalContainer: document.querySelector(".search-card"),
-  searchTag: document.getElementById("search-tag"),
-  searchTitle: document.getElementById("search-title"),
-  searchCookieToggle: document.getElementById("search-cookie-toggle"),
-  searchLarkToggle: document.getElementById("search-lark-toggle"),
-  searchStage: document.getElementById("search-stage"),
-  searchStageInner: document.getElementById("search-stage-inner"),
-  searchMainView: document.getElementById("search-main-view"),
-  searchCookieView: document.getElementById("search-cookie-view"),
-  searchLarkView: document.getElementById("search-lark-view"),
+  developerTagResetError: document.getElementById("developer-tag-reset-error"),
   gatchaPanel: document.getElementById("gatcha-panel"),
   gatchaTag: document.getElementById("gatcha-tag"),
   gatchaTitle: document.getElementById("gatcha-title"),
   gatchaStage: document.getElementById("gatcha-stage"),
   gatchaButton: document.getElementById("gatcha-button"),
   gatchaPoolConfigToggle: document.getElementById("gatcha-pool-config-toggle"),
-  gatchaUidToggle: document.getElementById("gatcha-uid-toggle"),
   gatchaMainView: document.getElementById("gatcha-main-view"),
-  gatchaUidView: document.getElementById("gatcha-uid-view"),
   gatchaConfirmButton: document.getElementById("gatcha-confirm-button"),
   gatchaRetryButton: document.getElementById("gatcha-retry-button"),
   gatchaMessage: document.getElementById("gatcha-message"),
+  gatchaPrerequisiteNotices: document.getElementById("gatcha-prerequisite-notices"),
+  gatchaLoginNotice: document.getElementById("gatcha-login-notice"),
+  gatchaSessionUserNotice: document.getElementById("gatcha-session-user-notice"),
   gatchaInitView: document.getElementById("gatcha-init-view"),
+  gatchaDrawingView: document.getElementById("gatcha-drawing-view"),
   gatchaResultView: document.getElementById("gatcha-result-view"),
+  gatchaErrorView: document.getElementById("gatcha-error-view"),
+  gatchaStateViews: document.querySelectorAll("[data-gatcha-view]"),
   gatchaCandidateTitle: document.getElementById("gatcha-candidate-title"),
+  gatchaCandidateCard: document.getElementById("gatcha-candidate-card"),
   searchForm: document.getElementById("search-form"),
   searchQuery: document.getElementById("search-query"),
   searchButton: document.getElementById("search-button"),
@@ -543,16 +854,9 @@ const elements = {
   larkSearchForm: document.getElementById("lark-search-form"),
   larkSearchQuery: document.getElementById("lark-search-query"),
   larkSearchButton: document.getElementById("lark-search-button"),
-  larkSearchHitboxForm: document.getElementById("lark-search-hitbox-form"),
-  larkSearchHitboxQuery: document.getElementById("lark-search-hitbox-query"),
-  larkSearchHitboxButton: document.getElementById("lark-search-hitbox-button"),
   larkSearchMessage: document.getElementById("lark-search-message"),
   larkSearchResults: document.getElementById("lark-search-results"),
-  gatchaUidForm: document.getElementById("gatcha-uid-form"),
-  gatchaUidInput: document.getElementById("gatcha-uid-input"),
-  addGatchaUidButton: document.getElementById("add-gatcha-uid-button"),
   refreshGatchaCacheButton: document.getElementById("refresh-gatcha-cache-button"),
-  pullGatchaFavlistButton: document.getElementById("pull-gatcha-favlist-button"),
   gatchaUidMessage: document.getElementById("gatcha-uid-message"),
 };
 
@@ -562,8 +866,22 @@ const historyExportGuard = window.BilikaraExportGuard.createExportGuard([
 ]);
 
 function setFormMessage(message, isError = false) {
-  elements.formMessage.textContent = message;
-  elements.formMessage.style.color = isError ? "var(--red)" : "var(--muted)";
+  if (isError && requiresSessionUsers(message)) {
+    showSessionUsersRequiredToast();
+    message = "";
+    isError = false;
+  }
+  elements.formMessage.textContent = "";
+  elements.formMessage.style.color = "var(--muted)";
+  setAppMessage(message, isError);
+}
+
+function setRequestActionMessage(message, isError = false) {
+  if (isError && requiresSessionUsers(message)) {
+    showSessionUsersRequiredToast();
+    return;
+  }
+  setAppMessage(message, isError);
 }
 
 function setSearchMessage(message, isError = false) {
@@ -575,6 +893,16 @@ function setSearchMessage(message, isError = false) {
 }
 
 function setMessageForSource(source, message, isError = false) {
+  if (isError && requiresSessionUsers(message)) {
+    showSessionUsersRequiredToast();
+    message = "";
+    isError = false;
+  }
+  if (isError) {
+    setAppMessage(message, true);
+    message = "";
+    isError = false;
+  }
   if (source === "search") {
     setSearchMessage(message, isError);
     return;
@@ -592,7 +920,7 @@ function setMessageForSource(source, message, isError = false) {
     return;
   }
   if (source === "modalBrowse") {
-    const msgElements = elements.searchModalOtherView?.querySelectorAll(".tag-browser-message");
+    const msgElements = elements.requestWorkspace?.querySelectorAll(".tag-browser-message");
     if (msgElements && msgElements.length > 0) {
       msgElements.forEach((el) => {
         el.textContent = message || "";
@@ -610,6 +938,7 @@ function setMessageForSource(source, message, isError = false) {
 }
 
 function setAppMessage(message, isError = false) {
+  if (String(message).includes("下载需要登录 Bilibili")) message = localizedCacheMessage(message);
   if (!elements.appToast) {
     return;
   }
@@ -628,81 +957,86 @@ function setAppMessage(message, isError = false) {
   }
 }
 
+function fullscreenRequestNotice() {
+  return state.fullscreenRequestNotice || (state.fullscreenRequestNotice = window.BilikaraIncomingRequest.create(
+    elements.fullscreenRequestToast, t,
+  ));
+}
+
 function hideFullscreenRequestToast() {
-  if (state.fullscreenRequestToastTimer) {
-    window.clearTimeout(state.fullscreenRequestToastTimer);
-    state.fullscreenRequestToastTimer = null;
-  }
-  const toast = elements.fullscreenRequestToast;
-  if (!toast || toast.classList.contains("hidden")) {
-    return;
-  }
-  toast.classList.remove("is-visible");
-  if (state.fullscreenRequestToastHideTimer) {
-    window.clearTimeout(state.fullscreenRequestToastHideTimer);
-  }
-  state.fullscreenRequestToastHideTimer = window.setTimeout(() => {
-    toast.classList.add("hidden");
-    state.fullscreenRequestToastHideTimer = null;
-  }, fullscreenRequestToastFadeMs);
+  fullscreenRequestNotice().hide();
 }
 
 function showFullscreenRequestToast(title) {
-  const toast = elements.fullscreenRequestToast;
-  const normalizedTitle = String(title || "").trim();
-  if (!toast || !normalizedTitle || !isPlayerPanelFullscreen()) {
-    return;
-  }
-  if (state.fullscreenRequestToastTimer) {
-    window.clearTimeout(state.fullscreenRequestToastTimer);
-    state.fullscreenRequestToastTimer = null;
-  }
-  if (state.fullscreenRequestToastHideTimer) {
-    window.clearTimeout(state.fullscreenRequestToastHideTimer);
-    state.fullscreenRequestToastHideTimer = null;
-  }
-  toast.replaceChildren();
-  const label = document.createElement("span");
-  label.className = "fullscreen-request-toast-label";
-  label.textContent = t("toast.incomingRequest");
-  const titleNode = document.createElement("span");
-  titleNode.className = "fullscreen-request-toast-title";
-  titleNode.textContent = normalizedTitle;
-  toast.append(label, titleNode);
-  toast.classList.remove("hidden");
-  window.requestAnimationFrame(() => {
-    toast.classList.add("is-visible");
+  if (!isAudiencePlayerSurface()) return;
+  fullscreenRequestNotice().show({
+    key: `${Date.now()}:${title}`, title, expiresAt: Date.now() + fullscreenRequestToastMs,
   });
-  state.fullscreenRequestToastTimer = window.setTimeout(() => {
-    hideFullscreenRequestToast();
-  }, fullscreenRequestToastMs);
 }
 
 function maybeShowIncomingRequestToast(previousData, nextData) {
-  if (!previousData || !nextData || !isPlayerPanelFullscreen()) {
+  const item = window.BilikaraIncomingRequest?.newestAddition(previousData, nextData);
+  if (!item) return;
+  const title = item.display_title || item.title || t("toast.incomingRequest");
+  state.presentationIncomingRequest = {
+    key: `${nextData.state_revision}:${item.id}`,
+    title,
+    expiresAt: Date.now() + fullscreenRequestToastMs,
+  };
+  if (isAudiencePlayerSurface()) fullscreenRequestNotice().show(state.presentationIncomingRequest);
+  publishPresentationOutputState();
+}
+
+function renderPresentationFeedback() {
+  const feedback = window.BilikaraPresentationFeedback;
+  if (!feedback || !elements.presentationFeedback) return;
+  const next = feedback.snapshot(state.data);
+  const previous = state.presentationFeedbackSnapshot;
+  const changes = feedback.changes(previous, next);
+  state.presentationFeedbackSnapshot = next;
+  const dualScreen = state.presentationSession?.mode === "localDualScreen"
+    && ["activating", "active"].includes(state.presentationSession.phase);
+  if (!state.presentationFeedbackView) state.presentationFeedbackView = feedback.create(elements.presentationFeedback, t);
+  if (previous && (previous.session !== next.session || previous.item !== next.item)) {
+    state.presentationFeedbackView.hide();
+    state.presentationActionFeedback = null;
+  }
+  if (!isAudiencePlayerSurface() && !dualScreen) {
+    state.presentationFeedbackView.hide();
+    state.presentationActionFeedback = null;
     return;
   }
-  const previousId = currentItemIdFromData(previousData);
-  const nextId = currentItemIdFromData(nextData);
-  if (previousId !== nextId && nextId) {
+  if (!changes.length) {
+    if (isAudiencePlayerSurface()) state.presentationFeedbackView.show(state.presentationActionFeedback);
     return;
   }
-  const previousItems = [
-    previousData.current_item,
-    ...(Array.isArray(previousData.playlist) ? previousData.playlist : []),
-  ];
-  const previousIds = new Set(previousItems.map((item) => String(item?.id || "")).filter(Boolean));
-  const nextItems = [
-    ...(Array.isArray(nextData.playlist) ? nextData.playlist : []),
-    nextData.current_item,
-  ];
-  const newItems = nextItems
-    .filter((item) => item?.id && !previousIds.has(String(item.id)));
-  if (!newItems.length) {
-    return;
+  showPresentationOperationFeedback(changes);
+}
+
+function showPresentationOperationFeedback(changes) {
+  const feedback = window.BilikaraPresentationFeedback;
+  const dualScreen = state.presentationSession?.mode === "localDualScreen"
+    && ["activating", "active"].includes(state.presentationSession.phase);
+  if (!feedback || !elements.presentationFeedback || (!isAudiencePlayerSurface() && !dualScreen)) return;
+  const notices = (Array.isArray(changes) ? changes : [changes]).map(change => ({
+    ...change,
+    key: `${state.presentationOutputSenderId}:${state.presentationFeedbackSequence = (state.presentationFeedbackSequence || 0) + 1}`,
+    expiresAt: Date.now() + feedback.durationMs,
+  }));
+  state.presentationActionFeedback = feedback.recent(state.presentationActionFeedback, notices);
+  if (!state.presentationFeedbackView) state.presentationFeedbackView = feedback.create(elements.presentationFeedback, t);
+  if (isAudiencePlayerSurface()) state.presentationFeedbackView.show(state.presentationActionFeedback);
+  publishPresentationOutputState();
+}
+
+function confirmPresentationPlaybackFeedback(session) {
+  if (session.presentationFeedbackPlayPending
+    && isCurrentHostPlaybackSession(session, session.video, session.audio)
+    && hostPlaybackSessionObservedPlaying(session, session.video, session.audio)) {
+    session.presentationFeedbackPlayPending = false;
+    showPresentationOperationFeedback({ kind: session.presentationFeedbackPlayKind || "play", value: "" });
+    session.presentationFeedbackPlayKind = null;
   }
-  const item = newItems[newItems.length - 1];
-  showFullscreenRequestToast(item.display_title || item.title || t("toast.incomingRequest"));
 }
 
 function requesterBadgeText(requesterName) {
@@ -796,7 +1130,26 @@ function applyStaticI18n(root = document) {
     setElementAttribute(node, "alt", t(node.dataset.i18nAlt));
   });
   document.title = t("document.title");
+  root.querySelectorAll("[data-duration-seconds]").forEach((node) => {
+    const seconds = Number(node.dataset.durationSeconds);
+    node.textContent = seconds > 0 ? t("player.durationSeconds", { seconds }) : t("player.durationUnknown");
+  });
+  root.querySelectorAll("[data-rating-score]").forEach((node) => {
+    node.setAttribute("aria-label", t("rating.scoreAria", { score: Number(node.dataset.ratingScore) }));
+  });
   document.documentElement.lang = state.language === "ja" ? "ja" : state.language === "en" ? "en" : "zh-CN";
+}
+
+function announceStaticI18n() {
+  document.dispatchEvent(new CustomEvent("bilikara:i18n", {
+    detail: {
+      language: state.language,
+      messages: {
+        ...(state.translations?.zh || {}),
+        ...(state.translations?.[state.language] || {}),
+      },
+    },
+  }));
 }
 
 function renderLanguageSwitch() {
@@ -812,9 +1165,7 @@ function invalidateLanguageSensitiveRenderCache() {
   state.playerFullscreenButtonRenderSignature = "";
   state.followBrowseRenderSignature = "";
   state.favlistBrowseRenderSignature = "";
-  state.searchCookieFaceRenderSignature = "";
   state.gatchaUidFaceRenderSignature = "";
-  state.gatchaTaskLastMessageSignature = "";
   state.currentTitleRenderSignature = "";
   state.remoteAccessRenderSignature = "";
   state.listHeaderRenderSignature = "";
@@ -826,7 +1177,7 @@ function invalidateLanguageSensitiveRenderCache() {
   state.historyRenderSignature = "";
   state.audioVariantBarRenderSignature = "";
   state.volumeControlsRenderSignature = "";
-  state.playerSignature = "";
+  state.playedSessionsLoaded = false;
 }
 
 function setLanguage(language) {
@@ -837,10 +1188,15 @@ function setLanguage(language) {
   }
   state.language = nextLanguage;
   writeLocalPreference(storageKeys.language, nextLanguage);
+  publishHostAppearance();
   invalidateLanguageSensitiveRenderCache();
   applyStaticI18n();
+  announceStaticI18n();
   renderLanguageSwitch();
   render();
+  if (state.catalogAdvancedTool === "maintenance") {
+    renderMaintenanceView();
+  }
 }
 
 function applyTheme(theme) {
@@ -848,7 +1204,36 @@ function applyTheme(theme) {
   state.theme = nextTheme;
   document.documentElement.setAttribute("data-theme", nextTheme);
   writeLocalPreference(storageKeys.theme, nextTheme);
+  publishHostAppearance();
   renderThemeSwitch();
+  syncNativeWindowTheme();
+  // The audience output follows the theme even while the Host stays idle.
+  publishPresentationOutputState();
+}
+
+function publishHostAppearance() {
+  // WebKit does not consistently deliver storage events to secondary windows.
+  // This UI-only message has no backend state or network traffic.
+  try {
+    if (typeof window.BroadcastChannel !== "function") return;
+    const channel = new window.BroadcastChannel("bilikara-host-appearance");
+    try {
+      channel.postMessage({ theme: state.theme, language: state.language });
+    } finally {
+      channel.close();
+    }
+  } catch { /* The storage listener remains available where channels are not. */ }
+}
+
+function syncNativeWindowTheme() {
+  const invoke = tauriInvoke();
+  if (typeof invoke !== "function") return;
+  const style = getComputedStyle(document.documentElement);
+  void invoke("set_window_chrome_theme", {
+    theme: state.theme,
+    background: style.getPropertyValue("--bg-middle").trim(),
+    foreground: style.getPropertyValue("--ink").trim(),
+  }).catch(() => {});
 }
 
 function normalizeTheme(theme) {
@@ -863,6 +1248,11 @@ function renderThemeSwitch() {
 
 async function loadTranslations() {
   state.language = normalizeLanguage(readLocalString(storageKeys.language, state.language));
+  let languageLoadFailed = false;
+  if (window.BilikaraHostLanguage) {
+    try { state.language = await window.BilikaraHostLanguage.load(); }
+    catch { languageLoadFailed = true; }
+  }
   try {
     const response = await fetch("/i18n.json", { cache: "no-store" });
     if (!response.ok) {
@@ -890,13 +1280,32 @@ async function loadTranslations() {
   }
   state.translationsLoaded = true;
   applyStaticI18n();
+  announceStaticI18n();
   renderLanguageSwitch();
+  if (languageLoadFailed) setAppMessage(t("settings.languageLoadFailed"), true);
 }
 
-function closeOpenMenus() {
+function closeOpenMenus({ restoreFocus = false } = {}) {
+  const trigger = state.openRowMenuTrigger;
+  let closed = false;
   document.querySelectorAll(".menu-content").forEach((menu) => {
+    if (!menu.classList.contains("hidden")) {
+      closed = true;
+    }
     menu.classList.add("hidden");
+    menu.closest(".song-actions-wrap, .history-actions-wrap")
+      ?.querySelector('[data-action="toggle-menu"]')
+      ?.setAttribute("aria-expanded", "false");
   });
+  state.openRowMenuTrigger = null;
+  if (
+    restoreFocus
+    && trigger?.isConnected
+    && !trigger.closest("[hidden], [inert]")
+  ) {
+    trigger.focus({ preventScroll: true });
+  }
+  return closed;
 }
 
 function selectedRequesterName() {
@@ -907,9 +1316,38 @@ function hasSessionUsers() {
   return Array.isArray(state.data?.session_users) && state.data.session_users.length > 0;
 }
 
+function requiresSessionUsers(message) {
+  const normalized = String(message || "").trim();
+  return normalized === "请先在服务端添加本场 KTV 用户"
+    || normalized === t("session.requireUsers");
+}
+
+function showSessionUsersRequiredToast() {
+  [
+    elements.formMessage,
+    elements.searchMessage,
+    elements.larkSearchMessage,
+    elements.followBrowseMessage,
+    elements.favlistBrowseMessage,
+    elements.gatchaMessage,
+  ].forEach((messageElement) => {
+    if (!messageElement) {
+      return;
+    }
+    messageElement.textContent = "";
+    messageElement.classList.remove("is-error");
+  });
+  if (elements.formMessage) {
+    elements.formMessage.style.color = "var(--muted)";
+  }
+  state.gatchaMessage = "";
+  state.gatchaMessageIsError = false;
+  setAppMessage(t("session.requireUsers"), true);
+}
+
 function validatedRequesterNameForAdd(showMessage = setFormMessage) {
   if (!hasSessionUsers()) {
-    showMessage(t("session.requireUsers"), true);
+    showSessionUsersRequiredToast();
     return "";
   }
   const requesterName = selectedRequesterName();
@@ -945,11 +1383,31 @@ function isTauriWebKitRuntime() {
   return Boolean(window.__TAURI__) && isWebKitPlaybackRuntime();
 }
 
-function clearWebKitAudioStarvationTimer() {
-  if (state.webKitAudioStarvationTimer) {
-    window.clearTimeout(state.webKitAudioStarvationTimer);
-    state.webKitAudioStarvationTimer = null;
+function isAndroidNativePlaybackRuntime() {
+  return typeof document !== "undefined"
+    && document.documentElement?.dataset?.nativeHost === "true"
+    && document.documentElement?.dataset?.hostPlatform !== "desktop"
+    && typeof navigator !== "undefined"
+    && /Android/i.test(navigator.userAgent || "");
+}
+
+function clearAndroidAudioClockRecovery(session = state.hostPlaybackSession) {
+  if (!session) {
+    return;
   }
+  if (session.audioClockRecoveryFrame != null) {
+    window.cancelAnimationFrame(session.audioClockRecoveryFrame);
+    session.audioClockRecoveryFrame = null;
+  }
+  session.audioClockRecovering = false;
+}
+
+function clearWebKitAudioStarvationTimer(session = state.hostPlaybackSession) {
+  if (!session?.audioStarvationTimer) {
+    return;
+  }
+  window.clearTimeout(session.audioStarvationTimer);
+  session.audioStarvationTimer = null;
 }
 
 function isPlayerPanelFullscreen() {
@@ -957,12 +1415,12 @@ function isPlayerPanelFullscreen() {
     || Boolean(elements.playerPanel?.classList.contains("is-tauri-fullscreen"));
 }
 
-function isPlayerPanelFullscreenForTransition() {
-  return isPlayerPanelFullscreen() || smokeTestBypassPlayerFullscreen;
+function isAudiencePlayerSurface() {
+  return isPlayerPanelFullscreen();
 }
 
 function supportsPlayerFullscreen() {
-  if (isTauriWebKitRuntime()) {
+  if (typeof tauriInvoke() === "function") {
     return Boolean(elements.playerPanel);
   }
   return Boolean(
@@ -979,32 +1437,53 @@ function supportsPlayerFullscreen() {
 }
 
 function canTogglePlayerFullscreen() {
-  return supportsPlayerFullscreen() && (Boolean(state.data?.current_item) || isPlayerPanelFullscreen());
+  if (state.playerFullscreenTransitioning || presentationCompositionActive()) {
+    return false;
+  }
+  return state.presentationSession.phase === "inactive"
+    && supportsPlayerFullscreen()
+    && (Boolean(state.data?.current_item) || isPlayerPanelFullscreen());
 }
 
-function tauriAppWindow() {
-  const tauriWebviewWindow = window.__TAURI__?.webviewWindow;
-  if (typeof tauriWebviewWindow?.getCurrentWebviewWindow === "function") {
-    try {
-      return tauriWebviewWindow.getCurrentWebviewWindow();
-    } catch {
-      // Try the Tauri v2 window API below.
-    }
-  }
-
-  const tauriWindow = window.__TAURI__?.window;
-  if (typeof tauriWindow?.getCurrentWindow === "function") {
-    try {
-      return tauriWindow.getCurrentWindow();
-    } catch {
-      return null;
-    }
-  }
-  return null;
-}
-
-function tauriInvoke() {
+function tauriInvoke(capability = "desktop") {
+  if (capability === "presentation" && window.BilikaraAndroidPresentation) return window.BilikaraAndroidPresentation.invoke;
+  if (typeof document !== "undefined" && document.documentElement?.dataset?.nativeHost === "true" && document.documentElement?.dataset?.hostPlatform !== "desktop") return null;
   return window.__TAURI__?.core?.invoke || null;
+}
+
+function syncApplicationRestartAvailability() {
+  const available = typeof tauriInvoke() === "function";
+  elements.applicationRestartRow?.classList.toggle("hidden", !available);
+  elements.applicationRestartRow?.setAttribute("aria-hidden", available ? "false" : "true");
+  if (elements.applicationRestartButton) {
+    elements.applicationRestartButton.disabled = !available || state.applicationRestartInFlight;
+    if (state.applicationRestartInFlight) {
+      elements.applicationRestartButton.setAttribute("aria-busy", "true");
+    } else {
+      elements.applicationRestartButton.removeAttribute("aria-busy");
+    }
+  }
+  return available;
+}
+
+async function restartApplication() {
+  const invoke = tauriInvoke();
+  if (typeof invoke !== "function") {
+    throw new Error(t("service.restartApplicationFailed"));
+  }
+  if (state.applicationRestartInFlight) {
+    return false;
+  }
+  state.applicationRestartInFlight = true;
+  syncApplicationRestartAvailability();
+  try {
+    await invoke("restart_application");
+    return true;
+  } catch {
+    state.applicationRestartInFlight = false;
+    syncApplicationRestartAvailability();
+    throw new Error(t("service.restartApplicationFailed"));
+  }
 }
 
 function isTauriCommandNotFoundError(error) {
@@ -1151,16 +1630,6 @@ async function saveTauriBackendDownload(path, body = null, fallback = t("history
 
 async function setTauriWindowFullscreen(enabled) {
   const fullscreen = Boolean(enabled);
-  const appWindow = tauriAppWindow();
-  if (appWindow && typeof appWindow.setFullscreen === "function") {
-    try {
-      await appWindow.setFullscreen(fullscreen);
-      return true;
-    } catch {
-      // Fall through to the command path below; some Tauri builds expose invoke more reliably.
-    }
-  }
-
   const invoke = tauriInvoke();
   if (typeof invoke !== "function") {
     return false;
@@ -1173,6 +1642,1745 @@ async function setTauriWindowFullscreen(enabled) {
   }
 }
 
+function presentationSceneApi() {
+  return window.BilikaraPresentationScene || null;
+}
+
+function presentationRendererApi() {
+  return window.BilikaraPresentationRenderer || null;
+}
+
+function presentationCacheStatusForItem(item) {
+  if (!item) {
+    return "";
+  }
+  // Transition labels/order stay fixed, but cache state follows fresh snapshots
+  // of the same song incarnation rather than the currently playing song.
+  const identity = String(item.item_incarnation_id || item.id || "");
+  const playlist = Array.isArray(state.data?.playlist) ? state.data.playlist : [];
+  const latest = [state.data?.current_item, ...playlist].find((candidate) => (
+    identity && String(candidate?.item_incarnation_id || candidate?.id || "") === identity
+  ));
+  return String((latest || item).cache_status || "");
+}
+
+function presentationOverlayModel() {
+  const playlist = Array.isArray(state.data?.playlist) ? state.data.playlist : [];
+  const primaryItem = state.localAdvanceOverlayPrimaryItem || playlist[0] || null;
+  const followItems = Array.isArray(state.localAdvanceOverlayFollowItems)
+    ? state.localAdvanceOverlayFollowItems
+    : playlist.slice(1);
+  const visible = state.localAdvanceDelayDeadline > 0;
+  const totalCount = Number.isFinite(state.localAdvanceOverlayTotalCount)
+    ? Number(state.localAdvanceOverlayTotalCount)
+    : (state.data?.current_item ? 1 : 0) + playlist.length;
+  const visibleRows = followItems.slice(0, localAdvanceOverlayMaxRows);
+  const remainingCount = Math.max(0, followItems.length - visibleRows.length);
+  return {
+    visible,
+    heading: t("player.upNext"),
+    countdownLabel: t("player.advanceCountdown"),
+    deadline: Number(state.localAdvanceDelayDeadline || 0),
+    durationMs: Number(state.localAdvanceOverlayDurationMs || 0),
+    title: delayOverlayTitleForItem(primaryItem, t("player.prepareNext")),
+    requester: primaryItem?.requester_name || "—",
+    duration: formatDurationSeconds(durationSecondsForItem(primaryItem)),
+    cacheStatus: presentationCacheStatusForItem(primaryItem),
+    queueHeading: t("player.followingQueue"),
+    rows: visibleRows.map((item) => ({
+      title: delayOverlayTitleForItem(item),
+      requester: item?.requester_name || "—",
+      duration: formatDurationSeconds(durationSecondsForItem(item)),
+      cacheStatus: presentationCacheStatusForItem(item),
+    })),
+    emptyText: visibleRows.length ? "" : t("player.followingQueueEmpty"),
+    remainingText: remainingCount > 0 ? t("player.remainingQueue", { count: remainingCount }) : "",
+    totalText: t("player.totalSongs", { count: totalCount }),
+  };
+}
+
+function currentPresentationScene() {
+  const currentItem = state.data?.current_item || null;
+  const mountedVideo = activePrimaryVideoElement();
+  const videoUrl = selectedVideoUrlForItem(currentItem)
+    || String(mountedVideo?.currentSrc || mountedVideo?.src || "");
+  const sceneKey = JSON.stringify({
+    generation: state.presentationSession.generation,
+    item: currentItem?.id || "",
+    title: currentItem?.display_title || currentItem?.title || "",
+    theme: state.theme,
+    language: state.language,
+  });
+  if (sceneKey !== state.presentationSceneKey) {
+    state.presentationSceneKey = sceneKey;
+    state.presentationSceneRevision += 1;
+  }
+  const candidate = {
+    generation: state.presentationSession.generation,
+    revision: state.presentationSceneRevision,
+    currentItemIdentity: String(currentItem?.id || ""),
+    title: String(currentItem?.display_title || currentItem?.title || ""),
+    videoUrl,
+    displayMetadata: {
+      requester: String(currentItem?.requester_name || ""),
+      duration: formatDurationSeconds(durationSecondsForItem(currentItem)),
+      detail: String(currentItem?.owner_name || ""),
+      cacheStatus: String(currentItem?.cache_status || ""),
+      cacheDetail: hostCacheDetailTextForItem(currentItem),
+      cacheProgress: cacheProgressPercentForItem(currentItem),
+    },
+    theme: state.theme,
+    language: state.language,
+    overlay: presentationOverlayModel(),
+  };
+  return presentationSceneApi()?.normalizePresentationScene(candidate) || candidate;
+}
+
+function renderCurrentPresentationScene() {
+  const renderer = presentationRendererApi();
+  if (!renderer || !elements.playerFrame) {
+    return;
+  }
+  renderer.renderScene(elements.playerFrame, currentPresentationScene(), {
+    compact: !isPlayerPanelFullscreen(),
+    showDownloadProgress: isPlayerPanelFullscreen(),
+    manageVisibility: false,
+    now: Date.now(),
+  });
+}
+
+function presentationSyncApi() {
+  return window.BilikaraPresentationSync || null;
+}
+
+function ensurePresentationOutputChannel() {
+  const sync = presentationSyncApi();
+  if (!sync) {
+    return null;
+  }
+  if (!state.presentationOutputReadyListener) {
+    let previous = null;
+    const ready = (candidate) => {
+      if (candidate?.type !== "output-ready"
+        || candidate.payload?.generation !== state.presentationSession.generation
+        || !sync.acceptsEnvelope(previous, candidate)) return;
+      previous = candidate;
+      // The initial scene can precede the new window's session initialization.
+      // Replay after readiness, including when no song/state changes follow.
+      publishPresentationOutputState();
+    };
+    state.presentationOutputReadyListener = ready;
+    window.addEventListener("storage", event => {
+      if (event.key !== sync.storageKey || !event.newValue) return;
+      try { ready(JSON.parse(event.newValue)); } catch { /* Ignore malformed messages. */ }
+    });
+    if (typeof BroadcastChannel === "function") {
+      state.presentationOutputChannel = new BroadcastChannel(sync.channelName);
+      state.presentationOutputChannel.addEventListener("message", event => ready(event.data));
+    }
+  }
+  return state.presentationOutputChannel;
+}
+
+// Desktop WebViews need not share browser storage, so the shell relays the
+// same envelope to the audience window. Keep one request in flight and send
+// only the newest envelope; the audience discards older sequences.
+function relayPresentationOutputState(envelope) {
+  const invoke = tauriInvoke("presentation");
+  if (typeof invoke !== "function") {
+    return;
+  }
+  state.presentationOutputRelayPending = { generation: state.presentationSession.generation, envelope };
+  if (state.presentationOutputRelayInFlight) {
+    return;
+  }
+  const next = state.presentationOutputRelayPending;
+  state.presentationOutputRelayPending = null;
+  state.presentationOutputRelayInFlight = true;
+  invoke("publish_presentation_output_state", next)
+    .catch(() => {})
+    .finally(() => {
+      state.presentationOutputRelayInFlight = false;
+      const pending = state.presentationOutputRelayPending;
+      if (pending?.generation === state.presentationSession.generation) {
+        relayPresentationOutputState(pending.envelope);
+      } else {
+        state.presentationOutputRelayPending = null;
+      }
+    });
+}
+
+function publishPresentationOutputState(session = state.hostPlaybackSession) {
+  const sync = presentationSyncApi();
+  if (
+    !sync
+    || state.presentationSession.mode !== "localDualScreen"
+    || !["activating", "active"].includes(state.presentationSession.phase)
+  ) {
+    return false;
+  }
+  const video = session?.video || activePrimaryVideoElement();
+  const scene = currentPresentationScene();
+  const internetQrImage = String(state.internetRemoteDisplay?.qr_image || "");
+  const clock = {
+    itemIdentity: scene.currentItemIdentity,
+    mediaTime: Math.max(0, Number(video?.currentTime || 0)),
+    sampledAt: Date.now(),
+    paused: !video || Boolean(video.paused),
+    playbackRate: Math.max(0.1, Number(video?.playbackRate || 1)),
+    seeking: Boolean(video?.seeking),
+  };
+  const envelope = sync.makeEnvelope("master-state", {
+    scene,
+    clock,
+    language: state.language,
+    incomingRequest: state.presentationIncomingRequest || null,
+    actionFeedback: state.presentationActionFeedback || null,
+    remoteAccess: remoteAccessForPresentation(),
+    remoteMenuVisible: Boolean(window.BilikaraAndroidPresentation && state.remoteQrPinned),
+    internetRemote: {
+      active: Boolean(state.internetRemoteDisplay?.active),
+      hint: String(state.internetRemoteDisplay?.hint || "").slice(0, 512),
+      connected_count: Math.max(0, Math.trunc(Number(state.internetRemoteDisplay?.connected_count) || 0)),
+      password: String(state.internetRemoteDisplay?.password || "").slice(0, 32),
+      qr_image: (internetQrImage.startsWith("data:image/png;base64,")
+        || internetQrImage.startsWith("data:image/svg+xml;base64,"))
+        ? internetQrImage.slice(0, 524_288)
+        : "",
+    },
+  }, {
+    senderId: state.presentationOutputSenderId,
+    sequence: ++state.presentationOutputSequence,
+    sentAt: Date.now(),
+  });
+  if (window.BilikaraAndroidPresentation) {
+    window.BilikaraAndroidPresentation.postMaster(envelope);
+    return true;
+  }
+  relayPresentationOutputState(envelope);
+  ensurePresentationOutputChannel()?.postMessage(envelope);
+  try {
+    localStorage.setItem(sync.storageKey, JSON.stringify(envelope));
+    localStorage.removeItem(sync.storageKey);
+  } catch {
+    // BroadcastChannel is primary; storage is only a same-origin fallback.
+  }
+  return true;
+}
+
+const presentationModes = new Set(["singleScreen", "localDualScreen"]);
+const presentationPhases = new Set(["inactive", "activating", "active", "recovering"]);
+
+function normalizePresentationSession(candidate) {
+  if (!candidate || typeof candidate !== "object") {
+    return null;
+  }
+  const mode = String(candidate.mode || "");
+  const phase = String(candidate.phase || "");
+  const generation = Number(candidate.generation);
+  const lastAcceptedCommandSequence = Number(candidate.lastAcceptedCommandSequence || 0);
+  const lastAppliedCommandSequence = Number(candidate.lastAppliedCommandSequence || 0);
+  if (
+    !presentationModes.has(mode)
+    || !presentationPhases.has(phase)
+    || !Number.isSafeInteger(generation)
+    || generation < 0
+    || !Number.isSafeInteger(lastAcceptedCommandSequence)
+    || lastAcceptedCommandSequence < 0
+    || !Number.isSafeInteger(lastAppliedCommandSequence)
+    || lastAppliedCommandSequence < 0
+    || lastAppliedCommandSequence > lastAcceptedCommandSequence
+    || candidate.playbackAuthority !== "host"
+    || candidate.mediaRendererOwner !== "host"
+  ) {
+    return null;
+  }
+  return {
+    mode,
+    phase,
+    generation,
+    selectedOutputDisplayId: String(candidate.selectedOutputDisplayId || ""),
+    controllerDisplayId: String(candidate.controllerDisplayId || ""),
+    hostReady: Boolean(candidate.hostReady),
+    controllerReady: Boolean(candidate.controllerReady),
+    lastAcceptedCommandSequence,
+    lastAppliedCommandSequence,
+    playbackAuthority: "host",
+    mediaRendererOwner: "host",
+    recoveryReason: String(candidate.recoveryReason || ""),
+  };
+}
+
+function presentationPhaseRank(session) {
+  if (session.phase === "inactive") return 4;
+  if (session.phase === "recovering") return 3;
+  if (session.phase === "active") return 2;
+  if (session.phase === "activating") return 1;
+  return 0;
+}
+
+function presentationCompositionActive(session = state.presentationSession) {
+  return state.presentationAppliedComposition === "stageOnly"
+    && session.mode === "localDualScreen"
+    && (session.phase === "activating" || session.phase === "active");
+}
+
+function clearPresentationCursorTimer() {
+  if (state.presentationCursorHideTimer) {
+    window.clearTimeout(state.presentationCursorHideTimer);
+    state.presentationCursorHideTimer = null;
+  }
+}
+
+function revealPresentationCursor() {
+  document.body?.classList.remove("is-presentation-cursor-hidden");
+  clearPresentationCursorTimer();
+}
+
+function handlePresentationPointerMove() {
+  revealPresentationCursor();
+}
+
+function applyPresentationCompositionDom(generation, composition) {
+  if (
+    !Number.isSafeInteger(generation)
+    || generation !== state.presentationSession.generation
+    || !["combined", "stageOnly"].includes(composition)
+  ) {
+    return false;
+  }
+  const active = composition === "stageOnly"
+    && state.presentationSession.mode === "localDualScreen"
+    && ["activating", "active"].includes(state.presentationSession.phase);
+  state.presentationAppliedComposition = active ? "stageOnly" : "combined";
+  state.playerFullscreenInteraction?.sync();
+  state.presentationCompositionGeneration = generation;
+  document.body?.classList.toggle("is-presentation-control-host", active);
+  document.body?.classList.remove("is-presentation-stage-only");
+  if (elements.playerFrame) {
+    elements.playerFrame.inert = active;
+  }
+  if (active) {
+    hideMountedPlayerControls();
+  } else {
+    clearPresentationCursorTimer();
+    document.body?.classList.remove("is-presentation-cursor-hidden");
+  }
+  renderCurrentPresentationScene();
+  if (typeof renderPresentationHostSurface === "function") {
+    renderPresentationHostSurface();
+  }
+  renderPlayerFullscreenButton();
+  if (typeof syncNarrowToolLayout === "function") {
+    syncNarrowToolLayout();
+  }
+  if (typeof schedulePersistentStageMeasurement === "function") {
+    schedulePersistentStageMeasurement();
+  }
+  return true;
+}
+
+function presentationAnimationFrame() {
+  if (typeof window.requestAnimationFrame !== "function") {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => window.requestAnimationFrame(() => resolve()));
+}
+
+async function applyPresentationComposition(candidate) {
+  const generation = Number(candidate?.generation);
+  const composition = String(candidate?.composition || "");
+  if (!applyPresentationCompositionDom(generation, composition)) {
+    return false;
+  }
+  const session = state.presentationSession;
+  const shouldAcknowledge = (
+    composition === "stageOnly"
+    && session.phase === "activating"
+    && !session.hostReady
+  ) || (
+    composition === "combined"
+    && session.phase === "recovering"
+    && !session.hostReady
+  );
+  const readyKey = `${generation}:${composition}`;
+  if (!shouldAcknowledge || state.presentationHostReadyKey === readyKey) {
+    return true;
+  }
+  state.presentationHostReadyKey = readyKey;
+  await presentationAnimationFrame();
+  const invoke = tauriInvoke("presentation");
+  if (typeof invoke !== "function") {
+    return false;
+  }
+  try {
+    await handlePresentationSession(await invoke("mark_presentation_host_ready", {
+      generation,
+      composition,
+    }));
+  } catch (error) {
+    state.presentationHostReadyKey = "";
+    setAppMessage(t("display.presentationReadyFailed", {
+      message: error?.message || String(error),
+    }), true);
+    return false;
+  }
+  return true;
+}
+
+function applyPresentationSession(candidate) {
+  const session = normalizePresentationSession(candidate);
+  if (!session) {
+    return null;
+  }
+  const current = state.presentationSession;
+  if (
+    session.generation < current.generation
+    || (
+      session.generation === current.generation
+      && presentationPhaseRank(session) < presentationPhaseRank(current)
+    )
+  ) {
+    return null;
+  }
+  if (session.generation !== current.generation) {
+    state.presentationLastAppliedCommandSequence = 0;
+    state.presentationPlaybackRevision = 0;
+    state.presentationPlaybackPublishSignature = "";
+    state.presentationHostReadyKey = "";
+  }
+  state.presentationSession = session;
+  state.presentationLastAppliedCommandSequence = Math.max(
+    state.presentationLastAppliedCommandSequence,
+    session.lastAppliedCommandSequence,
+  );
+  if (session.selectedOutputDisplayId) {
+    state.presentationSelectedDisplayId = session.selectedOutputDisplayId;
+  }
+  renderPresentationOutputControl();
+  return session;
+}
+
+function normalizePresentationDisplayInfo(candidate) {
+  if (!candidate || typeof candidate !== "object" || !Array.isArray(candidate.displays)) {
+    return null;
+  }
+  const displays = candidate.displays.flatMap((display) => {
+    if (!display || typeof display !== "object") {
+      return [];
+    }
+    const id = String(display.id || "").trim();
+    if (!id || id.length > 1024) {
+      return [];
+    }
+    return [{
+      id,
+      name: String(display.name || ""),
+      positionX: Number(display.positionX || 0),
+      positionY: Number(display.positionY || 0),
+      width: Math.max(0, Number(display.width || 0)),
+      height: Math.max(0, Number(display.height || 0)),
+      scaleFactor: Math.max(0, Number(display.scaleFactor || 0)),
+      builtIn: Boolean(display.builtIn),
+      controller: Boolean(display.controller),
+      primary: Boolean(display.primary),
+      selectable: Boolean(display.selectable),
+      mirrored: Boolean(display.mirrored),
+      identityStable: Boolean(display.identityStable),
+      identityQuality: display.identityQuality === "stable" ? "stable" : "unstable",
+    }];
+  });
+  return {
+    monitorCount: Math.max(displays.length, Number(candidate.monitorCount || 0)),
+    displays,
+    controllerDisplayId: String(candidate.controllerDisplayId || ""),
+    recommendedDisplayId: String(candidate.recommendedDisplayId || ""),
+  };
+}
+
+function preservePresentationDisplayOrder(previousDisplays, nextDisplays) {
+  const nextById = new Map(nextDisplays.map((display) => [display.id, display]));
+  const ordered = [];
+  const retainedIds = new Set();
+  for (const previous of previousDisplays || []) {
+    const current = nextById.get(previous.id);
+    if (!current) {
+      continue;
+    }
+    ordered.push(current);
+    retainedIds.add(current.id);
+  }
+  for (const display of nextDisplays) {
+    if (!retainedIds.has(display.id)) {
+      ordered.push(display);
+    }
+  }
+  return ordered;
+}
+
+function applyPresentationDisplayInfo(candidate) {
+  const info = normalizePresentationDisplayInfo(candidate);
+  if (!info) {
+    return null;
+  }
+  info.displays = preservePresentationDisplayOrder(
+    state.presentationDisplayInfo?.displays || [],
+    info.displays,
+  );
+  state.presentationDisplayInfo = info;
+  state.presentationDisplayError = "";
+  if (state.presentationSession.phase === "inactive" && !state.presentationSelectionInitialized) {
+    state.presentationSelectionInitialized = true;
+    if (info.displays.some(
+      (display) => display.id === info.recommendedDisplayId && display.selectable,
+    )) {
+      state.presentationSelectedDisplayId = info.recommendedDisplayId;
+    }
+  }
+  if (
+    state.presentationSession.phase === "inactive"
+    && state.presentationSelectedDisplayId
+    && !info.displays.some(
+      (display) => display.id === state.presentationSelectedDisplayId && display.selectable,
+    )
+  ) {
+    state.presentationSelectedDisplayId = "";
+  }
+  const selected = info.displays.find(
+    (display) => display.id === state.presentationSelectedDisplayId,
+  );
+  if (!selected?.controller) {
+    state.presentationSelectedHostDisplayId = "";
+  } else {
+    const alternatives = info.displays.filter((display) => (
+      display.id !== selected.id && display.identityStable && !display.mirrored
+    ));
+    const selectedHostIsAvailable = alternatives.some(
+      (display) => display.id === state.presentationSelectedHostDisplayId,
+    );
+    if (!selectedHostIsAvailable) {
+      state.presentationSelectedHostDisplayId = alternatives.find(
+        (display) => display.builtIn,
+      )?.id || "";
+    }
+  }
+  renderPresentationOutputControl();
+  return info;
+}
+
+async function refreshPresentationDisplays({ announceError = false } = {}) {
+  const invoke = tauriInvoke("presentation");
+  if (state.presentationDisplayRefreshTimer !== null) {
+    window.clearTimeout(state.presentationDisplayRefreshTimer);
+    state.presentationDisplayRefreshTimer = null;
+  }
+  if (typeof invoke !== "function" || state.presentationDisplayBusy) {
+    return null;
+  }
+  state.presentationDisplayBusy = true;
+  renderPresentationOutputControl();
+  try {
+    return applyPresentationDisplayInfo(await invoke("get_presentation_displays"));
+  } catch (error) {
+    state.presentationDisplayError = error?.message || String(error);
+    if (announceError) {
+      setAppMessage(t("display.presentationDiscoveryFailed", {
+        message: state.presentationDisplayError,
+      }), true);
+    }
+    return null;
+  } finally {
+    state.presentationDisplayBusy = false;
+    renderPresentationOutputControl();
+    if (state.presentationDisplayRefreshPending) {
+      state.presentationDisplayRefreshPending = false;
+      schedulePresentationDisplayRefreshFromWindowEvent();
+    }
+  }
+}
+
+async function showPresentationDisplayIdentifiers({ announceError = false } = {}) {
+  const invoke = tauriInvoke("presentation");
+  const displayIds = (state.presentationDisplayInfo?.displays || [])
+    .map((display) => display.id)
+    .filter(Boolean);
+  if (
+    typeof invoke !== "function"
+    || state.presentationIdentifiersBusy
+    || state.presentationDisplayBusy
+    || state.presentationControlBusy
+    || state.presentationSession.phase !== "inactive"
+    || !displayIds.length
+  ) {
+    return false;
+  }
+  state.presentationIdentifiersBusy = true;
+  renderPresentationOutputControl();
+  try {
+    await invoke("show_presentation_display_identifiers", {
+      displayIds,
+      theme: normalizeTheme(state.theme),
+      language: normalizeLanguage(state.language),
+    });
+    return true;
+  } catch (error) {
+    if (announceError) {
+      setAppMessage(t("display.identificationFailed", {
+        message: error?.message || String(error),
+      }), true);
+    }
+    return false;
+  } finally {
+    state.presentationIdentifiersBusy = false;
+    renderPresentationOutputControl();
+  }
+}
+
+function dismissPresentationDisplayIdentifiers() {
+  const invoke = tauriInvoke("presentation");
+  if (typeof invoke !== "function") {
+    return;
+  }
+  invoke("dismiss_presentation_display_identifiers").catch(() => {});
+}
+
+const presentationDisplayRefreshDebounceMs = 280;
+
+function schedulePresentationDisplayRefreshFromWindowEvent() {
+  if (
+    !state.presentationSettingsOpen
+    || state.presentationSession.phase !== "inactive"
+  ) {
+    return;
+  }
+  if (state.presentationDisplayRefreshTimer !== null) {
+    window.clearTimeout(state.presentationDisplayRefreshTimer);
+  }
+  state.presentationDisplayRefreshTimer = window.setTimeout(() => {
+    state.presentationDisplayRefreshTimer = null;
+    if (
+      !state.presentationSettingsOpen
+      || state.presentationSession.phase !== "inactive"
+    ) {
+      return;
+    }
+    if (state.presentationDisplayBusy) {
+      state.presentationDisplayRefreshPending = true;
+      return;
+    }
+    refreshPresentationDisplays().catch(() => {});
+  }, presentationDisplayRefreshDebounceMs);
+}
+
+function presentationDisplayById(displayId) {
+  return state.presentationDisplayInfo?.displays?.find(
+    (display) => display.id === displayId,
+  ) || null;
+}
+
+function presentationDisplayNumber(displayId) {
+  const index = (state.presentationDisplayInfo?.displays || []).findIndex(
+    (display) => display.id === displayId,
+  );
+  return index >= 0 ? index + 1 : 0;
+}
+
+function presentationHostAlternatives(target = presentationDisplayById(
+  state.presentationSelectedDisplayId,
+)) {
+  if (!target?.controller) {
+    return [];
+  }
+  return (state.presentationDisplayInfo?.displays || []).filter((display) => (
+    display.id !== target.id && display.identityStable && !display.mirrored
+  ));
+}
+
+function resolvedPresentationHostDisplayId(target = presentationDisplayById(
+  state.presentationSelectedDisplayId,
+)) {
+  if (!target?.controller) {
+    return "";
+  }
+  const alternatives = presentationHostAlternatives(target);
+  if (alternatives.some(
+    (display) => display.id === state.presentationSelectedHostDisplayId,
+  )) {
+    return state.presentationSelectedHostDisplayId;
+  }
+  const builtIn = alternatives.find((display) => display.builtIn);
+  if (builtIn) {
+    return builtIn.id;
+  }
+  return "";
+}
+
+const presentationDeviceIconShapes = Object.freeze({
+  host: [
+    ["rect", { x: "2.5", y: "3.5", width: "19", height: "14", rx: "2" }],
+    ["path", { d: "M8 21h8M12 17.5V21M6.5 8h11M6.5 12.5h11" }],
+    ["circle", { cx: "10", cy: "8", r: "1.15", fill: "currentColor", stroke: "none" }],
+    ["circle", { cx: "15", cy: "12.5", r: "1.15", fill: "currentColor", stroke: "none" }],
+  ],
+  output: [
+    ["rect", { x: "2.5", y: "3.5", width: "19", height: "14", rx: "2" }],
+    ["path", { d: "M8 21h8M12 17.5V21" }],
+    ["path", { d: "m10 7.5 5 3-5 3z", fill: "currentColor", stroke: "none" }],
+  ],
+});
+
+function createPresentationDeviceIcon(iconType) {
+  const iconElement = document.createElement("span");
+  iconElement.className = "presentation-device-icon";
+  iconElement.setAttribute("aria-hidden", "true");
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("fill", "none");
+  svg.setAttribute("stroke", "currentColor");
+  svg.setAttribute("stroke-width", "1.8");
+  svg.setAttribute("stroke-linecap", "round");
+  svg.setAttribute("stroke-linejoin", "round");
+  const shapes = presentationDeviceIconShapes[iconType] || presentationDeviceIconShapes.output;
+  for (const [tagName, attributes] of shapes) {
+    const shape = document.createElementNS("http://www.w3.org/2000/svg", tagName);
+    for (const [name, value] of Object.entries(attributes)) {
+      shape.setAttribute(name, value);
+    }
+    svg.append(shape);
+  }
+  iconElement.append(svg);
+  return iconElement;
+}
+
+function createPresentationDisplayOption(
+  display,
+  iconType = display.controller ? "host" : "output",
+) {
+  const selected = display.id === state.presentationSelectedDisplayId;
+  const sessionActive = state.presentationSession.phase !== "inactive";
+  const active = display.id === state.presentationSession.selectedOutputDisplayId
+    && state.presentationSession.phase === "active";
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = `presentation-display-option${selected ? " is-selected" : ""}`;
+  button.dataset.presentationDisplayId = display.id;
+  button.disabled = state.presentationControlBusy
+    || state.presentationDisplayBusy
+    || sessionActive
+    || !display.selectable;
+  button.setAttribute("aria-pressed", String(selected));
+
+  const number = document.createElement("span");
+  number.className = "presentation-display-index";
+  const displayNumber = presentationDisplayNumber(display.id);
+  number.textContent = displayNumber > 0 ? String(displayNumber) : "";
+  number.setAttribute("aria-hidden", "true");
+
+  const copy = document.createElement("span");
+  copy.className = "presentation-display-copy";
+  const name = document.createElement("span");
+  name.className = "presentation-display-name";
+  name.textContent = display.name || t("display.unnamedDisplay", { number: 1 });
+  const detail = document.createElement("span");
+  detail.className = "presentation-display-detail";
+  const resolution = display.width && display.height
+    ? `${display.width} × ${display.height}`
+    : t("display.resolutionUnknown");
+  const builtInSuffix = display.builtIn ? ` · ${t("display.builtInDisplay")}` : "";
+  detail.textContent = display.mirrored
+    ? `${resolution} · ${t("display.presentationMirrored")}`
+    : display.identityStable && display.identityQuality === "stable"
+      ? `${resolution}${builtInSuffix}`
+      : `${resolution} · ${t("display.presentationIdentityUnavailable")}`;
+  copy.append(name, detail);
+  const status = document.createElement("span");
+  status.className = "presentation-display-state";
+  status.textContent = active
+    ? t("display.displaying")
+    : selected
+      ? t("display.selected")
+      : display.controller
+        ? t("display.controllerDisplay")
+        : "";
+  button.append(
+    number,
+    createPresentationDeviceIcon(iconType),
+    copy,
+    status,
+  );
+  return button;
+}
+
+function createPresentationHostDisplayOption(display) {
+  const selected = display.id === state.presentationSelectedHostDisplayId;
+  const button = createPresentationDisplayOption({
+    ...display,
+    controller: false,
+    selectable: true,
+  }, "host");
+  button.classList.toggle("is-selected", selected);
+  button.dataset.presentationDisplayId = "";
+  button.dataset.presentationHostDisplayId = display.id;
+  button.setAttribute("aria-pressed", String(selected));
+  const status = button.querySelector(".presentation-display-state");
+  if (status) {
+    status.textContent = selected ? t("display.hostDestination") : "";
+  }
+  return button;
+}
+
+function renderPresentationDisplayList() {
+  const list = elements.presentationDisplayList;
+  if (!list) {
+    return;
+  }
+  const displays = state.presentationDisplayInfo?.displays || [];
+  const fragment = document.createDocumentFragment();
+  for (const display of displays) {
+    fragment.append(createPresentationDisplayOption(display));
+  }
+  if (!displays.some((display) => display.selectable)) {
+    const empty = document.createElement("p");
+    empty.className = "presentation-display-empty";
+    empty.textContent = state.presentationDisplayError
+      ? t("display.presentationUnavailable")
+      : t("display.presentationNoExternalDisplay");
+    fragment.append(empty);
+  }
+  if (state.presentationDisplayBusy) {
+    list.setAttribute("aria-busy", "true");
+  } else {
+    list.removeAttribute("aria-busy");
+  }
+  list.replaceChildren(fragment);
+
+  const target = presentationDisplayById(state.presentationSelectedDisplayId);
+  const alternatives = presentationHostAlternatives(target);
+  const hostDisplayId = resolvedPresentationHostDisplayId(target);
+  const hostDestination = alternatives.find((display) => display.id === hostDisplayId);
+  const showHostTarget = Boolean(target?.controller && alternatives.length);
+  elements.presentationHostTargetSection?.classList.toggle("hidden", !showHostTarget);
+  if (elements.presentationHostTargetSummary) {
+    elements.presentationHostTargetSummary.textContent = hostDestination
+      ? t("display.hostWillMoveTo", {
+        number: presentationDisplayNumber(hostDestination.id),
+        monitor: hostDestination.name || t("display.unnamedDisplay", {
+          number: presentationDisplayNumber(hostDestination.id),
+        }),
+        default: hostDestination.builtIn ? t("display.defaultSuffix") : "",
+      })
+      : t("display.presentationSelectHostDisplay");
+  }
+  if (elements.presentationHostDisplayList) {
+    const hostFragment = document.createDocumentFragment();
+    if (showHostTarget) {
+      alternatives.forEach((display) => {
+        hostFragment.append(createPresentationHostDisplayOption(display));
+      });
+    }
+    elements.presentationHostDisplayList.replaceChildren(hostFragment);
+  }
+}
+
+function renderPresentationOutputControl() {
+  const settings = elements.presentationSettings;
+  const button = elements.presentationOutputButton;
+  const status = elements.presentationOutputStatus;
+  if (!settings || !button || !status) {
+    return;
+  }
+  const nativeAvailable = typeof tauriInvoke("presentation") === "function";
+  settings.classList.toggle("hidden", false);
+  if (!nativeAvailable) {
+    button.disabled = true;
+    button.removeAttribute("aria-busy");
+    setElementAttribute(button, "aria-label", t("display.presentationUnavailable"));
+    setTextContent(status, t("display.presentationUnavailable"));
+    setTextContent(elements.presentationOutputSummary, t("display.outputOff"));
+    setTextContent(elements.presentationOutputMeta, t("display.presentationUnavailable"));
+    if (elements.presentationIdentifyButton) {
+      elements.presentationIdentifyButton.disabled = true;
+      elements.presentationIdentifyButton.removeAttribute("aria-busy");
+    }
+    return;
+  }
+  const session = state.presentationSession;
+  const selectedId = session.selectedOutputDisplayId || state.presentationSelectedDisplayId;
+  const selected = presentationDisplayById(selectedId);
+  const hostDisplayId = typeof resolvedPresentationHostDisplayId === "function"
+    ? resolvedPresentationHostDisplayId(selected)
+    : "";
+  const requiresHostConfirmation = Boolean(selected?.controller && !hostDisplayId);
+  const monitorName = selected?.name || t("display.secondaryDisplay");
+  const hasSelectableDisplay = Boolean(
+    state.presentationDisplayInfo?.displays?.some((display) => display.selectable),
+  );
+  const noExternalDisplayAvailable = (
+    session.phase === "inactive"
+      && !state.presentationDisplayBusy
+      && !state.presentationDisplayError
+      && Boolean(state.presentationDisplayInfo)
+      && !hasSelectableDisplay
+  );
+  const statusText = state.presentationControlBusy
+    ? t("display.presentationTransitioning")
+    : session.phase === "active"
+      ? t("display.presentationActive", { monitor: monitorName })
+      : session.phase === "activating"
+        ? t("display.presentationActivating", { monitor: monitorName })
+        : session.phase === "recovering"
+          ? t("display.presentationRecovering")
+          : noExternalDisplayAvailable
+            ? t("display.presentationNoExternalDisplay")
+            : state.presentationSelectedDisplayId
+              ? requiresHostConfirmation
+                ? t("display.presentationSelectHostDisplay")
+                : t("display.presentationTargetSelected", { monitor: monitorName })
+              : t("display.presentationSelectDisplay");
+  const summaryText = state.presentationControlBusy
+    ? t("display.presentationTransitioning")
+    : session.phase === "active"
+      ? t("display.dualOutputOn")
+      : session.phase === "inactive"
+        ? t("display.outputOff")
+        : t("display.presentationTransitioning");
+  const metaText = state.presentationDisplayBusy
+    ? t("display.detectingDisplays")
+    : state.presentationDisplayError
+      ? t("display.presentationUnavailable")
+      : state.presentationDisplayInfo
+        ? t("display.displayCount", { count: state.presentationDisplayInfo.monitorCount })
+        : t("display.detectingDisplays");
+  const canActivate = session.phase === "inactive"
+    && Boolean(selected?.selectable)
+    && !requiresHostConfirmation;
+  const canDeactivate = session.phase === "active" || session.phase === "activating";
+  const disabled = state.presentationControlBusy
+    || state.presentationDisplayBusy
+    || !(canActivate || canDeactivate);
+  const signature = JSON.stringify({
+    session,
+    selectedId: state.presentationSelectedDisplayId,
+    selectedHostId: state.presentationSelectedHostDisplayId,
+    displayInfo: state.presentationDisplayInfo,
+    displayError: state.presentationDisplayError,
+    displayBusy: state.presentationDisplayBusy,
+    controlBusy: state.presentationControlBusy,
+    identifiersBusy: state.presentationIdentifiersBusy,
+    language: state.language,
+  });
+  if (signature === state.presentationOutputRenderSignature) {
+    return;
+  }
+  state.presentationOutputRenderSignature = signature;
+  setTextContent(status, statusText);
+  setTextContent(elements.presentationOutputSummary, summaryText);
+  setTextContent(elements.presentationOutputMeta, metaText);
+  button.disabled = disabled;
+  setElementAttribute(button, "aria-checked", String(session.phase !== "inactive"));
+  setElementAttribute(
+    button,
+    "aria-label",
+    canDeactivate ? t("display.stopPresentation") : t("display.startPresentation"),
+  );
+  if (state.presentationControlBusy) {
+    setElementAttribute(button, "aria-busy", "true");
+  } else {
+    button.removeAttribute("aria-busy");
+  }
+  setClassToggle(settings, "is-active", session.phase === "active");
+  setClassToggle(elements.presentationStateDot, "is-active", session.phase === "active");
+  setClassToggle(
+    elements.presentationStateDot,
+    "is-connecting",
+    session.phase === "activating" || session.phase === "recovering",
+  );
+  setClassToggle(elements.presentationRefreshButton, "is-loading", state.presentationDisplayBusy);
+  if (elements.presentationRefreshButton) {
+    elements.presentationRefreshButton.disabled = state.presentationDisplayBusy
+      || state.presentationControlBusy
+      || session.phase !== "inactive";
+    if (state.presentationDisplayBusy) {
+      elements.presentationRefreshButton.setAttribute("aria-busy", "true");
+    } else {
+      elements.presentationRefreshButton.removeAttribute("aria-busy");
+    }
+  }
+  if (elements.presentationIdentifyButton) {
+    elements.presentationIdentifyButton.disabled = state.presentationIdentifiersBusy
+      || state.presentationDisplayBusy
+      || state.presentationControlBusy
+      || session.phase !== "inactive"
+      || !(state.presentationDisplayInfo?.displays?.length);
+    if (state.presentationIdentifiersBusy) {
+      elements.presentationIdentifyButton.setAttribute("aria-busy", "true");
+    } else {
+      elements.presentationIdentifyButton.removeAttribute("aria-busy");
+    }
+  }
+  renderPresentationDisplayList();
+}
+
+async function handlePresentationSession(candidate) {
+  const session = applyPresentationSession(candidate);
+  if (!session) {
+    return null;
+  }
+  await applyPresentationComposition({
+    generation: session.generation,
+    composition: ["activating", "active"].includes(session.phase)
+      ? "stageOnly"
+      : "combined",
+  });
+  if (session.phase === "active") {
+    publishPresentationPlaybackState().catch(() => {});
+  } else if (
+    session.phase === "inactive"
+    && session.recoveryReason === "displayDisconnected"
+  ) {
+    state.presentationSelectedDisplayId = "";
+    setAppMessage(t("display.presentationDisconnected"), true);
+    await refreshPresentationDisplays();
+  } else if (window.BilikaraAndroidPresentation && session.phase === "inactive"
+    && session.recoveryReason.startsWith("output")) {
+    setAppMessage(t("display.presentationTransitionFailed", {message:session.recoveryReason}), true);
+  }
+  return session;
+}
+
+async function activateLocalPresentation() {
+  const invoke = tauriInvoke("presentation");
+  const displayId = state.presentationSelectedDisplayId;
+  const selected = presentationDisplayById(displayId);
+  if (typeof invoke !== "function" || !selected?.selectable) {
+    throw new Error(t("display.presentationSelectDisplay"));
+  }
+  const hostDisplayId = typeof resolvedPresentationHostDisplayId === "function"
+    ? (resolvedPresentationHostDisplayId(selected) || null)
+    : null;
+  await handlePresentationSession(await invoke("activate_local_presentation", {
+    displayId,
+    hostDisplayId,
+  }));
+}
+
+async function deactivateLocalPresentation() {
+  const invoke = tauriInvoke("presentation");
+  if (typeof invoke !== "function") {
+    throw new Error(t("display.presentationUnavailable"));
+  }
+  await handlePresentationSession(await invoke("deactivate_local_presentation", {
+    generation: state.presentationSession.generation,
+  }));
+}
+
+async function toggleLocalPresentation() {
+  if (state.presentationControlBusy || state.presentationDisplayBusy) {
+    return;
+  }
+  state.presentationControlBusy = true;
+  renderPresentationOutputControl();
+  try {
+    if (state.presentationSession.phase === "inactive") {
+      await activateLocalPresentation();
+    } else {
+      await deactivateLocalPresentation();
+    }
+  } catch (error) {
+    setAppMessage(t("display.presentationTransitionFailed", {
+      message: error?.message || String(error),
+    }), true);
+  } finally {
+    state.presentationControlBusy = false;
+    renderPresentationOutputControl();
+  }
+}
+
+function selectPresentationDisplay(displayId) {
+  if (
+    state.presentationControlBusy
+    || state.presentationDisplayBusy
+    || state.presentationSession.phase !== "inactive"
+  ) {
+    return;
+  }
+  const target = presentationDisplayById(String(displayId || ""));
+  if (!target?.selectable) {
+    return;
+  }
+  state.presentationSelectedDisplayId = target.id;
+  const alternatives = presentationHostAlternatives(target);
+  state.presentationSelectedHostDisplayId = alternatives.find((display) => display.builtIn)?.id || "";
+  renderPresentationOutputControl();
+  const replacement = Array.from(
+    elements.presentationDisplayList?.querySelectorAll("[data-presentation-display-id]") || [],
+  ).find((option) => option.dataset.presentationDisplayId === target.id);
+  replacement?.focus();
+}
+
+function selectPresentationHostDisplay(displayId) {
+  if (
+    state.presentationControlBusy
+    || state.presentationDisplayBusy
+    || state.presentationSession.phase !== "inactive"
+  ) {
+    return;
+  }
+  const target = presentationDisplayById(state.presentationSelectedDisplayId);
+  const replacement = presentationHostAlternatives(target).find(
+    (display) => display.id === String(displayId || ""),
+  );
+  if (!replacement) {
+    return;
+  }
+  state.presentationSelectedHostDisplayId = replacement.id;
+  renderPresentationOutputControl();
+  Array.from(
+    elements.presentationHostDisplayList?.querySelectorAll("[data-presentation-host-display-id]") || [],
+  ).find((option) => option.dataset.presentationHostDisplayId === replacement.id)
+    ?.focus();
+}
+
+function normalizeControllerCommandEnvelope(candidate) {
+  if (!candidate || typeof candidate !== "object" || candidate.target !== "host") {
+    return null;
+  }
+  const generation = Number(candidate.generation);
+  const sequence = Number(candidate.sequence);
+  const command = candidate.command;
+  if (
+    !Number.isSafeInteger(generation)
+    || generation < 0
+    || !Number.isSafeInteger(sequence)
+    || sequence < 1
+    || !command
+    || typeof command !== "object"
+  ) {
+    return null;
+  }
+  return { generation, sequence, command };
+}
+
+function validControllerSeekTarget(value) {
+  return Number.isFinite(value) && value >= 0 && value <= 7 * 24 * 60 * 60;
+}
+
+function seekHostPlayer(video, audio, targetTime) {
+  if (!video || !validControllerSeekTarget(targetTime)) {
+    return Promise.reject(new Error("Invalid Controller seek target"));
+  }
+  if (!audio || !isActiveSplitPlayer(video, audio)) {
+    return Promise.reject(new Error("The Host player is not ready for seeking"));
+  }
+  const playbackSession = state.hostPlaybackSession;
+  if (!playbackSession.readyCommitted) {
+    const error = new Error("The Host playback session is not ready for seeking");
+    error.name = "AbortError";
+    return Promise.reject(error);
+  }
+  return new Promise((resolve, reject) => {
+    const rejectCancelledSeek = () => {
+      const retired = !isCurrentHostPlaybackSession(playbackSession, video, audio);
+      const error = new Error(
+        retired
+          ? "The Host playback session retired before seeking completed"
+          : "The Host seek was cancelled before completion",
+      );
+      if (retired) {
+        error.name = "AbortError";
+      }
+      reject(error);
+    };
+    const started = beginSplitPlayerSeek(video, audio, {
+      resumeAfterSeek: state.localShouldBePlaying,
+      targetTime,
+      diagnosticAction: "presentation-controller-seek",
+      onSettled: (applied) => {
+        if (!applied) {
+          rejectCancelledSeek();
+          return;
+        }
+        reportPlayerStatus(
+          video.dataset.playerItemId || "",
+          video,
+          playbackSession,
+        );
+        resolve(true);
+      },
+    });
+    if (!started) {
+      rejectCancelledSeek();
+    }
+  });
+}
+
+async function acknowledgeControllerCommand(generation, sequence) {
+  const invoke = tauriInvoke("presentation");
+  if (typeof invoke !== "function") {
+    throw new Error("Tauri presentation commands are unavailable");
+  }
+  await handlePresentationSession(await invoke("acknowledge_presentation_command", {
+    generation,
+    sequence,
+  }));
+  state.presentationLastAppliedCommandSequence = sequence;
+}
+
+async function applyControllerCommand(candidate) {
+  const envelope = normalizeControllerCommandEnvelope(candidate);
+  const session = state.presentationSession;
+  if (
+    !envelope
+    || session.phase !== "active"
+    || session.playbackAuthority !== "host"
+    || envelope.generation !== session.generation
+    || envelope.sequence !== state.presentationLastAppliedCommandSequence + 1
+    || envelope.sequence > session.lastAcceptedCommandSequence
+  ) {
+    return false;
+  }
+  const programRelativeCommand = ["seekRelative", "seekAbsolute", "nextTrack"].includes(
+    envelope.command.type,
+  );
+  if (programRelativeCommand) {
+    const expectedPlaybackGeneration = Number(
+      envelope.command.expectedPlaybackGeneration,
+    );
+    if (
+      !Number.isSafeInteger(expectedPlaybackGeneration)
+      || expectedPlaybackGeneration < 1
+    ) {
+      throw new Error("Invalid Controller playback target");
+    }
+    const playbackSession = state.hostPlaybackSession;
+    if (
+      expectedPlaybackGeneration !== state.data?.playback_generation
+      || playbackSession?.playbackGeneration !== expectedPlaybackGeneration
+      || !isCurrentHostPlaybackSession(playbackSession)
+    ) {
+      await acknowledgeControllerCommand(envelope.generation, envelope.sequence);
+      return false;
+    }
+  }
+  const { video, audio } = activeLocalPlayerElements();
+  let cancelledByPlaybackProgramChange = false;
+  try {
+    switch (envelope.command.type) {
+      case "play":
+        if (!video || !audio || !setSplitPlaybackIntent(video, audio, true, {
+          source: "presentation-controller-play",
+        })) {
+          throw new Error("The Host player is not ready to play");
+        }
+        break;
+      case "pause":
+        if (!video || !audio || !setSplitPlaybackIntent(video, audio, false, {
+          source: "presentation-controller-pause",
+        })) {
+          throw new Error("The Host player is not ready to pause");
+        }
+        break;
+      case "seekRelative": {
+        const deltaSeconds = Number(envelope.command.deltaSeconds);
+        if (!Number.isFinite(deltaSeconds) || deltaSeconds === 0 || Math.abs(deltaSeconds) > 600) {
+          throw new Error("Invalid Controller relative seek command");
+        }
+        const targetTime = Math.max(0, Number(video?.currentTime || 0) + deltaSeconds);
+        await seekHostPlayer(video, audio, targetTime);
+        break;
+      }
+      case "seekAbsolute": {
+        const targetSeconds = Number(envelope.command.targetSeconds);
+        if (!validControllerSeekTarget(targetSeconds)) {
+          throw new Error("Invalid Controller absolute seek command");
+        }
+        await seekHostPlayer(video, audio, targetSeconds);
+        break;
+      }
+      case "nextTrack": {
+        const expectedPlaybackGeneration = envelope.command.expectedPlaybackGeneration;
+        const advanced = await requestNextTrack(expectedPlaybackGeneration);
+        if (!advanced) {
+          if (
+            state.data?.playback_generation === expectedPlaybackGeneration
+            && state.hostPlaybackSession?.playbackGeneration === expectedPlaybackGeneration
+            && isCurrentHostPlaybackSession(state.hostPlaybackSession)
+          ) {
+            throw new Error("The Host could not advance to the next track");
+          }
+          cancelledByPlaybackProgramChange = true;
+        }
+        break;
+      }
+      case "setVolume": {
+        const volumePercent = Number(envelope.command.volumePercent);
+        if (
+          !Number.isInteger(volumePercent)
+          || volumePercent < 0
+          || volumePercent > 500
+          || typeof envelope.command.muted !== "boolean"
+        ) {
+          throw new Error("Invalid Controller volume command");
+        }
+        await setLocalPlayerVolumeAndMuted(volumePercent / 100, envelope.command.muted, {
+          reportError: false,
+        });
+        break;
+      }
+      default:
+        throw new Error("Unsupported Controller command");
+    }
+  } catch (error) {
+    if (
+      error?.name !== "AbortError"
+      || (envelope.command.type !== "seekRelative" && envelope.command.type !== "seekAbsolute")
+    ) {
+      throw error;
+    }
+    cancelledByPlaybackProgramChange = true;
+  }
+  await acknowledgeControllerCommand(envelope.generation, envelope.sequence);
+  if (cancelledByPlaybackProgramChange) {
+    return false;
+  }
+  publishPresentationPlaybackState().catch((error) => {
+    setAppMessage(error?.message || String(error), true);
+  });
+  return true;
+}
+
+function hostPlaybackSessionObservedPlaying(
+  session = state.hostPlaybackSession,
+  video = session?.video,
+  audio = session?.audio,
+) {
+  return Boolean(
+    session
+    && session === state.hostPlaybackSession
+    && session.readyCommitted
+    && session.phase === "playing"
+    && session.video === video
+    && session.audio === audio
+    && isActiveSplitPlayer(video, audio)
+    && !video.paused
+    && !audio.paused
+  );
+}
+
+function presentationPlaybackStateModel(session = state.hostPlaybackSession) {
+  const currentItem = state.data?.current_item || null;
+  const { video, audio } = activeLocalPlayerElements();
+  const media = video || activePrimaryVideoElement();
+  const duration = Number(media?.duration);
+  const currentTime = Number(media?.currentTime);
+  const volumeSource = audio || media;
+  return {
+    playbackGeneration: session?.playbackGeneration ?? null,
+    itemIdentity: currentItem?.id ? String(currentItem.id) : null,
+    title: String(currentItem?.display_title || currentItem?.title || t("player.noSong")),
+    paused: audio
+      ? !hostPlaybackSessionObservedPlaying(session, video, audio)
+      : !media || Boolean(media.paused),
+    currentTimeSeconds: Number.isFinite(currentTime) && currentTime >= 0 ? currentTime : 0,
+    durationSeconds: Number.isFinite(duration) && duration >= 0 ? duration : null,
+    volumePercent: Math.round(
+      Math.max(0, Math.min(5, Number(volumeSource?.bilikaraVolume ?? volumeSource?.volume ?? state.localPlayerVolume))) * 100,
+    ),
+    muted: Boolean(volumeSource?.muted ?? state.localPlayerMuted),
+    canSkip: Boolean(currentItem) && !state.localAdvanceInFlight,
+  };
+}
+
+function presentationHostAnnouncementSnapshot() {
+  const currentItem = state.data?.current_item || null;
+  const playlist = Array.isArray(state.data?.playlist) ? state.data.playlist : [];
+  const announcementItems = playlist.slice(0, 3).map((item) => ({
+    identity: String(item?.item_incarnation_id || item?.id || ""),
+    title: delayOverlayTitleForItem(item),
+    requester: String(item?.requester_name || ""),
+    durationSeconds: durationSecondsForItem(item),
+    cacheStatus: presentationCacheStatusForItem(item),
+  }));
+  const snapshotKey = JSON.stringify({
+    presentationGeneration: Number(state.presentationSession?.generation || 0),
+    playbackGeneration: Number(state.data?.playback_generation || 0),
+    currentItemIdentity: String(
+      currentItem?.item_incarnation_id || currentItem?.id || "",
+    ),
+    announcementItems,
+    language: state.language,
+  });
+  if (
+    snapshotKey === state.presentationHostAnnouncementKey
+    && state.presentationHostAnnouncementModel
+  ) {
+    return state.presentationHostAnnouncementModel;
+  }
+
+  const primaryItem = playlist[0] || null;
+  const followItems = playlist.slice(1, 3);
+  state.presentationHostAnnouncementKey = snapshotKey;
+  state.presentationHostAnnouncementModel = {
+    visible: true,
+    heading: t("player.followingQueue"),
+    countdownLabel: "",
+    deadline: 0,
+    durationMs: 1000,
+    title: delayOverlayTitleForItem(primaryItem, t("player.prepareNext")),
+    requester: primaryItem?.requester_name || "—",
+    duration: primaryItem
+      ? formatDurationSeconds(durationSecondsForItem(primaryItem))
+      : "—",
+    cacheStatus: presentationCacheStatusForItem(primaryItem),
+    queueHeading: "",
+    rows: followItems.map((item) => ({
+      title: delayOverlayTitleForItem(item),
+      requester: item?.requester_name || "—",
+      duration: formatDurationSeconds(durationSecondsForItem(item)),
+      cacheStatus: presentationCacheStatusForItem(item),
+    })),
+    emptyText: "",
+    remainingText: "",
+    totalText: "",
+  };
+  return state.presentationHostAnnouncementModel;
+}
+
+function renderPresentationHostAnnouncement() {
+  const renderer = presentationRendererApi();
+  if (!renderer || !elements.presentationHostAnnouncement) {
+    return null;
+  }
+  const overlay = renderer.ensureOverlay(elements.presentationHostAnnouncement);
+  if (!overlay) {
+    return null;
+  }
+  overlay.classList.add("presentation-host-next-song-overlay");
+  renderer.renderOverlay(overlay, presentationHostAnnouncementSnapshot(), {
+    manageVisibility: true,
+    now: 0,
+    primaryIndex: state.data?.playlist?.length ? 1 : null,
+  });
+  return overlay;
+}
+
+function formatPresentationHostClock(seconds) {
+  const normalized = Math.max(0, Math.floor(Number(seconds || 0)));
+  const hours = Math.floor(normalized / 3600);
+  const minutes = Math.floor((normalized % 3600) / 60);
+  const remainder = normalized % 60;
+  if (hours > 0) {
+    return `${hours}:${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`;
+  }
+  return `${minutes}:${String(remainder).padStart(2, "0")}`;
+}
+
+function paintPresentationHostProgress(currentSeconds, durationSeconds) {
+  const progress = elements.presentationHostProgress;
+  const duration = Number.isFinite(Number(durationSeconds)) && Number(durationSeconds) > 0
+    ? Number(durationSeconds)
+    : 0;
+  const current = duration > 0
+    ? Math.max(0, Math.min(duration, Number(currentSeconds || 0)))
+    : 0;
+  if (progress) {
+    const nextMax = String(duration || 1);
+    const nextValue = String(current);
+    if (progress.max !== nextMax) {
+      progress.max = nextMax;
+    }
+    if (progress.value !== nextValue) {
+      progress.value = nextValue;
+    }
+    const percent = duration > 0 ? (current / duration) * 100 : 0;
+    setRangeFillPercent(progress, percent);
+    const ariaValueText = duration > 0
+      ? `${formatPresentationHostClock(current)} / ${formatPresentationHostClock(duration)}`
+      : "—";
+    if (progress.getAttribute("aria-valuetext") !== ariaValueText) {
+      progress.setAttribute("aria-valuetext", ariaValueText);
+    }
+  }
+  setTextContent(elements.presentationHostCurrentTime, formatPresentationHostClock(current));
+  setTextContent(
+    elements.presentationHostDuration,
+    duration > 0 ? formatPresentationHostClock(duration) : "—",
+  );
+}
+
+function renderPresentationHostSurface(session = state.hostPlaybackSession) {
+  const active = typeof presentationCompositionActive === "function"
+    ? presentationCompositionActive()
+    : false;
+  const currentItem = state.data?.current_item || null;
+  const playback = presentationPlaybackStateModel(session);
+  if (elements.presentationHostAnnouncement) {
+    elements.presentationHostAnnouncement.hidden = !active;
+    elements.presentationHostAnnouncement.setAttribute("aria-hidden", String(!active));
+    if (active) {
+      renderPresentationHostAnnouncement();
+    }
+  }
+  if (elements.presentationHostControls) {
+    elements.presentationHostControls.hidden = !active;
+  }
+  const playLabel = playback.paused ? t("controller.play") : t("controller.pause");
+  setTextContent(
+    elements.presentationHostPlay?.querySelector("[data-presentation-host-play-label]"),
+    playLabel,
+  );
+  if (elements.presentationHostPlay) {
+    elements.presentationHostPlay.setAttribute("aria-label", playLabel);
+    elements.presentationHostPlay.setAttribute("title", playLabel);
+    elements.presentationHostPlay.setAttribute("aria-pressed", String(!playback.paused));
+    elements.presentationHostPlay.classList.toggle("is-playing", !playback.paused);
+    elements.presentationHostPlay.classList.toggle("is-paused", playback.paused);
+    elements.presentationHostPlay
+      .querySelector('[data-presentation-host-icon="play"]')
+      ?.classList.toggle("hidden", !playback.paused);
+    elements.presentationHostPlay
+      .querySelector('[data-presentation-host-icon="pause"]')
+      ?.classList.toggle("hidden", playback.paused);
+  }
+  const hasPlayableMedia = Boolean(
+    active
+    && currentItem
+    && session?.readyCommitted
+    && isCurrentHostPlaybackSession(session, session.video, session.audio),
+  );
+  if (elements.presentationHostPlay) {
+    elements.presentationHostPlay.disabled = !hasPlayableMedia
+      || state.presentationHostControlBusy;
+  }
+  const durationAvailable = Number(playback.durationSeconds || 0) > 0;
+  for (const button of [elements.presentationHostBack, elements.presentationHostForward]) {
+    if (button) {
+      button.disabled = !hasPlayableMedia
+        || state.presentationHostControlBusy;
+    }
+  }
+  if (elements.presentationHostProgress) {
+    elements.presentationHostProgress.disabled = !hasPlayableMedia
+      || !durationAvailable
+      || state.presentationHostControlBusy;
+  }
+  if (!state.presentationHostProgressScrubbing) {
+    paintPresentationHostProgress(
+      playback.currentTimeSeconds,
+      playback.durationSeconds,
+    );
+  }
+  if (elements.presentationHostNext) {
+    elements.presentationHostNext.disabled = !active
+      || !playback.canSkip
+      || state.presentationHostControlBusy;
+  }
+  playbackRestartMenu?.refresh();
+}
+
+function publishPresentationPlaybackState(session = state.hostPlaybackSession) {
+  const invoke = tauriInvoke("presentation");
+  const capturedVideo = session?.video;
+  const capturedAudio = session?.audio;
+  if (typeof publishPresentationOutputState === "function") {
+    publishPresentationOutputState(session);
+  }
+  if (typeof elements !== "undefined" && typeof renderPresentationHostSurface === "function") {
+    renderPresentationHostSurface(session);
+  }
+  if (
+    typeof invoke !== "function"
+    || !["activating", "active"].includes(state.presentationSession.phase)
+    || (session && !session.readyCommitted)
+    || (
+      session
+      && !isCurrentHostPlaybackSession(session, capturedVideo, capturedAudio)
+    )
+  ) {
+    return Promise.resolve(null);
+  }
+  const playbackState = presentationPlaybackStateModel(session);
+  const signature = JSON.stringify({
+    generation: state.presentationSession.generation,
+    playbackGeneration: session?.playbackGeneration ?? null,
+    playbackProgram: session?.playbackProgram ?? null,
+    playbackState,
+  });
+  if (signature === state.presentationPlaybackPublishSignature) {
+    return state.presentationPlaybackPublishPromise || Promise.resolve(null);
+  }
+  state.presentationPlaybackPublishSignature = signature;
+  playbackState.revision = ++state.presentationPlaybackRevision;
+  const generation = state.presentationSession.generation;
+  const previous = state.presentationPlaybackPublishPromise || Promise.resolve();
+  const pending = previous
+    .catch(() => {})
+    .then(() => {
+      if (
+        state.presentationSession.generation !== generation
+        || (
+          session
+            ? !isCurrentHostPlaybackSession(session, capturedVideo, capturedAudio)
+            : state.hostPlaybackSession !== session
+        )
+      ) {
+        return null;
+      }
+      return invoke("publish_presentation_playback_state", {
+        generation,
+        playbackState,
+      });
+    })
+    .catch((error) => {
+      if (
+        state.presentationSession.generation === generation
+        && state.presentationPlaybackPublishSignature === signature
+        && (
+          session
+            ? isCurrentHostPlaybackSession(session, capturedVideo, capturedAudio)
+            : state.hostPlaybackSession === session
+        )
+      ) {
+        state.presentationPlaybackPublishSignature = "";
+      }
+      throw error;
+    });
+  const tracked = pending.finally(() => {
+    if (state.presentationPlaybackPublishPromise === tracked) {
+      state.presentationPlaybackPublishPromise = null;
+    }
+  });
+  state.presentationPlaybackPublishPromise = tracked;
+  return tracked;
+}
+
+function tauriEventListen(capability = "desktop") {
+  if (capability === "presentation" && window.BilikaraAndroidPresentation) return window.BilikaraAndroidPresentation.listen;
+  if (typeof document !== "undefined" && document.documentElement?.dataset?.nativeHost === "true" && document.documentElement?.dataset?.hostPlatform !== "desktop") return null;
+  return window.__TAURI__?.event?.listen || null;
+}
+
+function teardownLocalPresentationListeners() {
+  state.presentationUnlisteners.splice(0).forEach((unlisten) => {
+    try {
+      unlisten();
+    } catch {
+      // The native listener may already have been released with the WebView.
+    }
+  });
+  state.presentationListenersReady = false;
+  document.removeEventListener("pointermove", handlePresentationPointerMove);
+  clearPresentationCursorTimer();
+}
+
+async function initializeLocalPresentation() {
+  const invoke = tauriInvoke("presentation");
+  const listen = tauriEventListen("presentation");
+  if (typeof invoke !== "function" || typeof listen !== "function") {
+    renderPresentationOutputControl();
+    return;
+  }
+  if (state.presentationListenersReady) {
+    return;
+  }
+  state.presentationListenersReady = true;
+  document.addEventListener("pointermove", handlePresentationPointerMove);
+  try {
+    const unlistenSession = await listen("bilikara-presentation-state", (event) => {
+      handlePresentationSession(event?.payload?.session).catch((error) => {
+        setAppMessage(error?.message || String(error), true);
+      });
+    });
+    const unlistenComposition = await listen(
+      "bilikara-presentation-host-composition",
+      (event) => {
+        applyPresentationComposition(event?.payload).catch((error) => {
+          setAppMessage(error?.message || String(error), true);
+        });
+      },
+    );
+    const unlistenCommand = await listen("bilikara-presentation-host-command", (event) => {
+      const commandGeneration = Number(event?.payload?.generation);
+      const pending = state.presentationCommandApplyPromise
+        .catch(() => {})
+        .then(() => applyControllerCommand(event?.payload));
+      state.presentationCommandApplyPromise = pending;
+      pending.catch(async (error) => {
+        setAppMessage(error?.message || String(error), true);
+        if (
+          !Number.isSafeInteger(commandGeneration)
+          || state.presentationSession.phase !== "active"
+          || state.presentationSession.generation !== commandGeneration
+        ) {
+          return;
+        }
+        try {
+          await handlePresentationSession(await invoke("deactivate_local_presentation", {
+            generation: commandGeneration,
+          }));
+        } catch (recoveryError) {
+          setAppMessage(recoveryError?.message || String(recoveryError), true);
+        }
+      });
+    });
+    // A newly loaded audience page asks for the current output through the shell.
+    const unlistenOutputRequest = await listen("bilikara-presentation-output-request", (event) => {
+      if (Number(event?.payload?.generation) === state.presentationSession.generation) {
+        publishPresentationOutputState();
+      }
+    });
+    state.presentationUnlisteners.push(
+      unlistenSession,
+      unlistenComposition,
+      unlistenCommand,
+      unlistenOutputRequest,
+    );
+    if (window.BilikaraAndroidPresentation) {
+      state.presentationUnlisteners.push(await listen("displays-changed", event => {
+        applyPresentationDisplayInfo(event.payload);
+      }));
+    }
+    await handlePresentationSession(await invoke("get_presentation_session"));
+    await refreshPresentationDisplays();
+  } catch (error) {
+    teardownLocalPresentationListeners();
+    state.presentationDisplayError = error?.message || String(error);
+    renderPresentationOutputControl();
+  }
+}
+
+function syncPlayerFullscreenExpandedWidth() {
+  const control = elements.playerFullscreenControl;
+  const button = elements.playerFullscreenButton;
+  const label = button?.querySelector(".fullscreen-exit-hover-label");
+  const exitIcon = button?.querySelector(".fullscreen-exit-icon");
+  if (!control || !button || !label || !exitIcon) {
+    return;
+  }
+  const buttonStyle = getComputedStyle(button);
+  const iconStyle = getComputedStyle(exitIcon);
+  const controlStyle = getComputedStyle(control);
+  const number = (value) => Number.parseFloat(value) || 0;
+  const labelWidth = Math.max(label.scrollWidth, label.getBoundingClientRect().width);
+  const expandedWidth = Math.ceil(
+    number(buttonStyle.paddingLeft)
+      + number(buttonStyle.paddingRight)
+      + number(buttonStyle.borderLeftWidth)
+      + number(buttonStyle.borderRightWidth)
+      + number(iconStyle.width)
+      + number(controlStyle.getPropertyValue("--fullscreen-action-label-gap"))
+      + labelWidth,
+  );
+  control.style.setProperty(
+    "--fullscreen-action-expanded-width",
+    `${Math.max(112, expandedWidth)}px`,
+  );
+  control.style.setProperty(
+    "--fullscreen-action-label-width",
+    `${Math.ceil(labelWidth)}px`,
+  );
+}
+
 function renderPlayerFullscreenButton() {
   const button = elements.playerFullscreenButton;
   if (!button) {
@@ -1182,7 +3390,7 @@ function renderPlayerFullscreenButton() {
   const enabled = canTogglePlayerFullscreen();
   const label = active ? t("player.fullscreenExit") : t("player.fullscreen");
   const title = enabled
-    ? (active ? t("player.fullscreenExitLabel") : t("player.fullscreenEnterLabel"))
+    ? (active ? t("player.fullscreenRemoteExit") : t("player.fullscreenEnterLabel"))
     : supportsPlayerFullscreen()
       ? t("player.fullscreenDisabled")
       : t("player.fullscreenUnsupported");
@@ -1196,9 +3404,39 @@ function renderPlayerFullscreenButton() {
   if (button.disabled !== !enabled) {
     button.disabled = !enabled;
   }
-  setTextContent(button, label);
+  setTextContent(elements.playerFullscreenLabel, label);
   setElementAttribute(button, "aria-pressed", String(active));
-  setElementTitle(button, title);
+  setElementAttribute(button, "aria-label", active ? t("player.fullscreenRemoteExit") : title);
+  setElementTitle(button, active ? "" : title);
+  syncPlayerFullscreenExpandedWidth();
+  if (!active) {
+    setPlayerFullscreenRemotePinned(false);
+  }
+}
+
+function setPlayerFullscreenRemotePinned(pinned) {
+  state.playerFullscreenRemotePinned = Boolean(pinned) && isPlayerPanelFullscreen();
+  elements.androidFullscreenRemoteButton?.setAttribute("aria-expanded", String(state.playerFullscreenRemotePinned));
+  elements.playerFullscreenControl?.classList.toggle(
+    "is-qr-pinned",
+    state.playerFullscreenRemotePinned,
+  );
+  elements.playerFullscreenButton?.setAttribute(
+    "aria-expanded",
+    String(state.playerFullscreenRemotePinned),
+  );
+}
+
+function playerFullscreenActivationUsesTouch(event) {
+  const pointerType = state.playerFullscreenLastPointerType;
+  state.playerFullscreenLastPointerType = "";
+  if (pointerType) {
+    return pointerType === "touch";
+  }
+  return Boolean(
+    event?.detail
+    && window.matchMedia?.("(hover: none), (pointer: coarse)")?.matches,
+  );
 }
 
 function requestElementFullscreen(element) {
@@ -1227,50 +3465,81 @@ function exitDocumentFullscreen() {
 }
 
 async function togglePlayerFullscreen() {
-  if (!supportsPlayerFullscreen()) {
+  if (!canTogglePlayerFullscreen()) {
     return;
   }
-  if (isPlayerPanelFullscreen()) {
-    const exitFullscreenPromise = exitDocumentFullscreen();
-    const tauriFullscreenPromise = setTauriWindowFullscreen(false);
-    elements.playerPanel?.classList.remove("is-tauri-fullscreen");
-    document.body?.classList.remove("is-tauri-fullscreen-active");
-    await exitFullscreenPromise;
-    await tauriFullscreenPromise;
-    renderPlayerFullscreenButton();
-    return;
-  }
-  if (!state.data?.current_item) {
-    return;
-  }
-  const activeFullscreen = fullscreenElement();
-  if (activeFullscreen && activeFullscreen !== elements.playerPanel) {
-    await exitDocumentFullscreen();
-    await setTauriWindowFullscreen(false);
-    elements.playerPanel?.classList.remove("is-tauri-fullscreen");
-    document.body?.classList.remove("is-tauri-fullscreen-active");
-  }
-  const elementFullscreenPromise = requestElementFullscreen(elements.playerPanel);
-  const tauriFullscreenPromise = setTauriWindowFullscreen(true);
-  const elementFullscreenStarted = await elementFullscreenPromise;
-  const tauriFullscreenStarted = await tauriFullscreenPromise;
-  if (!elementFullscreenStarted) {
-    if (isTauriWebKitRuntime() && tauriFullscreenStarted) {
-      elements.playerPanel?.classList.add("is-tauri-fullscreen");
-      document.body?.classList.add("is-tauri-fullscreen-active");
-    } else if (tauriFullscreenStarted) {
-      await setTauriWindowFullscreen(false);
-    }
-  }
+  const entering = !isPlayerPanelFullscreen();
+  fullscreenControlHover.reset();
+  setPlayerFullscreenRemotePinned(false);
+  hideMountedPlayerControls();
+  state.playerFullscreenTransitioning = true;
+  state.playerFullscreenRevision += 1;
   renderPlayerFullscreenButton();
+  try {
+    let changed;
+    if (typeof tauriInvoke() === "function") {
+      // Desktop has one native fullscreen owner, just like dual-screen output.
+      // DOM fullscreen also drives the WebView2 window and must not race it.
+      // Hide windowed chrome before the OS expands the window. Keep fullscreen
+      // chrome during exit until native restoration finishes, and roll back failures.
+      if (entering) {
+        document.body?.classList.add("is-tauri-fullscreen-active");
+      }
+      changed = await setTauriWindowFullscreen(entering);
+      if (changed || entering) {
+        const active = changed ? entering : !entering;
+        elements.playerPanel?.classList.toggle("is-tauri-fullscreen", active);
+        document.body?.classList.toggle("is-tauri-fullscreen-active", active);
+      }
+    } else if (!entering) {
+      changed = await exitDocumentFullscreen();
+    } else {
+      const activeFullscreen = fullscreenElement();
+      if (activeFullscreen && activeFullscreen !== elements.playerPanel) {
+        await exitDocumentFullscreen();
+      }
+      changed = await requestElementFullscreen(elements.playerPanel);
+    }
+    if (!changed) setAppMessage(t("player.fullscreenFailed"), true);
+    if (changed) handleFullscreenChange();
+  } catch {
+    setAppMessage(t("player.fullscreenFailed"), true);
+  } finally {
+    state.playerFullscreenTransitioning = false;
+    state.playerFullscreenInteraction?.sync();
+    renderPlayerFullscreenButton();
+  }
 }
 
-function clearPlayerFrameClickTimer() {
-  if (!state.playerFrameClickTimer) {
+async function syncNativePlayerFullscreen(appWindow) {
+  if (state.playerFullscreenTransitioning
+      || !elements.playerPanel?.classList.contains("is-tauri-fullscreen")
+      || typeof appWindow?.isFullscreen !== "function") return;
+  const revision = state.playerFullscreenRevision;
+  try {
+    const active = await appWindow.isFullscreen();
+    if (!active && !state.playerFullscreenTransitioning && revision === state.playerFullscreenRevision) {
+      elements.playerPanel.classList.remove("is-tauri-fullscreen");
+      document.body?.classList.remove("is-tauri-fullscreen-active");
+      handleFullscreenChange();
+    }
+  } catch {
+    // A failed native read is not evidence that the OS left fullscreen.
+  }
+}
+
+function handleNativePlayerFullscreenEscape(event) {
+  if (event.key !== "Escape" || !elements.playerPanel?.classList.contains("is-tauri-fullscreen")) return;
+  event.preventDefault();
+  void togglePlayerFullscreen();
+}
+
+function clearPlayerFrameClickTimer(session = state.hostPlaybackSession) {
+  if (!session?.frameClickTimer) {
     return;
   }
-  window.clearTimeout(state.playerFrameClickTimer);
-  state.playerFrameClickTimer = null;
+  window.clearTimeout(session.frameClickTimer);
+  session.frameClickTimer = null;
 }
 
 function clearLocalPlayerControlsHideTimer() {
@@ -1283,8 +3552,10 @@ function clearLocalPlayerControlsHideTimer() {
 }
 
 function mountedLocalVideoElement() {
-  return elements.playerFrame.querySelector('video[data-player-role="video"]')
-    || elements.playerFrame.querySelector("video");
+  const session = state.hostPlaybackSession;
+  return isCurrentHostPlaybackSession(session, session?.video, session?.audio)
+    ? session.video
+    : null;
 }
 
 function hidePlayerControls(video) {
@@ -1306,6 +3577,10 @@ function scheduleMountedPlayerControlsHide() {
   if (!video || !video.controls) {
     return;
   }
+  // Android's UA-shadow controls consume thumb events before the page sees
+  // them. Let the WebView fade its own controls instead of removing the entire
+  // controls attribute on a timer and aborting an in-progress native drag.
+  if (isAndroidNativePlaybackRuntime()) return;
   const hideGeneration = state.localPlayerControlsHideGeneration;
   const hideTimer = window.setTimeout(() => {
     if (
@@ -1316,12 +3591,23 @@ function scheduleMountedPlayerControlsHide() {
       return;
     }
     state.localPlayerControlsHideTimer = null;
+    if (state.playerFullscreenInteraction?.holdingPointer()) {
+      scheduleMountedPlayerControlsHide();
+      return;
+    }
     hidePlayerControls(video);
   }, playerControlsAutoHideMs);
   state.localPlayerControlsHideTimer = hideTimer;
 }
 
-function revealMountedPlayerControlsForUserInteraction() {
+function revealMountedPlayerControlsForUserInteraction(event) {
+  if (presentationCompositionActive() || state.playerFullscreenTransitioning) {
+    hideMountedPlayerControls();
+    return;
+  }
+  // Incidental focus/hover is not permission to show controls, but must not
+  // dismiss controls already revealed by the preceding pointerdown either.
+  if (isPlayerPanelFullscreen() && !state.playerFullscreenInteraction?.allowsReveal(event)) return;
   const video = mountedLocalVideoElement();
   if (!video) {
     return;
@@ -1385,17 +3671,82 @@ function toggleMountedLocalPlayback() {
   return true;
 }
 
+async function handlePresentationHostControl(action, button) {
+  if (
+    !presentationCompositionActive()
+    || state.presentationHostControlBusy
+    || !button
+  ) {
+    return;
+  }
+  const session = state.hostPlaybackSession;
+  const { video, audio } = activeLocalPlayerElements();
+  state.presentationHostControlBusy = true;
+  button.setAttribute("aria-busy", "true");
+  renderPresentationHostSurface(session);
+  try {
+    if (action === "toggle") {
+      toggleMountedLocalPlayback();
+    } else if (action === "seek" || action === "seek-relative") {
+      if (!video) return;
+      const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : Number.POSITIVE_INFINITY;
+      const requestedTime = action === "seek-relative"
+        ? Number(video.currentTime || 0) + Number(button.dataset.delta || 0)
+        : Number(elements.presentationHostProgress?.value || 0);
+      const targetTime = Math.max(
+        0,
+        Math.min(requestedTime, duration),
+      );
+      if (audio) {
+        beginSplitPlayerSeek(video, audio, {
+          resumeAfterSeek: state.localShouldBePlaying,
+          targetTime,
+          diagnosticAction: "presentation-host-seek",
+          onSettled: (applied) => {
+            if (applied) reportPlayerStatus(state.data?.current_item?.id || "", video, session);
+          },
+        });
+      } else {
+        setMediaCurrentTime(video, targetTime);
+      }
+    } else if (action === "next") {
+      await requestNextTrack(state.data?.playback_generation ?? null);
+    }
+    publishPresentationPlaybackState(session).catch(() => {});
+  } finally {
+    state.presentationHostProgressScrubbing = false;
+    state.presentationHostControlBusy = false;
+    button.removeAttribute("aria-busy");
+    renderPresentationHostSurface();
+  }
+}
+
 function queuePlayerFrameSingleClick() {
-  clearPlayerFrameClickTimer();
-  state.playerFrameClickTimer = window.setTimeout(() => {
-    state.playerFrameClickTimer = null;
+  const session = state.hostPlaybackSession;
+  const video = session?.video;
+  const audio = session?.audio;
+  if (!isCurrentHostPlaybackSession(session, video, audio)) {
+    return false;
+  }
+  clearPlayerFrameClickTimer(session);
+  let clickTimer = null;
+  clickTimer = window.setTimeout(() => {
+    if (session.frameClickTimer !== clickTimer) {
+      return;
+    }
+    session.frameClickTimer = null;
+    if (!isCurrentHostPlaybackSession(session, video, audio)) {
+      return;
+    }
     toggleMountedLocalPlayback();
   }, playerClickDelayMs);
+  session.frameClickTimer = clickTimer;
+  return true;
 }
 
 async function handlePlayerFrameDoubleClick() {
   clearPlayerFrameClickTimer();
-  if (!supportsPlayerFullscreen()) {
+  if (!canTogglePlayerFullscreen()) {
     return;
   }
   if (!state.data?.current_item && !isPlayerPanelFullscreen()) {
@@ -1450,10 +3801,13 @@ function writeLocalPreference(key, value) {
 function hydrateLocalPreferences() {
   state.localPlayerVolume = Math.max(
     0,
-    Math.min(1, readLocalNumber(storageKeys.playerVolume, state.localPlayerVolume)),
+    Math.min(5, readLocalNumber(storageKeys.playerVolume, state.localPlayerVolume)),
   );
   state.localPlayerMuted = readLocalBoolean(storageKeys.playerMuted, state.localPlayerMuted);
-  state.layoutMode = normalizeLayoutMode(readLocalString(storageKeys.layoutMode, state.layoutMode));
+  state.updateAutomaticEnabled = readLocalBoolean(
+    storageKeys.updateAutomatic,
+    state.updateAutomaticEnabled,
+  );
   state.updatePreviewEnabled = readLocalBoolean(storageKeys.updatePreview, state.updatePreviewEnabled);
 
   // Hydrate and apply theme
@@ -1461,37 +3815,1860 @@ function hydrateLocalPreferences() {
   applyTheme(state.theme);
 }
 
-function normalizeLayoutMode(value) {
-  if (value === "basic" || value === "normal") {
-    return "basic";
+async function hydrateNativeUpdatePreferences() {
+  const store = globalThis.BilikaraHostUpdates?.preferences;
+  if (!store) return;
+  const saved = await store.load();
+  if (saved === null) {
+    // Migrate choices from this origin once, before the first automatic check.
+    await store.save({automatic: state.updateAutomaticEnabled, preview: state.updatePreviewEnabled});
+  } else {
+    if (!saved || Object.keys(saved).length !== 2 || typeof saved.automatic !== "boolean" || typeof saved.preview !== "boolean") {
+      throw new Error(t("service.updatePreferencesFailed"));
+    }
+    state.updateAutomaticEnabled = saved.automatic;
+    state.updatePreviewEnabled = saved.preview;
+    writeLocalPreference(storageKeys.updateAutomatic, saved.automatic);
+    writeLocalPreference(storageKeys.updatePreview, saved.preview);
   }
-  return "full";
 }
 
-function renderLayoutMode() {
-  const layoutMode = normalizeLayoutMode(state.layoutMode);
-  elements.appShell?.classList.toggle("layout-mode-basic", layoutMode === "basic");
-  elements.appShell?.classList.toggle("layout-mode-full", layoutMode === "full");
-  elements.layoutModeSwitch?.querySelectorAll("button[data-layout-mode]").forEach((button) => {
-    button.classList.toggle("active", button.dataset.layoutMode === layoutMode);
-  });
-  const layoutKey = layoutMode === "basic" ? "layout.basicLayout" : "layout.fullLayout";
-  setTextContent(elements.displayLayoutSummary, t(layoutKey));
+async function saveUpdatePreference(control, key) {
+  if (state.updatePreferenceSaveInFlight) return false;
+  const checked = Boolean(control.checked);
+  state.updatePreferenceSaveInFlight = true;
+  control.setAttribute("aria-busy", "true");
+  renderUpdatePreviewControl();
+  try {
+    await state.updatePreferencesHydration;
+    const preferences = {
+      automatic: key === "automatic" ? checked : state.updateAutomaticEnabled,
+      preview: key === "preview" ? checked : state.updatePreviewEnabled,
+    };
+    await globalThis.BilikaraHostUpdates?.preferences?.save(preferences);
+    state.updateAutomaticEnabled = preferences.automatic;
+    state.updatePreviewEnabled = preferences.preview;
+    writeLocalPreference(storageKeys.updateAutomatic, preferences.automatic);
+    writeLocalPreference(storageKeys.updatePreview, preferences.preview);
+    return true;
+  } catch {
+    state.updateAutomaticEnabled = false;
+    setAppMessage(t("service.updatePreferencesFailed"), true);
+    return false;
+  } finally {
+    state.updatePreferenceSaveInFlight = false;
+    control.removeAttribute("aria-busy");
+    renderUpdatePreviewControl();
+  }
 }
 
-function setLayoutMode(mode) {
-  const nextMode = normalizeLayoutMode(mode);
-  if (state.layoutMode === nextMode) {
-    renderLayoutMode();
+function normalizeRequestSubview(value, fallback = "quick") {
+  const candidate = String(value || "").trim().toLowerCase();
+  return ["quick", "search", "discover", "sources"].includes(candidate)
+    ? candidate
+    : fallback;
+}
+
+function normalizeSearchMode(value, fallback = "shared") {
+  const candidate = String(value || "").trim().toLowerCase();
+  return ["shared", "local"].includes(candidate) ? candidate : fallback;
+}
+
+function normalizeDiscoverMode(value, fallback = "categories") {
+  const candidate = String(value || "").trim().toLowerCase();
+  return ["categories", "name", "artist"].includes(candidate) ? candidate : fallback;
+}
+
+function normalizeSourcesMode(value, fallback = "uids") {
+  const candidate = String(value || "").trim().toLowerCase();
+  return ["uids", "favorites"].includes(candidate) ? candidate : fallback;
+}
+
+function setRequestPanelVisibility(panel, visible) {
+  if (!panel) {
     return;
   }
-  state.layoutMode = nextMode;
-  writeLocalPreference(storageKeys.layoutMode, nextMode);
-  renderLayoutMode();
+  panel.hidden = !visible;
+  panel.inert = !visible;
+  panel.setAttribute("aria-hidden", String(!visible));
+}
+
+function activeRequestScrollOwner() {
+  const subview = normalizeRequestSubview(state.requestSubview);
+  if (subview === "search") {
+    return normalizeSearchMode(state.searchMode) === "shared"
+      ? elements.larkSearchResults
+      : elements.searchResults;
+  }
+  if (subview === "discover") {
+    if (state.catalogAdvancedTool) {
+      return elements.catalogAdvancedView;
+    }
+    const mode = normalizeDiscoverMode(state.discoverMode);
+    if (mode === "categories") {
+      return state.categoryBrowseLevel === "detail"
+        ? elements.discoverCategoriesPanel?.querySelector("[data-category-browse-results]")
+        : elements.discoverCategoriesPanel?.querySelector("[data-category-browser-home]");
+    }
+    const panel = mode === "artist"
+      ? elements.discoverArtistPanel
+      : elements.discoverNamePanel;
+    return normalizedD1BrowseLevel(d1BrowseModeState(mode).level) === "items"
+      ? panel?.querySelector("[data-d1-browse-results]")
+      : panel?.querySelector("[data-d1-browse-tags]");
+  }
+  if (subview === "sources") {
+    const mode = normalizeSourcesMode(state.sourcesMode);
+    if (mode === "favorites") {
+      return state.favlistBrowseSelectedFolderId ? elements.favlistSongResults : elements.sourcesFavoritesScroll;
+    }
+    return state.followBrowseSelectedUid
+      ? elements.followSongResults
+      : elements.sourcesFollowedScroll;
+  }
+  return null;
+}
+
+function normalizedD1BrowseLevel(value) {
+  return ["alphabet", "tags", "items"].includes(value) ? value : "alphabet";
+}
+
+function rememberDiscoverHierarchyScrollPosition(owner = activeRequestScrollOwner(), mode = state.discoverMode) {
+  const normalizedMode = normalizeDiscoverMode(mode);
+  if (!owner) {
+    return;
+  }
+  const scrollTop = Math.max(0, Number(owner.scrollTop || 0));
+  if (normalizedMode === "categories") {
+    const level = state.categoryBrowseLevel === "detail" ? "detail" : "home";
+    state.categoryBrowseScrollPositions[level] = scrollTop;
+  } else {
+    const modeState = d1BrowseModeState(normalizedMode);
+    const level = normalizedD1BrowseLevel(modeState.level);
+    modeState.scrollPositions[level] = scrollTop;
+  }
+  state.requestScrollPositions.discover[normalizedMode] = scrollTop;
+}
+
+function discoverHierarchyScrollPosition(mode = state.discoverMode) {
+  const normalizedMode = normalizeDiscoverMode(mode);
+  if (normalizedMode === "categories") {
+    const level = state.categoryBrowseLevel === "detail" ? "detail" : "home";
+    return Math.max(0, Number(state.categoryBrowseScrollPositions[level] || 0));
+  }
+  const modeState = d1BrowseModeState(normalizedMode);
+  const level = normalizedD1BrowseLevel(modeState.level);
+  return Math.max(0, Number(modeState.scrollPositions[level] || 0));
+}
+
+function rememberRequestScrollPosition() {
+  const owner = activeRequestScrollOwner();
+  if (!owner) {
+    return;
+  }
+  const subview = normalizeRequestSubview(state.requestSubview);
+  if (subview === "discover") {
+    rememberDiscoverHierarchyScrollPosition(owner);
+    return;
+  }
+  const mode = subview === "search"
+    ? normalizeSearchMode(state.searchMode)
+    : subview === "discover"
+      ? normalizeDiscoverMode(state.discoverMode)
+      : subview === "sources"
+        ? normalizeSourcesMode(state.sourcesMode)
+        : "";
+  if (mode && state.requestScrollPositions?.[subview]) {
+    state.requestScrollPositions[subview][mode] = Math.max(0, Number(owner.scrollTop || 0));
+  }
+}
+
+function restoreRequestScrollPosition() {
+  const owner = activeRequestScrollOwner();
+  if (!owner) {
+    return;
+  }
+  const subview = normalizeRequestSubview(state.requestSubview);
+  if (subview === "discover") {
+    const expectedScrollTop = discoverHierarchyScrollPosition();
+    const restoreToken = state.requestScrollRestoreToken + 1;
+    state.requestScrollRestoreToken = restoreToken;
+    state.requestScrollRestoring = true;
+    owner.scrollTop = expectedScrollTop;
+    window.requestAnimationFrame(() => {
+      if (state.requestScrollRestoreToken !== restoreToken || activeRequestScrollOwner() !== owner) {
+        return;
+      }
+      owner.scrollTop = expectedScrollTop;
+      window.requestAnimationFrame(() => {
+        if (state.requestScrollRestoreToken === restoreToken) {
+          state.requestScrollRestoring = false;
+        }
+      });
+    });
+    return;
+  }
+  const mode = subview === "search"
+    ? normalizeSearchMode(state.searchMode)
+    : subview === "discover"
+      ? normalizeDiscoverMode(state.discoverMode)
+      : subview === "sources"
+        ? normalizeSourcesMode(state.sourcesMode)
+        : "";
+  owner.scrollTop = Math.max(0, Number(state.requestScrollPositions?.[subview]?.[mode] || 0));
+}
+
+function requestSessionUserNoticePlacement() {
+  const subview = normalizeRequestSubview(state.requestSubview);
+  if (subview === "quick") {
+    return elements.addForm ? { anchor: elements.addForm } : null;
+  }
+  if (subview === "search") {
+    const mode = normalizeSearchMode(state.searchMode);
+    const panel = elements.requestWorkspace?.querySelector(`[data-search-panel="${mode}"]`);
+    const anchor = panel?.querySelector(".request-query-form");
+    return anchor ? { anchor } : panel ? { container: panel } : null;
+  }
+  if (subview === "discover") {
+    if (state.catalogAdvancedTool) {
+      return elements.catalogAdvancedView ? { container: elements.catalogAdvancedView } : null;
+    }
+    const mode = normalizeDiscoverMode(state.discoverMode);
+    const panel = elements.requestWorkspace?.querySelector(`[data-discover-panel="${mode}"]`);
+    const form = panel?.querySelector("[data-category-browse-search], [data-d1-browse-search]");
+    const anchor = form?.closest(".browse-search-bar") || form;
+    return anchor ? { anchor } : panel ? { container: panel } : null;
+  }
+  if (subview === "sources") {
+    const mode = normalizeSourcesMode(state.sourcesMode);
+    const panel = elements.requestWorkspace?.querySelector(`[data-sources-panel="${mode}"]`);
+    const anchor = panel?.querySelector(".source-action-row");
+    return anchor ? { anchor } : panel ? { container: panel } : null;
+  }
+  return null;
+}
+
+function syncRequestSessionUserNoticePlacement() {
+  const notice = elements.requestSessionUserNotice;
+  const placement = requestSessionUserNoticePlacement();
+  if (!notice || !placement) {
+    return;
+  }
+  elements.requestWorkspace
+    ?.querySelectorAll(".has-request-session-user-notice")
+    .forEach((owner) => owner.classList.remove("has-request-session-user-notice"));
+  if (placement.anchor) {
+    if (notice.previousElementSibling !== placement.anchor) {
+      placement.anchor.insertAdjacentElement("afterend", notice);
+    }
+  } else if (placement.container && placement.container.firstElementChild !== notice) {
+    placement.container.prepend(notice);
+  }
+  if (!notice.hidden) {
+    notice.parentElement?.classList.add("has-request-session-user-notice");
+  }
+}
+
+function syncHostSearchCounts() {
+  for (const mode of ["shared", "local"]) {
+    const summary = document.querySelector(`[data-search-summary="${mode}"]`);
+    if (!summary) continue;
+    const search = state.searchModeState[mode];
+    const data = search.pageData;
+    summary.hidden = !state.developerMode || !data || Boolean(search.error);
+    const known = Number.isSafeInteger(data?.matched_count) && data.matched_count >= 0;
+    const total = known ? data.matched_count : search.items.length;
+    const label = known ? "pagination.countTotal" : "pagination.countReturned";
+    summary.textContent = t(label, {count: total});
+    const container = mode === "shared" ? elements.larkSearchResults : elements.searchResults;
+    const record = androidBrowsePages.get(container);
+    if (record && !record.frame.hidden) record.pager.update(androidBrowseOptions(container, search.items, t("search.empty")));
+  }
+}
+
+function syncSearchModeSelection() {
+  syncHostSearchCounts();
+  const activeMode = normalizeSearchMode(state.searchMode);
+  const focusedMode = normalizeSearchMode(state.focusedSearchMode, activeMode);
+  state.searchMode = activeMode;
+  state.focusedSearchMode = focusedMode;
+  elements.searchModeButtons?.forEach((button) => {
+    const mode = normalizeSearchMode(button.dataset.searchMode, "");
+    button.setAttribute("aria-selected", String(mode === activeMode));
+    button.tabIndex = mode === focusedMode ? 0 : -1;
+  });
+  elements.searchModePanels?.forEach((panel) => {
+    setRequestPanelVisibility(panel, panel.dataset.searchPanel === activeMode);
+  });
+  window.BilikaraBrowseSearch?.primary(elements.searchForm, {translate:t});
+  window.BilikaraBrowseSearch?.primary(elements.larkSearchForm, {translate:t});
+  syncRequestSessionUserNoticePlacement();
+}
+
+function syncDiscoverModeSelection() {
+  const activeMode = normalizeDiscoverMode(state.discoverMode);
+  const focusedMode = normalizeDiscoverMode(state.focusedDiscoverMode, activeMode);
+  const advancedOpen = Boolean(state.catalogAdvancedTool);
+  state.discoverMode = activeMode;
+  state.focusedDiscoverMode = focusedMode;
+  elements.discoverModeButtons?.forEach((button) => {
+    const mode = normalizeDiscoverMode(button.dataset.discoverMode, "");
+    button.setAttribute("aria-selected", String(mode === activeMode && !advancedOpen));
+    button.tabIndex = mode === focusedMode ? 0 : -1;
+  });
+  elements.discoverModePanels?.forEach((panel) => {
+    setRequestPanelVisibility(
+      panel,
+      !advancedOpen && panel.dataset.discoverPanel === activeMode,
+    );
+  });
+  setRequestPanelVisibility(elements.catalogAdvancedView, advancedOpen);
+  if (!advancedOpen) {
+    if (activeMode === "categories") {
+      renderCategoryBrowseView();
+    } else {
+      restoreD1BrowseMode(activeMode);
+      renderD1BrowseView();
+    }
+  }
+  syncRequestSessionUserNoticePlacement();
+}
+
+function syncSourcesModeSelection() {
+  const activeMode = normalizeSourcesMode(state.sourcesMode);
+  const focusedMode = normalizeSourcesMode(state.focusedSourcesMode, activeMode);
+  state.sourcesMode = activeMode;
+  state.focusedSourcesMode = focusedMode;
+  elements.sourcesModeButtons?.forEach((button) => {
+    const mode = normalizeSourcesMode(button.dataset.sourcesMode, "");
+    button.setAttribute("aria-selected", String(mode === activeMode));
+    button.tabIndex = mode === focusedMode ? 0 : -1;
+  });
+  elements.sourcesModePanels?.forEach((panel) => {
+    setRequestPanelVisibility(panel, panel.dataset.sourcesPanel === activeMode);
+  });
+  if (activeMode === "uids") {
+    renderFollowBrowse();
+  } else if (activeMode === "favorites") {
+    renderFavlistBrowse();
+  }
+  syncRequestSessionUserNoticePlacement();
+}
+
+function ensureActiveSourcesLoaded() {
+  const activeMode = normalizeSourcesMode(state.sourcesMode);
+  if (activeMode === "uids" && !state.followBrowseData && !state.followBrowseLoading) {
+    void loadFollowBrowse({ uid: "", query: state.followBrowseQuery });
+  } else if (activeMode === "favorites" && !state.favlistBrowseData && !state.favlistBrowseLoading) {
+    void loadFavlistBrowse({ folderId: "", query: state.favlistBrowseQuery });
+  }
+}
+
+function syncRequestSubviewSelection() {
+  const activeSubview = normalizeRequestSubview(state.requestSubview);
+  const focusedSubview = normalizeRequestSubview(state.focusedRequestSubview, activeSubview);
+  state.requestSubview = activeSubview;
+  state.focusedRequestSubview = focusedSubview;
+  if (elements.requestWorkspace) {
+    elements.requestWorkspace.dataset.requestSubview = activeSubview;
+  }
+  if (elements.appShell) {
+    elements.appShell.dataset.requestSubview = activeSubview;
+  }
+  elements.requestSubviewButtons?.forEach((button) => {
+    const subview = normalizeRequestSubview(button.dataset.requestView, "");
+    button.setAttribute("aria-selected", String(subview === activeSubview));
+    button.tabIndex = subview === focusedSubview ? 0 : -1;
+  });
+  elements.requestSubviewPanels?.forEach((panel) => {
+    setRequestPanelVisibility(panel, panel.dataset.requestPanel === activeSubview);
+  });
+  if (activeSubview === "search") {
+    syncSearchModeSelection();
+  } else if (activeSubview === "discover") {
+    syncDiscoverModeSelection();
+  } else if (activeSubview === "sources") {
+    syncSourcesModeSelection();
+  }
+  syncRequestSessionUserNoticePlacement();
+  globalThis.BilikaraHostLayout?.syncRequestTabs?.();
+}
+
+function closeRequestDetailForNavigation() {
+  if (!searchDetailController?.isOpen?.()) {
+    return false;
+  }
+  const activeKey = state.activeRequestDetailOriginKey;
+  const selected = activeKey ? state.requestDetailSelections?.[activeKey] : null;
+  if (selected) {
+    selected.closedForNavigation = true;
+  }
+  searchDetailController.close({ immediate: true, restoreFocus: false, reason: "navigation" });
+  state.activeRequestDetailOriginKey = "";
+  return true;
+}
+
+function activateRequestSubview(subview, { focusTab = false } = {}) {
+  const nextSubview = normalizeRequestSubview(subview, "");
+  if (!nextSubview) {
+    return false;
+  }
+  rememberRequestScrollPosition();
+  const changed = state.requestSubview !== nextSubview;
+  if (changed) leaveSourceEditors();
+  if (changed) {
+    closeRequestDetailForNavigation();
+  }
+  state.requestSubview = nextSubview;
+  state.focusedRequestSubview = nextSubview;
+  syncRequestSubviewSelection();
+  if (nextSubview === "sources") {
+    ensureActiveSourcesLoaded();
+  }
+  restoreRequestScrollPosition();
+  if (focusTab) {
+    Array.from(elements.requestSubviewButtons || [])
+      .find((button) => button.dataset.requestView === nextSubview)
+      ?.focus({ preventScroll: true });
+  }
+  return changed;
+}
+
+function activateSearchMode(mode, { focusTab = false } = {}) {
+  const nextMode = normalizeSearchMode(mode, "");
+  if (!nextMode) {
+    return false;
+  }
+  rememberRequestScrollPosition();
+  const changed = state.searchMode !== nextMode;
+  if (changed) {
+    closeRequestDetailForNavigation();
+  }
+  state.searchMode = nextMode;
+  state.focusedSearchMode = nextMode;
+  syncSearchModeSelection();
+  restoreRequestScrollPosition();
+  if (focusTab) {
+    Array.from(elements.searchModeButtons || [])
+      .find((button) => button.dataset.searchMode === nextMode)
+      ?.focus({ preventScroll: true });
+  }
+  return changed;
+}
+
+function activateDiscoverMode(mode, { focusTab = false } = {}) {
+  const nextMode = normalizeDiscoverMode(mode, "");
+  if (!nextMode) {
+    return false;
+  }
+  rememberRequestScrollPosition();
+  if (["name", "artist"].includes(state.discoverMode)) {
+    rememberD1BrowseMode(state.discoverMode);
+  }
+  const changed = state.discoverMode !== nextMode || Boolean(state.catalogAdvancedTool);
+  if (changed) {
+    closeRequestDetailForNavigation();
+  }
+  state.catalogAdvancedTool = "";
+  state.discoverMode = nextMode;
+  state.focusedDiscoverMode = nextMode;
+  syncDiscoverModeSelection();
+  restoreRequestScrollPosition();
+  if (focusTab) {
+    Array.from(elements.discoverModeButtons || [])
+      .find((button) => button.dataset.discoverMode === nextMode)
+      ?.focus({ preventScroll: true });
+  }
+  return changed;
+}
+
+function activateSourcesMode(mode, { focusTab = false } = {}) {
+  const nextMode = normalizeSourcesMode(mode, "");
+  if (!nextMode) {
+    return false;
+  }
+  rememberRequestScrollPosition();
+  const changed = state.sourcesMode !== nextMode;
+  if (changed) leaveSourceEditors();
+  if (changed) {
+    closeRequestDetailForNavigation();
+  }
+  state.sourcesMode = nextMode;
+  state.focusedSourcesMode = nextMode;
+  syncSourcesModeSelection();
+  ensureActiveSourcesLoaded();
+  restoreRequestScrollPosition();
+  if (focusTab) {
+    Array.from(elements.sourcesModeButtons || [])
+      .find((button) => button.dataset.sourcesMode === nextMode)
+      ?.focus({ preventScroll: true });
+  }
+  return changed;
+}
+
+function handleHorizontalTabKeydown(event, values, activate) {
+  const currentValue = String(
+    event.currentTarget?.dataset?.requestView
+      || event.currentTarget?.dataset?.searchMode
+      || event.currentTarget?.dataset?.discoverMode
+      || event.currentTarget?.dataset?.sourcesMode
+      || "",
+  );
+  const currentIndex = Math.max(0, values.indexOf(currentValue));
+  let targetIndex = null;
+  if (event.key === "ArrowRight") {
+    targetIndex = (currentIndex + 1) % values.length;
+  } else if (event.key === "ArrowLeft") {
+    targetIndex = (currentIndex - 1 + values.length) % values.length;
+  } else if (event.key === "Home") {
+    targetIndex = 0;
+  } else if (event.key === "End") {
+    targetIndex = values.length - 1;
+  } else {
+    return false;
+  }
+  event.preventDefault();
+  activate(values[targetIndex], { focusTab: true });
+  return true;
+}
+
+function renderHostWorkspaceSelection({ measureNarrowLayout = true } = {}) {
+  const previousNarrowToolLayout = elements.appShell?.dataset.narrowToolLayout || "";
+  const nextNarrowToolLayout = measureNarrowLayout || !previousNarrowToolLayout
+    ? syncNarrowToolLayout()
+    : previousNarrowToolLayout;
+  const activeWorkspace = normalizeHostWorkspaceName(state.activeHostWorkspace, "queue");
+  const focusedWorkspace = normalizeHostWorkspaceName(
+    state.focusedHostWorkspace,
+    activeWorkspace,
+  );
+  const requestOverlay = activeWorkspace === "request"
+    && state.hostWorkspaceOverlayOpen
+    && hostRequestWorkspaceUsesOverlay();
+  const requestOverlayClosed = activeWorkspace === "request"
+    && !state.hostWorkspaceOverlayOpen
+    && hostRequestWorkspaceUsesOverlay();
+  const narrowToolSheet = hostNarrowToolSheetUsesOverlay();
+  if (narrowToolSheet && !state.hostNarrowToolSheetActive) {
+    // Resizing while editing must not hide/inert the active form. Keep the
+    // shared tool drawer open for that focus owner; idle layouts still fold.
+    state.hostWorkspaceOverlayOpen = typeof document !== "undefined"
+      && Boolean(elements.hostWorkspaceRegion?.contains?.(document.activeElement)
+        || state.sessionUserEditor?.editor?.node.contains(document.activeElement));
+  } else if (!narrowToolSheet) {
+    state.hostWorkspaceOverlayOpen = false;
+  }
+  state.hostNarrowToolSheetActive = narrowToolSheet;
+  const narrowToolSheetClosed = narrowToolSheet && !state.hostWorkspaceOverlayOpen;
+  if (activeWorkspace !== "users" || narrowToolSheetClosed) {
+    state.sessionUserEditor?.closeEditor({ restoreFocus: false });
+  }
+  const workspaceTransition = state.hostWorkspaceTransition?.to === activeWorkspace
+    ? state.hostWorkspaceTransition
+    : null;
+
+  state.activeHostWorkspace = activeWorkspace;
+  state.focusedHostWorkspace = focusedWorkspace;
+  if (elements.appShell) {
+    elements.appShell.dataset.activeWorkspace = activeWorkspace;
+    elements.appShell.classList.toggle("host-workspace-overlay-open", requestOverlay);
+    elements.appShell.classList.toggle("host-tool-sheet-open", narrowToolSheet && !narrowToolSheetClosed);
+    elements.appShell.classList.toggle("host-tool-sheet-closed", narrowToolSheetClosed);
+  }
+  if (elements.hostWorkspaceRegion) {
+    elements.hostWorkspaceRegion.dataset.activeWorkspace = activeWorkspace;
+    if (workspaceTransition) {
+      elements.hostWorkspaceRegion.dataset.toolTransitionDirection = workspaceTransition.direction;
+    } else {
+      delete elements.hostWorkspaceRegion.dataset.toolTransitionDirection;
+    }
+    elements.hostWorkspaceRegion.setAttribute(
+      "aria-labelledby",
+      `work-rail-${activeWorkspace}`,
+    );
+    elements.hostWorkspaceRegion.inert = narrowToolSheetClosed;
+    elements.hostWorkspaceRegion.setAttribute("aria-hidden", String(narrowToolSheetClosed));
+  }
+  const sessionUsersAvailable = Array.isArray(state.data?.session_users)
+    && state.data.session_users.length > 0;
+  elements.hostWorkspaceButtons?.forEach((button) => {
+    const workspace = normalizeHostWorkspaceName(button.dataset.hostWorkspace, "");
+    const selected = workspace === activeWorkspace;
+    button.setAttribute("aria-selected", String(selected));
+    if (narrowToolSheet) {
+      button.setAttribute("aria-expanded", String(selected && !narrowToolSheetClosed));
+    } else {
+      button.removeAttribute?.("aria-expanded");
+    }
+    button.tabIndex = workspace === focusedWorkspace ? 0 : -1;
+    button.classList.toggle("needs-attention", workspace === "users" && !sessionUsersAvailable);
+  });
+  elements.hostWorkspacePanels?.forEach((panel) => {
+    const workspace = normalizeHostWorkspaceName(panel.dataset.hostWorkspacePanel, "");
+    const transitionRole = workspaceTransition?.resume && workspace === workspaceTransition.to
+      ? "resume"
+      : (workspaceTransition && workspace === workspaceTransition.from
+        ? "out"
+        : (workspaceTransition && workspace === workspaceTransition.to ? "in" : ""));
+    const visible = workspace === activeWorkspace
+      && ((workspace === "request" && Boolean(state.requestWorkspaceExpansion))
+        || (!requestOverlayClosed && !narrowToolSheetClosed));
+    panel.hidden = !visible;
+    panel.inert = !visible || transitionRole === "out";
+    panel.setAttribute("aria-hidden", String(!visible));
+    panel.classList.toggle("is-tool-transition-in", transitionRole === "in");
+    panel.classList.toggle("is-tool-transition-out", transitionRole === "out");
+    panel.classList.toggle("is-tool-transition-resume", transitionRole === "resume");
+    applyHostWorkspaceTransitionVisual(panel, workspaceTransition, transitionRole);
+  });
+  if (elements.hostWorkspaceBackdrop) {
+    elements.hostWorkspaceBackdrop.hidden = !requestOverlay;
+    elements.hostWorkspaceBackdrop.inert = !requestOverlay;
+    elements.hostWorkspaceBackdrop.setAttribute("aria-hidden", String(!requestOverlay));
+  }
+  if (typeof scheduleQueueScrollOwnershipSync === "function") {
+    scheduleQueueScrollOwnershipSync();
+  }
+  globalThis.BilikaraHostLayout?.syncVisibility();
+  if (
+    previousNarrowToolLayout
+    && previousNarrowToolLayout !== nextNarrowToolLayout
+    && typeof window.requestAnimationFrame === "function"
+  ) {
+    // WebKit can report the pre-collapse Stage height for the first resize
+    // frame. Measure again after the resident/overlay grid has painted so the
+    // playback controls can reclaim space released by the tool workspace.
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(schedulePersistentStageMeasurement);
+    });
+  }
+}
+
+function normalizeHostWorkspaceName(value, fallback = "queue") {
+  const candidate = String(value || "").trim().toLowerCase();
+  return ["queue", "history", "request", "random", "users", "settings"].includes(candidate)
+    ? candidate
+    : fallback;
+}
+
+const hostWorkspaceRailOrder = Object.freeze([
+  "queue",
+  "history",
+  "request",
+  "random",
+  "users",
+  "settings",
+]);
+
+const hostWorkspaceContentTransitionMs = 190;
+const hostWorkspaceResumeTransitionMs = 120;
+
+function hostWorkspaceReducedMotion() {
+  return typeof window !== "undefined" && Boolean(
+    window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches,
+  );
+}
+
+function hostWorkspaceContentVisual(panel) {
+  const content = panel?.firstElementChild || panel;
+  if (!content || typeof getComputedStyle !== "function") {
+    return { opacity: 1 };
+  }
+  const style = getComputedStyle(content);
+  const opacity = Math.max(0, Math.min(1, Number.parseFloat(style.opacity) || 0));
+  return { opacity };
+}
+
+function currentHostWorkspaceVisualSource(fallbackWorkspace) {
+  const fallback = normalizeHostWorkspaceName(fallbackWorkspace, "queue");
+  const candidates = Array.from(elements.hostWorkspacePanels || [])
+    .filter((panel) => {
+      if (!panel.hidden) {
+        return true;
+      }
+      return panel.classList.contains("is-tool-transition-out")
+        || panel.classList.contains("is-tool-transition-in")
+        || panel.classList.contains("is-tool-transition-resume");
+    })
+    .map((panel) => ({
+      workspace: normalizeHostWorkspaceName(panel.dataset.hostWorkspacePanel, ""),
+      ...hostWorkspaceContentVisual(panel),
+      geometry: (() => {
+        const box = panel.getBoundingClientRect();
+        const region = elements.hostWorkspaceRegion.getBoundingClientRect();
+        return { display: getComputedStyle(panel).display, width: box.width, height: box.height,
+          left: box.left - region.left - elements.hostWorkspaceRegion.clientLeft,
+          top: box.top - region.top - elements.hostWorkspaceRegion.clientTop };
+      })(),
+    }))
+    .filter((candidate) => candidate.workspace);
+  candidates.sort((left, right) => right.opacity - left.opacity);
+  return candidates[0] || {
+    workspace: fallback,
+    opacity: 1,
+  };
+}
+
+function applyHostWorkspaceTransitionVisual(panel, transition, role) {
+  panel.style?.removeProperty?.("--host-tool-start-opacity");
+  for (const key of ["display", "width", "height", "left", "top"]) {
+    panel.style?.removeProperty?.(`--host-tool-exit-${key}`);
+  }
+  if (!transition || !role) {
+    return;
+  }
+  if (role === "out") {
+    panel.style?.setProperty?.("--host-tool-start-opacity", String(transition.outgoingOpacity ?? 1));
+    const geometry = transition.outgoingGeometry;
+    if (geometry) {
+      // Leaving content keeps its grid/flex layout and border-box size. Only
+      // opacity changes; switching the next workspace must not reflow it.
+      for (const key of ["display", "width", "height", "left", "top"]) {
+        const value = key === "top" ? geometry.top + elements.hostWorkspaceRegion.scrollTop : geometry[key];
+        panel.style.setProperty(`--host-tool-exit-${key}`, key === "display" ? value : `${value}px`);
+      }
+    }
+  } else if (role === "resume") {
+    panel.style?.setProperty?.("--host-tool-start-opacity", String(transition.incomingOpacity ?? 0));
+  }
+}
+
+function restartHostWorkspaceTransitionAnimations() {
+  let cleared = false;
+  elements.hostWorkspacePanels?.forEach((panel) => {
+    if (
+      panel.classList.contains("is-tool-transition-in")
+      || panel.classList.contains("is-tool-transition-out")
+      || panel.classList.contains("is-tool-transition-resume")
+    ) {
+      cleared = true;
+    }
+    panel.classList.remove?.(
+      "is-tool-transition-in",
+      "is-tool-transition-out",
+      "is-tool-transition-resume",
+    );
+  });
+  if (cleared) {
+    elements.hostWorkspaceRegion?.getBoundingClientRect?.();
+  }
+}
+
+function beginHostWorkspaceTransition(fromWorkspace, toWorkspace) {
+  const from = normalizeHostWorkspaceName(fromWorkspace, "");
+  const to = normalizeHostWorkspaceName(toWorkspace, "");
+  const fromIndex = hostWorkspaceRailOrder.indexOf(from);
+  const toIndex = hostWorkspaceRailOrder.indexOf(to);
+  const reducedMotion = hostWorkspaceReducedMotion();
+  if (!from || !to || from === to || fromIndex < 0 || toIndex < 0 || reducedMotion) {
+    if (state.hostWorkspaceTransitionTimer) {
+      globalThis.clearTimeout(state.hostWorkspaceTransitionTimer);
+      state.hostWorkspaceTransitionTimer = null;
+    }
+    state.hostWorkspaceTransition = null;
+    return null;
+  }
+  if (state.hostWorkspaceTransitionTimer) {
+    globalThis.clearTimeout(state.hostWorkspaceTransitionTimer);
+  }
+  const visualSource = currentHostWorkspaceVisualSource(from);
+  restartHostWorkspaceTransitionAnimations();
+  const resume = visualSource.workspace === to;
+  const transition = {
+    from: resume ? "" : visualSource.workspace,
+    to,
+    direction: toIndex > fromIndex ? "forward" : "backward",
+    resume,
+    outgoingOpacity: visualSource.opacity,
+    outgoingGeometry: visualSource.geometry,
+    incomingOpacity: resume ? visualSource.opacity : 0,
+    token: Number(state.hostWorkspaceTransition?.token || 0) + 1,
+  };
+  state.hostWorkspaceTransition = transition;
+  state.hostWorkspaceTransitionTimer = globalThis.setTimeout(() => {
+    if (state.hostWorkspaceTransition?.token !== transition.token) {
+      return;
+    }
+    state.hostWorkspaceTransition = null;
+    state.hostWorkspaceTransitionTimer = null;
+    renderHostWorkspaceSelection({ measureNarrowLayout: false });
+  }, resume ? hostWorkspaceResumeTransitionMs : hostWorkspaceContentTransitionMs);
+  return transition;
+}
+
+function hostRequestWorkspaceUsesOverlay() {
+  return false;
+}
+
+function openExpandedRequestWorkspace() {
+  if (!state.developerMode || state.requestWorkspaceExpansion || !elements.requestWorkspaceModalCard) return;
+  const panel = elements.requestWorkspace;
+  const anchor = document.createComment("request workspace position");
+  const scroll = [...panel.querySelectorAll("*")].filter(node => node.scrollTop || node.scrollLeft)
+    .map(node => [node, node.scrollTop, node.scrollLeft]);
+  panel.before(anchor);
+  state.requestWorkspaceExpansion = { anchor, opener: document.activeElement, shellInert: elements.appShell.inert };
+  const tabs = document.querySelector(".request-subview-tabs");
+  if (tabs && !panel.contains(tabs)) {
+    const tabsAnchor = document.createComment("compact request tabs position");
+    tabs.before(tabsAnchor);
+    state.requestWorkspaceExpansion.tabs = { node: tabs, anchor: tabsAnchor };
+    panel.querySelector(".request-workspace-head").insertBefore(tabs, elements.requestWorkspaceExpand.parentElement);
+  }
+  // Move the existing forms, never clone them or touch the media tree.
+  elements.requestWorkspaceModalCard.append(panel);
+  elements.requestWorkspaceModal.classList.remove("hidden");
+  elements.requestWorkspaceExpand.hidden = true;
+  elements.requestWorkspaceCollapse.hidden = false;
+  elements.appShell.inert = true;
+  panel.setAttribute("role", "region");
+  panel.setAttribute("aria-labelledby", "workspace-request-heading");
+  scroll.forEach(([node, top, left]) => { node.scrollTop = top; node.scrollLeft = left; });
+  elements.requestWorkspaceCollapse.focus({ preventScroll: true });
+}
+
+function closeExpandedRequestWorkspace({ restoreFocus = true } = {}) {
+  const expansion = state.requestWorkspaceExpansion;
+  if (!expansion) return false;
+  const panel = elements.requestWorkspace;
+  const scroll = [...panel.querySelectorAll("*")].filter(node => node.scrollTop || node.scrollLeft)
+    .map(node => [node, node.scrollTop, node.scrollLeft]);
+  expansion.anchor.replaceWith(panel);
+  expansion.tabs?.anchor.replaceWith(expansion.tabs.node);
+  elements.requestWorkspaceModal.classList.add("hidden");
+  elements.requestWorkspaceExpand.hidden = false;
+  elements.requestWorkspaceCollapse.hidden = true;
+  elements.appShell.inert = expansion.shellInert;
+  panel.setAttribute("role", "tabpanel");
+  panel.setAttribute("aria-labelledby", "work-rail-request");
+  state.requestWorkspaceExpansion = null;
+  renderHostWorkspaceSelection();
+  scroll.forEach(([node, top, left]) => { node.scrollTop = top; node.scrollLeft = left; });
+  if (restoreFocus && expansion.opener?.isConnected) expansion.opener.focus({ preventScroll: true });
+  return true;
+}
+
+function trapDeveloperDialogFocus(event, dialog) {
+  if (event.key !== "Tab") return;
+  const controls = [...dialog.querySelectorAll('button, a[href], input, select, textarea, [tabindex]')]
+    .filter(node => !node.disabled && node.tabIndex >= 0 && !node.closest("[inert]") && node.getClientRects().length);
+  const first = controls[0], last = controls[controls.length - 1];
+  if (!first) return;
+  if (event.shiftKey && (document.activeElement === first || !dialog.contains(document.activeElement))) {
+    event.preventDefault(); last.focus({ preventScroll: true });
+  } else if (!event.shiftKey && (document.activeElement === last || !dialog.contains(document.activeElement))) {
+    event.preventDefault(); first.focus({ preventScroll: true });
+  }
+}
+
+function narrowHostViewport() {
+  return typeof window !== "undefined"
+    && Boolean(window.matchMedia?.("(max-width: 1179px)")?.matches);
+}
+
+function syncNarrowToolLayout() {
+  if (!elements.appShell) {
+    return "wide";
+  }
+  if (globalThis.BilikaraHostLayout?.isPortrait()) {
+    elements.appShell.dataset.narrowToolLayout = "portrait";
+    elements.appShell.style?.removeProperty?.("--narrow-stage-resident-height");
+    return "portrait";
+  }
+  if (!narrowHostViewport()) {
+    elements.appShell.dataset.narrowToolLayout = "wide";
+    elements.appShell.style?.removeProperty?.("--narrow-stage-resident-height");
+    return "wide";
+  }
+  const contentRect = elements.hostContentRegion?.getBoundingClientRect?.();
+  const canReadComputedStyle = typeof window.getComputedStyle === "function";
+  const panelStyle = elements.playerPanel && canReadComputedStyle
+    ? window.getComputedStyle(elements.playerPanel)
+    : null;
+  const contentWidth = Math.max(0, Number(contentRect?.width || 0));
+  const contentHeight = Math.max(0, Number(contentRect?.height || 0));
+  const panelPaddingInline = (parseFloat(panelStyle?.paddingLeft) || 0)
+    + (parseFloat(panelStyle?.paddingRight) || 0);
+  const panelPaddingBlock = (parseFloat(panelStyle?.paddingTop) || 0)
+    + (parseFloat(panelStyle?.paddingBottom) || 0);
+  const panelGap = parseFloat(panelStyle?.rowGap || panelStyle?.gap) || 10;
+  const headerHeight = elements.playerPanel
+    ?.querySelector(".panel-head")
+    ?.getBoundingClientRect?.().height || 42;
+  const variantHeight = elements.audioVariantAnchor && !elements.audioVariantAnchor.hidden
+    ? elements.audioVariantAnchor.getBoundingClientRect?.().height || 0
+    : 0;
+  const presentationActive = typeof presentationCompositionActive === "function"
+    ? presentationCompositionActive()
+    : false;
+  const presentationControlsHeight = presentationActive
+    && elements.presentationHostControls
+    && !elements.presentationHostControls.hidden
+    ? elements.presentationHostControls.getBoundingClientRect?.().height || 0
+    : 0;
+  const toggleHeight = elements.stageControlsToggle?.getBoundingClientRect?.().height || 40;
+  const frameWidth = Math.max(0, contentWidth - panelPaddingInline);
+  const frameHeight = frameWidth * (9 / 16);
+  const persistentRowGapCount = (variantHeight > 0 ? 3 : 2)
+    + (presentationControlsHeight > 0 ? 1 : 0);
+  const compactStageHeight = Math.ceil(
+    panelPaddingBlock + headerHeight + variantHeight + presentationControlsHeight
+      + toggleHeight + frameHeight
+      + (panelGap * persistentRowGapCount),
+  );
+  const shellGap = canReadComputedStyle
+    ? parseFloat(
+      window.getComputedStyle(elements.appShell).getPropertyValue("--host-shell-gap"),
+    ) || 12
+    : 12;
+  const minimumResidentToolHeight = 300;
+  const availableStageHeight = Math.floor(
+    contentHeight - minimumResidentToolHeight - shellGap,
+  );
+  const inlineFit = findStageControlFit(frameWidth, { layout: "inline" });
+  const inlineTraySize = inlineFit.size;
+  const inlineTrayHeight = inlineTraySize.height;
+  const inlineTrayFitsWidth = inlineTraySize.width <= frameWidth + 1
+    && inlineTraySize.contentFits;
+  const fullStageHeight = Math.ceil(
+    panelPaddingBlock + headerHeight + variantHeight + presentationControlsHeight
+      + frameHeight + inlineTrayHeight
+      + (panelGap * persistentRowGapCount),
+  );
+
+  if (presentationActive) {
+    const minimumFrameHeight = Math.min(
+      frameHeight,
+      Math.max(180, Math.min(260, frameHeight)),
+    );
+    const minimumInlineStageHeight = Math.ceil(
+      panelPaddingBlock + headerHeight + variantHeight + presentationControlsHeight
+        + minimumFrameHeight + inlineTrayHeight
+        + (panelGap * persistentRowGapCount),
+    );
+    const resident = contentWidth > 0
+      && contentHeight > 0
+      && inlineTrayFitsWidth
+      && availableStageHeight >= minimumInlineStageHeight;
+    if (!resident) {
+      elements.appShell.dataset.narrowToolLayout = "overlay";
+      elements.appShell.style?.removeProperty?.("--narrow-stage-resident-height");
+      return "overlay";
+    }
+    elements.appShell.dataset.narrowToolLayout = "resident";
+    elements.appShell.style?.setProperty?.(
+      "--narrow-stage-resident-height",
+      `${Math.max(
+        minimumInlineStageHeight,
+        Math.min(fullStageHeight, availableStageHeight),
+      )}px`,
+    );
+    return "resident";
+  }
+
+  const resident = contentWidth > 0
+    && contentHeight > 0
+    && availableStageHeight >= compactStageHeight;
+  if (!resident) {
+    elements.appShell.dataset.narrowToolLayout = "overlay";
+    elements.appShell.style?.removeProperty?.("--narrow-stage-resident-height");
+    return "overlay";
+  }
+  const residentStageHeight = inlineTrayFitsWidth && availableStageHeight >= fullStageHeight
+    ? fullStageHeight
+    : compactStageHeight;
+  elements.appShell.dataset.narrowToolLayout = "resident";
+  elements.appShell.style?.setProperty?.(
+    "--narrow-stage-resident-height",
+    `${Math.max(1, Math.floor(residentStageHeight))}px`,
+  );
+  return "resident";
+}
+
+function hostNarrowToolSheetUsesOverlay() {
+  if (globalThis.BilikaraHostLayout?.isPortrait()) return false;
+  return narrowHostViewport()
+    && elements.appShell?.dataset.narrowToolLayout !== "resident";
+}
+
+function hostWorkspaceButton(workspace) {
+  const normalized = normalizeHostWorkspaceName(workspace, "");
+  return Array.from(elements.hostWorkspaceButtons || []).find(
+    (button) => button.dataset.hostWorkspace === normalized,
+  ) || null;
+}
+
+function rememberHostWorkspaceScrollPosition(workspace = state.activeHostWorkspace) {
+  const normalized = normalizeHostWorkspaceName(workspace, "");
+  if (!normalized || !elements.hostWorkspaceRegion) {
+    return;
+  }
+  if (!state.hostWorkspaceScrollPositions) state.hostWorkspaceScrollPositions = {};
+  state.hostWorkspaceScrollPositions[normalized] = Math.max(
+    0,
+    Number(elements.hostWorkspaceRegion.scrollTop || 0),
+  );
+}
+
+function restoreHostWorkspaceScrollPosition(workspace = state.activeHostWorkspace) {
+  const normalized = normalizeHostWorkspaceName(workspace, "");
+  if (!normalized || !elements.hostWorkspaceRegion) {
+    return;
+  }
+  const scrollTop = Math.max(
+    0,
+    Number(state.hostWorkspaceScrollPositions?.[normalized] || 0),
+  );
+  elements.hostWorkspaceRegion.scrollTop = scrollTop;
+  const transition = state.hostWorkspaceTransition;
+  if (transition?.outgoingGeometry) {
+    const panel = [...elements.hostWorkspacePanels].find(node => node.dataset.hostWorkspacePanel === transition.from);
+    panel?.style.setProperty("--host-tool-exit-top", `${transition.outgoingGeometry.top + elements.hostWorkspaceRegion.scrollTop}px`);
+  }
+}
+
+function activateHostWorkspace(workspace, { inputOrigin = "pointer" } = {}) {
+  const nextWorkspace = normalizeHostWorkspaceName(workspace, "");
+  if (!nextWorkspace) {
+    return false;
+  }
+  if (nextWorkspace !== "request") closeExpandedRequestWorkspace({ restoreFocus: false });
+  rememberHostWorkspaceScrollPosition();
+  if (state.activeHostWorkspace === "request" && typeof rememberRequestScrollPosition === "function") {
+    rememberRequestScrollPosition();
+  }
+  const changed = state.activeHostWorkspace !== nextWorkspace;
+  if (changed) {
+    leaveSourceEditors();
+    state.sessionUserEditor?.setMode("");
+  }
+  const interactiveActivation = inputOrigin === "pointer" || inputOrigin === "keyboard";
+  if (changed && interactiveActivation) {
+    beginHostWorkspaceTransition(state.activeHostWorkspace, nextWorkspace);
+  } else if (changed) {
+    state.hostWorkspaceTransition = null;
+    if (state.hostWorkspaceTransitionTimer) {
+      window.clearTimeout(state.hostWorkspaceTransitionTimer);
+      state.hostWorkspaceTransitionTimer = null;
+    }
+  }
+  const previousToolSheetOpen = state.hostWorkspaceOverlayOpen;
+  if (changed) {
+    if (typeof closeOpenMenus === "function") {
+      closeOpenMenus({ restoreFocus: false });
+    }
+    if (typeof closeRequestDetailForNavigation === "function") {
+      closeRequestDetailForNavigation();
+    } else if (typeof searchDetailController !== "undefined") {
+      searchDetailController?.close({ immediate: true });
+    }
+  }
+  state.activeHostWorkspace = nextWorkspace;
+  state.focusedHostWorkspace = nextWorkspace;
+  if (hostNarrowToolSheetUsesOverlay()) {
+    state.hostWorkspaceOverlayOpen = !changed && interactiveActivation
+      ? !state.hostWorkspaceOverlayOpen
+      : true;
+  } else {
+    state.hostWorkspaceOverlayOpen = false;
+  }
+  renderHostWorkspaceSelection({ measureNarrowLayout: false });
+  if (nextWorkspace === "request" && typeof syncRequestSubviewSelection === "function") {
+    syncRequestSubviewSelection();
+    if (typeof restoreRequestScrollPosition === "function") {
+      restoreRequestScrollPosition();
+    }
+  }
+  if (nextWorkspace === "history") {
+    loadPlayedSessions().catch((error) => {
+      console.warn("加载历史场次失败:", error);
+    });
+  }
+  restoreHostWorkspaceScrollPosition(nextWorkspace);
+  globalThis.BilikaraHostLayout?.workspaceActivated(nextWorkspace, inputOrigin);
+
+  const trigger = hostWorkspaceButton(nextWorkspace);
+  if (inputOrigin === "pointer") {
+    trigger?.focus({ preventScroll: true });
+  } else if (inputOrigin === "keyboard") {
+    const heading = Array.from(elements.hostWorkspacePanels || [])
+      .find((panel) => (
+        panel.dataset.hostWorkspacePanel === nextWorkspace && !panel.hidden
+      ))
+      ?.querySelector("[data-host-workspace-heading]");
+    heading?.focus({ preventScroll: true });
+  }
+  return changed || previousToolSheetOpen !== state.hostWorkspaceOverlayOpen;
+}
+
+function focusHostWorkspaceRailItem(workspace) {
+  const nextWorkspace = normalizeHostWorkspaceName(workspace, "");
+  const trigger = hostWorkspaceButton(nextWorkspace);
+  if (!nextWorkspace || !trigger) {
+    return false;
+  }
+  state.focusedHostWorkspace = nextWorkspace;
+  elements.hostWorkspaceButtons?.forEach((button) => {
+    button.tabIndex = button === trigger ? 0 : -1;
+  });
+  trigger.focus({ preventScroll: true });
+  return true;
+}
+
+function handleHostWorkspaceRailKeydown(event) {
+  const currentWorkspace = normalizeHostWorkspaceName(
+    event.currentTarget?.dataset?.hostWorkspace,
+    state.focusedHostWorkspace,
+  );
+  const workspaces = hostWorkspaceRailOrder;
+  const currentIndex = Math.max(0, workspaces.indexOf(currentWorkspace));
+  let targetIndex = null;
+  if (event.key === "ArrowDown") {
+    targetIndex = (currentIndex + 1) % workspaces.length;
+  } else if (event.key === "ArrowUp") {
+    targetIndex = (currentIndex - 1 + workspaces.length) % workspaces.length;
+  } else if (event.key === "Home") {
+    targetIndex = 0;
+  } else if (event.key === "End") {
+    targetIndex = workspaces.length - 1;
+  } else if (event.key === "Enter" || event.key === " ") {
+    event.preventDefault();
+    activateHostWorkspace(currentWorkspace, { inputOrigin: "keyboard" });
+    return true;
+  } else {
+    return false;
+  }
+  event.preventDefault();
+  focusHostWorkspaceRailItem(workspaces[targetIndex]);
+  return true;
+}
+
+function closeHostWorkspaceOverlay({ restoreFocus = true } = {}) {
+  if (hostNarrowToolSheetUsesOverlay() && state.hostWorkspaceOverlayOpen) {
+    rememberHostWorkspaceScrollPosition();
+    state.hostWorkspaceOverlayOpen = false;
+    renderHostWorkspaceSelection();
+    if (restoreFocus) {
+      focusHostWorkspaceRailItem(state.activeHostWorkspace);
+    }
+    return true;
+  }
+  if (
+    state.activeHostWorkspace !== "request"
+    || !state.hostWorkspaceOverlayOpen
+    || !hostRequestWorkspaceUsesOverlay()
+  ) {
+    return false;
+  }
+  rememberHostWorkspaceScrollPosition("request");
+  state.hostWorkspaceOverlayOpen = false;
+  renderHostWorkspaceSelection();
+  if (restoreFocus) {
+    state.focusedHostWorkspace = "request";
+    focusHostWorkspaceRailItem("request");
+  }
+  return true;
+}
+
+function closeHighestRequestTaskLayerForEscape() {
+  if (state.bindingIntent) {
+    closeBindingModal();
+    return true;
+  }
+  if (state.gatchaFavlistIntent) {
+    closeGatchaFavlistModal();
+    return true;
+  }
+  if (elements.poolConfigModal && !elements.poolConfigModal.classList.contains("hidden")) {
+    closePoolConfigModal();
+    return true;
+  }
+  if (elements.bilikaraSecretModal && !elements.bilikaraSecretModal.classList.contains("hidden")) {
+    closeBilikaraSecretModal();
+    return true;
+  }
+  if (elements.developerTagResetModal && !elements.developerTagResetModal.classList.contains("hidden")) {
+    closeDeveloperTagResetModal();
+    return true;
+  }
+  if (state.requestWorkspaceExpansion) {
+    if (searchDetailController?.isOpen?.()) return false;
+    if (state.ratingPromptElement) {
+      closeRatingPrompt({ submit: false });
+      return true;
+    }
+    return closeExpandedRequestWorkspace();
+  }
+  if (state.catalogAdvancedTool) {
+    state.catalogAdvancedTool = "";
+    syncDiscoverModeSelection();
+    restoreRequestScrollPosition();
+    elements.catalogAdvancedMenu?.querySelector("summary")?.focus({ preventScroll: true });
+    return true;
+  }
+  if (state.ratingPromptElement) {
+    closeRatingPrompt({ submit: false });
+    return true;
+  }
+  return false;
+}
+
+function closeOrdinaryPopoverForEscape() {
+  const infoTrigger = document.querySelector(
+    ".cache-advanced-info.is-visible .cache-advanced-info-button",
+  );
+  if (closeCacheAdvancedInfo()) {
+    infoTrigger?.focus({ preventScroll: true });
+    return true;
+  }
+  if (state.playerFullscreenRemotePinned) {
+    setPlayerFullscreenRemotePinned(false);
+    elements.playerFullscreenButton?.focus({ preventScroll: true });
+    return true;
+  }
+  if (state.remoteQrPinned) {
+    setRemoteQrPinned(false, { dismissTransient: true });
+    elements.remoteMiniTrigger?.focus({ preventScroll: true });
+    elements.remoteMiniControl?.classList.add("is-qr-dismissed");
+    return true;
+  }
+  if (state.cacheSettingsOpen) {
+    state.cacheSettingsOpen = false;
+    syncCachePanelVisibility();
+    elements.cacheSettingsToggle?.focus({ preventScroll: true });
+    return true;
+  }
+  if (state.presentationSettingsOpen) {
+    state.presentationSettingsOpen = false;
+    syncPresentationPanelVisibility();
+    elements.presentationSettingsToggle?.focus({ preventScroll: true });
+    return true;
+  }
+  if (elements.catalogAdvancedMenu?.open) {
+    elements.catalogAdvancedMenu.open = false;
+    elements.catalogAdvancedMenu.querySelector("summary")?.focus({ preventScroll: true });
+    return true;
+  }
+  return false;
+}
+
+function stageControlsAreInline() {
+  return elements.appShell?.dataset.stageControlsLayout === "inline";
+}
+
+function measureStageControlTrayNaturalSize(width, { layout = "", density = "" } = {}) {
+  if (!elements.stageControlTray) {
+    return { width: 0, height: 0, contentFits: false };
+  }
+  const tray = elements.stageControlTray;
+  const previousLayout = elements.appShell?.dataset.stageControlsLayout;
+  const previousDensity = elements.appShell?.dataset.stageControlDensity;
+  const previousStyle = tray.getAttribute("style");
+  const previousHidden = tray.hidden;
+  if (layout && elements.appShell) {
+    elements.appShell.dataset.stageControlsLayout = layout;
+  }
+  if (density && elements.appShell) {
+    elements.appShell.dataset.stageControlDensity = density;
+  }
+  tray.classList.add("is-measuring");
+  tray.hidden = false;
+  tray.style.width = `${Math.max(280, Math.round(width))}px`;
+  tray.style.maxHeight = "none";
+  const visibleChildren = (container) => [...(container?.children || [])]
+    .filter((child) => !child.hidden && (child.offsetWidth || child.offsetHeight));
+  const controlsStayOnOneRow = [
+    ...tray.querySelectorAll(".av-sync-controls, .volume-controls"),
+  ].every((controls) => {
+    const children = visibleChildren(controls);
+    if (children.length < 2) {
+      return true;
+    }
+    const controlsRect = controls.getBoundingClientRect();
+    const centers = children.map((child) => {
+      const rect = child.getBoundingClientRect();
+      return rect.top + (rect.height / 2);
+    });
+    const childrenStayInside = children.every((child) => {
+      const rect = child.getBoundingClientRect();
+      return rect.left >= controlsRect.left - 1 && rect.right <= controlsRect.right + 1;
+    });
+    return Math.max(...centers) - Math.min(...centers) <= 2
+      && controls.scrollWidth <= controls.clientWidth + 1
+      && childrenStayInside;
+  });
+  const panelColumnsStayAligned = [...tray.querySelectorAll(".av-sync-panel")]
+    .every((panel) => {
+      const copy = panel.querySelector(".av-sync-copy")?.getBoundingClientRect?.();
+      const controls = panel.querySelector(".av-sync-controls")?.getBoundingClientRect?.();
+      return copy && controls
+        && controls.left >= copy.right - 1
+        && Math.min(copy.bottom, controls.bottom) - Math.max(copy.top, controls.top) > 0;
+    });
+  const labelledButtonsFit = [...tray.querySelectorAll("button")]
+    .filter((button) => !button.hidden && (button.offsetWidth || button.offsetHeight))
+    .every((button) => button.scrollWidth <= button.clientWidth + 1);
+  const size = {
+    width: Math.ceil(tray.scrollWidth || width),
+    // scrollHeight excludes borders; max-height uses the border box. Measuring
+    // the untransformed box avoids a permanent two-pixel vertical overflow.
+    height: Math.max(tray.offsetHeight, tray.scrollHeight + tray.offsetHeight - tray.clientHeight),
+    contentFits: controlsStayOnOneRow && panelColumnsStayAligned && labelledButtonsFit,
+  };
+  tray.classList.remove("is-measuring");
+  tray.hidden = previousHidden;
+  if (previousStyle === null) {
+    tray.removeAttribute("style");
+  } else {
+    tray.setAttribute("style", previousStyle);
+  }
+  if (elements.appShell) {
+    if (previousLayout === undefined) {
+      delete elements.appShell.dataset.stageControlsLayout;
+    } else {
+      elements.appShell.dataset.stageControlsLayout = previousLayout;
+    }
+    if (previousDensity === undefined) {
+      delete elements.appShell.dataset.stageControlDensity;
+    } else {
+      elements.appShell.dataset.stageControlDensity = previousDensity;
+    }
+  }
+  return size;
+}
+
+function findStageControlFit(width, { layout = "" } = {}) {
+  const availableWidth = Math.max(0, Number(width || 0));
+  const densities = ["full", "compact", "plain"];
+  let fallback = { density: "plain", size: { width: 0, height: 0, contentFits: false } };
+  for (const density of densities) {
+    const size = measureStageControlTrayNaturalSize(availableWidth, { layout, density });
+    fallback = { density, size };
+    if (size.contentFits && size.width <= availableWidth + 1) {
+      return fallback;
+    }
+  }
+  return fallback;
+}
+
+function clearStageControlTrayPosition() {
+  if (!elements.stageControlTray) {
+    return;
+  }
+  for (const property of ["left", "top", "width", "maxHeight", "transformOrigin"]) {
+    elements.stageControlTray.style[property] = "";
+  }
+  delete elements.stageControlTray.dataset.popoverDirection;
+}
+
+function positionStageControlTray() {
+  if (!elements.stageControlTray || !elements.stageControlsToggle || stageControlsAreInline()) {
+    clearStageControlTrayPosition();
+    return;
+  }
+  const anchor = elements.stageControlsToggle.getBoundingClientRect();
+  const toolbar = elements.topbar?.getBoundingClientRect();
+  const viewportInset = 12;
+  const popupGap = 10;
+  const topBoundary = Math.max(viewportInset, Number(toolbar?.bottom || 0) + 8);
+  const stageBounds = (
+    elements.playerPanel?.getBoundingClientRect?.()
+    || elements.leftColumn?.getBoundingClientRect?.()
+    || { left: viewportInset, right: window.innerWidth - viewportInset }
+  );
+  const boundsLeft = Math.max(viewportInset, stageBounds.left);
+  const boundsRight = Math.min(window.innerWidth - viewportInset, stageBounds.right);
+  const availableWidth = Math.max(
+    280,
+    Math.min(860, window.innerWidth - (viewportInset * 2), boundsRight - boundsLeft),
+  );
+  const width = availableWidth;
+  const popupFit = findStageControlFit(width, { layout: "popup" });
+  if (elements.appShell) {
+    elements.appShell.dataset.stageControlDensity = popupFit.density;
+  }
+  const naturalHeight = popupFit.size.height || 520;
+  const spaceBelow = Math.max(0, window.innerHeight - anchor.bottom - viewportInset - popupGap);
+  const spaceAbove = Math.max(0, anchor.top - topBoundary - popupGap);
+  const direction = spaceBelow >= naturalHeight ? "down" : "up";
+  const directionSpace = direction === "down" ? spaceBelow : spaceAbove;
+  const maxHeight = Math.max(120, Math.min(naturalHeight, directionSpace));
+  const left = Math.max(
+    boundsLeft,
+    Math.min(anchor.left, boundsRight - width),
+  );
+  const top = direction === "down"
+    ? anchor.bottom + popupGap
+    : Math.max(topBoundary, anchor.top - popupGap - maxHeight);
+  state.stageControlTrayDirection = direction;
+  elements.stageControlTray.dataset.popoverDirection = direction;
+  elements.stageControlTray.style.left = `${Math.round(left)}px`;
+  elements.stageControlTray.style.top = `${Math.round(top)}px`;
+  elements.stageControlTray.style.width = `${Math.round(width)}px`;
+  elements.stageControlTray.style.maxHeight = `${Math.round(maxHeight)}px`;
+  elements.stageControlTray.style.transformOrigin = direction === "down" ? "0 0" : "0 100%";
+  if (typeof schedulePlaybackContextualTooltipPositionSync === "function") {
+    schedulePlaybackContextualTooltipPositionSync();
+  }
+}
+
+function setStageControlTrayOpen(open, { restoreFocus = false, moveFocus = true } = {}) {
+  if (state.stageControlTrayFocusHandler && elements.stageControlTray) {
+    elements.stageControlTray.removeEventListener("transitionend", state.stageControlTrayFocusHandler);
+    state.stageControlTrayFocusHandler = null;
+  }
+  state.stageControlTrayOpen = Boolean(open);
+  const inline = stageControlsAreInline();
+  if (state.stageControlTrayOpen) {
+    if (!inline) {
+      closeCacheAdvancedInfo();
+      setRemoteQrPinned(false, { dismissTransient: true });
+      state.cacheSettingsOpen = false;
+      state.presentationSettingsOpen = false;
+      syncCachePanelVisibility();
+      syncPresentationPanelVisibility();
+    }
+    if (elements.stageControlTray) {
+      elements.stageControlTray.hidden = false;
+      elements.stageControlTray.inert = false;
+      elements.stageControlTray.setAttribute("aria-hidden", "false");
+      elements.stageControlTray.setAttribute("role", inline ? "region" : "dialog");
+      if (inline) {
+        elements.stageControlTray.removeAttribute("aria-modal");
+      } else {
+        elements.stageControlTray.setAttribute("aria-modal", "true");
+      }
+    }
+    if (elements.stageControlBackdrop) {
+      elements.stageControlBackdrop.hidden = inline;
+      elements.stageControlBackdrop.inert = inline;
+      elements.stageControlBackdrop.setAttribute("aria-hidden", String(inline));
+    }
+    positionStageControlTray();
+  }
+  elements.stageControlTray?.classList.toggle("is-open", state.stageControlTrayOpen);
+  elements.stageControlsToggle?.setAttribute("aria-expanded", String(state.stageControlTrayOpen));
+  if (state.stageControlTrayOpen && !inline && moveFocus) {
+    const focusCloseAfterOpen = (event) => {
+      if (event.target !== elements.stageControlTray || event.propertyName !== "opacity") {
+        return;
+      }
+      elements.stageControlTray.removeEventListener("transitionend", focusCloseAfterOpen);
+      state.stageControlTrayFocusHandler = null;
+      if (state.stageControlTrayOpen && !elements.stageControlTray.inert) {
+        elements.stageControlsClose?.focus({ preventScroll: true });
+      }
+    };
+    state.stageControlTrayFocusHandler = focusCloseAfterOpen;
+    elements.stageControlTray?.addEventListener("transitionend", focusCloseAfterOpen);
+    elements.stageControlsClose?.focus({ preventScroll: true });
+    window.requestAnimationFrame(() => {
+      if (state.stageControlTrayOpen && !elements.stageControlTray?.inert) {
+        elements.stageControlsClose?.focus({ preventScroll: true });
+      }
+    });
+    return;
+  }
+  if (state.stageControlTrayOpen) {
+    return;
+  }
+  if (elements.stageControlTray) {
+    elements.stageControlTray.hidden = true;
+    elements.stageControlTray.inert = true;
+    elements.stageControlTray.setAttribute("aria-hidden", "true");
+  }
+  if (elements.stageControlBackdrop) {
+    elements.stageControlBackdrop.hidden = true;
+    elements.stageControlBackdrop.inert = true;
+    elements.stageControlBackdrop.setAttribute("aria-hidden", "true");
+  }
+  if (restoreFocus) {
+    elements.stageControlsToggle?.focus({ preventScroll: true });
+  }
+}
+
+function measurePersistentStage() {
+  state.stageMeasureFrame = null;
+  if (!elements.appShell || !elements.leftColumn || !elements.playerPanel) {
+    return "compact";
+  }
+  if (globalThis.BilikaraHostLayout?.isPortrait()) {
+    globalThis.BilikaraTextMarquee?.reset(elements.currentTitle, elements.currentTitleText);
+    const changed = elements.appShell.dataset.stageControlsLayout !== "inline";
+    elements.appShell.dataset.stageMode = "portrait";
+    elements.appShell.dataset.stageControlsLayout = "inline";
+    elements.appShell.dataset.stageControlDensity = "compact";
+    elements.playerPanel.style.removeProperty("--stage-frame-inline-size");
+    elements.playerPanel.style.removeProperty("--stage-frame-block-size");
+    elements.currentTitle?.classList.remove("is-two-line", "is-scrolling");
+    if (changed || !state.stageControlTrayOpen) {
+      clearStageControlTrayPosition();
+      setStageControlTrayOpen(true, {moveFocus: false});
+    }
+    syncAudioVariantOverflow();
+    return "portrait";
+  }
+  const narrowShell = Boolean(window.matchMedia?.("(max-width: 1179px)")?.matches);
+  const titleNode = elements.currentTitle;
+  const titleTextNode = elements.currentTitleText || titleNode;
+  titleNode?.classList.remove("is-two-line", "is-scrolling");
+  titleNode?.style.removeProperty("--host-current-title-marquee-offset");
+  titleNode?.style.removeProperty("--host-current-title-marquee-duration");
+  if (titleNode) {
+    titleNode.dataset.visibleLines = "1";
+  }
+  const presentationActive = presentationCompositionActive();
+  const presentationContextChanged = state.stageMeasuredPresentationActive !== presentationActive;
+  state.stageMeasuredPresentationActive = presentationActive;
+  const panelStyle = window.getComputedStyle(elements.playerPanel);
+  const panelPaddingInline = (parseFloat(panelStyle.paddingLeft) || 0)
+    + (parseFloat(panelStyle.paddingRight) || 0);
+  const panelPaddingBlock = (parseFloat(panelStyle.paddingTop) || 0)
+    + (parseFloat(panelStyle.paddingBottom) || 0);
+  const panelGap = parseFloat(panelStyle.rowGap || panelStyle.gap) || 0;
+  const innerWidth = Math.max(0, elements.playerPanel.clientWidth - panelPaddingInline);
+  const innerHeight = Math.max(0, elements.playerPanel.clientHeight - panelPaddingBlock);
+  let headerHeight = elements.playerPanel.querySelector(".panel-head")?.getBoundingClientRect().height || 0;
+  const variantHeight = elements.audioVariantAnchor && !elements.audioVariantAnchor.hidden
+    ? elements.audioVariantAnchor.getBoundingClientRect().height
+    : 0;
+  const presentationControlsHeight = presentationActive
+    && elements.presentationHostControls
+    && !elements.presentationHostControls.hidden
+    ? elements.presentationHostControls.getBoundingClientRect().height
+    : 0;
+  const persistentRowGapCount = (variantHeight > 0 ? 3 : 2)
+    + (presentationControlsHeight > 0 ? 1 : 0);
+  const toggleHeight = elements.stageControlsToggle?.getBoundingClientRect().height || 40;
+  const fullFrameWidth = innerWidth;
+  const fullFrameHeight = fullFrameWidth * (9 / 16);
+  const inlineFit = findStageControlFit(innerWidth, { layout: "inline" });
+  const inlineTraySize = inlineFit.size;
+  const trayHeight = inlineTraySize.height;
+  const inlineWidthSlack = innerWidth - inlineTraySize.width;
+  const minimumPresentationFrameHeight = Math.min(
+    fullFrameHeight,
+    Math.max(180, Math.min(260, fullFrameHeight)),
+  );
+  const desiredInlineFrameHeight = presentationActive
+    ? minimumPresentationFrameHeight
+    : fullFrameHeight;
+  const inlineHeightSlack = innerHeight - (
+    headerHeight
+      + variantHeight
+      + presentationControlsHeight
+      + desiredInlineFrameHeight
+      + trayHeight
+      + (panelGap * persistentRowGapCount)
+  );
+  // `findStageControlFit` measures the tray at exactly `innerWidth`, so the
+  // horizontal slack is intentionally zero whenever the controls fit. Use
+  // the vertical slack as the hysteresis signal in that case; otherwise a
+  // permanently-zero min() would prevent a popup from ever returning inline.
+  const inlineFitSlack = inlineWidthSlack >= -1
+    ? inlineHeightSlack
+    : Math.min(inlineWidthSlack, inlineHeightSlack);
+  const fullFrameWithInlineControlsFits = inlineWidthSlack >= -1
+    && inlineTraySize.contentFits
+    && trayHeight > 0
+    && inlineHeightSlack >= -1;
+  const previousLayout = elements.appShell.dataset.stageControlsLayout;
+  const fitHysteresis = 16;
+  const inlineControls = narrowShell
+    ? fullFrameWithInlineControlsFits
+    : presentationContextChanged
+      ? fullFrameWithInlineControlsFits
+      : previousLayout === "inline"
+        ? fullFrameWithInlineControlsFits || inlineFitSlack >= -fitHysteresis
+        : previousLayout === "popup"
+          ? fullFrameWithInlineControlsFits && inlineFitSlack >= fitHysteresis
+          : fullFrameWithInlineControlsFits;
+  const controlLayout = inlineControls ? "inline" : "popup";
+  const titleStyle = titleNode ? window.getComputedStyle(titleNode) : null;
+  const titleTextStyle = titleTextNode ? window.getComputedStyle(titleTextNode) : null;
+  const titlePaintPadding = (parseFloat(titleTextStyle?.paddingTop) || 0)
+    + (parseFloat(titleTextStyle?.paddingBottom) || 0);
+  const titleLineHeight = parseFloat(titleStyle?.lineHeight || "0") || 0;
+  const titleAvailableWidth = titleNode?.clientWidth || 0;
+  const titleNaturalWidth = titleTextNode?.scrollWidth || 0;
+  const titleOverflowDistance = Math.max(0, titleNaturalWidth - titleAvailableWidth);
+  const titleOverflowsSingleLine = titleOverflowDistance > 1;
+  let titleNaturalWrappedHeight = titleLineHeight;
+  if (!narrowShell && titleOverflowsSingleLine && titleNode && titleTextNode) {
+    titleNode.classList.add("is-measuring-two-line");
+    titleNaturalWrappedHeight = titleTextNode.scrollHeight - titlePaintPadding;
+    titleNode.classList.remove("is-measuring-two-line");
+  }
+  const titleFitsWithinTwoLines = titleNaturalWrappedHeight <= (titleLineHeight * 2) + 1;
+  const popupHeightSlack = innerHeight - (
+    headerHeight
+      + variantHeight
+      + presentationControlsHeight
+      + fullFrameHeight
+      + toggleHeight
+      + (panelGap * persistentRowGapCount)
+  );
+  const titleHeightSlack = inlineControls ? inlineHeightSlack : popupHeightSlack;
+  const titleCanUseTwoLines = !narrowShell
+    && titleOverflowsSingleLine
+    && titleFitsWithinTwoLines
+    && titleLineHeight > 0
+    && titleHeightSlack >= titleLineHeight + 4;
+  titleNode?.classList.toggle("is-two-line", titleCanUseTwoLines);
+  if (titleNode) {
+    titleNode.dataset.visibleLines = titleCanUseTwoLines ? "2" : "1";
+    titleNode.dataset.singleLineOverflow = String(titleOverflowsSingleLine);
+    titleNode.dataset.fitsWithinTwoLines = String(titleFitsWithinTwoLines);
+    titleNode.dataset.naturalWrappedHeight = String(Math.round(titleNaturalWrappedHeight * 100) / 100);
+    titleNode.dataset.heightSlack = String(Math.round(titleHeightSlack * 100) / 100);
+  }
+  if (titleOverflowsSingleLine && !titleCanUseTwoLines && titleNode) {
+    const durationSeconds = Math.max(6, Math.min(16, 3 + (titleOverflowDistance / 28)));
+    titleNode.style.setProperty("--host-current-title-marquee-offset", `${-titleOverflowDistance}px`);
+    titleNode.style.setProperty("--host-current-title-marquee-duration", `${durationSeconds}s`);
+    titleNode.classList.add("is-scrolling");
+    globalThis.BilikaraTextMarquee?.configure(titleNode, titleTextNode, titleAvailableWidth, titleNaturalWidth);
+  } else {
+    globalThis.BilikaraTextMarquee?.reset(titleNode, titleTextNode);
+  }
+  if (titleCanUseTwoLines) {
+    headerHeight = elements.playerPanel.querySelector(".panel-head")?.getBoundingClientRect().height || headerHeight;
+  }
+  const popupFit = inlineControls
+    ? inlineFit
+    : findStageControlFit(Math.min(860, Math.max(280, window.innerWidth - 24)), { layout: "popup" });
+  const controlDensity = popupFit.density;
+  const reservedControlsHeight = inlineControls
+    ? headerHeight + variantHeight + presentationControlsHeight
+      + trayHeight + (panelGap * persistentRowGapCount)
+    : headerHeight + variantHeight + presentationControlsHeight
+      + toggleHeight + (panelGap * persistentRowGapCount);
+  const frameHeight = Math.max(0, Math.min(fullFrameHeight, innerHeight - reservedControlsHeight));
+  const frameWidth = Math.max(0, Math.min(fullFrameWidth, frameHeight * (16 / 9)));
+  const mode = narrowShell
+    ? "narrow"
+    : inlineControls
+      ? "full"
+      : "compact";
+  const previousMode = elements.appShell.dataset.stageMode;
+  elements.appShell.dataset.stageMode = mode;
+  elements.appShell.dataset.stageControlsLayout = controlLayout;
+  elements.appShell.dataset.stageControlDensity = controlDensity;
+  elements.playerPanel.style.setProperty("--stage-frame-inline-size", `${Math.floor(frameWidth)}px`);
+  elements.playerPanel.style.setProperty("--stage-frame-block-size", `${Math.floor(frameHeight)}px`);
+  if (previousLayout !== controlLayout) {
+    if (inlineControls) {
+      state.stageControlInlineCollapsed = false;
+      clearStageControlTrayPosition();
+      setStageControlTrayOpen(true, { moveFocus: false });
+    } else {
+      setStageControlTrayOpen(false, { moveFocus: false });
+    }
+  } else if (inlineControls && !state.stageControlTrayOpen) {
+    state.stageControlInlineCollapsed = false;
+    setStageControlTrayOpen(true, { moveFocus: false });
+  } else if (state.stageControlTrayOpen && !inlineControls) {
+    positionStageControlTray();
+  }
+  syncAudioVariantOverflow();
+  return mode;
+}
+
+function schedulePersistentStageMeasurement() {
+  if (state.stageMeasureFrame !== null) {
+    return;
+  }
+  state.stageMeasureFrame = window.requestAnimationFrame(measurePersistentStage);
+}
+
+function initializePersistentStageFitting() {
+  if (typeof ResizeObserver === "function") {
+    state.stageResizeObserver?.disconnect?.();
+    state.stageResizeObserver = new ResizeObserver(schedulePersistentStageMeasurement);
+    state.stageResizeObserver.observe(elements.leftColumn);
+    state.stageResizeObserver.observe(elements.playerPanel);
+    if (elements.audioVariantAnchor) {
+      state.stageResizeObserver.observe(elements.audioVariantAnchor);
+    }
+    state.queueScrollResizeObserver?.disconnect?.();
+    state.queueScrollResizeObserver = new ResizeObserver(scheduleQueueScrollOwnershipSync);
+    state.queueScrollResizeObserver.observe(elements.listStage);
+    state.queueScrollResizeObserver.observe(elements.playlist);
+  }
+  schedulePersistentStageMeasurement();
+  scheduleQueueScrollOwnershipSync();
+  document.querySelectorAll(".history-list, .source-browse-scroll").forEach(observeHostScrollInsets);
+}
+
+function renderWindowMaximizeState(maximized) {
+  document.body.classList.toggle("is-tauri-maximized", maximized);
+  const button = elements.windowMaximize;
+  if (!button) return;
+  const key = maximized ? "window.restore" : "window.maximize";
+  const nativeWindows = document.body.dataset.tauriPlatform === "windows";
+  if (nativeWindows) delete button.dataset.i18nTitle;
+  else button.dataset.i18nTitle = key;
+  button.dataset.i18nAriaLabel = key;
+  setElementTitle(button, nativeWindows ? "" : t(key));
+  setElementAttribute(button, "aria-label", t(key));
+  button.querySelector(".window-maximize-icon")?.toggleAttribute("hidden", maximized);
+  button.querySelector(".window-restore-icon")?.toggleAttribute("hidden", !maximized);
+}
+
+function initializeNativeMaximizeRegion(appWindow) {
+  const invoke = tauriInvoke();
+  const button = elements.windowMaximize;
+  if (typeof invoke !== "function" || !button || typeof appWindow.listen !== "function") return;
+  let frame = null;
+  let sent = "";
+  let pending = false;
+  let dirty = false;
+  const update = async () => {
+    frame = null;
+    if (pending) { dirty = true; return; }
+    const rect = button.getBoundingClientRect();
+    const scale = window.devicePixelRatio || 1;
+    const visible = rect.width > 0 && rect.height > 0 && !button.disabled
+      && !elements.windowControls.hidden && !isPlayerPanelFullscreen()
+      && !presentationCompositionActive();
+    const region = visible ? {
+      x: Math.round(rect.left * scale), y: Math.round(rect.top * scale),
+      width: Math.round(rect.width * scale), height: Math.round(rect.height * scale),
+    } : null;
+    const signature = JSON.stringify(region);
+    if (sent === signature) return;
+    pending = true;
+    try {
+      await invoke("set_window_maximize_region", { region });
+      sent = signature;
+    } catch {
+      // Keep the accessible DOM button working if native integration is absent.
+      button.classList.remove("is-native-hovered");
+    } finally {
+      pending = false;
+      if (dirty) { dirty = false; schedule(); }
+    }
+  };
+  const schedule = () => {
+    if (frame === null) frame = window.requestAnimationFrame(update);
+  };
+  appWindow.listen("bilikara:maximize-hover", ({ payload }) => {
+    button.classList.toggle("is-native-hovered", payload === true);
+  }).then(() => {
+    // Install the native surface only after its hover listener is ready.
+    if (typeof ResizeObserver === "function") {
+      const observer = new ResizeObserver(schedule);
+      observer.observe(elements.windowControls);
+      observer.observe(elements.topbar);
+    }
+    window.addEventListener("resize", () => { sent = ""; schedule(); });
+    window.addEventListener("focus", schedule);
+    document.addEventListener("bilikara:i18n", schedule);
+    document.fonts?.ready.then(schedule);
+    schedule();
+  }).catch(() => {});
+}
+
+function initializeWindowChrome() {
+  if (document.documentElement?.dataset?.nativeHost === "true" && document.documentElement?.dataset?.hostPlatform !== "desktop") return;
+  const tauriWindowApi = window.__TAURI__?.window;
+  const appWindow = tauriWindowApi?.getCurrentWindow?.();
+  const userAgent = String(navigator.userAgent || "");
+  const platform = /Windows/i.test(userAgent)
+    ? "windows"
+    : /Macintosh|Mac OS X/i.test(userAgent)
+      ? "macos"
+      : "linux";
+  const renderedPlatform = appWindow ? platform : "browser";
+  document.documentElement.dataset.tauriPlatform = renderedPlatform;
+  document.body.dataset.tauriPlatform = renderedPlatform;
+  if (!appWindow) {
+    return;
+  }
+  let frameStateRequest = 0;
+  const syncWindowFrameState = () => {
+    if (platform !== "windows" || typeof appWindow.isMaximized !== "function") {
+      return Promise.resolve();
+    }
+    const request = ++frameStateRequest;
+    return appWindow.isMaximized()
+      .then((maximized) => {
+        if (request === frameStateRequest) renderWindowMaximizeState(Boolean(maximized));
+      })
+      .catch(() => {});
+  };
+  const toggleWindowMaximize = () => appWindow.toggleMaximize()
+    .then(syncWindowFrameState)
+    .catch(() => {});
+  const handleWindowGeometryChange = () => {
+    syncWindowFrameState();
+    void syncNativePlayerFullscreen(appWindow);
+    schedulePresentationDisplayRefreshFromWindowEvent();
+  };
+  const resizeListener = appWindow.onResized?.(handleWindowGeometryChange);
+  resizeListener?.catch?.(() => {});
+  const moveListener = appWindow.onMoved?.(schedulePresentationDisplayRefreshFromWindowEvent);
+  moveListener?.catch?.(() => {});
+  const scaleListener = appWindow.onScaleChanged?.(schedulePresentationDisplayRefreshFromWindowEvent);
+  scaleListener?.catch?.(() => {});
+  window.addEventListener("focus", schedulePresentationDisplayRefreshFromWindowEvent);
+  if (platform === "windows") {
+    elements.windowControls.hidden = false;
+    let focusChanged = false;
+    const focusListener = appWindow.onFocusChanged?.(({ payload }) => {
+      focusChanged = true;
+      document.body.dataset.windowFocused = String(Boolean(payload));
+    });
+    focusListener?.catch?.(() => {});
+    appWindow.isFocused?.().then((focused) => {
+      if (!focusChanged) document.body.dataset.windowFocused = String(Boolean(focused));
+    }).catch(() => {});
+    initializeNativeMaximizeRegion(appWindow);
+    elements.windowMinimize?.addEventListener("click", () => appWindow.minimize().catch(() => {}));
+    elements.windowMaximize?.addEventListener("click", toggleWindowMaximize);
+    elements.windowClose?.addEventListener("click", () => appWindow.close().catch(() => {}));
+    syncWindowFrameState();
+  }
+  elements.topbar?.addEventListener("dblclick", (event) => {
+    const target = event.target instanceof Element ? event.target : null;
+    if (
+      event.button !== 0
+      || platform !== "windows"
+      || target?.closest("[data-tauri-drag-region]")
+      || target?.closest("button, a, input, select, textarea, [role='button']")
+    ) {
+      return;
+    }
+    event.preventDefault();
+    toggleWindowMaximize();
+  }, true);
+}
+
+function initializeHostShell() {
+  state.activeHostWorkspace = "request";
+  state.focusedHostWorkspace = "request";
+  state.hostWorkspaceOverlayOpen = false;
+  state.requestSubview = "quick";
+
+  state.focusedRequestSubview = state.requestSubview;
+  state.searchMode = "shared";
+  state.focusedSearchMode = "shared";
+  renderHostWorkspaceSelection();
+  renderGatchaWorkspace();
+  initializeWindowChrome();
+  initializePersistentStageFitting();
+  if (typeof syncRequestSubviewSelection === "function") {
+    syncRequestSubviewSelection();
+  }
+  try {
+    window.localStorage?.removeItem("bilikara.layout.mode");
+  } catch {
+    // The retired Host preference is optional; responsive shell behavior is unconditional.
+  }
 }
 
 function rememberedVolumePercent() {
-  return Math.max(0, Math.min(100, Math.round(readLocalNumber(storageKeys.playerVolume, 1) * 100)));
+  return Math.max(0, Math.min(500, Math.round(readLocalNumber(storageKeys.playerVolume, 1) * 100)));
 }
 
 function rememberedMuted() {
@@ -1502,7 +5679,7 @@ function syncLocalPlayerSettingsFromSnapshot(playerSettings) {
   if (Date.now() < state.playerSettingsEchoSuppressUntil) {
     return;
   }
-  const volumePercent = Math.max(0, Math.min(100, Number(playerSettings?.volume_percent ?? 100)));
+  const volumePercent = Math.max(0, Math.min(500, Number(playerSettings?.volume_percent ?? 100)));
   state.localPlayerVolume = volumePercent / 100;
   state.localPlayerMuted = Boolean(playerSettings?.is_muted);
   persistLocalVolumePreferences();
@@ -1531,7 +5708,7 @@ function localizedBBDownLoginMessage(message) {
   if (!raw) {
     return "";
   }
-  if (raw === "请使用哔哩哔哩 App 扫码登录" || raw.includes("扫码登录")) {
+  if (raw === "请使用哔哩哔哩 App 扫码登录" || raw.includes("扫码登录") || raw.startsWith("请使用哔哩哔哩 App 扫码")) {
     return t("service.scanWithBilibiliApp");
   }
   if (raw === "正在启动 BBDown 登录" || raw.includes("启动 BBDown 登录")) {
@@ -1554,6 +5731,10 @@ function localizedApiMessage(message) {
   if (!raw) {
     return "";
   }
+  if (raw === "队列已更新，请重新拖动") return t("remote.queueChanged");
+  if (raw === "歌曲已离开等待队列，请刷新后重试") return t("remote.queueItemMissing");
+  if (raw === "Invalid YouTube video link") return t("request.youtubeInvalid");
+  if (raw === "Multiple YouTube videos found; paste one video link") return t("request.youtubeMultiple");
   const bbdownMessage = localizedBBDownLoginMessage(raw);
   if (bbdownMessage && bbdownMessage !== raw) {
     return bbdownMessage;
@@ -1569,8 +5750,58 @@ function localizedApiMessage(message) {
   return raw;
 }
 
+async function parseApiResponse(response, requestUrl = "") {
+  const status = Number(response?.status || 0);
+  const responseOk = Boolean(response?.ok);
+  const contentType = String(response?.headers?.get?.("content-type") || "").toLowerCase();
+  const jsonContentType = contentType
+    .split(";", 1)[0]
+    .trim()
+    .match(/^(?:application|text)\/(?:[a-z0-9.+-]*\+)?json$/);
+  let responseUrl = String(response?.url || "");
+  if (!responseUrl && requestUrl) {
+    try {
+      responseUrl = new URL(requestUrl, window.location?.href || undefined).href;
+    } catch {
+      responseUrl = String(requestUrl);
+    }
+  }
+  const tauriAssetApiResponse = /^(?:tauri:\/\/localhost|https?:\/\/tauri\.localhost)\/api(?:\/|$)/i
+    .test(responseUrl);
+
+  if (!jsonContentType) {
+    const error = new Error("Backend returned a non-JSON response");
+    error.kind = "non_json_response";
+    error.status = status;
+    error.contentType = contentType;
+    error.responseUrl = responseUrl;
+    error.backendNotReady = responseOk && tauriAssetApiResponse;
+    throw error;
+  }
+
+  try {
+    return await response.json();
+  } catch (cause) {
+    const error = new Error("Backend returned invalid JSON");
+    error.kind = "invalid_json_response";
+    error.status = status;
+    error.contentType = contentType;
+    error.responseUrl = responseUrl;
+    error.cause = cause;
+    throw error;
+  }
+}
+
+function shouldReportStateFetchError(error) {
+  if (!state.hasValidStateResponse) {
+    return !error?.backendNotReady;
+  }
+  return ["non_json_response", "invalid_json_response"].includes(error?.kind);
+}
+
 async function apiPost(url, payload = {}, options = {}) {
   const timeoutMs = Math.max(0, Number(options.timeoutMs || 0));
+  const returnEnvelope = options.returnEnvelope === true;
   const controller = timeoutMs > 0 && typeof AbortController === "function"
     ? new AbortController()
     : null;
@@ -1584,7 +5815,7 @@ async function apiPost(url, payload = {}, options = {}) {
       body: JSON.stringify(payload),
       ...(controller ? { signal: controller.signal } : {}),
     });
-    const data = await response.json();
+    const data = await parseApiResponse(response, url);
     if (!response.ok || !data.ok) {
       const error = new Error(localizedApiMessage(data.error) || t("error.requestFailed"));
       error.status = response.status;
@@ -1592,7 +5823,7 @@ async function apiPost(url, payload = {}, options = {}) {
       error.payload = data;
       throw error;
     }
-    return data.data;
+    return returnEnvelope ? data : data.data;
   } catch (error) {
     if (error?.name === "AbortError") {
       throw new Error(t("error.requestTimeout"));
@@ -1605,19 +5836,20 @@ async function apiPost(url, payload = {}, options = {}) {
   }
 }
 
-function submitSongRating(item, score) {
+function submitSongRating(item, score, trigger = null) {
   const bvid = String(item?.bvid || "").trim();
   const playId = ratingSubmissionPlayId(item);
   const sessionUserName = ratingSubmissionUserName(item);
+  const sessionUserId = ratingSubmissionUserId(item);
   if (!bvid) {
     return null;
   }
   const submissionKey = ratingSubmissionKey({ ...item, play_id: playId, requester_name: sessionUserName });
-  if (submissionKey && state.ratingSubmittedKeys.has(submissionKey)) {
+  if (submissionKey && (hasSubmittedSongRating(item) || serverRatingStatus(item) === "sending" || state.ratingPendingKeys.has(submissionKey))) {
     return false;
   }
   if (submissionKey) {
-    state.ratingSubmittedKeys.add(submissionKey);
+    state.ratingPendingKeys.add(submissionKey);
   }
   const payload = {
     session_user_name: sessionUserName,
@@ -1625,15 +5857,45 @@ function submitSongRating(item, score) {
     bvid,
     score: Math.max(1, Math.min(5, Math.trunc(Number(score) || 5))),
   };
+  const button = trigger && "disabled" in trigger ? trigger : null;
+  const wasDisabled = button?.disabled;
+  if (button) {
+    button.disabled = true;
+    button.setAttribute("aria-busy", "true");
+  }
+  renderCurrentRatingButton(state.data?.current_item);
   fetch("/api/rating/submit", {
     method: "POST",
     headers: clientHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify(payload),
+    keepalive: true,
+  }).then(async (response) => {
+    const result = await response.json();
+    if (!response.ok || result?.ok !== true || result?.success === false || result?.data?.success !== true) {
+      throw new Error(result?.error || t("error.requestFailed"));
+    }
+    if (submissionKey) {
+      if (result?.data?.queued) state.ratingQueuedKeys.add(submissionKey);
+      else state.ratingSubmittedKeys.add(submissionKey);
+      state.ratingSavedScores.set(submissionKey, payload.score);
+      const entry = (state.data?.song_ratings || []).find(entry => entry.play_id === playId
+        && (sessionUserId && entry.session_user_id ? entry.session_user_id === sessionUserId
+          : String(entry.session_user_name || "").toLowerCase() === sessionUserName.toLowerCase()));
+      if (entry && entry.status === "waiting") entry.score = payload.score;
+    }
   }).catch((error) => {
     if (submissionKey) {
       state.ratingSubmittedKeys.delete(submissionKey);
     }
-    console.warn("Rating submit failed:", error);
+    state.ratingPromptSeenPlayIds.delete(playId);
+    setAppMessage(error.message || t("error.requestFailed"), true);
+  }).finally(() => {
+    state.ratingPendingKeys.delete(submissionKey);
+    renderCurrentRatingButton(state.data?.current_item);
+    if (button) {
+      button.disabled = wasDisabled;
+      button.removeAttribute("aria-busy");
+    }
   });
   return true;
 }
@@ -1689,7 +5951,17 @@ function ratingSubmissionUserName(item) {
 
 function ratingSubmissionPlayId(item) {
   const bvid = String(item?.bvid || "").trim();
-  return String(item?.play_id || item?.id || state.ratingPromptItemId || bvid).trim();
+  return String(item?.play_id || item?.id || item?.item_id || state.ratingPromptItemId || bvid).trim();
+}
+
+function ratingSubmissionUserId(item) {
+  return state.data?.session_user_entries?.find(user => user.name === ratingSubmissionUserName(item))?.id || "";
+}
+
+function ratingBelongsToUser(entry, item) {
+  const id = ratingSubmissionUserId(item);
+  return id && entry.session_user_id ? entry.session_user_id === id
+    : String(entry.session_user_name || "").toLowerCase() === ratingSubmissionUserName(item).toLowerCase();
 }
 
 function ratingSubmissionKey(item) {
@@ -1697,12 +5969,47 @@ function ratingSubmissionKey(item) {
   if (!playId) {
     return "";
   }
-  return `${ratingSubmissionUserName(item).toLowerCase()}::${playId}`;
+  return `${state.data?.session_generation ?? state.remoteIdentity?.session_id ?? ""}::${ratingSubmissionUserId(item) || ratingSubmissionUserName(item).toLowerCase()}::${playId}`;
+}
+
+function renderCurrentRatingButton(current) {
+  const button = elements.openRatingButton;
+  if (!button) return;
+  button.disabled = false;
+  const label = t("rating.rate");
+  const title = t("rating.rateTitle");
+  if (button.textContent !== label) button.textContent = label;
+  if (button.title !== title) button.title = title;
+  button.removeAttribute("aria-busy");
+  refreshOpenRatingPrompt(current);
+}
+
+function serverRatingStatus(item) {
+  const playId = ratingSubmissionPlayId(item);
+  const entry = (state.data?.song_ratings || []).find(entry => entry.play_id === playId
+    && ratingBelongsToUser(entry, item));
+  const key = ratingSubmissionKey(item);
+  if (entry && !["waiting", "sending"].includes(entry.status)) state.ratingQueuedKeys.delete(key);
+  if (entry) return entry.status;
+  if (playId !== ratingSubmissionPlayId(state.data?.current_item)) state.ratingQueuedKeys.delete(key);
+  return state.ratingQueuedKeys.has(key) ? "waiting" : "";
+}
+
+function isSongRatingQueued(item) {
+  return ["waiting", "sending"].includes(serverRatingStatus(item));
 }
 
 function hasSubmittedSongRating(item) {
   const key = ratingSubmissionKey(item);
-  return Boolean(key && state.ratingSubmittedKeys.has(key));
+  return serverRatingStatus(item) === "accepted" || Boolean(key && state.ratingSubmittedKeys.has(key));
+}
+
+function savedSongRatingScore(item) {
+  if (!item) return 5;
+  const entry = (state.data?.song_ratings || []).find(entry => entry.play_id === ratingSubmissionPlayId(item)
+    && ratingBelongsToUser(entry, item));
+  const score = Number(entry?.score ?? state.ratingSavedScores.get(ratingSubmissionKey(item)) ?? 5);
+  return Math.max(1, Math.min(5, Math.trunc(score) || 5));
 }
 
 function normalizeRatingPromptItem(item) {
@@ -1740,6 +6047,41 @@ function ratingPromptItemsForItem(item) {
   };
 }
 
+function isItemRateable(item, isCurrent = false) {
+  if (!item?.bvid || !selectedRequesterName() || state.data?.capabilities?.song_rating === false) return false;
+  const playId = ratingSubmissionPlayId(item);
+  const played = (state.data?.session_played || []).find(entry => String(entry.item_id || entry.id || "") === playId);
+  // Current-song confirmation may be held by the Host until its accepted
+  // playback observation reaches 50%; a skipped, ineligible song cannot be rated.
+  return (Boolean(state.data?.current_item && playId === ratingSubmissionPlayId(state.data.current_item)) || Boolean(played?.threshold_reached))
+    && !hasSubmittedSongRating(item)
+    && serverRatingStatus(item) !== "sending"
+    && !state.ratingPendingKeys.has(ratingSubmissionKey(item));
+}
+
+function refreshOpenRatingPrompt(current) {
+  if (!state.ratingPromptElement) return;
+  const items = ratingPromptItemsForItem(current);
+  const selectedItem = activeRatingPromptItem();
+  const selectedId = selectedItem ? ratingSubmissionPlayId(selectedItem) : "";
+  const tab = ["current", "previous"].find(key => items[key]
+    && ratingSubmissionPlayId(items[key]) === selectedId) || (items.current ? "current" : "previous");
+  const changed = (items[tab] ? ratingSubmissionPlayId(items[tab]) : "") !== selectedId;
+  state.ratingPromptItems = items;
+  state.ratingPromptActiveTab = tab;
+  state.ratingPromptItem = items[tab];
+  state.ratingPromptItemId = String(items[tab]?.id || "");
+  const submissionKey = items[tab] ? ratingSubmissionKey(items[tab]) : "";
+  if (changed || submissionKey !== state.ratingPromptSubmissionKey) state.ratingPromptScoreDirty = false;
+  state.ratingPromptSubmissionKey = submissionKey;
+  if (!state.ratingPromptScoreDirty || !isItemRateable(items[tab])) {
+    state.ratingPromptScore = savedSongRatingScore(items[tab]);
+    state.ratingPromptScoreDirty = false;
+  }
+  if (changed) renderRatingPromptContent();
+  else syncRatingPromptControls();
+}
+
 function activeRatingPromptItem() {
   return normalizeRatingPromptItem(
     state.ratingPromptItems?.[state.ratingPromptActiveTab]
@@ -1760,19 +6102,36 @@ function renderRatingStars() {
   });
 }
 
+function syncRatingPromptControls() {
+  const root = state.ratingPromptElement;
+  if (!root) return;
+  const item = activeRatingPromptItem();
+  const rateable = isItemRateable(item);
+  root.querySelectorAll("[data-rating-tab]").forEach(button => {
+    button.disabled = !state.ratingPromptItems?.[button.dataset.ratingTab]?.bvid;
+    button.classList.toggle("active", button.dataset.ratingTab === state.ratingPromptActiveTab);
+    button.setAttribute("aria-selected", String(button.dataset.ratingTab === state.ratingPromptActiveTab));
+  });
+  const submit = root.querySelector("[data-rating-submit]");
+  submit.disabled = !rateable;
+  if (state.ratingPendingKeys.has(ratingSubmissionKey(item))) submit.setAttribute("aria-busy", "true");
+  else submit.removeAttribute("aria-busy");
+  root.querySelectorAll("[data-rating-score]").forEach(button => { button.disabled = !rateable; });
+  renderRatingStars();
+}
+
 function renderRatingPromptContent() {
   const root = state.ratingPromptElement;
   if (!root) {
     return;
   }
-  const activeItem = activeRatingPromptItem();
+  const activeItem = activeRatingPromptItem() || {};
   state.ratingPromptItem = activeItem;
   state.ratingPromptBvid = String(activeItem?.bvid || "").trim();
 
   root.querySelectorAll("[data-rating-tab]").forEach((button) => {
     const tab = button.dataset.ratingTab;
-    const hasItem = Boolean(state.ratingPromptItems?.[tab]);
-    button.disabled = !hasItem;
+    button.disabled = !state.ratingPromptItems?.[tab]?.bvid;
     button.classList.toggle("active", tab === state.ratingPromptActiveTab);
     button.setAttribute("aria-selected", tab === state.ratingPromptActiveTab ? "true" : "false");
   });
@@ -1785,9 +6144,11 @@ function renderRatingPromptContent() {
   const ownerName = String(activeItem.owner_name || "").trim() || t("rating.unknownOwner");
   const coverUrl = safeHttpUrl(activeItem.cover_url);
   const url = safeHttpUrl(ratingItemUrl(activeItem) || (bvid ? `https://www.bilibili.com/video/${bvid}` : ""));
-  const titleKey = state.ratingPromptActiveTab === "previous" ? "rating.previousTitle" : "rating.title";
   const media = document.createElement("div");
-  media.className = "rating-media";
+  media.className = "song-detail-hero";
+  const cover = document.createElement("div");
+  cover.className = "song-detail-cover";
+  media.appendChild(cover);
   if (coverUrl) {
     const image = document.createElement("img");
     image.className = "rating-cover";
@@ -1795,74 +6156,92 @@ function renderRatingPromptContent() {
     image.alt = "";
     image.loading = "lazy";
     image.referrerPolicy = "no-referrer";
-    media.appendChild(image);
+    cover.appendChild(image);
   } else {
     const placeholder = document.createElement("div");
     placeholder.className = "rating-cover rating-cover-empty";
-    media.appendChild(placeholder);
+    cover.appendChild(placeholder);
   }
   const copy = document.createElement("div");
-  copy.className = "rating-copy";
-  const kicker = document.createElement("p");
-  kicker.className = "rating-kicker";
-  kicker.textContent = t("rating.kicker");
+  copy.className = "song-detail-facts";
   const title = document.createElement("h2");
-  title.textContent = t(titleKey);
-  const hint = document.createElement("p");
-  hint.className = "rating-hint";
-  hint.textContent = t("rating.hint");
+  title.className = "song-detail-title rating-title";
+  title.dataset.i18n = "rating.title";
+  title.textContent = t("rating.title");
   const owner = document.createElement("p");
-  owner.className = "rating-owner owner-badge-label";
-  renderOwnerBadgeLabel(owner, ownerName);
-  copy.append(kicker, title, hint, owner);
+  owner.className = "rating-owner";
+  window.BilikaraSongDetail.renderOwnerLabel(owner, activeItem, ownerName, state.followBrowseData?.owners);
+  copy.append(owner);
   if (url) {
     const link = document.createElement("a");
-    link.className = "rating-link";
+    link.className = "rating-link song-detail-bilibili-link";
+    link.dataset.i18n = "search.openOnBilibili";
     link.href = url;
     link.target = "_blank";
     link.rel = "noreferrer";
-    link.textContent = url;
+    link.textContent = t("search.openOnBilibili");
     copy.appendChild(link);
   }
+  const score = document.createElement("div");
+  score.className = "song-detail-metric rating-score";
+  score.append(root.querySelector(".rating-stars"));
+  copy.appendChild(score);
   media.appendChild(copy);
-  content.replaceChildren(media);
+  content.replaceChildren(title, media);
   const addUpButton = root.querySelector("[data-rating-add-up]");
   if (addUpButton) {
     const ownerUid = ratingOwnerUid(activeItem);
-    addUpButton.disabled = !ownerUid;
-    addUpButton.textContent = ownerUid ? t("rating.addUp") : t("rating.missingUid");
+    addUpButton.disabled = addUpButton.hasAttribute("aria-busy") || !ownerUid;
+    addUpButton.dataset.i18n = ownerUid ? "rating.addUp" : "rating.missingUid";
+    addUpButton.textContent = t(addUpButton.dataset.i18n);
   }
-  renderRatingStars();
+  syncRatingPromptControls();
 }
 
 function setRatingPromptActiveTab(tab) {
-  if (!state.ratingPromptElement || !state.ratingPromptItems?.[tab]) {
+  if (!state.ratingPromptElement || !state.ratingPromptItems?.[tab]?.bvid) {
     return;
   }
   state.ratingPromptActiveTab = tab;
+  state.ratingPromptItemId = ratingSubmissionPlayId(state.ratingPromptItems[tab]);
+  state.ratingPromptScore = savedSongRatingScore(state.ratingPromptItems[tab]);
+  state.ratingPromptScoreDirty = false;
+  state.ratingPromptSubmissionKey = ratingSubmissionKey(state.ratingPromptItems[tab]);
   renderRatingPromptContent();
 }
 
-function closeRatingPrompt({ submit = true } = {}) {
+function closeRatingPrompt({ submit = false, trigger = null } = {}) {
   const root = state.ratingPromptElement;
   if (!root) {
     return;
   }
   const item = state.data?.current_item;
   const bvid = state.ratingPromptBvid;
-  const shouldSubmit = submit && !state.ratingPromptSubmitted && !state.ratingOptOut && bvid;
+  const shouldSubmit = submit && !state.ratingPromptSubmitted && bvid && isItemRateable(activeRatingPromptItem());
   state.ratingPromptSubmitted = true;
   const promptItem = activeRatingPromptItem();
-  root.remove();
+  root.classList.add("closing");
+  root.setAttribute("inert", "");
+  root.querySelector('[role="dialog"]')?.setAttribute("aria-modal", "false");
+  const animation = root.querySelector(".rating-card")?.getAnimations()
+    .find((entry) => entry.animationName === "scale-to-center-card");
+  if (animation) animation.finished.catch(() => {}).then(() => root.remove());
+  else root.remove();
   state.ratingPromptElement = null;
   state.ratingPromptItem = null;
   state.ratingPromptItems = null;
   state.ratingPromptActiveTab = "current";
   state.ratingPromptItemId = "";
   state.ratingPromptBvid = "";
+  state.ratingPromptSubmissionKey = "";
+  const opener = state.ratingPromptOpener;
+  state.ratingPromptOpener = null;
 
   if (shouldSubmit) {
-    submitSongRating({ ...(promptItem || item), bvid }, state.ratingPromptScore);
+    submitSongRating({ ...(promptItem || item), bvid }, state.ratingPromptScore, trigger);
+  }
+  if (opener?.isConnected) {
+    opener.focus({ preventScroll: true });
   }
 }
 
@@ -1870,25 +6249,33 @@ function setRatingOptOut(enabled) {
   state.ratingOptOut = Boolean(enabled);
 }
 
-function openRatingPrompt(item) {
-  const bvid = String(item?.bvid || "").trim();
-  const playId = String(item?.id || bvid).trim();
-  if (!item || !bvid || !playId || state.ratingOptOut || state.ratingPromptSeenPlayIds.has(playId)) {
+function openRatingPrompt(item, { manual = false } = {}) {
+  const playId = String(item?.id || "").trim();
+  if (!manual && (state.ratingOptOut || state.ratingPromptSeenPlayIds.has(playId))) {
     return;
   }
   if (fullscreenElement()) {
     return;
   }
   const promptItems = ratingPromptItemsForItem(item);
-  closeRatingPrompt({ submit: true });
-  state.ratingPromptSeenPlayIds.add(playId);
-  state.ratingPromptItemId = playId;
+  const currentRateable = isItemRateable(promptItems.current, true);
+  const previousRateable = isItemRateable(promptItems.previous, false);
+  if (!manual && (!currentRateable && !previousRateable)) return;
+  closeRatingPrompt({ submit: false });
+  const tab = manual
+    ? (promptItems.current ? "current" : "previous")
+    : (currentRateable || !promptItems.previous ? "current" : "previous");
+  const activeItem = promptItems[tab] || {};
+  state.ratingPromptItemId = ratingSubmissionPlayId(activeItem);
   state.ratingPromptItems = promptItems;
-  state.ratingPromptActiveTab = "current";
-  state.ratingPromptItem = promptItems.current;
-  state.ratingPromptBvid = bvid;
-  state.ratingPromptScore = 5;
+  state.ratingPromptActiveTab = tab;
+  state.ratingPromptItem = activeItem;
+  state.ratingPromptBvid = activeItem.bvid;
+  state.ratingPromptScore = savedSongRatingScore(activeItem);
+  state.ratingPromptScoreDirty = false;
+  state.ratingPromptSubmissionKey = ratingSubmissionKey(activeItem);
   state.ratingPromptSubmitted = false;
+  state.ratingPromptOpener = document.activeElement;
 
   const root = document.createElement("div");
   root.className = "rating-modal";
@@ -1901,14 +6288,16 @@ function openRatingPrompt(item) {
   card.className = "rating-card";
   card.setAttribute("role", "dialog");
   card.setAttribute("aria-modal", "true");
+  card.dataset.i18nAriaLabel = "rating.dialogLabel";
   card.setAttribute("aria-label", t("rating.dialogLabel"));
 
   const closeButton = document.createElement("button");
   closeButton.type = "button";
   closeButton.className = "rating-close";
   closeButton.dataset.ratingClose = "";
+  closeButton.dataset.i18nAriaLabel = "rating.closeLabel";
   closeButton.setAttribute("aria-label", t("rating.closeLabel"));
-  closeButton.textContent = "\u00d7";
+  closeButton.innerHTML = '<svg class="close-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m6 6 12 12M18 6 6 18" /></svg>';
 
   const content = document.createElement("div");
   content.dataset.ratingContent = "";
@@ -1916,6 +6305,7 @@ function openRatingPrompt(item) {
   const stars = document.createElement("div");
   stars.className = "rating-stars";
   stars.setAttribute("role", "radiogroup");
+  stars.dataset.i18nAriaLabel = "rating.scoreLabel";
   stars.setAttribute("aria-label", t("rating.scoreLabel"));
   [1, 2, 3, 4, 5].forEach((score) => {
     const button = document.createElement("button");
@@ -1928,48 +6318,47 @@ function openRatingPrompt(item) {
 
   const actions = document.createElement("div");
   actions.className = "rating-actions";
+  const doneButton = document.createElement("button");
+  doneButton.type = "button";
+  doneButton.className = "next-button";
+  doneButton.dataset.ratingSubmit = "";
+  doneButton.dataset.i18n = "rating.done";
+  doneButton.textContent = t("rating.done");
   const addUpButton = document.createElement("button");
   addUpButton.type = "button";
   addUpButton.className = "toolbar-button";
   addUpButton.dataset.ratingAddUp = "";
   addUpButton.textContent = t("rating.addUp");
-  const doneButton = document.createElement("button");
-  doneButton.type = "button";
-  doneButton.className = "next-button";
-  doneButton.dataset.ratingClose = "";
-  doneButton.textContent = t("rating.done");
   actions.append(addUpButton, doneButton);
-
-  const optOut = document.createElement("label");
-  optOut.className = "rating-opt-out";
-  const optOutInput = document.createElement("input");
-  optOutInput.type = "checkbox";
-  optOutInput.dataset.ratingOptOut = "";
-  const optOutText = document.createElement("span");
-  optOutText.textContent = t("rating.optOut");
-  optOut.append(optOutInput, optOutText);
 
   const tabs = document.createElement("div");
   tabs.className = "rating-tabs";
   tabs.setAttribute("role", "tablist");
+  tabs.dataset.i18nAriaLabel = "rating.dialogLabel";
   tabs.setAttribute("aria-label", t("rating.dialogLabel"));
   const previousTab = document.createElement("button");
   previousTab.type = "button";
   previousTab.dataset.ratingTab = "previous";
   previousTab.setAttribute("role", "tab");
-  previousTab.disabled = !promptItems.previous;
+  previousTab.disabled = !previousRateable;
+  previousTab.dataset.i18n = "rating.previousTab";
   previousTab.textContent = t("rating.previousTab");
   const currentTab = document.createElement("button");
   currentTab.type = "button";
+  currentTab.disabled = !currentRateable;
   currentTab.dataset.ratingTab = "current";
   currentTab.setAttribute("role", "tab");
+  currentTab.dataset.i18n = "rating.currentTab";
   currentTab.textContent = t("rating.currentTab");
   tabs.append(previousTab, currentTab);
 
   const message = document.createElement("p");
   message.className = "rating-message";
   message.dataset.ratingMessage = "";
-  card.append(closeButton, content, stars, actions, optOut, tabs, message);
+  const body = document.createElement("div");
+  body.className = "rating-body";
+  body.append(content, stars, actions, tabs, message);
+  card.append(closeButton, body);
   root.append(backdrop, card);
   document.body.appendChild(root);
   state.ratingPromptElement = root;
@@ -1981,35 +6370,11 @@ function maybeShowRatingPromptForProgress(item, currentTime, duration) {
 }
 
 function handleRatingCurrentItemChange(currentItem) {
-  if (!state.ratingPromptElement) {
-    return;
-  }
-  const currentId = String(currentItem?.id || "");
-  if (!currentId || currentId !== state.ratingPromptItemId) {
-    closeRatingPrompt({ submit: true });
-    return;
-  }
+  refreshOpenRatingPrompt(currentItem);
 }
 
 function handleRequesterSelectionChange() {
   render();
-}
-
-async function apiGet(url, options = {}) {
-  const response = await fetch(url, {
-    cache: "no-store",
-    headers: clientHeaders(),
-    signal: options.signal,
-  });
-  const data = await response.json();
-  if (!response.ok || !data.ok) {
-    const error = new Error(localizedApiMessage(data.error) || t("error.requestFailed"));
-    error.status = response.status;
-    error.code = data.code || "";
-    error.payload = data;
-    throw error;
-  }
-  return data.data;
 }
 
 const hevcCanPlayTypes = [
@@ -2101,18 +6466,35 @@ async function reportMediaCapabilities() {
 async function fetchState() {
   const previousOffsetMs = currentAvOffsetMs();
   const previousData = state.data;
-  const response = await fetch("/api/state", {
-    headers: clientHeaders(),
-  });
-  const payload = await response.json();
-  if (!response.ok || !payload.ok) {
-    throw new Error(localizedApiMessage(payload.error) || t("error.stateFailed"));
+  const sequence = ++state.remoteAccessRequestSequence;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10_000);
+  let response, payload;
+  try {
+    response = await fetch("/api/state", {
+      headers: clientHeaders(), signal: controller.signal,
+    });
+    payload = await parseApiResponse(response, "/api/state");
+    if (!response.ok || !payload.ok || !validatedHostSnapshotIdentity(payload.data)) {
+      throw new Error(localizedApiMessage(payload.error) || t("error.stateFailed"));
+    }
+  } catch (error) {
+    const kind = response && !response.ok ? "http"
+      : response ? "invalid"
+      : ["TimeoutError", "AbortError"].includes(error.name) ? "timeout" : "network";
+    updateRemoteAccessFailure({ kind, status: response?.status }, sequence);
+    throw error;
+  } finally {
+    clearTimeout(timeout);
   }
-  if (!applyFreshStateSnapshot(payload.data)) {
-    return;
+  updateRemoteAccessFailure(null, sequence);
+  if (!acceptHostStateSnapshot(payload.data)) {
+    if (state.hasValidStateResponse) scheduleStartupAppUpdateCheck();
+    return false;
   }
-  maybeShowIncomingRequestToast(previousData, state.data);
-  maybeShowSongTransitionOverlay(previousData, state.data);
+  state.hasValidStateResponse = true;
+  window.BilikaraAnnouncements?.sync();
+  scheduleStartupAppUpdateCheck();
 
   syncLocalPlayerSettingsFromSnapshot(state.data?.player_settings);
   if (!state.localPreferencesHydrated) {
@@ -2122,7 +6504,7 @@ async function fetchState() {
     const serverMuted = Boolean(state.data?.player_settings?.is_muted);
     state.localPreferencesHydrated = true;
     if (rememberedVolume !== serverVolume || rememberedMute !== serverMuted) {
-      state.data = await apiPost("/api/player/volume", {
+      await apiPostStateSnapshot("/api/player/volume", {
         volume_percent: rememberedVolume,
         is_muted: rememberedMute,
       });
@@ -2138,13 +6520,22 @@ async function fetchState() {
     refreshRetryButtons();
   }
   resyncMountedLocalPlayerIfOffsetChanged(previousOffsetMs);
+  return true;
 }
 
 function renderSignatureForData(data) {
   if (!data) {
     return "";
   }
-  const { player_status: _playerStatus, ...renderedData } = data;
+  // Transport revisions advance with playback observations, too. They guard
+  // snapshot acceptance, but are not visual changes to the Host workspace.
+  const {
+    player_status: _playerStatus,
+    state_revision: _stateRevision,
+    revision: _revision,
+    updated_at: _updatedAt,
+    ...renderedData
+  } = data;
   return JSON.stringify(renderedData);
 }
 
@@ -2159,24 +6550,25 @@ function hasDownloadingItems(data) {
   return items.some((item) => item?.cache_status === "downloading");
 }
 
-async function searchGatchaCache(query) {
+async function searchGatchaCache(query, {offset = 0, limit = 80} = {}) {
   const normalizedQuery = String(query || "").trim();
-  const response = await fetch(`/api/gatcha/search?q=${encodeURIComponent(normalizedQuery)}`, {
+  const response = await fetch(`/api/gatcha/search?q=${encodeURIComponent(normalizedQuery)}&offset=${offset}&limit=${limit}`, {
     headers: clientHeaders(),
   });
   const payload = await response.json();
   if (!response.ok || !payload.ok) {
     throw new Error(localizedApiMessage(payload.error) || t("error.searchFailed"));
   }
-  return Array.isArray(payload.data?.items) ? payload.data.items : [];
+  return {...payload.data, items: Array.isArray(payload.data?.items) ? payload.data.items : []};
 }
 
-async function searchLarkPool(query) {
+async function searchCatalog(query, {offset = 0, limit = 80} = {}) {
   const normalizedQuery = String(query || "").trim();
   const params = new URLSearchParams();
   params.set("q", normalizedQuery);
-  params.set("limit", "80");
-  const response = await fetch(`/api/lark/search?${params.toString()}`, {
+  params.set("limit", String(limit));
+  params.set("offset", String(offset));
+  const response = await fetch(`/api/catalog/search?${params.toString()}`, {
     cache: "no-store",
     headers: clientHeaders(),
   });
@@ -2184,30 +6576,15 @@ async function searchLarkPool(query) {
   if (!response.ok || !payload.ok) {
     throw new Error(localizedApiMessage(payload.error) || t("error.larkSearchFailed"));
   }
-  return Array.isArray(payload.data?.items) ? payload.data.items : [];
+  return {...payload.data, items: Array.isArray(payload.data?.items) ? payload.data.items : []};
 }
 
-async function searchLarkPoolTable(query, tableIndex) {
-  const normalizedQuery = String(query || "").trim();
-  const params = new URLSearchParams();
-  params.set("q", normalizedQuery);
-  params.set("table", String(tableIndex));
-  params.set("limit", "80");
-  const response = await fetch(`/api/lark/search?${params.toString()}`, {
-    cache: "no-store",
-    headers: clientHeaders(),
-  });
-  const payload = await response.json();
-  if (!response.ok || !payload.ok) {
-    throw new Error(localizedApiMessage(payload.error) || t("error.larkSearchFailed"));
-  }
-  return Array.isArray(payload.data?.items) ? payload.data.items : [];
-}
 
-async function fetchD1Browse({ kind = "name", letter = "", query = "", tag = "", locale = "", limit = 100 } = {}) {
+async function fetchD1Browse({ kind = "name", letter = "", query = "", tag = "", locale = "", offset = 0, limit = 100 } = {}) {
   const params = new URLSearchParams();
   params.set("kind", kind === "artist" ? "artist" : "name");
   params.set("limit", String(limit));
+  if (offset) params.set("offset", String(offset));
   const normalizedLetter = String(letter || "").trim().toUpperCase();
   const normalizedQuery = String(query || "").trim();
   const normalizedTag = String(tag || "").trim();
@@ -2247,6 +6624,24 @@ async function approvePendingReviewItems(bvids) {
     BILIKARA_ADMIN_SECRET: state.bilikaraSecret,
     bvids: Array.isArray(bvids) ? bvids : [],
     limit: 20,
+  });
+}
+
+async function fetchBlacklistItems({ query = "", offset = 0, limit = 20 } = {}) {
+  return apiPost("/api/admin-blacklist/list", {
+    BILIKARA_ADMIN_SECRET: state.bilikaraSecret,
+    query: String(query || "").trim(),
+    offset: Math.max(0, Number(offset) || 0),
+    limit: Math.max(1, Number(limit) || 20),
+  });
+}
+
+async function restoreBlacklistItem(bvid, restoreVideo = false) {
+  return apiPost("/api/admin-blacklist/restore", {
+    bvid: String(bvid || "").trim(),
+    BILIKARA_ADMIN_SECRET: state.bilikaraSecret,
+    restore_video: Boolean(restoreVideo),
+    restored_by: selectedRequesterName() || developerModeRequesterName,
   });
 }
 
@@ -2293,7 +6688,7 @@ async function fetchD1CategoryBrowse({ tags = [], query = "", offset = 0, limit 
   };
 }
 
-async function fetchGatchaBrowse(uid = "", query = "") {
+async function fetchGatchaBrowse(uid = "", query = "", page = null) {
   const params = new URLSearchParams();
   const normalizedUid = String(uid || "").trim();
   const normalizedQuery = String(query || "").trim();
@@ -2303,6 +6698,7 @@ async function fetchGatchaBrowse(uid = "", query = "") {
   if (normalizedQuery) {
     params.set("q", normalizedQuery);
   }
+  if (page) { params.set("offset", String(page.offset)); params.set("limit", String(page.limit)); }
   const queryString = params.toString();
   const response = await fetch(`/api/gatcha/browse${queryString ? `?${queryString}` : ""}`, {
     cache: "no-store",
@@ -2315,7 +6711,7 @@ async function fetchGatchaBrowse(uid = "", query = "") {
   return payload.data || { owners: [], items: [] };
 }
 
-async function fetchGatchaFavlistBrowse(folderId = "", query = "") {
+async function fetchGatchaFavlistBrowse(folderId = "", query = "", page = null) {
   const params = new URLSearchParams();
   const normalizedFolderId = String(folderId || "").trim();
   const normalizedQuery = String(query || "").trim();
@@ -2325,6 +6721,7 @@ async function fetchGatchaFavlistBrowse(folderId = "", query = "") {
   if (normalizedQuery) {
     params.set("q", normalizedQuery);
   }
+  if (page) { params.set("offset", String(page.offset)); params.set("limit", String(page.limit)); }
   const queryString = params.toString();
   const response = await fetch(`/api/gatcha/favlist/browse${queryString ? `?${queryString}` : ""}`, {
     cache: "no-store",
@@ -2337,8 +6734,8 @@ async function fetchGatchaFavlistBrowse(folderId = "", query = "") {
   return payload.data || { folders: [], items: [] };
 }
 
-async function fetchPoolConfig() {
-  const response = await fetch("/api/gatcha/pool-config", {
+async function fetchPoolConfig(requester = selectedRequesterName()) {
+  const response = await fetch(`/api/gatcha/pool-config?${new URLSearchParams({ requester_name: requester })}`, {
     cache: "no-store",
     headers: clientHeaders(),
   });
@@ -2349,8 +6746,8 @@ async function fetchPoolConfig() {
   return payload.data || {};
 }
 
-async function savePoolConfig(payload) {
-  return apiPost("/api/gatcha/pool-config", payload);
+async function savePoolConfig(payload, requester = selectedRequesterName()) {
+  return apiPost("/api/gatcha/pool-config", { ...payload, requester_name: requester });
 }
 
 async function previewGatchaUid(uid) {
@@ -2358,7 +6755,10 @@ async function previewGatchaUid(uid) {
 }
 
 async function addGatchaUid(uid) {
-  return apiPost("/api/gatcha/uids/add", { uid: String(uid || "").trim() });
+  return apiPost("/api/gatcha/uids/add", {
+    uid: String(uid || "").trim(),
+    queue: Boolean(state.data?.capabilities?.source_queue),
+  });
 }
 
 async function refreshGatchaCache() {
@@ -2369,14 +6769,20 @@ async function previewGatchaFavlist(uid) {
   return apiPost("/api/gatcha/favlist/preview", { uid: String(uid || "").trim() });
 }
 
-async function pullGatchaFavlist(uid, folderIds = []) {
+async function pullGatchaFavlist(uid, folderIds = [], folders = []) {
   return apiPost("/api/gatcha/favlist", {
+    queue: Boolean(state.data?.capabilities?.source_queue),
     uid: String(uid || "").trim(),
     folder_ids: Array.isArray(folderIds) ? folderIds : [],
+    ...(state.data?.capabilities?.source_queue_titles ? {
+      folder_titles: Object.fromEntries(folders.filter(folder => folderIds.includes(String(folder.id || folder.folder_id)))
+        .map(folder => [String(folder.id || folder.folder_id).split(":").pop(), String(folder.title || "").trim().slice(0, 200)])),
+    } : {}),
   });
 }
 
 function gatchaUidResultMessage(result, fallbackUid = "") {
+  if (result?.queued) return t(result.duplicate ? "gatcha.sourceAlreadyQueued" : "gatcha.sourceQueued");
   const cache = result?.cache || {};
   const addedCount = Number(cache.added_count || 0);
   const totalCount = Number(cache.total_count || 0);
@@ -2397,18 +6803,19 @@ function gatchaUidResultMessage(result, fallbackUid = "") {
 async function confirmGatchaUidAdd(intent) {
   closeConfirm();
   const messageTarget = intent.messageTarget || "gatcha";
-  if (gatchaTaskBusy()) {
+  if (gatchaSourceBusy()) {
     setGatchaUidFlowMessage(messageTarget, gatchaTaskBusyMessage(), true);
     renderGatchaUidFace();
     return;
   }
   state.gatchaUidSaving = true;
   renderGatchaUidFace();
-  setGatchaUidFlowMessage(messageTarget, t("gatcha.pullingOwnerItems", { name: intent.name || intent.uid }));
+  setGatchaUidFlowLoadingMessage(messageTarget, t("gatcha.pullingOwnerItems", { name: intent.name || intent.uid }));
+  window.BilikaraSourceStatus?.rememberSource({ uid: intent.uid, title: intent.name });
   try {
     const result = await addGatchaUid(intent.uid);
     setGatchaUidFlowMessage(messageTarget, gatchaUidResultMessage(result, intent.uid));
-    clearGatchaUidFlowInput(intent.clearInputId || "gatcha-uid-input");
+    clearGatchaUidFlowInput(intent.clearInputId || "modal-follow-uid-input");
     await refreshFollowBrowseAfterGatchaUidAdd(result?.uid || intent.uid);
   } catch (error) {
     setGatchaUidFlowMessage(messageTarget, error.message, true);
@@ -2420,7 +6827,10 @@ async function confirmGatchaUidAdd(intent) {
 
 function setDeveloperMode(enabled) {
   state.developerMode = Boolean(enabled);
+  syncHostSearchCounts();
   if (!state.developerMode) {
+    closeExpandedRequestWorkspace({ restoreFocus: false });
+    closeDeveloperTagResetModal({ restoreFocus: false });
     state.bilikaraSecret = "";
     state.pendingReviewItems = [];
     state.pendingReviewTotal = 0;
@@ -2430,16 +6840,23 @@ function setDeveloperMode(enabled) {
     state.pendingReviewSeq += 1;
     state.pendingReviewMessage = "";
     state.pendingReviewError = "";
-    const activeReviewButton = Array.from(elements.searchSidebarItems || []).find(
-      (button) => button.dataset.target === "review" && button.classList.contains("active"),
-    );
-    if (activeReviewButton) {
-      elements.searchSidebarItems?.forEach((button) => {
-        button.classList.toggle("active", button.dataset.target === "search");
-      });
-      elements.searchModalPlaceholder?.classList.remove("hidden");
-      elements.favlistBrowserView?.classList.add("hidden");
-      elements.searchModalOtherView?.classList.add("hidden");
+    state.blacklistItems = [];
+    state.blacklistTotal = 0;
+    state.blacklistOffset = 0;
+    state.blacklistHasMore = false;
+    state.blacklistQuery = "";
+    state.blacklistLoaded = false;
+    state.blacklistLoading = false;
+    state.blacklistSeq += 1;
+    state.blacklistMessage = "";
+    state.blacklistError = "";
+    state.maintenanceJobRunning = "";
+    state.maintenanceJobMessage = "";
+    state.maintenanceJobError = "";
+    state.catalogAdvancedTool = "";
+    elements.catalogAdvancedMenu?.removeAttribute("open");
+    if (state.requestSubview === "discover") {
+      syncDiscoverModeSelection();
     }
   }
   document.body?.classList.toggle("developer-mode", state.developerMode);
@@ -2463,11 +6880,12 @@ function openBilikaraSecretModal() {
     elements.bilikaraSecretMessage.textContent = "";
     elements.bilikaraSecretMessage.classList.remove("is-error");
   }
+  state.bilikaraSecretOpener = document.activeElement;
   elements.bilikaraSecretModal?.classList.remove("hidden");
   window.setTimeout(() => elements.bilikaraSecretInput?.focus(), 0);
 }
 
-function closeBilikaraSecretModal() {
+function closeBilikaraSecretModal({ restoreFocus = true } = {}) {
   if (state.bilikaraSecretVerifying) {
     return;
   }
@@ -2478,6 +6896,11 @@ function closeBilikaraSecretModal() {
   if (elements.bilikaraSecretMessage) {
     elements.bilikaraSecretMessage.textContent = "";
     elements.bilikaraSecretMessage.classList.remove("is-error");
+  }
+  const opener = state.bilikaraSecretOpener;
+  state.bilikaraSecretOpener = null;
+  if (restoreFocus && opener?.isConnected) {
+    opener.focus({ preventScroll: true });
   }
 }
 
@@ -2523,7 +6946,7 @@ async function verifyBilikaraSecret() {
     }
   }
 }
-function closeDeveloperTagResetModal() {
+function closeDeveloperTagResetModal({ restoreFocus = true } = {}) {
   if (state.developerTagResetSaving) {
     return;
   }
@@ -2534,6 +6957,11 @@ function closeDeveloperTagResetModal() {
     elements.developerTagResetFields.innerHTML = "";
   }
   elements.developerTagResetDeleteMid?.classList.add("hidden");
+  const opener = state.developerTagResetOpener;
+  state.developerTagResetOpener = null;
+  if (restoreFocus && opener?.isConnected) {
+    opener.focus({ preventScroll: true });
+  }
 }
 
 function renderDeveloperActionFields(fields) {
@@ -2556,39 +6984,85 @@ function renderDeveloperActionFields(fields) {
 }
 
 function openDeveloperTagResetModal(snapshot, action = "reset-tags") {
-  if (!state.developerMode || !snapshot?.bvid) {
+  if (!state.developerMode || state.developerTagResetSaving || (!snapshot?.bvid && !snapshot?.items?.length)) {
     return;
   }
+  state.developerTagResetOpener = document.activeElement;
   state.developerTagResetItem = snapshot;
   state.developerTagResetAction = action;
+  elements.developerTagResetError.hidden = true;
+  renderDeveloperTagResetModal();
+  elements.developerTagResetModal?.classList.remove("hidden");
+  elements.developerTagResetConfirm?.focus({ preventScroll: true });
+}
+
+function renderDeveloperTagResetModal() {
+  const snapshot = state.developerTagResetItem;
+  if (!snapshot) return;
+  const action = state.developerTagResetAction;
   const isDelete = action === "delete-entry";
+  const isReject = action === "reject-entry";
+  const isRejectPage = action === "reject-page";
+  const isBlacklistRelease = action === "blacklist-release";
+  const isBlacklistRestore = action === "blacklist-release-restore";
   if (elements.developerTagResetTitle) {
-    elements.developerTagResetTitle.textContent = isDelete ? "删除 D1 条目" : "重置标签字段";
+    elements.developerTagResetTitle.textContent = isRejectPage ? t("search.reviewRejectPage") : isReject
+      ? "拒绝并加入黑名单"
+      : isBlacklistRestore
+        ? t("search.blacklistReleaseRestore")
+        : isBlacklistRelease
+          ? t("search.blacklistRelease")
+          : isDelete
+            ? "拉黑并删除 D1 条目"
+            : "重置标签字段";
   }
   if (elements.developerTagResetText) {
     const title = snapshot.title ? `《${snapshot.title}》` : "当前条目";
-    elements.developerTagResetText.textContent = isDelete
-      ? `确认从 D1 删除 ${title} (${snapshot.bvid})？`
-      : `确认重置 ${title} (${snapshot.bvid}) 的标签字段？`;
+    elements.developerTagResetText.textContent = isRejectPage
+      ? t("search.reviewRejectPageConfirm", { count: snapshot.items.length }) : isReject
+      ? `确认拒绝 ${title} (${snapshot.bvid})，并阻止收藏夹再次写入 D1？`
+      : isBlacklistRestore
+        ? `确认解除 ${title} (${snapshot.bvid}) 的黑名单并恢复删除前记录？`
+        : isBlacklistRelease
+          ? `确认解除 ${title} (${snapshot.bvid}) 的黑名单？此操作不会立即恢复视频。`
+          : isDelete
+            ? `确认将 ${title} (${snapshot.bvid}) 加入黑名单并从 D1 删除？`
+            : `确认重置 ${title} (${snapshot.bvid}) 的标签字段？`;
   }
-  renderDeveloperActionFields(snapshot.fields);
+  renderDeveloperActionFields(isRejectPage
+    ? Object.fromEntries(snapshot.items.map(item => [item.bvid, item.title])) : snapshot.fields);
   if (elements.developerTagResetNote) {
-    elements.developerTagResetNote.textContent = isDelete
-      ? "确认后将按 bvid 删除 D1 中对应条目；此操作不会删除 B 站视频本体。"
-      : "确认后目标变更：清空 tag_1-5、preserved_2-5，并将 tag_status 改为 0。";
+    elements.developerTagResetNote.textContent = isRejectPage ? t("search.reviewRejectPageNote") : isReject
+      ? "视频快照会保存在黑名单中；点歌和本地播放不受影响。"
+      : isBlacklistRestore
+        ? "将从黑名单快照恢复 D1 记录，并重新建立名称/歌手浏览索引。"
+        : isBlacklistRelease
+          ? "只解除写入拦截；后续收藏夹刷新可以再次收录该视频。"
+          : isDelete
+            ? "只拉黑当前 BV；后续收藏夹不会重新写入，可在黑名单页解除或恢复。"
+            : "确认后目标变更：清空 tag_1-5、preserved_2-5，并将 tag_status 改为 0。";
   }
   if (elements.developerTagResetConfirm) {
     elements.developerTagResetConfirm.disabled = false;
-    elements.developerTagResetConfirm.textContent = isDelete ? "确认删除" : "确认重置";
-    elements.developerTagResetConfirm.classList.toggle("danger-button", isDelete);
+    elements.developerTagResetConfirm.textContent = isRejectPage ? t("search.reviewRejectConfirm") : isReject
+      ? "确认拒绝"
+      : isBlacklistRestore
+        ? t("search.blacklistReleaseRestore")
+        : isBlacklistRelease
+          ? t("search.blacklistRelease")
+          : isDelete
+            ? "确认拉黑并删除"
+            : "确认重置";
+    elements.developerTagResetConfirm.classList.toggle("danger-button", isDelete || isReject || isRejectPage);
   }
   if (elements.developerTagResetDeleteMid) {
     const mid = String(snapshot.fields?.mid || "").trim();
     elements.developerTagResetDeleteMid.classList.toggle("hidden", !isDelete || !mid);
     elements.developerTagResetDeleteMid.disabled = false;
-    elements.developerTagResetDeleteMid.textContent = mid ? `按 MID 删除 ${mid}` : "按 MID 删除";
+    elements.developerTagResetDeleteMid.textContent = mid
+      ? `拉黑 MID ${mid} 的现有稿件`
+      : "按 MID 拉黑现有稿件";
   }
-  elements.developerTagResetModal?.classList.remove("hidden");
 }
 
 function parseDeveloperActionButton(button) {
@@ -2604,15 +7078,23 @@ function parseDeveloperActionButton(button) {
 }
 
 function handleDeveloperTagResetButtonClick(event) {
-  const button = event.target.closest('button[data-dev-action="reset-tags"], button[data-dev-action="delete-entry"]');
-  if (!button || !elements.searchModal?.contains(button)) {
+  const button = event.target.closest("button[data-dev-action]");
+  if (!button || !elements.requestWorkspace?.contains(button)) {
     return;
   }
   event.preventDefault();
   event.stopPropagation();
   const snapshot = parseDeveloperActionButton(button);
   if (snapshot) {
-    openDeveloperTagResetModal(snapshot, String(button.dataset.devAction || "reset-tags"));
+    let action = String(button.dataset.devAction || "reset-tags");
+    if (
+      action === "delete-entry"
+      && button.closest("[data-pending-review-view]")
+      && state.pendingReviewItems.some((item) => searchResultBvid(item) === snapshot.bvid)
+    ) {
+      action = "reject-entry";
+    }
+    openDeveloperTagResetModal(snapshot, action);
   }
 }
 
@@ -2625,13 +7107,61 @@ async function deleteDeveloperD1Entry(snapshot) {
   if (reviewCacheExhausted) {
     await loadPendingReviewItems({ force: true });
   }
-  setAppMessage(`已删除 ${snapshot.bvid} 的 D1 条目。`);
+  setAppMessage(`已将 ${snapshot.bvid} 加入黑名单并从 D1 删除。`);
+}
+
+async function rejectPendingReviewEntry(snapshot, { refresh = true } = {}) {
+  await apiPost("/api/admin-review/reject", {
+    bvid: snapshot.bvid,
+    record: snapshot.fields,
+    rejected_by: selectedRequesterName() || developerModeRequesterName,
+    BILIKARA_ADMIN_SECRET: state.bilikaraSecret,
+  });
+  const reviewCacheExhausted = removePendingReviewItem(snapshot.bvid);
+  if (reviewCacheExhausted && refresh) {
+    await loadPendingReviewItems({ force: true });
+  }
+  if (refresh) setAppMessage(`已拒绝 ${snapshot.bvid} 并加入黑名单。`);
+}
+
+function openPendingReviewRejectModal() {
+  if (!state.developerMode || !state.bilikaraSecret || state.pendingReviewLoading
+    || state.pendingReviewApproving || state.developerTagResetSaving) return;
+  const items = [...new Map(state.pendingReviewItems.map(item => {
+    const snapshot = developerDeleteSnapshot(item);
+    return [snapshot.bvid, snapshot];
+  }).filter(([bvid]) => bvid)).values()];
+  if (items.length) openDeveloperTagResetModal({ items }, "reject-page");
+}
+
+async function rejectPendingReviewPage(snapshot) {
+  const count = snapshot.items.length;
+  // The confirmed snapshot is the whole scope. Never append the next page.
+  while (snapshot.items.length) {
+    if (!state.developerMode || !state.bilikaraSecret) throw new Error(t("search.reviewNeedDeveloper"));
+    await rejectPendingReviewEntry(snapshot.items[0], { refresh: false });
+    snapshot.items.shift();
+  }
+  await loadPendingReviewItems({ force: true });
+  setAppMessage(t("search.reviewRejected", { count }));
+}
+
+async function restoreDeveloperBlacklistEntry(snapshot, restoreVideo) {
+  await restoreBlacklistItem(snapshot.bvid, restoreVideo);
+  const nextOffset = state.blacklistItems.length <= 1 && state.blacklistOffset > 0
+    ? Math.max(0, state.blacklistOffset - state.blacklistLimit)
+    : state.blacklistOffset;
+  await loadBlacklistItems({ force: true, offset: nextOffset });
+  state.blacklistMessage = t(restoreVideo ? "search.blacklistRestored" : "search.blacklistReleased", {
+    bvid: snapshot.bvid,
+  });
+  renderBlacklistView();
 }
 
 async function deleteDeveloperD1EntriesByMid(snapshot) {
   const mid = String(snapshot.fields?.mid || "").trim();
   if (!mid) {
-    throw new Error("缺少 MID，无法按 MID 删除。");
+    throw new Error("缺少 MID，无法拉黑现有稿件。");
   }
   const result = await apiPost("/api/admin-video/delete-mid", {
     mid,
@@ -2646,12 +7176,12 @@ async function deleteDeveloperD1EntriesByMid(snapshot) {
       state.pendingReviewLoaded = false;
       await loadPendingReviewItems({ force: true });
     }
-    if (elements.searchModalOtherView?.querySelector("[data-pending-review-view]")) {
+    if (elements.catalogAdvancedContent?.querySelector("[data-pending-review-view]")) {
       renderPendingReviewView();
     }
   }
   const deleted = Number(result?.deleted_count ?? result?.changed ?? 0);
-  setAppMessage(`已按 MID ${mid} 删除 ${deleted} 条 D1 条目。`);
+  setAppMessage(`已将 D1 中 MID ${mid} 的 ${deleted} 条现有稿件加入黑名单并删除。`);
 }
 
 async function resetDeveloperTagFields(snapshot) {
@@ -2668,41 +7198,76 @@ async function confirmDeveloperAction() {
   }
   const snapshot = state.developerTagResetItem;
   const action = state.developerTagResetAction || "reset-tags";
-  if (!state.developerMode || !state.bilikaraSecret || !snapshot?.bvid) {
+  if (!state.developerMode || !state.bilikaraSecret || !(action === "reject-page" ? snapshot?.items?.length : snapshot?.bvid)) {
     closeDeveloperTagResetModal();
     return;
   }
   state.developerTagResetSaving = true;
+  elements.developerTagResetError.hidden = true;
+  const confirmLabel = elements.developerTagResetConfirm?.textContent;
+  const previousDisabled = elements.developerTagResetConfirm?.disabled;
   if (elements.developerTagResetConfirm) {
     elements.developerTagResetConfirm.disabled = true;
+    elements.developerTagResetConfirm.setAttribute("aria-busy", "true");
+    elements.developerTagResetConfirm.textContent = t("search.reviewApproving");
   }
   if (elements.developerTagResetDeleteMid) {
     elements.developerTagResetDeleteMid.disabled = true;
   }
+  renderPendingReviewView();
   try {
-    if (action === "delete-entry") {
+    if (action === "reject-page") {
+      await rejectPendingReviewPage(snapshot);
+    } else if (action === "delete-entry") {
       await deleteDeveloperD1Entry(snapshot);
+    } else if (action === "reject-entry") {
+      await rejectPendingReviewEntry(snapshot);
+    } else if (action === "blacklist-release" || action === "blacklist-release-restore") {
+      await restoreDeveloperBlacklistEntry(snapshot, action === "blacklist-release-restore");
     } else {
       await resetDeveloperTagFields(snapshot);
     }
     state.developerTagResetSaving = false;
     closeDeveloperTagResetModal();
   } catch (error) {
-    setAppMessage(error?.message || (action === "delete-entry" ? "删除失败。" : "重置失败。"), true);
+    const fallbackMessage = action === "delete-entry"
+      ? "删除失败。"
+      : action === "reject-entry" || action === "reject-page"
+        ? "加入黑名单失败。"
+        : action === "blacklist-release" || action === "blacklist-release-restore"
+          ? "解除黑名单失败。"
+          : "重置失败。";
+    setAppMessage(error?.message || fallbackMessage, true);
+    elements.developerTagResetError.textContent = error?.message || fallbackMessage;
+    elements.developerTagResetError.hidden = false;
   } finally {
     state.developerTagResetSaving = false;
     if (elements.developerTagResetConfirm) {
-      elements.developerTagResetConfirm.disabled = false;
+      elements.developerTagResetConfirm.disabled = previousDisabled;
+      elements.developerTagResetConfirm.removeAttribute("aria-busy");
+      elements.developerTagResetConfirm.textContent = confirmLabel;
     }
     if (elements.developerTagResetDeleteMid) {
       elements.developerTagResetDeleteMid.disabled = false;
     }
+    if (state.developerTagResetItem) renderDeveloperTagResetModal();
+    renderPendingReviewView();
   }
 }
 
 function hideSearchResults() {
+  hideAndroidBrowsePages(elements.searchResults);
   elements.searchResults.innerHTML = "";
   elements.searchResults.classList.add("hidden");
+}
+
+function hideLarkSearchResults() {
+  hideAndroidBrowsePages(elements.larkSearchResults);
+  if (!elements.larkSearchResults) {
+    return;
+  }
+  elements.larkSearchResults.innerHTML = "";
+  elements.larkSearchResults.classList.add("hidden");
 }
 
 function searchResultOwnerName(item) {
@@ -2762,7 +7327,7 @@ async function confirmDeveloperDeleteMid() {
     state.developerTagResetSaving = false;
     closeDeveloperTagResetModal();
   } catch (error) {
-    setAppMessage(error?.message || "按 MID 删除失败。", true);
+    setAppMessage(error?.message || "按 MID 拉黑现有稿件失败。", true);
   } finally {
     state.developerTagResetSaving = false;
     if (elements.developerTagResetConfirm) {
@@ -2839,7 +7404,7 @@ function createDeveloperDeleteButton(item) {
   button.dataset.devAction = "delete-entry";
   button.dataset.item = JSON.stringify(snapshot);
   button.textContent = "删除";
-  button.title = "删除 D1 条目";
+  button.title = "拉黑并删除 D1 条目";
   return button;
 }
 
@@ -2909,17 +7474,20 @@ function searchResultRatingText(item) {
   return rating == null ? t("search.ratingNone") : t("search.ratingValue", { rating: formatSearchRating(rating) });
 }
 
-function createSearchResultRatingStars(item) {
+function createSearchResultRatingBadge(item) {
   const rating = searchResultRatingValue(item);
   if (rating == null) {
     return null;
   }
-  const stars = document.createElement("span");
-  stars.className = "search-result-rating-stars";
-  stars.setAttribute("aria-label", searchResultRatingText(item));
-  stars.style.setProperty("--rating-width", `${(rating / 5) * 100}%`);
-  stars.innerHTML = `<span class="search-result-rating-stars-base">★★★★★</span><span class="search-result-rating-stars-fill">★★★★★</span>`;
-  return stars;
+  const badge = document.createElement("span");
+  badge.className = "search-result-rating-badge";
+  badge.setAttribute("role", "img");
+  badge.setAttribute("aria-label", searchResultRatingText(item));
+  badge.title = searchResultRatingText(item);
+  const value = document.createElement("span");
+  value.textContent = `★ ${rating.toFixed(1)}`;
+  badge.appendChild(value);
+  return badge;
 }
 
 function searchResultStatusLabel(item) {
@@ -2932,7 +7500,7 @@ function searchResultStatusLabel(item) {
   }
 
   const source = String(item?.source || "").trim();
-  if (source === "bilikara" || source === "cloudflare") {
+  if (source === "bilikara" || source === "cloudflare" || source === "sheets") {
     return "";
   }
   if (source === "favlist") {
@@ -2948,10 +7516,6 @@ function createSearchResultUrlLine(item) {
   const line = document.createElement("div");
   line.className = "search-result-url";
 
-  const bvid = document.createElement("span");
-  bvid.className = "search-result-bvid";
-  bvid.textContent = String(item?.bvid || item?.url || "");
-
   const ownerName = searchResultOwnerName(item);
   if (ownerName) {
     const owner = document.createElement("span");
@@ -2963,12 +7527,113 @@ function createSearchResultUrlLine(item) {
   rating.className = "search-result-rating-text";
   rating.textContent = searchResultRatingText(item);
   line.appendChild(rating);
-  line.appendChild(bvid);
 
   return line;
 }
 
-function createSearchResultItem(item) {
+function requestResultItemKey(item) {
+  return String(
+    item?.bvid
+      || item?.url
+      || item?.id
+      || `${item?.title || ""}\n${searchResultOwnerName(item)}`,
+  ).trim();
+}
+
+function requestDetailOriginForContainer(container, source = "") {
+  if (!container) {
+    return null;
+  }
+  if (container === elements.larkSearchResults || container.closest?.("#request-search-shared")) {
+    return { key: "shared", subview: "search", mode: "shared", source: source || "lark" };
+  }
+  if (container === elements.searchResults || container.closest?.("#request-search-local")) {
+    return { key: "local", subview: "search", mode: "local", source: source || "search" };
+  }
+  if (container === elements.followSongResults || container.closest?.("#request-sources-uids")) {
+    return { key: "followed", subview: "sources", mode: "uids", source: source || "modalFollow" };
+  }
+  if (container === elements.favlistSongResults || container.closest?.("#request-sources-favorites")) {
+    return { key: "favorites", subview: "sources", mode: "favorites", source: source || "modalFavlist" };
+  }
+  if (container === elements.discoverCategoriesPanel || container.closest?.("#request-discover-categories")) {
+    return { key: "categories", subview: "discover", mode: "categories", source: source || "discover" };
+  }
+  if (container === elements.discoverNamePanel || container.closest?.("#request-discover-name")) {
+    return { key: "name", subview: "discover", mode: "name", source: source || "discover" };
+  }
+  if (container === elements.discoverArtistPanel || container.closest?.("#request-discover-artist")) {
+    return { key: "artist", subview: "discover", mode: "artist", source: source || "discover" };
+  }
+  if (container === elements.requestDiscoverPanel || container.closest?.("#request-discover-panel")) {
+    const mode = normalizeDiscoverMode(state.discoverMode);
+    return { key: mode, subview: "discover", mode, source: source || "discover" };
+  }
+  return null;
+}
+
+function applyRequestResultSelection(row, item, origin) {
+  if (!row || !origin?.key) {
+    return;
+  }
+  const itemKey = requestResultItemKey(item);
+  row.dataset.requestResultOrigin = origin.key;
+  row.dataset.requestResultKey = itemKey;
+  const selected = state.requestDetailSelections?.[origin.key];
+  const isSelected = Boolean(itemKey && selected?.selectedKey === itemKey);
+  row.classList.toggle("is-selected", isSelected);
+  row.setAttribute("aria-current", isSelected ? "true" : "false");
+}
+
+function requestResultContainerForOrigin(originKey) {
+  const containers = {
+    shared: elements.larkSearchResults,
+    local: elements.searchResults,
+    categories: elements.discoverCategoriesPanel?.querySelector?.("[data-category-browse-results]"),
+    name: elements.discoverNamePanel?.querySelector?.("[data-d1-browse-results]"),
+    artist: elements.discoverArtistPanel?.querySelector?.("[data-d1-browse-results]"),
+    followed: elements.followSongResults,
+    favorites: elements.favlistSongResults,
+  };
+  return containers[originKey] || null;
+}
+
+function requestModeControlForOrigin(originKey) {
+  if (["shared", "local"].includes(originKey)) {
+    return Array.from(elements.searchModeButtons || [])
+      .find((button) => button.dataset.searchMode === originKey) || null;
+  }
+  if (["categories", "name", "artist"].includes(originKey)) {
+    return Array.from(elements.discoverModeButtons || [])
+      .find((button) => button.dataset.discoverMode === originKey) || null;
+  }
+  if (originKey === "followed") {
+    return Array.from(elements.sourcesModeButtons || [])
+      .find((button) => button.dataset.sourcesMode === "uids") || null;
+  }
+  return Array.from(elements.sourcesModeButtons || [])
+    .find((button) => button.dataset.sourcesMode === originKey) || null;
+}
+
+function resolveRequestDetailReturnFocus(_previouslyFocused, item) {
+  const originKey = String(item?.detailOrigin?.key || "");
+  const selectedKey = String(item?.detailSelectedKey || "");
+  const container = requestResultContainerForOrigin(originKey);
+  const recoveredRow = Array.from(container?.querySelectorAll?.(".search-result-item") || [])
+    .find((row) => row.dataset.requestResultKey === selectedKey);
+  if (recoveredRow?.isConnected) {
+    return recoveredRow;
+  }
+  if (container?.isConnected && !container.closest?.("[inert]")) {
+    if (container.tabIndex < 0) {
+      container.tabIndex = -1;
+    }
+    return container;
+  }
+  return requestModeControlForOrigin(originKey);
+}
+
+function createSearchResultItem(item, options = {}) {
   const row = document.createElement("article");
   row.className = "search-result-item";
   searchResultItemByElement.set(row, item);
@@ -2993,29 +7658,56 @@ function createSearchResultItem(item) {
     cover.appendChild(image);
   } else {
     const fallback = document.createElement("span");
-    fallback.textContent = String(item?.bvid || "Bili");
+    fallback.className = "search-result-cover-fallback";
+    fallback.textContent = "Bili";
     cover.appendChild(fallback);
     cover.classList.add("is-empty");
   }
 
+  const stats = document.createElement("div");
+  stats.className = "search-result-cover-stats";
+  const playCount = formatCompactCount(firstSearchResultValue(item, ["played_count", "play_count", "play", "view", "views"]));
+  if (playCount) {
+    const plays = document.createElement("span");
+    plays.className = "search-result-plays";
+    plays.setAttribute("role", "img");
+    plays.setAttribute("aria-label", `${t("search.playCountLabel")} ${playCount}`);
+    plays.title = plays.getAttribute("aria-label");
+    plays.innerHTML = '<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="1.25" y="2.5" width="13.5" height="11" rx="2.5"/><path d="m6.5 5 4 3-4 3Z"/></svg>';
+    const value = document.createElement("span");
+    value.textContent = playCount;
+    plays.appendChild(value);
+    stats.appendChild(plays);
+  }
+  const ratingBadge = createSearchResultRatingBadge(item);
+  if (ratingBadge) stats.appendChild(ratingBadge);
   const duration = formatSearchDuration(firstSearchResultValue(item, ["preserved_1", "duration", "length"]));
   if (duration) {
     const durationNode = document.createElement("span");
     durationNode.className = "search-result-duration";
     durationNode.textContent = duration;
-    cover.appendChild(durationNode);
+    stats.appendChild(durationNode);
   }
-  const ratingStars = createSearchResultRatingStars(item);
-  if (ratingStars) {
-    cover.appendChild(ratingStars);
+  if (stats.children.length) cover.appendChild(stats);
+  const statusLabel = searchResultStatusLabel(item);
+  if (statusLabel) {
+    const status = document.createElement("span");
+    status.className = "search-result-follow";
+    status.textContent = statusLabel;
+    status.title = statusLabel;
+    cover.appendChild(status);
   }
-  const developerDeleteButton = createDeveloperDeleteButton(item);
-  if (developerDeleteButton) {
-    cover.appendChild(developerDeleteButton);
-  }
-  const developerResetButton = createDeveloperTagResetButton(item);
-  if (developerResetButton) {
-    cover.appendChild(developerResetButton);
+  if (options.showDeveloperActions !== false) {
+    const developerDeleteButton = createDeveloperDeleteButton(item);
+    if (developerDeleteButton) {
+      cover.appendChild(developerDeleteButton);
+      cover.classList.add("has-developer-actions");
+    }
+    const developerResetButton = createDeveloperTagResetButton(item);
+    if (developerResetButton) {
+      cover.appendChild(developerResetButton);
+      cover.classList.add("has-developer-actions");
+    }
   }
 
   const body = document.createElement("div");
@@ -3025,28 +7717,6 @@ function createSearchResultItem(item) {
   title.className = "search-result-title";
   title.textContent = String(item.title || "");
 
-  const statusLine = document.createElement("div");
-  statusLine.className = "search-result-status";
-  const statusLabel = searchResultStatusLabel(item);
-  if (statusLabel) {
-    const status = document.createElement("span");
-    status.className = "search-result-follow";
-    status.textContent = statusLabel;
-    statusLine.appendChild(status);
-  }
-  const playCount = formatCompactCount(firstSearchResultValue(item, ["played_count", "play_count", "play", "view", "views"]));
-  if (playCount) {
-    const plays = document.createElement("span");
-    plays.className = "search-result-plays";
-    const playLabel = document.createElement("span");
-    playLabel.className = "search-result-play-label";
-    playLabel.textContent = t("search.playCountLabel");
-    const playValue = document.createElement("span");
-    playValue.textContent = playCount;
-    plays.append(playLabel, playValue);
-    statusLine.appendChild(plays);
-  }
-
   const url = createSearchResultUrlLine(item);
 
   const button = document.createElement("button");
@@ -3055,16 +7725,96 @@ function createSearchResultItem(item) {
   button.dataset.url = itemUrl;
   button.textContent = t("search.add");
 
-  body.append(title);
-  if (statusLine.children.length) {
-    body.appendChild(statusLine);
+  body.append(title, url);
+  row.append(cover, body);
+  if (options.showPrimaryAction !== false) {
+    row.appendChild(button);
   }
-  body.appendChild(url);
-  row.append(cover, body, button);
+  applyRequestResultSelection(row, item, options.requestOrigin);
   return row;
 }
 
+// Android browse results reuse Remote's page model, gestures, footer and cache.
+// Desktop keeps its existing scrolling/append workflow.
+const androidBrowsePages = new WeakMap();
+function androidBrowseEnabled() {
+  return document.documentElement.dataset.hostPlatform === "android" && Boolean(window.BilikaraResultPager);
+}
+function androidBrowseFrame(container, renderPage) {
+  let record = androidBrowsePages.get(container);
+  if (!record) {
+    const frame = document.createElement("div");
+    frame.className = "android-result-frame";
+    container.before(frame); frame.append(container);
+    record = {frame, renderPage};
+    record.pager = window.BilikaraResultPager.create(container, {
+      footer: frame, translate: t, reportError: message => setAppMessage(message, true),
+      renderItems: (items, message, target = container) => record.renderPage(items, message, target),
+    });
+    androidBrowsePages.set(container, record);
+  }
+  record.renderPage = renderPage;
+  record.frame.hidden = container.classList.contains("hidden");
+  return record;
+}
+function hideAndroidBrowsePages(container) {
+  const record = androidBrowsePages.get(container);
+  if (record) { record.frame.hidden = true; record.pager.hide(); }
+}
+function androidBrowseOptions(container, items, emptyText) {
+  const owner = requestDetailOriginForContainer(container)?.key;
+  let data = {}, key = owner, loading = false, load = null;
+  if (owner === "shared" || owner === "local") {
+    const mode = state.searchModeState[owner];
+    data = mode.pageData || {}; loading = mode.loading;
+    key = JSON.stringify([owner, mode.submitted, mode.seq, owner === "shared" ? state.larkSearchSeq : 0]);
+    const query = mode.submitted;
+    if (typeof data.has_more === "boolean") load = page => (owner === "shared" ? searchCatalog : searchGatchaCache)(query, page);
+  } else if (owner === "name" || owner === "artist") {
+    const mode = d1BrowseModeState(owner);
+    data = mode.itemData || {}; loading = state.d1BrowseLoading;
+    const query = {kind:owner, letter:mode.letter, tag:mode.tag, locale:mode.locale, query:mode.query};
+    key = JSON.stringify([query, mode.seq]);
+    if (typeof data.has_more === "boolean") load = page => fetchD1Browse({...query, ...page});
+  } else if (owner === "categories") {
+    const category = selectedCategoryBrowseDefinition();
+    data = {matched_count:state.categoryBrowseMatchedCount, has_more:state.categoryBrowseHasMore};
+    loading = state.categoryBrowseLoading;
+    const query = {tags:category?.tags || [], query:state.categoryBrowseQuery};
+    key = JSON.stringify([query, state.categoryBrowseSeq]);
+    load = page => fetchD1CategoryBrowse({...query, ...page});
+  } else if (owner === "followed" || owner === "favorites") {
+    const favorites = owner === "favorites";
+    data = (favorites ? state.favlistBrowseData : state.followBrowseData) || {};
+    const selected = favorites ? state.favlistBrowseSelectedFolderId : state.followBrowseSelectedUid;
+    const query = String(data.query || ""); loading = favorites ? state.favlistBrowseLoading : state.followBrowseLoading;
+    key = JSON.stringify([owner, selected, query, favorites ? state.favlistBrowseSeq : state.followBrowseSeq]);
+    if (typeof data.has_more === "boolean") load = page => (favorites ? fetchGatchaFavlistBrowse : fetchGatchaBrowse)(selected, query, page);
+  }
+  const limited = !load;
+  const total = !limited && Number.isSafeInteger(data.matched_count) && data.matched_count >= 0
+    ? data.matched_count : limited || data.has_more === false ? items.length : null;
+  return {key, items, emptyText, total, hasMore:Boolean(data.has_more), limited, load, loading, language:state.language,
+    readSize:["shared","local"].includes(owner) ? 72 : undefined};
+}
+function androidGridPages(container, items, key, renderPage, {loading = false, emptyText = ""} = {}) {
+  const record = androidBrowseFrame(container, renderPage);
+  const signature = JSON.stringify([key, items]);
+  if (record.signature !== signature) { record.signature = signature; record.items = items; }
+  record.pager.update({key, items:record.items, total:items.length, pageSize:12,
+    limited:true, loading, emptyText, language:state.language});
+}
+
 function renderSearchResultItems(container, items, emptyText = t("search.empty")) {
+  if (container && androidBrowseEnabled() && requestDetailOriginForContainer(container)) {
+    container.classList.remove("hidden");
+    const record = androidBrowseFrame(container, (page, message, target) => renderSearchResultPage(target, page, message, container));
+    record.pager.update(androidBrowseOptions(container, items, emptyText));
+    return;
+  }
+  renderSearchResultPage(container, items, emptyText);
+}
+function renderSearchResultPage(container, items, emptyText, originContainer = container) {
   if (!container) {
     return;
   }
@@ -3079,14 +7829,9 @@ function renderSearchResultItems(container, items, emptyText = t("search.empty")
     return;
   }
 
+  const requestOrigin = requestDetailOriginForContainer(originContainer);
   items.forEach((item) => {
-    const row = createSearchResultItem(item);
-    if (container.closest("#search-modal")) {
-      const button = row.querySelector(".search-result-add");
-      if (button) {
-        button.textContent = t("search.detail");
-      }
-    }
+    const row = createSearchResultItem(item, { requestOrigin });
     container.appendChild(row);
   });
 }
@@ -3101,14 +7846,9 @@ function appendSearchResultItems(container, items) {
   }
   container.classList.remove("hidden");
 
+  const requestOrigin = requestDetailOriginForContainer(container);
   items.forEach((item) => {
-    const row = createSearchResultItem(item);
-    if (container.closest("#search-modal")) {
-      const button = row.querySelector(".search-result-add");
-      if (button) {
-        button.textContent = t("search.detail");
-      }
-    }
+    const row = createSearchResultItem(item, { requestOrigin });
     container.appendChild(row);
   });
 }
@@ -3126,7 +7866,9 @@ function d1BrowsePickLetterText(kind = state.d1BrowseKind) {
 }
 
 function d1BrowseSearchPlaceholder(kind = state.d1BrowseKind) {
-  return state.d1BrowseTag ? t("search.browseItemPlaceholder") : t("search.tagBrowsePlaceholder", { title: d1BrowseTitle(kind) });
+  return state.d1BrowseLevel === "items"
+    ? t("search.browseItemPlaceholder")
+    : t("search.tagBrowsePlaceholder", { title: d1BrowseTitle(kind) });
 }
 
 const D1_BROWSE_ITEM_LIMIT = 450;
@@ -3239,35 +7981,35 @@ const CATEGORY_BROWSE_FULL_FIELD_TAGS = new Set([
   "FAIRY TAIL",
 ].map(categoryBrowseTagKey));
 const CATEGORY_BROWSE_IMAGE_URLS = [
-  "/pic/cat_1.png",
-  "/pic/cat_2.png",
-  "/pic/cat_3.png",
-  "/pic/cat_4.png",
-  "/pic/cat_5.png",
-  "/pic/cat_6.png",
+  "/pic/cat_1.jpg",
+  "/pic/cat_2.jpg",
+  "/pic/cat_3.jpg",
+  "/pic/cat_4.jpg",
+  "/pic/cat_5.jpg",
+  "/pic/cat_6.jpg",
   "/pic/cat_7.jpg",
   "/pic/cat_8.jpg",
-  "/pic/cat_9.png",
+  "/pic/cat_9.jpg",
   "/pic/cat_10.jpg",
   "/pic/cat_11.jpg",
   "/pic/cat_12.jpg",
   "/pic/cat_13.jpg",
-  "/pic/cat_14.png",
-  "/pic/cat_15.png",
+  "/pic/cat_14.jpg",
+  "/pic/cat_15.jpg",
   "/pic/cat_16.jpg",
   "/pic/cat_17.jpg",
   "/pic/cat_18.jpg",
   "/pic/cat_19.jpg",
   "/pic/cat_20.jpg",
-  "/pic/cat_21.png",
+  "/pic/cat_21.jpg",
   "/pic/cat_22.jpg",
   "/pic/cat_23.jpg",
   "/pic/cat_24.jpg",
-  "/pic/cat_25.png",
-  "/pic/cat_26.png",
+  "/pic/cat_25.jpg",
+  "/pic/cat_26.jpg",
   "/pic/cat_27.jpg",
   "/pic/cat_28.jpg",
-  "/pic/cat_29.png",
+  "/pic/cat_29.jpg",
   "/pic/cat_30.jpg",
   "/pic/cat_31.jpg",
   "/pic/cat_32.jpg",
@@ -3277,8 +8019,8 @@ const CATEGORY_BROWSE_IMAGE_URLS = [
   "/pic/cat_36.jpg",
   "/pic/cat_37.jpg",
   "/pic/cat_38.jpg",
-  "/pic/cat_39.webp",
-  "/pic/cat_40.png",
+  "/pic/cat_39.jpg",
+  "/pic/cat_40.jpg",
 ];
 
 function categoryBrowseTagKey(value) {
@@ -3291,6 +8033,52 @@ function categoryBrowseUsesFullFieldSearch(tag) {
 
 function d1BrowseItemKey(item) {
   return String(item?.bvid || item?.url || item?.id || `${item?.title || ""}\n${searchResultOwnerName(item)}`).trim();
+}
+
+function d1BrowseModeState(kind = state.d1BrowseKind || state.discoverMode) {
+  const normalized = kind === "artist" ? "artist" : "name";
+  if (!state.d1BrowseModes[normalized]) state.d1BrowseModes[normalized] = {
+    level: "alphabet", letter: "", tag: "", locale: "", query: "", data: null,
+    tagData: null, itemData: null, loading: false, seq: 0, error: "",
+    scrollPositions: { alphabet: 0, tags: 0, items: 0 },
+  };
+  const mode = state.d1BrowseModes[normalized];
+  mode.level = normalizedD1BrowseLevel(mode.level);
+  if (!mode.scrollPositions) mode.scrollPositions = { alphabet: 0, tags: 0, items: 0 };
+  if (mode.tagData == null) mode.tagData = mode.level === "tags" ? mode.data : null;
+  if (mode.itemData == null) mode.itemData = mode.level === "items" ? mode.data : null;
+  return mode;
+}
+
+function rememberD1BrowseMode(kind = state.d1BrowseKind) {
+  if (!kind) {
+    return;
+  }
+  const mode = d1BrowseModeState(kind);
+  mode.level = normalizedD1BrowseLevel(state.d1BrowseLevel);
+  mode.letter = state.d1BrowseLetter;
+  mode.tag = state.d1BrowseTag;
+  mode.locale = state.d1BrowseLocale;
+  mode.query = state.d1BrowseQuery;
+  mode.data = state.d1BrowseData;
+  mode.loading = state.d1BrowseLoading;
+  mode.seq = state.d1BrowseSeq;
+  mode.error = state.d1BrowseError;
+}
+
+function restoreD1BrowseMode(kind) {
+  const normalized = kind === "artist" ? "artist" : "name";
+  const mode = d1BrowseModeState(normalized);
+  state.d1BrowseKind = normalized;
+  state.d1BrowseLevel = normalizedD1BrowseLevel(mode.level);
+  state.d1BrowseLetter = mode.letter;
+  state.d1BrowseTag = mode.tag;
+  state.d1BrowseLocale = mode.locale;
+  state.d1BrowseQuery = mode.query;
+  state.d1BrowseData = mode.data;
+  state.d1BrowseLoading = mode.loading;
+  state.d1BrowseSeq = mode.seq;
+  state.d1BrowseError = mode.error;
 }
 
 function categoryBrowseIdForName(name) {
@@ -3348,15 +8136,17 @@ function mergeCategoryBrowseItems(existingItems, nextItems) {
 }
 
 function ensureD1BrowseView() {
-  if (!elements.searchModalOtherView) {
+  const container = state.d1BrowseKind === "artist"
+    ? elements.discoverArtistPanel
+    : elements.discoverNamePanel;
+  if (!container) {
     return null;
   }
-  elements.searchModalOtherView.classList.add("search-modal-browser-view");
-  let view = elements.searchModalOtherView.querySelector("[data-d1-browse-view]");
+  let view = container.querySelector("[data-d1-browse-view]");
   if (view) {
     return view;
   }
-  elements.searchModalOtherView.textContent = "";
+  container.textContent = "";
   view = document.createElement("div");
   view.className = "tag-browser";
   view.dataset.d1BrowseView = "1";
@@ -3374,7 +8164,7 @@ function ensureD1BrowseView() {
     <div class="search-results hidden" data-d1-browse-results></div>
     <p class="gatcha-message tag-browser-message" data-d1-browse-message role="status"></p>
   `;
-  elements.searchModalOtherView.appendChild(view);
+  container.appendChild(view);
   return view;
 }
 
@@ -3384,13 +8174,16 @@ function renderD1BrowseView() {
     return;
   }
   const kind = state.d1BrowseKind || "name";
-  const title = d1BrowseTitle(kind);
+  const mode = d1BrowseModeState(kind);
+  const level = normalizedD1BrowseLevel(mode.level);
+  state.d1BrowseLevel = level;
   const queryInput = view.querySelector("[data-d1-browse-query]");
-  const submitButton = view.querySelector("[data-d1-browse-submit]");
   const alphabet = view.querySelector("[data-d1-browse-alphabet]");
   const backButton = view.querySelector("[data-d1-browse-back]");
   const current = view.querySelector("[data-d1-browse-current]");
+  const navigation = current?.closest(".tag-browser-nav");
   const tagGrid = view.querySelector("[data-d1-browse-tags]");
+  observeHostScrollInsets(tagGrid);
   const results = view.querySelector("[data-d1-browse-results]");
   const message = view.querySelector("[data-d1-browse-message]");
 
@@ -3400,11 +8193,10 @@ function renderD1BrowseView() {
   if (queryInput) {
     queryInput.placeholder = d1BrowseSearchPlaceholder(kind);
   }
-  if (submitButton) {
-    submitButton.textContent = t("search.submit");
-    submitButton.disabled = state.d1BrowseLoading;
-  }
   if (alphabet) {
+    const collapsed = globalThis.document?.documentElement?.dataset?.hostPlatform === "android" && level !== "alphabet";
+    alphabet.classList.toggle("hidden", collapsed);
+    view.classList.toggle("is-browsing-tags", collapsed);
     alphabet.innerHTML = "";
     D1_BROWSE_LETTERS.forEach((letter) => {
       const button = document.createElement("button");
@@ -3419,32 +8211,51 @@ function renderD1BrowseView() {
   }
   if (backButton) {
     backButton.textContent = t("common.back");
-    backButton.classList.toggle("hidden", !state.d1BrowseLetter);
-    backButton.disabled = state.d1BrowseLoading;
+    backButton.classList.toggle("hidden", level === "alphabet");
+    backButton.disabled = false;
   }
+  navigation?.classList.toggle("hidden", level === "alphabet");
 
-  const tags = Array.isArray(state.d1BrowseData?.tags) ? state.d1BrowseData.tags : [];
-  const items = Array.isArray(state.d1BrowseData?.items) ? state.d1BrowseData.items : [];
+  const tags = Array.isArray(mode.tagData?.tags) ? mode.tagData.tags : [];
+  const items = Array.isArray(mode.itemData?.items) ? mode.itemData.items : [];
   if (current) {
-    const parts = [title];
-    if (state.d1BrowseLetter) {
+    const parts = [];
+    if (level !== "alphabet" && state.d1BrowseLetter) {
       parts.push(state.d1BrowseLetter);
     }
-    if (state.d1BrowseTag) {
+    if (level === "items" && state.d1BrowseTag) {
       parts.push(state.d1BrowseTag);
     }
     current.textContent = parts.join(" / ");
   }
   if (tagGrid) {
-    tagGrid.innerHTML = "";
-    tagGrid.classList.toggle("hidden", Boolean(state.d1BrowseTag));
-    if (!state.d1BrowseTag) {
+    if (!androidBrowseEnabled()) tagGrid.innerHTML = "";
+    tagGrid.classList.toggle("hidden", level === "items");
+    if (level === "items") hideAndroidBrowsePages(tagGrid);
+    if (androidBrowseEnabled() && level !== "items") {
+      const emptyText = state.d1BrowseLoading ? t("search.browseLoading")
+        : level === "alphabet" ? d1BrowsePickLetterText(kind) : t("search.browseNoTags");
+      androidGridPages(tagGrid, level === "alphabet" || state.d1BrowseLoading ? [] : tags,
+        JSON.stringify([kind, mode.letter, mode.query, mode.seq]), (entries, message, target) => {
+          target.replaceChildren();
+          if (!entries.length) {
+            const empty = document.createElement("div"); empty.className = "search-empty"; empty.textContent = message; target.append(empty);
+          }
+          for (const entry of entries) {
+            const button = document.createElement("button"); button.type = "button"; button.className = "tag-browser-tag";
+            button.dataset.tag = String(entry.tag || ""); button.dataset.locale = String(entry.locale || "");
+            const name = document.createElement("span"); name.className = "tag-browser-tag-name"; name.textContent = String(entry.tag || "");
+            const count = document.createElement("span"); count.className = "tag-browser-tag-count";
+            count.textContent = t("search.browseTagCount", {count:Number(entry.count || 0)}); button.append(name, count); target.append(button);
+          }
+        }, {loading:state.d1BrowseLoading, emptyText});
+    } else if (level !== "items") {
       if (state.d1BrowseLoading) {
         const loading = document.createElement("div");
         loading.className = "search-empty";
         loading.textContent = t("search.browseLoading");
         tagGrid.appendChild(loading);
-      } else if (!state.d1BrowseLetter) {
+      } else if (level === "alphabet") {
         const empty = document.createElement("div");
         empty.className = "search-empty";
         empty.textContent = d1BrowsePickLetterText(kind);
@@ -3474,91 +8285,141 @@ function renderD1BrowseView() {
     }
   }
   if (results) {
-    if (state.d1BrowseTag) {
-      renderSearchResultItems(results, items, t("search.larkNoResults"));
+    if (level === "items") {
+      renderSearchResultItems(results, items, state.d1BrowseLoading ? t("search.browseLoading") : t("search.larkNoResults"));
     } else {
+      hideAndroidBrowsePages(results);
       results.innerHTML = "";
       results.classList.add("hidden");
     }
   }
-  if (message) {
-    let text = "";
-    if (state.d1BrowseTag && !state.d1BrowseLoading) {
-      text = items.length ? t("search.larkFound", { count: items.length }) : t("search.larkNoResults");
-    } else if (!state.d1BrowseTag && tags.length) {
-      text = t("search.browseTagsFound", { count: tags.length });
-    }
-    message.textContent = state.d1BrowseLoading ? t("search.browseLoading") : text;
-    message.classList.toggle("is-error", false);
-  }
+  if (message) message.textContent = "";
+  window.BilikaraBrowseSearch?.sync(view.querySelector("[data-d1-browse-search]"), navigation, {
+    key: JSON.stringify([kind, mode.letter, mode.tag, mode.locale]),
+    title: mode.tag || [d1BrowseTitle(kind), mode.letter].filter(Boolean).join(" / "),
+    query: mode.query, loading: mode.loading, translate: t, available: level !== "alphabet",
+  });
 }
 
 async function loadD1Browse({ kind = state.d1BrowseKind || "name", letter = state.d1BrowseLetter, query = state.d1BrowseQuery, tag = "", locale = "" } = {}) {
-  const searchSeq = state.d1BrowseSeq + 1;
-  state.d1BrowseSeq = searchSeq;
-  state.d1BrowseKind = kind === "artist" ? "artist" : "name";
-  state.d1BrowseLetter = String(letter || "").trim().toUpperCase();
-  state.d1BrowseQuery = String(query || "").trim();
-  state.d1BrowseTag = String(tag || "").trim();
-  state.d1BrowseLocale = String(locale || "").trim();
+  const normalizedKind = kind === "artist" ? "artist" : "name";
+  const normalizedLetter = String(letter || "").trim().toUpperCase();
+  const normalizedQuery = String(query || "").trim();
+  const normalizedTag = String(tag || "").trim();
+  const normalizedLocale = String(locale || "").trim();
+  const targetLevel = normalizedTag ? "items" : "tags";
+  const isolatedMode = typeof d1BrowseModeState === "function"
+    ? d1BrowseModeState(normalizedKind)
+    : null;
+  const searchSeq = (isolatedMode?.seq ?? state.d1BrowseSeq) + 1;
+  if (isolatedMode) {
+    isolatedMode.level = targetLevel;
+    isolatedMode.letter = normalizedLetter;
+    isolatedMode.query = normalizedQuery;
+    isolatedMode.tag = normalizedTag;
+    isolatedMode.locale = normalizedLocale;
+    isolatedMode.loading = true;
+    isolatedMode.error = "";
+    isolatedMode.seq = searchSeq;
+    isolatedMode.scrollPositions[targetLevel] = 0;
+  }
+  state.d1BrowseKind = normalizedKind;
+  state.d1BrowseLevel = targetLevel;
+  state.d1BrowseLetter = normalizedLetter;
+  state.d1BrowseQuery = normalizedQuery;
+  state.d1BrowseTag = normalizedTag;
+  state.d1BrowseLocale = normalizedLocale;
   state.d1BrowseLoading = true;
+  state.d1BrowseError = "";
+  state.d1BrowseSeq = searchSeq;
   renderD1BrowseView();
+  if (state.discoverMode === normalizedKind && typeof restoreRequestScrollPosition === "function") {
+    restoreRequestScrollPosition();
+  }
   try {
     const data = await fetchD1Browse({
-      kind: state.d1BrowseKind,
-      letter: state.d1BrowseLetter,
-      query: state.d1BrowseQuery,
-      tag: state.d1BrowseTag,
-      locale: state.d1BrowseLocale,
-      limit: state.d1BrowseTag ? D1_BROWSE_ITEM_LIMIT : D1_BROWSE_TAG_LIMIT,
+      kind: normalizedKind,
+      letter: normalizedLetter,
+      query: normalizedQuery,
+      tag: normalizedTag,
+      locale: normalizedLocale,
+      limit: normalizedTag ? D1_BROWSE_ITEM_LIMIT : D1_BROWSE_TAG_LIMIT,
     });
-    if (state.d1BrowseSeq !== searchSeq) {
+    if ((isolatedMode?.seq ?? state.d1BrowseSeq) !== searchSeq) {
       return;
     }
-    state.d1BrowseData = data || {};
+    if (isolatedMode) {
+      if (targetLevel === "items") {
+        isolatedMode.itemData = data || {};
+      } else {
+        isolatedMode.tagData = data || {};
+      }
+      isolatedMode.data = data || {};
+    }
+    if (!isolatedMode || state.d1BrowseKind === normalizedKind) {
+      state.d1BrowseData = data || {};
+    }
   } catch (error) {
-    const view = ensureD1BrowseView();
-    const message = view?.querySelector("[data-d1-browse-message]");
-    if (message) {
-      message.textContent = error.message;
-      message.classList.add("is-error");
+    if ((isolatedMode?.seq ?? state.d1BrowseSeq) === searchSeq) {
+      if (isolatedMode) {
+        isolatedMode.error = error.message;
+      }
+      if (!isolatedMode || state.d1BrowseKind === normalizedKind) {
+        state.d1BrowseError = error.message;
+      }
+      setAppMessage(error.message, true);
     }
   } finally {
-    if (state.d1BrowseSeq === searchSeq) {
-      state.d1BrowseLoading = false;
-      renderD1BrowseView();
+    if ((isolatedMode?.seq ?? state.d1BrowseSeq) === searchSeq) {
+      if (isolatedMode) {
+        isolatedMode.loading = false;
+      }
+      if (!isolatedMode || state.d1BrowseKind === normalizedKind) {
+        state.d1BrowseLoading = false;
+        if (isolatedMode) {
+          state.d1BrowseLevel = normalizedD1BrowseLevel(isolatedMode.level);
+          state.d1BrowseData = targetLevel === "items"
+            ? isolatedMode.itemData
+            : isolatedMode.tagData;
+          state.d1BrowseError = isolatedMode.error;
+        }
+        renderD1BrowseView();
+        if (typeof restoreRequestScrollPosition === "function") {
+          restoreRequestScrollPosition();
+        }
+      }
     }
   }
 }
 
 function ensurePendingReviewView() {
-  if (!elements.searchModalOtherView) {
+  if (!elements.catalogAdvancedContent) {
     return null;
   }
-  elements.searchModalOtherView.classList.add("search-modal-browser-view");
-  let view = elements.searchModalOtherView.querySelector("[data-pending-review-view]");
+  let view = elements.catalogAdvancedContent.querySelector("[data-pending-review-view]");
   if (view) {
     return view;
   }
-  elements.searchModalOtherView.textContent = "";
+  elements.catalogAdvancedContent.textContent = "";
   view = document.createElement("div");
   view.className = "pending-review-browser";
   view.dataset.pendingReviewView = "1";
   view.innerHTML = `
     <div class="pending-review-head">
       <div class="pending-review-title-block">
-        <p class="section-tag" data-pending-review-eyebrow></p>
-        <h2 data-pending-review-title></h2>
+        <p class="section-tag" data-pending-review-eyebrow data-i18n="search.reviewTag"></p>
+        <h2 data-pending-review-title data-i18n="search.reviewPending"></h2>
       </div>
       <button type="button" class="toolbar-button" data-pending-review-refresh></button>
     </div>
     <div class="search-results pending-review-results hidden" data-pending-review-results></div>
     <p class="gatcha-message pending-review-message" data-pending-review-message role="status"></p>
     <div class="pending-review-actions">
+      <button type="button" class="toolbar-button danger-button" data-pending-review-reject></button>
       <button type="button" class="next-button" data-pending-review-approve></button>
     </div>
   `;
-  elements.searchModalOtherView.appendChild(view);
+  elements.catalogAdvancedContent.appendChild(view);
   return view;
 }
 
@@ -3573,17 +8434,21 @@ function renderPendingReviewView() {
   const results = view.querySelector("[data-pending-review-results]");
   const message = view.querySelector("[data-pending-review-message]");
   const approveButton = view.querySelector("[data-pending-review-approve]");
+  const rejectButton = view.querySelector("[data-pending-review-reject]");
   const items = Array.isArray(state.pendingReviewItems) ? state.pendingReviewItems : [];
+  const busy = state.pendingReviewLoading || state.pendingReviewApproving || state.developerTagResetSaving;
 
   if (eyebrow) {
-    eyebrow.textContent = "D1 REVIEW";
+    eyebrow.textContent = t("search.reviewTag");
   }
   if (title) {
     title.textContent = t("search.reviewPending");
   }
   if (refreshButton) {
     refreshButton.textContent = t("search.reviewRefresh");
-    refreshButton.disabled = state.pendingReviewLoading || state.pendingReviewApproving;
+    refreshButton.disabled = busy;
+    if (state.pendingReviewLoading) refreshButton.setAttribute("aria-busy", "true");
+    else refreshButton.removeAttribute("aria-busy");
   }
   if (results) {
     renderSearchResultItems(
@@ -3610,7 +8475,13 @@ function renderPendingReviewView() {
   }
   if (approveButton) {
     approveButton.textContent = state.pendingReviewApproving ? t("search.reviewApproving") : t("search.reviewApprove");
-    approveButton.disabled = state.pendingReviewLoading || state.pendingReviewApproving || !items.length;
+    approveButton.disabled = busy || !items.length;
+    if (state.pendingReviewApproving) approveButton.setAttribute("aria-busy", "true");
+    else approveButton.removeAttribute("aria-busy");
+  }
+  if (rejectButton) {
+    rejectButton.textContent = t("search.reviewRejectPage");
+    rejectButton.disabled = busy || !items.length || !state.developerMode;
   }
 }
 
@@ -3623,7 +8494,7 @@ async function loadPendingReviewItems({ force = false } = {}) {
     renderPendingReviewView();
     return;
   }
-  if (!force && (state.pendingReviewLoaded || state.pendingReviewLoading)) {
+  if (state.pendingReviewLoading || !force && state.pendingReviewLoaded) {
     renderPendingReviewView();
     return;
   }
@@ -3671,14 +8542,15 @@ function removePendingReviewItem(bvid) {
   if (exhausted) {
     state.pendingReviewLoaded = false;
   }
-  if (elements.searchModalOtherView?.querySelector("[data-pending-review-view]")) {
+  if (elements.catalogAdvancedContent?.querySelector("[data-pending-review-view]")) {
     renderPendingReviewView();
   }
   return exhausted;
 }
 
 async function approvePendingReviewVisibleItems() {
-  if (state.pendingReviewLoading || state.pendingReviewApproving) {
+  if (!state.developerMode || !state.bilikaraSecret || state.pendingReviewLoading
+    || state.pendingReviewApproving || state.developerTagResetSaving) {
     return;
   }
   const bvids = (Array.isArray(state.pendingReviewItems) ? state.pendingReviewItems : [])
@@ -3693,14 +8565,23 @@ async function approvePendingReviewVisibleItems() {
   renderPendingReviewView();
   try {
     const payload = await approvePendingReviewItems(bvids);
-    state.pendingReviewItems = Array.isArray(payload?.items) ? payload.items : [];
-    state.pendingReviewTotal = Number(payload?.total_pending || 0);
-    state.pendingReviewExportCount = Number(payload?.export_count || 0);
-    state.pendingReviewLoaded = true;
     state.pendingReviewMessage = t("search.reviewApproved", {
       count: Number(payload?.approved || 0),
       skipped: Number(payload?.skipped_missing || 0),
     });
+    if (payload?.refresh_error) {
+      const approved = new Set(payload.approved_bvids || []);
+      const before = state.pendingReviewItems.length;
+      state.pendingReviewItems = state.pendingReviewItems.filter(item => !approved.has(searchResultBvid(item)));
+      state.pendingReviewTotal = Math.max(0, state.pendingReviewTotal - before + state.pendingReviewItems.length);
+      state.pendingReviewLoaded = false;
+      state.pendingReviewError = `${state.pendingReviewMessage} ${t("search.reviewRefreshFailed")}`;
+    } else {
+      state.pendingReviewItems = Array.isArray(payload?.items) ? payload.items : [];
+      state.pendingReviewTotal = Number(payload?.total_pending || 0);
+      state.pendingReviewExportCount = Number(payload?.export_count || 0);
+      state.pendingReviewLoaded = true;
+    }
   } catch (error) {
     state.pendingReviewError = error?.message || t("error.requestFailed");
   } finally {
@@ -3709,16 +8590,333 @@ async function approvePendingReviewVisibleItems() {
   }
 }
 
-function ensureCategoryBrowseView() {
-  if (!elements.searchModalOtherView) {
+function createBlacklistResultItem(item) {
+  const row = createSearchResultItem(item, {
+    showDeveloperActions: false,
+    showPrimaryAction: false,
+  });
+  row.classList.add("blacklist-result-item");
+  const body = row.querySelector(".search-result-body");
+  if (body) {
+    const audit = document.createElement("div");
+    audit.className = "blacklist-result-audit";
+    const rejectedAt = Number(item?.rejected_at || 0);
+    const rejectedText = rejectedAt > 0 ? new Date(rejectedAt * 1000).toLocaleString() : "";
+    audit.textContent = [
+      rejectedText,
+      String(item?.rejected_by || "").trim(),
+      String(item?.reason_code || "").trim(),
+    ].filter(Boolean).join(" · ");
+    if (audit.textContent) {
+      body.appendChild(audit);
+    }
+  }
+  const snapshot = developerDeleteSnapshot(item);
+  const actions = document.createElement("div");
+  actions.className = "blacklist-result-actions";
+  const releaseButton = document.createElement("button");
+  releaseButton.type = "button";
+  releaseButton.className = "toolbar-button ghost";
+  releaseButton.dataset.devAction = "blacklist-release";
+  releaseButton.dataset.item = JSON.stringify(snapshot);
+  releaseButton.textContent = t("search.blacklistRelease");
+  const restoreButton = document.createElement("button");
+  restoreButton.type = "button";
+  restoreButton.className = "next-button";
+  restoreButton.dataset.devAction = "blacklist-release-restore";
+  restoreButton.dataset.item = JSON.stringify(snapshot);
+  restoreButton.textContent = t("search.blacklistReleaseRestore");
+  actions.append(releaseButton, restoreButton);
+  row.appendChild(actions);
+  return row;
+}
+
+function renderBlacklistItems(container, items) {
+  if (!container) {
+    return;
+  }
+  container.innerHTML = "";
+  container.classList.remove("hidden");
+  if (!items.length) {
+    const empty = document.createElement("div");
+    empty.className = "search-empty";
+    empty.textContent = state.blacklistLoading ? t("search.blacklistLoading") : t("search.blacklistEmpty");
+    container.appendChild(empty);
+    return;
+  }
+  items.forEach((item) => container.appendChild(createBlacklistResultItem(item)));
+}
+
+function ensureBlacklistView() {
+  if (!elements.catalogAdvancedContent) {
     return null;
   }
-  elements.searchModalOtherView.classList.add("search-modal-browser-view");
-  let view = elements.searchModalOtherView.querySelector("[data-category-browse-view]");
+  let view = elements.catalogAdvancedContent.querySelector("[data-blacklist-view]");
   if (view) {
     return view;
   }
-  elements.searchModalOtherView.textContent = "";
+  elements.catalogAdvancedContent.textContent = "";
+  view = document.createElement("div");
+  view.className = "pending-review-browser blacklist-browser";
+  view.dataset.blacklistView = "1";
+  view.innerHTML = `
+    <div class="pending-review-head">
+      <div class="pending-review-title-block">
+        <p class="section-tag" data-blacklist-eyebrow data-i18n="search.blacklistTag"></p>
+        <h2 data-blacklist-title data-i18n="search.blacklistTitle"></h2>
+      </div>
+      <button type="button" class="toolbar-button" data-blacklist-refresh></button>
+    </div>
+    <form class="blacklist-search-form" data-blacklist-search>
+      <input type="search" data-blacklist-query autocomplete="off">
+      <button type="submit" class="next-button" data-blacklist-search-submit></button>
+    </form>
+    <div class="search-results pending-review-results hidden" data-blacklist-results></div>
+    <p class="gatcha-message pending-review-message" data-blacklist-message role="status"></p>
+    <div class="pending-review-actions blacklist-pagination">
+      <button type="button" class="toolbar-button ghost" data-blacklist-previous></button>
+      <button type="button" class="toolbar-button ghost" data-blacklist-next></button>
+    </div>
+  `;
+  elements.catalogAdvancedContent.appendChild(view);
+  return view;
+}
+
+function renderBlacklistView() {
+  const view = ensureBlacklistView();
+  if (!view) {
+    return;
+  }
+  const eyebrow = view.querySelector("[data-blacklist-eyebrow]");
+  const title = view.querySelector("[data-blacklist-title]");
+  const refreshButton = view.querySelector("[data-blacklist-refresh]");
+  const queryInput = view.querySelector("[data-blacklist-query]");
+  const searchButton = view.querySelector("[data-blacklist-search-submit]");
+  const results = view.querySelector("[data-blacklist-results]");
+  const message = view.querySelector("[data-blacklist-message]");
+  const previousButton = view.querySelector("[data-blacklist-previous]");
+  const nextButton = view.querySelector("[data-blacklist-next]");
+  if (eyebrow) eyebrow.textContent = t("search.blacklistTag");
+  if (title) title.textContent = t("search.blacklistTitle");
+  if (refreshButton) {
+    refreshButton.textContent = t("search.blacklistRefresh");
+    refreshButton.disabled = state.blacklistLoading;
+    refreshButton.setAttribute("aria-busy", String(state.blacklistLoading));
+  }
+  if (queryInput && document.activeElement !== queryInput) {
+    queryInput.value = state.blacklistQuery;
+  }
+  if (queryInput) queryInput.placeholder = t("search.blacklistSearchPlaceholder");
+  if (searchButton) {
+    searchButton.textContent = t("search.modalSearch");
+    searchButton.disabled = state.blacklistLoading;
+    searchButton.setAttribute("aria-busy", String(state.blacklistLoading));
+  }
+  renderBlacklistItems(results, state.blacklistItems);
+  if (message) {
+    const start = state.blacklistItems.length ? state.blacklistOffset + 1 : 0;
+    const end = state.blacklistOffset + state.blacklistItems.length;
+    message.textContent = state.blacklistError
+      || (state.blacklistLoading ? t("search.blacklistLoading") : "")
+      || state.blacklistMessage
+      || (state.blacklistTotal ? t("search.blacklistFound", { start, end, total: state.blacklistTotal }) : "");
+    message.classList.toggle("is-error", Boolean(state.blacklistError));
+  }
+  if (previousButton) {
+    previousButton.textContent = t("search.blacklistPrevious");
+    previousButton.disabled = state.blacklistLoading || state.blacklistOffset <= 0;
+  }
+  if (nextButton) {
+    nextButton.textContent = t("search.blacklistNext");
+    nextButton.disabled = state.blacklistLoading || !state.blacklistHasMore;
+  }
+}
+
+async function loadBlacklistItems({ force = false, query = state.blacklistQuery, offset = state.blacklistOffset } = {}) {
+  if (!state.developerMode || !state.bilikaraSecret) {
+    state.blacklistItems = [];
+    state.blacklistLoaded = false;
+    state.blacklistError = t("search.reviewNeedDeveloper");
+    renderBlacklistView();
+    return;
+  }
+  if (!force && state.blacklistLoading) {
+    return;
+  }
+  const seq = state.blacklistSeq + 1;
+  state.blacklistSeq = seq;
+  state.blacklistLoading = true;
+  state.blacklistQuery = String(query || "").trim();
+  state.blacklistOffset = Math.max(0, Number(offset) || 0);
+  state.blacklistMessage = "";
+  state.blacklistError = "";
+  renderBlacklistView();
+  try {
+    const payload = await fetchBlacklistItems({
+      query: state.blacklistQuery,
+      offset: state.blacklistOffset,
+      limit: state.blacklistLimit,
+    });
+    if (state.blacklistSeq !== seq) {
+      return;
+    }
+    state.blacklistItems = Array.isArray(payload?.items) ? payload.items : [];
+    state.blacklistTotal = Number(payload?.total || 0);
+    state.blacklistHasMore = Boolean(payload?.has_more);
+    state.blacklistLoaded = true;
+  } catch (error) {
+    if (state.blacklistSeq === seq) {
+      state.blacklistItems = [];
+      state.blacklistLoaded = false;
+      state.blacklistError = error?.message || t("error.requestFailed");
+    }
+  } finally {
+    if (state.blacklistSeq === seq) {
+      state.blacklistLoading = false;
+      renderBlacklistView();
+    }
+  }
+}
+
+const maintenanceJobDefinitions = [
+  {
+    job: "monthly-d1-refresh",
+    titleKey: "maintenance.monthlyTitle",
+    descriptionKey: "maintenance.monthlyDescription",
+  },
+  {
+    job: "tagger-yomi",
+    titleKey: "maintenance.taggerYomiTitle",
+    descriptionKey: "maintenance.taggerYomiDescription",
+  },
+];
+
+function boundedMaintenanceMessage(value, limit = 360) {
+  return String(value || "").trim().slice(0, limit);
+}
+
+function renderMaintenanceView() {
+  if (!elements.catalogAdvancedContent) {
+    return;
+  }
+  const focusedJob = elements.catalogAdvancedContent.contains(document.activeElement)
+    ? String(document.activeElement?.dataset?.maintenanceJob || "")
+    : "";
+  const scrollTop = Math.max(0, Number(elements.catalogAdvancedView?.scrollTop || 0));
+  elements.catalogAdvancedContent.textContent = "";
+
+  const view = document.createElement("section");
+  view.className = "maintenance-browser";
+  view.dataset.maintenanceView = "1";
+
+  const heading = document.createElement("div");
+  heading.className = "maintenance-browser-head";
+  const title = document.createElement("h2");
+  title.textContent = t("maintenance.title");
+  const description = document.createElement("p");
+  description.textContent = t("maintenance.description");
+  heading.append(title, description);
+
+  const jobs = document.createElement("div");
+  jobs.className = "maintenance-job-list";
+  maintenanceJobDefinitions.forEach((definition) => {
+    const card = document.createElement("article");
+    card.className = "maintenance-job-card";
+    const copy = document.createElement("div");
+    const jobTitle = document.createElement("h3");
+    jobTitle.textContent = t(definition.titleKey);
+    const jobDescription = document.createElement("p");
+    jobDescription.textContent = t(definition.descriptionKey);
+    copy.append(jobTitle, jobDescription);
+
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "next-button";
+    button.dataset.maintenanceJob = definition.job;
+    const isRunning = state.maintenanceJobRunning === definition.job;
+    button.disabled = Boolean(state.maintenanceJobRunning);
+    if (isRunning) {
+      button.setAttribute("aria-busy", "true");
+    } else {
+      button.removeAttribute("aria-busy");
+    }
+    button.textContent = isRunning ? t("maintenance.starting") : t("maintenance.start");
+    card.append(copy, button);
+    jobs.appendChild(card);
+  });
+
+  const message = document.createElement("p");
+  message.className = "gatcha-message maintenance-job-message";
+  message.setAttribute("role", "status");
+  message.setAttribute("aria-live", "polite");
+  message.textContent = state.maintenanceJobError || state.maintenanceJobMessage;
+  message.classList.toggle("is-error", Boolean(state.maintenanceJobError));
+  view.append(heading, jobs, message);
+  elements.catalogAdvancedContent.appendChild(view);
+  if (elements.catalogAdvancedView) {
+    elements.catalogAdvancedView.scrollTop = scrollTop;
+  }
+  if (focusedJob) {
+    view.querySelector(`[data-maintenance-job="${focusedJob}"]`)?.focus({ preventScroll: true });
+  }
+}
+
+async function triggerMaintenanceJob(job) {
+  if (state.maintenanceJobRunning || !state.developerMode || !state.bilikaraSecret) {
+    return;
+  }
+  const definition = maintenanceJobDefinitions.find((item) => item.job === job);
+  if (!definition) {
+    return;
+  }
+  state.maintenanceJobRunning = job;
+  state.maintenanceJobMessage = t("maintenance.starting");
+  state.maintenanceJobError = "";
+  renderMaintenanceView();
+  try {
+    const result = await apiPost("/api/admin-maintenance/trigger", {
+      job,
+      BILIKARA_ADMIN_SECRET: state.bilikaraSecret,
+      requested_by: boundedMaintenanceMessage(
+        selectedRequesterName() || developerModeRequesterName,
+        120,
+      ),
+    });
+    if (!state.developerMode || !state.bilikaraSecret) {
+      return;
+    }
+    state.maintenanceJobMessage = boundedMaintenanceMessage(t("maintenance.started", {
+      job: t(definition.titleKey),
+      id: boundedMaintenanceMessage(result?.instance_id || "-", 120),
+    }));
+    state.maintenanceJobError = "";
+  } catch (error) {
+    if (state.developerMode && state.bilikaraSecret) {
+      state.maintenanceJobError = boundedMaintenanceMessage(
+        error?.message || t("error.requestFailed"),
+      );
+      state.maintenanceJobMessage = "";
+    }
+  } finally {
+    state.maintenanceJobRunning = "";
+    if (state.catalogAdvancedTool === "maintenance") {
+      renderMaintenanceView();
+      elements.catalogAdvancedContent
+        ?.querySelector(`[data-maintenance-job="${job}"]`)
+        ?.focus({ preventScroll: true });
+    }
+  }
+}
+
+function ensureCategoryBrowseView() {
+  if (!elements.discoverCategoriesPanel) {
+    return null;
+  }
+  let view = elements.discoverCategoriesPanel.querySelector("[data-category-browse-view]");
+  if (view) {
+    return view;
+  }
+  elements.discoverCategoriesPanel.textContent = "";
   view = document.createElement("div");
   view.className = "category-browser";
   view.dataset.categoryBrowseView = "1";
@@ -3732,15 +8930,11 @@ function ensureCategoryBrowseView() {
         <button type="submit" class="next-button" data-category-browse-submit></button>
       </form>
       <div class="category-browser-tabs" data-category-browser-tabs></div>
-      <div class="tag-browser-nav">
-        <button type="button" class="tag-browser-back" data-category-browse-back></button>
-        <div class="tag-browser-current" data-category-browse-current></div>
-      </div>
       <div class="search-results category-browser-results" data-category-browse-results></div>
       <p class="gatcha-message tag-browser-message" data-category-browse-message role="status"></p>
     </div>
   `;
-  elements.searchModalOtherView.appendChild(view);
+  elements.discoverCategoriesPanel.appendChild(view);
   return view;
 }
 
@@ -3761,33 +8955,45 @@ function createCategoryBrowseCard(category, { compact = false } = {}) {
   return button;
 }
 
+function createCategoryBrowseBackCard() {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "tag-browser-back";
+  button.dataset.categoryBrowseBack = "";
+  button.setAttribute("aria-label", t("common.back"));
+  button.textContent = t("common.back");
+  return button;
+}
+
 function renderCategoryBrowseView() {
   const view = ensureCategoryBrowseView();
   if (!view) {
     return;
   }
   const categories = categoryBrowseDefinitions();
-  const selected = selectedCategoryBrowseDefinition();
+  const retainedCategory = selectedCategoryBrowseDefinition();
+  const selected = state.categoryBrowseLevel === "detail" ? retainedCategory : null;
   const home = view.querySelector("[data-category-browser-home]");
   const detail = view.querySelector("[data-category-browser-detail]");
   const grid = view.querySelector("[data-category-browser-grid]");
   const tabs = view.querySelector("[data-category-browser-tabs]");
   const queryInput = view.querySelector("[data-category-browse-query]");
-  const submitButton = view.querySelector("[data-category-browse-submit]");
-  const backButton = view.querySelector("[data-category-browse-back]");
-  const current = view.querySelector("[data-category-browse-current]");
   const results = view.querySelector("[data-category-browse-results]");
   const message = view.querySelector("[data-category-browse-message]");
 
   home?.classList.toggle("hidden", Boolean(selected));
   detail?.classList.toggle("hidden", !selected);
   if (grid && !selected) {
-    grid.innerHTML = "";
-    categories.forEach((category) => {
-      grid.appendChild(createCategoryBrowseCard(category));
+    if (androidBrowseEnabled()) androidGridPages(grid, categories, "categories-home", (entries, _message, target) => {
+      target.replaceChildren(...entries.map(category => createCategoryBrowseCard(category)));
     });
+    else {
+      grid.innerHTML = "";
+      categories.forEach(category => grid.appendChild(createCategoryBrowseCard(category)));
+    }
   }
   if (!selected) {
+    window.BilikaraBrowseSearch?.reset(view.querySelector("[data-category-browse-search]"));
     return;
   }
   if (queryInput && document.activeElement !== queryInput) {
@@ -3796,20 +9002,11 @@ function renderCategoryBrowseView() {
   if (queryInput) {
     queryInput.placeholder = t("search.browseItemPlaceholder");
   }
-  if (submitButton) {
-    submitButton.textContent = t("search.submit");
-    submitButton.disabled = state.categoryBrowseLoading;
-  }
-  if (backButton) {
-    backButton.textContent = t("common.back");
-    backButton.disabled = state.categoryBrowseLoading;
-  }
-  if (current) {
-    current.textContent = "";
-    current.classList.add("hidden");
-  }
   if (tabs) {
     tabs.innerHTML = "";
+    const backButton = createCategoryBrowseBackCard();
+    backButton.disabled = false;
+    tabs.appendChild(backButton);
     categories.forEach((category) => {
       const tab = createCategoryBrowseCard(category, { compact: true });
       tab.classList.toggle("active", category.id === selected.id);
@@ -3818,29 +9015,19 @@ function renderCategoryBrowseView() {
     });
   }
   if (results) {
-    renderSearchResultItems(results, state.categoryBrowseItems, t("search.larkNoResults"));
+    renderSearchResultItems(results, state.categoryBrowseItems, state.categoryBrowseLoading ? t("search.browseLoading") : t("search.larkNoResults"));
   }
-  if (message) {
-    let text = "";
-    if (state.categoryBrowseError) {
-      text = state.categoryBrowseError;
-    } else if (state.categoryBrowseLoading && !state.categoryBrowseItems.length) {
-      text = t("search.browseLoading");
-    } else if (state.categoryBrowseItems.length) {
-      text = state.categoryBrowseHasMore
-        ? t("search.categoryLoadedMore", { count: state.categoryBrowseItems.length })
-        : t("search.categoryLoadedAll", { count: state.categoryBrowseItems.length });
-    } else if (!state.categoryBrowseLoading) {
-      text = t("search.larkNoResults");
-    }
-    message.textContent = text;
-    message.classList.toggle("is-error", Boolean(state.categoryBrowseError));
-  }
+  if (message) message.textContent = "";
+  window.BilikaraBrowseSearch?.sync(view.querySelector("[data-category-browse-search]"), tabs, {
+    key: selected.id, title: selected.name, query: state.categoryBrowseQuery,
+    loading: state.categoryBrowseLoading, translate: t,
+  });
 }
 
 async function loadCategoryBrowse({ categoryId = state.categoryBrowseSelectedId, query = state.categoryBrowseQuery, append = false } = {}) {
   const category = categoryBrowseDefinitions().find((entry) => entry.id === categoryId);
   if (!category) {
+    state.categoryBrowseLevel = "home";
     state.categoryBrowseSelectedId = "";
     state.categoryBrowseItems = [];
     state.categoryBrowseOffset = 0;
@@ -3850,6 +9037,7 @@ async function loadCategoryBrowse({ categoryId = state.categoryBrowseSelectedId,
   }
   const searchSeq = state.categoryBrowseSeq + 1;
   state.categoryBrowseSeq = searchSeq;
+  state.categoryBrowseLevel = "detail";
   state.categoryBrowseSelectedId = category.id;
   state.categoryBrowseQuery = String(query || "").trim();
   state.categoryBrowseError = "";
@@ -3857,9 +9045,12 @@ async function loadCategoryBrowse({ categoryId = state.categoryBrowseSelectedId,
     state.categoryBrowseItems = [];
     state.categoryBrowseOffset = 0;
     state.categoryBrowseHasMore = true;
+    state.categoryBrowseLoaded = false;
+    state.categoryBrowseScrollPositions.detail = 0;
   }
   state.categoryBrowseLoading = true;
   renderCategoryBrowseView();
+  restoreRequestScrollPosition();
   try {
     const data = await fetchD1CategoryBrowse({
       tags: category.tags,
@@ -3874,21 +9065,26 @@ async function loadCategoryBrowse({ categoryId = state.categoryBrowseSelectedId,
     state.categoryBrowseItems = append ? mergeCategoryBrowseItems(state.categoryBrowseItems, nextItems) : mergeCategoryBrowseItems([], nextItems);
     state.categoryBrowseHasMore = Boolean(data.has_more);
     state.categoryBrowseOffset = Number(data.next_offset ?? (append ? state.categoryBrowseOffset + nextItems.length : nextItems.length)) || state.categoryBrowseItems.length;
+    state.categoryBrowseLoaded = true;
   } catch (error) {
     if (state.categoryBrowseSeq === searchSeq) {
       state.categoryBrowseError = error.message;
+      setAppMessage(error.message, true);
     }
   } finally {
     if (state.categoryBrowseSeq === searchSeq) {
       state.categoryBrowseLoading = false;
+      state.categoryBrowseLoaded = true;
       renderCategoryBrowseView();
+      restoreRequestScrollPosition();
     }
   }
 }
 
 function maybeLoadMoreCategoryBrowse(scrollContainer) {
   if (
-    !state.categoryBrowseSelectedId
+    state.categoryBrowseLevel !== "detail"
+    || !state.categoryBrowseSelectedId
     || state.categoryBrowseLoading
     || !state.categoryBrowseHasMore
     || !scrollContainer
@@ -3896,7 +9092,7 @@ function maybeLoadMoreCategoryBrowse(scrollContainer) {
     return;
   }
   const remaining = scrollContainer.scrollHeight - scrollContainer.scrollTop - scrollContainer.clientHeight;
-  if (remaining <= 160) {
+  if (remaining <= Math.max(160, scrollContainer.clientHeight)) {
     loadCategoryBrowse({ append: true });
   }
 }
@@ -3938,68 +9134,145 @@ function followOwnerDisplayName(owner) {
   return stateOwnerName || ownerName || `UID ${uid}`;
 }
 
+const sourceRemovalEditors = new Map();
+function sourceBrowseReady(source) {
+  const editor = sourceRemovalEditors.get(source);
+  return !(source === "uid" ? state.followBrowseLoading : state.favlistBrowseLoading)
+    && !editor?.interacting && !editor?.pending;
+}
+function leaveSourceEditors() {
+  for (const editor of sourceRemovalEditors.values()) editor?.leave();
+}
+function sourceRemovalEditor(source) {
+  if (!sourceRemovalEditors.has(source)) {
+    sourceRemovalEditors.set(source, window.BilikaraSourceRemoval?.create(
+      source === "uid" ? elements.followUpGrid : elements.favlistGrid, {
+        source, translate: t, reportError: message => setAppMessage(message, true),
+        message: setAppMessage,
+        bindHelp: info => bindHostContextualInfo(info, { actionHelp: false }),
+        onIdle: () => window.BilikaraSourceStatus?.flush(source === "uid" ? "uids" : "favorites"),
+        post: body => apiPost("/api/gatcha/sources/edit", body),
+        reload: async () => {
+          state.gatchaCandidate = null;
+          renderGatchaWorkspace();
+          if (source === "uid") {
+            state.followBrowseRenderSignature = "";
+            await loadFollowBrowse({ uid: state.followBrowseSelectedUid, query: state.followBrowseQuery, keepQuery: true });
+          } else {
+            state.favlistBrowseRenderSignature = "";
+            await loadFavlistBrowse({ folderId: state.favlistBrowseSelectedFolderId, query: state.favlistBrowseQuery, keepQuery: true });
+          }
+        },
+        refresh: () => source === "uid" ? renderFollowBrowse() : renderFavlistBrowse(),
+        confirm: (editor, captured, message) => {
+          openConfirm({type: "remove-sources", sourceEditor: editor, captured,
+            message, anchorElement: editor.trashSlot, anchorSide: "above",
+            primaryLabel: t("sources.removeSelected")});
+          elements.confirmCancel.focus({preventScroll:true});
+        },
+        closeConfirmation: editor => {
+          if (state.confirmIntent?.sourceEditor === editor) closeConfirm();
+        },
+        renderPage: (rows, message, container, editor) => renderHostSourceCardPage(container, rows, message, source, editor),
+      },
+    ));
+  }
+  return sourceRemovalEditors.get(source);
+}
+
+function renderHostSourceCardPage(container, rows, emptyText, source, editor) {
+  const favorites = source === "favlist", nodes = [];
+  for (const entry of rows) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = favorites ? "follow-up-button favlist-browse-button" : "follow-up-button";
+    button.classList.toggle("source-card-placeholder", Boolean(entry.placeholder));
+    button.dataset[favorites ? "folderId" : "uid"] = entry.id;
+    button.title = entry.title;
+    const name = document.createElement("span");
+    name.className = favorites ? "follow-up-name favlist-browse-name" : "follow-up-name";
+    name.textContent = entry.title;
+    const count = document.createElement("span");
+    count.className = favorites ? "follow-up-count favlist-browse-count" : "follow-up-count";
+    count.textContent = entry.placeholder ? "" : t(favorites ? "favlist.mediaCount" : "follow.countSongs", {
+      count: Number((favorites ? entry.media_count : entry.count) || entry.count || 0),
+    });
+    button.append(name, count);
+    if (entry.avatar_url) {
+      const avatar = document.createElement("img");
+      avatar.className = "follow-up-avatar";
+      avatar.alt = ""; avatar.loading = "lazy"; avatar.referrerPolicy = "no-referrer";
+      avatar.src = entry.avatar_url; button.append(avatar);
+    }
+    window.BilikaraSourceStatus?.syncCard(button, state.data?.gatcha, t);
+    button.dataset.contentSignature = JSON.stringify([entry, state.language,
+      window.BilikaraSourceStatus.sourceState(state.data?.gatcha, favorites ? {folderId:entry.id} : {uid:entry.id})]);
+    nodes.push(editor?.card(button, entry) || button);
+  }
+  if (!nodes.length) {
+    const empty = document.createElement("div"); empty.className = "search-empty";
+    empty.textContent = emptyText; nodes.push(empty);
+  }
+  // Keep capture, focus and unchanged card nodes through progress-only snapshots.
+  for (const node of [...container.children]) if (!nodes.includes(node)) node.remove();
+  nodes.forEach((node, index) => {
+    if (container.children[index] !== node) container.insertBefore(node, container.children[index] || null);
+  });
+}
+
+function updateHostSourceEditor(source, entries, data, {loading, detail, filter, emptyText}) {
+  const editor = sourceRemovalEditor(source);
+  const records = entries.map(entry => ({...entry,
+    id:String(source === "uid" ? entry.uid : entry.id),
+    placeholder:Boolean(entry.placeholder),
+    title:source === "uid" ? followOwnerDisplayName(entry)
+      : String(entry.title || (entry.placeholder ? t("favlist.folder") + " " + entry.folder_id : entry.id || t("favlist.folder"))),
+  }));
+  editor?.update({records, version:data?.source_order_version, editable:data?.source_order_editable,
+    editRevision:state.data?.gatcha?.source_edit_revisions?.[source === "uid" ? "uids" : "favorites"],
+    count:data?.source_order_count, loading,
+    active:!detail && state.requestSubview === "sources"
+      && state.sourcesMode === (source === "uid" ? "uids" : "favorites")
+      && state.activeHostWorkspace === "request", filter, language:state.language, emptyText});
+}
+
 function renderFollowBrowse() {
   if (!elements.followUpGrid || !elements.followSongResults) {
     return;
   }
   const owners = Array.isArray(state.followBrowseData?.owners) ? state.followBrowseData.owners : [];
   const items = Array.isArray(state.followBrowseData?.items) ? state.followBrowseData.items : [];
+  const hasSelectedUid = Boolean(state.followBrowseSelectedUid);
+  const placeholders = window.BilikaraSourceStatus?.queuedSources?.(state.data?.gatcha, "uids",
+    owners.map((owner) => owner?.uid)) || [];
+  elements.sourcesFollowedScroll?.classList.toggle("is-detail-view", hasSelectedUid);
   const signature = JSON.stringify({
     loading: state.followBrowseLoading,
     selected: state.followBrowseSelectedUid,
+    sourceState: window.BilikaraSourceStatus.sourceState(state.data?.gatcha, {uid: state.followBrowseSelectedUid}),
     owners,
+    editorState: [state.followBrowseData?.source_order_version, state.followBrowseData?.source_order_editable],
+    placeholders,
     items,
     language: state.language,
+    query: state.followBrowseQuery,
+  });
+  updateHostSourceEditor("uid", [...placeholders, ...owners], state.followBrowseData, {
+    loading:state.followBrowseLoading, detail:hasSelectedUid, filter:state.followBrowseQuery,
+    emptyText:state.followBrowseLoading ? t("follow.loadingOwners") : t("follow.noOwners"),
   });
   if (signature === state.followBrowseRenderSignature) {
     return;
   }
   state.followBrowseRenderSignature = signature;
 
-  const hasSelectedUid = Boolean(state.followBrowseSelectedUid);
   elements.followUpListView?.classList.toggle("hidden", hasSelectedUid);
   elements.followUpItemsView?.classList.toggle("hidden", !hasSelectedUid);
 
   if (!hasSelectedUid) {
-    elements.followUpGrid.innerHTML = "";
-    if (!owners.length) {
-      const empty = document.createElement("div");
-      empty.className = "search-empty";
-      empty.textContent = state.followBrowseLoading ? t("follow.loadingOwners") : t("follow.noOwners");
-      elements.followUpGrid.appendChild(empty);
-    } else {
-      owners.forEach((owner) => {
-        const displayName = followOwnerDisplayName(owner);
-        const button = document.createElement("button");
-        button.type = "button";
-        button.className = "follow-up-button";
-        button.dataset.uid = String(owner.uid || "");
-        button.title = displayName;
-
-        const name = document.createElement("span");
-        name.className = "follow-up-name";
-        name.textContent = displayName;
-
-        const count = document.createElement("span");
-        count.className = "follow-up-count";
-        count.textContent = t("follow.countSongs", { count: Number(owner.count || 0) });
-
-        button.append(name, count);
-
-        if (owner.avatar_url) {
-          const avatar = document.createElement("img");
-          avatar.className = "follow-up-avatar";
-          avatar.src = owner.avatar_url;
-          avatar.alt = "";
-          avatar.loading = "lazy";
-          avatar.referrerPolicy = "no-referrer";
-          button.append(avatar);
-        }
-
-        elements.followUpGrid.appendChild(button);
-      });
-    }
-    setFollowBrowseMessage(state.followBrowseLoading ? t("follow.loadingOwners") : "");
+    window.BilikaraBrowseSearch?.reset(elements.followSearchForm);
+    elements.followSongResults.innerHTML = "";
+    setFollowBrowseMessage("");
     return;
   }
 
@@ -4023,40 +9296,59 @@ function renderFollowBrowse() {
   renderSearchResultItems(
     elements.followSongResults,
     items,
-    state.followBrowseLoading ? t("follow.loadingItems") : t("follow.noItems"),
+    state.followBrowseLoading ? t("follow.loadingItems") : window.BilikaraSourceStatus.emptyText(state.data?.gatcha, {uid: state.followBrowseSelectedUid}, t, t("follow.noItems")),
   );
-  setFollowBrowseMessage(state.followBrowseLoading ? t("follow.loadingItems") : "");
+  setFollowBrowseMessage("");
+  window.BilikaraBrowseSearch?.sync(elements.followSearchForm,
+    elements.followUpItemsView.querySelector(".follow-browser-head"), {
+      key:state.followBrowseSelectedUid, title:elements.followBrowseTitle.textContent,
+      query:state.followBrowseQuery, loading:state.followBrowseLoading, translate:t,
+    });
 }
 
 async function loadFollowBrowse({ uid = state.followBrowseSelectedUid, query = "", keepQuery = false } = {}) {
+  const seq = state.followBrowseSeq + 1;
+  state.followBrowseSeq = seq;
   state.followBrowseLoading = true;
   state.followBrowseSelectedUid = String(uid || "").trim();
+  state.followBrowseQuery = String(query || "");
   renderFollowBrowse();
   try {
     const nextData = await fetchGatchaBrowse(state.followBrowseSelectedUid, query);
+    if (state.followBrowseSeq !== seq) {
+      return;
+    }
     state.followBrowseData = nextData;
-    state.followBrowseSelectedUid = String(nextData.selected_uid || state.followBrowseSelectedUid || "");
+    state.followBrowseSelectedUid = String(nextData.selected_uid ?? state.followBrowseSelectedUid ?? "");
     if (!keepQuery && elements.followSearchQuery) {
       elements.followSearchQuery.value = String(nextData.query || "");
     }
   } catch (error) {
-    setFollowBrowseMessage(error.message, true);
+    if (state.followBrowseSeq === seq) {
+      setFollowBrowseMessage("");
+      setAppMessage(error.message, true);
+    }
   } finally {
-    state.followBrowseLoading = false;
-    renderFollowBrowse();
+    if (state.followBrowseSeq === seq) {
+      state.followBrowseLoading = false;
+      renderFollowBrowse();
+      window.BilikaraSourceStatus?.flush("uids");
+    }
   }
 }
 
 async function refreshFollowBrowseAfterGatchaUidAdd(uid = "") {
   state.followBrowseRenderSignature = "";
   const currentUid = String(state.followBrowseSelectedUid || "").trim();
-  const nextUid = currentUid || String(uid || "").trim();
-  await loadFollowBrowse({ uid: nextUid, query: "", keepQuery: false });
+  // Keep the owner list visible after a pull. Entering the newly added owner
+  // here made refreshed cards appear stale until the user navigated back.
+  void uid;
+  await loadFollowBrowse({ uid: currentUid, query: "", keepQuery: false });
 }
 
 function selectedFavlistFolder() {
   const folders = Array.isArray(state.favlistBrowseData?.folders) ? state.favlistBrowseData.folders : [];
-  return folders.find((folder) => String(folder.id || "") === state.favlistBrowseSelectedFolderId) || null;
+  return window.BilikaraSourceStatus.selectedFolder(state.data?.gatcha, folders, state.favlistBrowseSelectedFolderId);
 }
 
 function renderFavlistBrowse() {
@@ -4065,12 +9357,23 @@ function renderFavlistBrowse() {
   }
   const folders = Array.isArray(state.favlistBrowseData?.folders) ? state.favlistBrowseData.folders : [];
   const items = Array.isArray(state.favlistBrowseData?.items) ? state.favlistBrowseData.items : [];
+  elements.sourcesFavoritesScroll?.classList.toggle("is-detail-view", Boolean(state.favlistBrowseSelectedFolderId));
+  const placeholders = window.BilikaraSourceStatus?.queuedSources?.(state.data?.gatcha, "favorites",
+    folders.map((folder) => folder?.folder_id || folder?.id)) || [];
   const signature = JSON.stringify({
     loading: state.favlistBrowseLoading,
     selected: state.favlistBrowseSelectedFolderId,
+    sourceState: window.BilikaraSourceStatus.sourceState(state.data?.gatcha, {folderId: state.favlistBrowseSelectedFolderId}),
     folders,
+    editorState: [state.favlistBrowseData?.source_order_version, state.favlistBrowseData?.source_order_editable],
+    placeholders,
     items,
     language: state.language,
+    query: state.favlistBrowseQuery,
+  });
+  updateHostSourceEditor("favlist", [...placeholders, ...folders], state.favlistBrowseData, {
+    loading:state.favlistBrowseLoading, detail:Boolean(state.favlistBrowseSelectedFolderId), filter:state.favlistBrowseQuery,
+    emptyText:state.favlistBrowseLoading ? t("favlist.loadingFolders") : t("favlist.noBrowseFolders"),
   });
   if (signature === state.favlistBrowseRenderSignature) {
     return;
@@ -4082,46 +9385,9 @@ function renderFavlistBrowse() {
   elements.favlistItemsView?.classList.toggle("hidden", !hasSelectedFolder);
 
   if (!hasSelectedFolder) {
-    elements.favlistGrid.innerHTML = "";
-    if (!folders.length) {
-      const empty = document.createElement("div");
-      empty.className = "search-empty";
-      empty.textContent = state.favlistBrowseLoading ? t("favlist.loadingFolders") : t("favlist.noBrowseFolders");
-      elements.favlistGrid.appendChild(empty);
-    } else {
-      folders.forEach((folder) => {
-        const folderId = String(folder.id || "").trim();
-        const title = String(folder.title || folderId || t("favlist.folder")).trim();
-        const button = document.createElement("button");
-        button.type = "button";
-        button.className = "follow-up-button favlist-browse-button";
-        button.dataset.folderId = folderId;
-        button.title = title;
-
-        const name = document.createElement("span");
-        name.className = "follow-up-name favlist-browse-name";
-        name.textContent = title;
-
-        const count = document.createElement("span");
-        count.className = "follow-up-count favlist-browse-count";
-        count.textContent = t("favlist.mediaCount", { count: Number(folder.media_count || folder.count || 0) });
-
-        button.append(name, count);
-
-        if (folder.avatar_url) {
-          const avatar = document.createElement("img");
-          avatar.className = "follow-up-avatar favlist-browse-avatar";
-          avatar.src = folder.avatar_url;
-          avatar.alt = "";
-          avatar.loading = "lazy";
-          avatar.referrerPolicy = "no-referrer";
-          button.append(avatar);
-        }
-
-        elements.favlistGrid.appendChild(button);
-      });
-    }
-    setFavlistBrowseMessage(state.favlistBrowseLoading ? t("favlist.loadingFolders") : "");
+    window.BilikaraBrowseSearch?.reset(elements.favlistSearchForm);
+    elements.favlistSongResults.innerHTML = "";
+    setFavlistBrowseMessage("");
     return;
   }
 
@@ -4145,9 +9411,14 @@ function renderFavlistBrowse() {
   renderSearchResultItems(
     elements.favlistSongResults,
     items,
-    state.favlistBrowseLoading ? t("favlist.loadingItems") : t("favlist.noItems"),
+    state.favlistBrowseLoading ? t("favlist.loadingItems") : window.BilikaraSourceStatus.emptyText(state.data?.gatcha, {folderId: state.favlistBrowseSelectedFolderId}, t, t("favlist.noItems")),
   );
-  setFavlistBrowseMessage(state.favlistBrowseLoading ? t("favlist.loadingItems") : "");
+  setFavlistBrowseMessage("");
+  window.BilikaraBrowseSearch?.sync(elements.favlistSearchForm,
+    elements.favlistItemsView.querySelector(".follow-browser-head"), {
+      key: state.favlistBrowseSelectedFolderId, title: elements.favlistBrowseTitle.textContent,
+      query: state.favlistBrowseQuery, loading: state.favlistBrowseLoading, translate: t,
+    });
 }
 
 async function loadFavlistBrowse({
@@ -4155,26 +9426,37 @@ async function loadFavlistBrowse({
   query = "",
   keepQuery = false,
 } = {}) {
+  const seq = state.favlistBrowseSeq + 1;
+  state.favlistBrowseSeq = seq;
   state.favlistBrowseLoading = true;
   state.favlistBrowseSelectedFolderId = String(folderId || "").trim();
+  state.favlistBrowseQuery = String(query || "");
   renderFavlistBrowse();
   let caughtError = null;
   try {
     const nextData = await fetchGatchaFavlistBrowse(state.favlistBrowseSelectedFolderId, query);
+    if (state.favlistBrowseSeq !== seq) {
+      return;
+    }
     state.favlistBrowseData = nextData;
-    state.favlistBrowseSelectedFolderId = String(
-      nextData.selected_folder_id || state.favlistBrowseSelectedFolderId || "",
-    );
+    state.favlistBrowseSelectedFolderId = window.BilikaraSourceStatus.selectedFolderId(
+      state.data?.gatcha, nextData.selected_folder_id, state.favlistBrowseSelectedFolderId);
     if (!keepQuery && elements.favlistSearchQuery) {
       elements.favlistSearchQuery.value = String(nextData.query || "");
     }
   } catch (error) {
-    caughtError = error;
+    if (state.favlistBrowseSeq === seq) {
+      caughtError = error;
+    }
   } finally {
-    state.favlistBrowseLoading = false;
-    renderFavlistBrowse();
-    if (caughtError) {
-      setFavlistBrowseMessage(caughtError.message, true);
+    if (state.favlistBrowseSeq === seq) {
+      state.favlistBrowseLoading = false;
+      renderFavlistBrowse();
+      window.BilikaraSourceStatus?.flush("favorites");
+      if (caughtError) {
+        setFavlistBrowseMessage("");
+        setAppMessage(caughtError.message, true);
+      }
     }
   }
 }
@@ -4194,24 +9476,15 @@ async function refreshFavlistBrowseAfterPull() {
 function scheduleFavlistBrowseReloadFromState(previousSnapshot, nextSnapshot) {
   const previousUpdatedAt = Number(previousSnapshot?.gatcha_favlist_updated_at || 0);
   const nextUpdatedAt = Number(nextSnapshot?.gatcha_favlist_updated_at || 0);
-  if (!state.favlistBrowseData || state.favlistBrowseLoading || !nextUpdatedAt || nextUpdatedAt <= previousUpdatedAt) {
+  if (!state.favlistBrowseData || !nextUpdatedAt || nextUpdatedAt <= previousUpdatedAt) {
     return;
   }
-  if (state.favlistBrowseReloadTimer) {
-    window.clearTimeout(state.favlistBrowseReloadTimer);
-  }
-  state.favlistBrowseReloadTimer = window.setTimeout(() => {
-    state.favlistBrowseReloadTimer = null;
-    if (!state.favlistBrowseData || state.favlistBrowseLoading) {
-      return;
-    }
-    refreshFavlistBrowseAfterPull();
-  }, 0);
+  window.BilikaraSourceStatus?.queueReload("favorites", () => sourceBrowseReady("favlist"), refreshFavlistBrowseAfterPull);
 }
 
 async function previewGatchaUidAddFromInput(input, {
   messageTarget = "gatcha",
-  anchor = elements.addGatchaUidButton,
+  anchor = elements.modalAddFollowUidButton,
   event = null,
 } = {}) {
   const uid = String(input?.value || "").trim();
@@ -4220,7 +9493,7 @@ async function previewGatchaUidAddFromInput(input, {
     return;
   }
 
-  if (gatchaTaskBusy()) {
+  if (gatchaSourceBusy()) {
     setGatchaUidFlowMessage(messageTarget, gatchaTaskBusyMessage(), true);
     renderGatchaUidFace();
     return;
@@ -4228,7 +9501,7 @@ async function previewGatchaUidAddFromInput(input, {
 
   state.gatchaUidSaving = true;
   renderGatchaUidFace();
-  setGatchaUidFlowMessage(messageTarget, t("gatcha.checkingUid"));
+  setGatchaUidFlowLoadingMessage(messageTarget, t("gatcha.checkingUid"));
   try {
     const preview = await previewGatchaUid(uid);
     const ownerName = preview?.name || `UID ${preview?.uid || uid}`;
@@ -4263,7 +9536,7 @@ async function previewGatchaFavlistFromInput(input, {
     return;
   }
 
-  if (gatchaTaskBusy()) {
+  if (gatchaSourceBusy()) {
     setGatchaUidFlowMessage(messageTarget, gatchaTaskBusyMessage(), true);
     renderGatchaUidFace();
     return;
@@ -4271,7 +9544,7 @@ async function previewGatchaFavlistFromInput(input, {
 
   state.gatchaFavlistSaving = true;
   renderGatchaUidFace();
-  setGatchaUidFlowMessage(messageTarget, t("gatcha.readingFavlists"));
+  setGatchaUidFlowLoadingMessage(messageTarget, t("gatcha.readingFavlists"));
   try {
     const result = await previewGatchaFavlist(uid);
     openGatchaFavlistModal(result?.uid || uid, result, { messageTarget: modalSource });
@@ -4284,33 +9557,196 @@ async function previewGatchaFavlistFromInput(input, {
   }
 }
 
-async function handleGatchaDraw() {
+function normalizedGatchaView(value) {
+  const candidate = String(value || "").trim().toLowerCase();
+  return ["idle", "drawing", "candidate", "error"].includes(candidate)
+    ? candidate
+    : "idle";
+}
+
+function setGatchaControlVisibility(control, visible) {
+  if (!control) {
+    return;
+  }
+  control.hidden = !visible;
+  control.inert = !visible;
+  control.setAttribute("aria-hidden", String(!visible));
+}
+
+function renderGatchaWorkspace() {
+  let view = normalizedGatchaView(state.gatchaView);
+  if (state.gatchaDrawBusy) {
+    view = "drawing";
+  } else if (view === "candidate" && !state.gatchaCandidate) {
+    view = state.gatchaDrawError ? "error" : "idle";
+  }
+  state.gatchaView = view;
+
+  elements.gatchaStateViews?.forEach((panel) => {
+    const visible = panel.dataset.gatchaView === view;
+    panel.hidden = !visible;
+    panel.inert = !visible;
+    panel.setAttribute("aria-hidden", String(!visible));
+  });
+  if (elements.gatchaCandidateTitle) {
+    elements.gatchaCandidateTitle.textContent = state.gatchaCandidate?.title || t("gatcha.titleLoading");
+  }
+  if (document.documentElement?.dataset?.nativeHost === "true" && elements.gatchaCandidateCard) {
+    const container = elements.gatchaCandidateCard;
+    const candidate = state.gatchaCandidate;
+    container.hidden = !candidate;
+    elements.gatchaCandidateTitle.hidden = Boolean(candidate);
+    // Reuse search's safe metadata renderer, without a second add button or
+    // reloading the same cover on each playback/SSE state update.
+    if (!candidate) container.replaceChildren();
+    else if (searchResultItemByElement.get(container.firstElementChild) !== candidate
+      || container.lang !== document.documentElement.lang) {
+      container.lang = document.documentElement.lang;
+      container.replaceChildren(createSearchResultItem(candidate, {
+        showPrimaryAction: false, showDeveloperActions: false,
+      }));
+    }
+  }
+  if (elements.gatchaMessage) {
+    elements.gatchaMessage.textContent = state.gatchaMessage || "";
+    elements.gatchaMessage.classList.toggle("is-error", Boolean(state.gatchaMessageIsError));
+  }
+
+  const loggedIn = Boolean(
+    state.data?.bbdown?.login?.logged_in || state.data?.bbdown?.logged_in,
+  );
+  const sessionUsersAvailable = Array.isArray(state.data?.session_users)
+    && state.data.session_users.length > 0;
+  if (elements.gatchaPrerequisiteNotices) {
+    elements.gatchaPrerequisiteNotices.hidden = loggedIn && sessionUsersAvailable;
+  }
+  if (elements.gatchaLoginNotice) {
+    elements.gatchaLoginNotice.hidden = loggedIn;
+  }
+  if (elements.gatchaSessionUserNotice) {
+    elements.gatchaSessionUserNotice.hidden = sessionUsersAvailable;
+  }
+
+  const drawingWithRetry = state.gatchaDrawBusy
+    && state.gatchaDrawControlId === "gatcha-retry-button";
+  setGatchaControlVisibility(
+    elements.gatchaButton,
+    view === "idle" || (view === "drawing" && !drawingWithRetry),
+  );
+  setGatchaControlVisibility(elements.gatchaConfirmButton, view === "candidate");
+  setGatchaControlVisibility(
+    elements.gatchaRetryButton,
+    view === "candidate" || view === "error" || drawingWithRetry,
+  );
+
+  const drawingControl = drawingWithRetry ? elements.gatchaRetryButton : elements.gatchaButton;
+  [elements.gatchaButton, elements.gatchaRetryButton].forEach((button) => {
+    if (!button) {
+      return;
+    }
+    const busy = state.gatchaDrawBusy && button === drawingControl;
+    button.disabled = state.gatchaDrawBusy || !loggedIn;
+    button.textContent = busy
+      ? t("gatcha.drawing")
+      : t(button === elements.gatchaRetryButton ? "gatcha.retry" : "gatcha.title");
+    if (busy) {
+      button.setAttribute("aria-busy", "true");
+    } else {
+      button.removeAttribute("aria-busy");
+    }
+  });
+  if (elements.gatchaConfirmButton) {
+    elements.gatchaConfirmButton.disabled = state.gatchaRequestBusy;
+    elements.gatchaConfirmButton.textContent = state.gatchaRequestBusy
+      ? t("search.adding")
+      : t("gatcha.confirm");
+    if (state.gatchaRequestBusy) {
+      elements.gatchaConfirmButton.setAttribute("aria-busy", "true");
+    } else {
+      elements.gatchaConfirmButton.removeAttribute("aria-busy");
+    }
+  }
+}
+
+function clearAcceptedGatchaCandidate({ focusDraw = true } = {}) {
+  state.gatchaCandidate = null;
+  state.gatchaView = "idle";
+  state.gatchaDrawError = "";
+  renderGatchaWorkspace();
+  if (
+    focusDraw
+    && state.activeHostWorkspace === "random"
+    && elements.gatchaButton?.isConnected
+  ) {
+    elements.gatchaButton.focus({ preventScroll: true });
+  }
+}
+
+async function handleGatchaDraw(event = null) {
+  const loggedIn = Boolean(
+    state.data?.bbdown?.login?.logged_in || state.data?.bbdown?.logged_in,
+  );
+  if (state.gatchaDrawBusy || !loggedIn) {
+    renderGatchaWorkspace();
+    return false;
+  }
+  const control = event?.currentTarget === elements.gatchaRetryButton
+    ? elements.gatchaRetryButton
+    : elements.gatchaButton;
+  const idleLabel = control?.textContent || "";
+  const drawSequence = state.gatchaDrawSequence + 1;
+  state.gatchaDrawSequence = drawSequence;
+  state.gatchaDrawControlId = control?.id || "gatcha-button";
+  state.gatchaDrawBusy = true;
+  state.gatchaView = "drawing";
+  state.gatchaDrawError = "";
   setGatchaMessage(t("gatcha.drawing"));
+  renderGatchaWorkspace();
   try {
-    const response = await fetch("/api/gatcha/candidate", { headers: clientHeaders() });
+    const response = await fetch(`/api/gatcha/candidate?${new URLSearchParams({ requester_name: selectedRequesterName() })}`, { headers: clientHeaders() });
     const payload = await response.json();
+    if (state.gatchaDrawSequence !== drawSequence) {
+      return false;
+    }
     if (!response.ok || !payload.ok) {
       throw new Error(localizedApiMessage(payload.error) || t("gatcha.drawFailed"));
     }
 
     state.gatchaCandidate = payload.data;
-    elements.gatchaCandidateTitle.textContent = state.gatchaCandidate.title;
-
-    // 切换界面
-    elements.gatchaInitView.classList.add("hidden");
-    elements.gatchaResultView.classList.remove("hidden");
+    state.gatchaView = "candidate";
+    state.gatchaDrawError = "";
     setGatchaMessage("");
+    return true;
   } catch (error) {
-    setGatchaMessage(error.message, true);
+    if (state.gatchaDrawSequence === drawSequence) {
+      state.gatchaView = "error";
+      state.gatchaDrawError = error.message;
+      setGatchaMessage(error.message, true);
+    }
+    return false;
+  } finally {
+    if (state.gatchaDrawSequence === drawSequence) {
+      state.gatchaDrawBusy = false;
+      renderGatchaWorkspace();
+      if (control) {
+        control.textContent = idleLabel;
+      }
+    }
   }
 }
 
 function setGatchaMessage(message, isError = false) {
-  if (!elements.gatchaMessage) {
-    return;
+  if (isError && requiresSessionUsers(message)) {
+    showSessionUsersRequiredToast();
+    message = "";
+    isError = false;
   }
-  elements.gatchaMessage.textContent = message || "";
-  elements.gatchaMessage.classList.toggle("is-error", Boolean(isError));
+  state.gatchaMessage = message || "";
+  state.gatchaMessageIsError = Boolean(isError);
+  if (elements.gatchaMessage) {
+    elements.gatchaMessage.textContent = state.gatchaMessage;
+    elements.gatchaMessage.classList.toggle("is-error", state.gatchaMessageIsError);
+  }
 }
 
 function setFollowBrowseMessage(message, isError = false) {
@@ -4342,6 +9778,8 @@ function localizedCacheMessage(message, cacheStatus = "") {
   if (raw.includes("\n")) {
     raw = raw.split("\n")[0].trim();
   }
+  const loginRequired = raw.match(/(BBDown|DownKyi\/aria2c) 下载需要登录 Bilibili/);
+  if (loginRequired) return t("cache.downloadLoginRequired", { source: loginRequired[1] });
   const status = String(cacheStatus || "").trim();
   if (!raw) {
     return "";
@@ -4400,38 +9838,52 @@ function localizedCacheMessageLines(message, cacheStatus = "") {
     .join("\n");
 }
 
-function syncLarkSearchInputs(value, source = "") {
-  const nextValue = String(value || "");
-  if (source !== "main" && elements.larkSearchQuery && elements.larkSearchQuery.value !== nextValue) {
-    elements.larkSearchQuery.value = nextValue;
-  }
-  if (
-    source !== "hitbox" &&
-    elements.larkSearchHitboxQuery &&
-    elements.larkSearchHitboxQuery.value !== nextValue
-  ) {
-    elements.larkSearchHitboxQuery.value = nextValue;
+function setGatchaUidInlineMessage(message, isError = false) {
+  const normalizedMessage = String(message || "");
+  if (elements.gatchaUidMessage) {
+    elements.gatchaUidMessage.textContent = normalizedMessage;
+    elements.gatchaUidMessage.classList.toggle("is-error", Boolean(isError));
   }
 }
 
 function setGatchaUidMessage(message, isError = false) {
-  if (!elements.gatchaUidMessage) {
+  const normalizedMessage = String(message || "");
+  setGatchaUidInlineMessage("");
+  const toastSignature = JSON.stringify({ message: normalizedMessage, isError: Boolean(isError) });
+  if (!normalizedMessage) {
+    state.gatchaUidLastToastSignature = "";
     return;
   }
-  elements.gatchaUidMessage.textContent = message || "";
-  elements.gatchaUidMessage.classList.toggle("is-error", Boolean(isError));
+  if (toastSignature !== state.gatchaUidLastToastSignature) {
+    state.gatchaUidLastToastSignature = toastSignature;
+    setAppMessage(normalizedMessage, isError);
+  }
 }
 
 function setGatchaUidFlowMessage(target, message, isError = false) {
   if (target === "follow-modal") {
-    setFollowBrowseMessage(message, isError);
+    setFollowBrowseMessage("");
+    setAppMessage(message, isError);
     return;
   }
   if (target === "favlist-modal") {
-    setFavlistBrowseMessage(message, isError);
+    setFavlistBrowseMessage("");
+    setAppMessage(message, isError);
     return;
   }
   setGatchaUidMessage(message, isError);
+}
+
+function setGatchaUidFlowLoadingMessage(target, message) {
+  if (target === "follow-modal") {
+    setFollowBrowseMessage(message);
+    return;
+  }
+  if (target === "favlist-modal") {
+    setFavlistBrowseMessage(message);
+    return;
+  }
+  setGatchaUidInlineMessage(message);
 }
 
 function clearGatchaUidFlowInput(inputId) {
@@ -4442,7 +9894,11 @@ function clearGatchaUidFlowInput(inputId) {
 }
 
 function gatchaTaskBusy() {
-  return Boolean(state.data?.gatcha?.busy);
+  return Boolean(state.data?.gatcha?.busy || state.data?.gatcha?.background_busy);
+}
+
+function gatchaSourceBusy() {
+  return gatchaTaskBusy() && !state.data?.capabilities?.source_queue;
 }
 
 function localizedGatchaTaskMessage(message, status = "") {
@@ -4482,150 +9938,56 @@ function gatchaTaskBusyMessage() {
 }
 
 function syncGatchaTaskTerminalMessage() {
-  const task = state.data?.gatcha || {};
-  if (task.busy || state.gatchaUidSaving || state.gatchaRefreshSaving || state.gatchaFavlistSaving) {
-    return;
+  const task = state.data?.gatcha;
+  if (!task) return;
+  const changedSources = window.BilikaraSourceStatus?.takeSourceChanges?.(task) || [];
+  const completed = window.BilikaraSourceStatus?.takeCompletion(task,
+    state.gatchaUidSaving || state.gatchaRefreshSaving || state.gatchaFavlistSaving);
+  if (!completed && !changedSources.length) return;
+  if (completed) {
+    const status = String(task.last_status || "");
+    const fallback =
+      status === "success"
+        ? t("gatcha.refreshDone")
+        : status === "partial"
+          ? t("gatcha.refreshPartial")
+          : t("gatcha.refreshFailed");
+    const operation = task.last_result?.operation;
+    const message = operation === "source_order" ? t("sources.orderSaved")
+      : operation === "source_cleanup" ? t(status === "partial" ? "sources.removedCleanupPending" : "sources.cleanupDone")
+      : ["remove_source", "remove_sources"].includes(operation)
+        ? t(status === "partial" ? "sources.removedCleanupPending" : "sources.removedLocal")
+        : localizedGatchaTaskMessage(task.last_message, status) || fallback;
+    const detail = task.last_error ? `${message} ${task.last_error}` : message;
+    setGatchaUidMessage(detail, status !== "success");
   }
-  const status = String(task.last_status || "");
-  if (!["success", "partial", "failed"].includes(status)) {
-    return;
-  }
-  const updatedAt = Number(task.last_updated_at || 0);
-  if (updatedAt && updatedAt < state.gatchaTaskWatchStartedAt - 1) {
-    return;
-  }
-  const signature = JSON.stringify({
-    status,
-    message: task.last_message || "",
-    error: task.last_error || "",
-    updatedAt,
+  // Each committed source becomes visible while the rest of the batch runs.
+  if ((completed || changedSources.includes("uids")) && (state.followBrowseData || state.followBrowseLoading)) window.BilikaraSourceStatus?.queueReload("uids", () => sourceBrowseReady("uid"), () => {
+    state.followBrowseRenderSignature = "";
+    void loadFollowBrowse({
+      uid: state.followBrowseSelectedUid,
+      query: state.followBrowseQuery,
+      keepQuery: true,
+    });
   });
-  if (signature === state.gatchaTaskLastMessageSignature) {
-    return;
-  }
-  state.gatchaTaskLastMessageSignature = signature;
-  const fallback =
-    status === "success"
-      ? t("gatcha.refreshDone")
-      : status === "partial"
-        ? t("gatcha.refreshPartial")
-        : t("gatcha.refreshFailed");
-  const message = localizedGatchaTaskMessage(task.last_message, status) || fallback;
-  const detail = task.last_error ? `${message} ${task.last_error}` : message;
-  setGatchaUidMessage(detail, status !== "success");
-}
-
-function syncSearchStageView(view) {
-  const nextView = view || "search";
-  const previousView = state.searchStageView || "search";
-  const isInitialRender = !state.searchStageView;
-  if (state.searchStageView === nextView) {
-    return;
-  }
-  state.searchStageView = nextView;
-
-  if (state.searchFlipTimer) {
-    window.clearTimeout(state.searchFlipTimer);
-    state.searchFlipTimer = null;
-  }
-  if (state.searchFlipFrame) {
-    window.cancelAnimationFrame(state.searchFlipFrame);
-    state.searchFlipFrame = null;
-    elements.searchStage?.classList.remove("is-preparing-flip");
-  }
-
-  if (isInitialRender) {
-    const initialAngles = { search: 0, browse: -120, lark: 120 };
-    state.searchStageAngle = initialAngles[nextView] ?? 0;
-    if (elements.searchStageInner) {
-      elements.searchStageInner.style.transform = `rotateY(${state.searchStageAngle}deg)`;
-    }
-    setClassToggle(elements.searchStage, "is-cookie-view", nextView === "browse");
-    setClassToggle(elements.searchStage, "is-lark-view", nextView === "lark");
-    elements.searchStage?.classList.remove("is-flipping");
-    elements.searchStage?.classList.remove("is-flip-involving-cookie", "is-flip-involving-lark");
-    return;
-  }
-
-  const applySearchStageClass = (activeView) => {
-    setClassToggle(elements.searchStage, "is-cookie-view", activeView === "browse");
-    setClassToggle(elements.searchStage, "is-lark-view", activeView === "lark");
-  };
-  const clearFlip = () => {
-    elements.searchStage?.classList.remove("is-flipping", "is-preparing-flip");
-    state.searchFlipTimer = null;
-  };
-  const searchViewOrder = ["search", "browse", "lark"];
-  const previousIndex = searchViewOrder.indexOf(previousView);
-  const nextIndex = searchViewOrder.indexOf(nextView);
-  const forwardSteps = (nextIndex - previousIndex + searchViewOrder.length) % searchViewOrder.length;
-  const startAngle = state.searchStageAngle;
-  if (forwardSteps === 1) {
-    state.searchStageAngle -= 120;
-  } else if (forwardSteps === 2) {
-    state.searchStageAngle += 120;
-  }
-
-  elements.searchStage?.classList.add("is-preparing-flip", "is-flipping");
-  if (elements.searchStageInner) {
-    elements.searchStageInner.style.transform = `rotateY(${startAngle}deg)`;
-    elements.searchStageInner.getBoundingClientRect();
-  }
-  state.searchFlipFrame = window.requestAnimationFrame(() => {
-    state.searchFlipFrame = null;
-    elements.searchStage?.classList.remove("is-preparing-flip");
-    if (elements.searchStageInner) {
-      elements.searchStageInner.style.transform = `rotateY(${state.searchStageAngle}deg)`;
-    }
-    applySearchStageClass(nextView);
+  if ((completed || changedSources.includes("favorites")) && (state.favlistBrowseData || state.favlistBrowseLoading)) window.BilikaraSourceStatus?.queueReload("favorites", () => sourceBrowseReady("favlist"), () => {
+    state.favlistBrowseRenderSignature = "";
+    void loadFavlistBrowse({
+      folderId: state.favlistBrowseSelectedFolderId,
+      query: state.favlistBrowseQuery,
+      keepQuery: true,
+    });
   });
-  state.searchFlipTimer = window.setTimeout(clearFlip, 440);
-}
-
-function renderSearchCookieFace() {
-  const showCookie = Boolean(state.searchCookieVisible);
-  const showLark = Boolean(state.searchLarkVisible);
-  const view = showLark ? "lark" : showCookie ? "browse" : "search";
-  const signature = JSON.stringify({
-    face: view,
-    selected: state.followBrowseSelectedUid,
-    loading: state.followBrowseLoading,
-    larkLoading: state.larkSearchLoading,
-    language: state.language,
-  });
-  if (signature === state.searchCookieFaceRenderSignature) {
-    return;
-  }
-  state.searchCookieFaceRenderSignature = signature;
-
-  setClassToggle(elements.searchPanel, "is-cookie-view", showCookie);
-  setClassToggle(elements.searchPanel, "is-lark-view", showLark);
-  syncSearchStageView(view);
-  setTextContent(elements.searchTag, showCookie ? t("search.followTag") : t("search.localTag"));
-  setTextContent(elements.searchTitle, showCookie ? t("follow.title") : t("search.title"));
-  setTextContent(elements.searchCookieToggle, showCookie ? t("search.followBrowseBack") : t("search.followBrowse"));
-  if (showLark) {
-    setTextContent(elements.searchTag, t("search.larkTag"));
-    setTextContent(elements.searchTitle, t("search.larkSearch"));
-  }
-  setTextContent(elements.searchLarkToggle, showLark ? t("search.larkBack") : t("search.larkSearch"));
-  if (elements.searchCookieToggle?.getAttribute("aria-pressed") !== String(showCookie)) {
-    elements.searchCookieToggle.setAttribute("aria-pressed", String(showCookie));
-  }
-  if (elements.searchLarkToggle?.getAttribute("aria-pressed") !== String(showLark)) {
-    elements.searchLarkToggle.setAttribute("aria-pressed", String(showLark));
-  }
-  if (showCookie) {
-    renderFollowBrowse();
-  }
 }
 
 function renderGatchaUidFace() {
   syncGatchaTaskTerminalMessage();
-  const showUid = Boolean(state.gatchaUidVisible);
+  window.BilikaraSourceStatus?.sync([document.getElementById("request-sources-uids"), document.getElementById("request-sources-favorites")], {
+    task:state.data?.gatcha, loading:state.gatchaUidSaving || state.gatchaFavlistSaving || state.gatchaRefreshSaving, translate:t,
+  });
   const taskBusy = gatchaTaskBusy();
+  const sourceBusy = gatchaSourceBusy();
   const signature = JSON.stringify({
-    showUid,
     saving: state.gatchaUidSaving,
     refreshing: state.gatchaRefreshSaving,
     favlistSaving: state.gatchaFavlistSaving,
@@ -4639,56 +10001,45 @@ function renderGatchaUidFace() {
     return;
   }
   state.gatchaUidFaceRenderSignature = signature;
+  if (state.gatchaFavlistIntent) {
+    setTextContent(document.getElementById("gatcha-favlist-count"), t("favlist.folderCount", {count:state.gatchaFavlistIntent.folders.length}));
+  }
 
-  setClassToggle(elements.gatchaPanel, "is-uid-view", showUid);
-  setClassToggle(elements.gatchaStage, "is-uid-view", showUid);
-  setTextContent(elements.gatchaTag, showUid ? t("gatcha.uidTag") : t("gatcha.tag"));
-  setTextContent(elements.gatchaTitle, showUid ? t("gatcha.uidTitle") : t("gatcha.title"));
-  setTextContent(elements.gatchaUidToggle, showUid ? t("gatcha.backToDraw") : t("gatcha.addUid"));
+  setTextContent(elements.gatchaTag, t("gatcha.tag"));
+  setTextContent(elements.gatchaTitle, t("gatcha.title"));
   if (elements.gatchaConfirmButton && !elements.gatchaConfirmButton.disabled) {
     elements.gatchaConfirmButton.textContent = t("gatcha.confirm");
   }
-  if (elements.gatchaUidToggle?.getAttribute("aria-pressed") !== String(showUid)) {
-    elements.gatchaUidToggle.setAttribute("aria-pressed", String(showUid));
-  }
   if (elements.modalFollowUidInput) {
-    elements.modalFollowUidInput.disabled = state.gatchaUidSaving || taskBusy;
+    elements.modalFollowUidInput.disabled = state.gatchaUidSaving || sourceBusy;
   }
   if (elements.modalFavlistUidInput) {
-    elements.modalFavlistUidInput.disabled = state.gatchaFavlistSaving || taskBusy;
-  }
-  if (elements.addGatchaUidButton) {
-    elements.addGatchaUidButton.disabled = state.gatchaUidSaving || taskBusy;
-    elements.addGatchaUidButton.textContent = state.gatchaUidSaving ? t("gatcha.adding") : t("gatcha.add");
+    elements.modalFavlistUidInput.disabled = state.gatchaFavlistSaving || sourceBusy;
   }
   if (elements.modalAddFollowUidButton) {
-    elements.modalAddFollowUidButton.disabled = state.gatchaUidSaving || taskBusy;
+    elements.modalAddFollowUidButton.disabled = state.gatchaUidSaving || sourceBusy;
+    window.BilikaraSourceStatus.setBusy(elements.modalAddFollowUidButton, state.gatchaUidSaving || sourceBusy);
     elements.modalAddFollowUidButton.textContent = state.gatchaUidSaving ? t("gatcha.adding") : t("gatcha.add");
   }
   if (elements.refreshGatchaCacheButton) {
     elements.refreshGatchaCacheButton.disabled = state.gatchaRefreshSaving || taskBusy;
+    window.BilikaraSourceStatus.setBusy(elements.refreshGatchaCacheButton, state.gatchaRefreshSaving || taskBusy);
     elements.refreshGatchaCacheButton.textContent = state.gatchaRefreshSaving ? t("gatcha.refreshing") : t("gatcha.refresh");
   }
-  if (elements.pullGatchaFavlistButton) {
-    elements.pullGatchaFavlistButton.disabled = state.gatchaFavlistSaving || taskBusy;
-    elements.pullGatchaFavlistButton.textContent = state.gatchaFavlistSaving ? t("gatcha.pulling") : t("gatcha.pullFavlist");
-  }
   if (elements.modalPullFavlistButton) {
-    elements.modalPullFavlistButton.disabled = state.gatchaFavlistSaving || taskBusy;
+    elements.modalPullFavlistButton.disabled = state.gatchaFavlistSaving || sourceBusy;
+    window.BilikaraSourceStatus.setBusy(elements.modalPullFavlistButton, state.gatchaFavlistSaving || sourceBusy);
     elements.modalPullFavlistButton.textContent = state.gatchaFavlistSaving ? t("gatcha.pulling") : t("gatcha.pullFavlist");
   }
   if (taskBusy) {
     if (elements.refreshGatchaCacheButton) {
-      elements.refreshGatchaCacheButton.textContent = t("gatcha.globalCooldown");
+      elements.refreshGatchaCacheButton.textContent = t("gatcha.pulling");
     }
-    if (elements.pullGatchaFavlistButton) {
-      elements.pullGatchaFavlistButton.textContent = t("gatcha.globalCooldown");
+    if (sourceBusy && elements.modalAddFollowUidButton) {
+      elements.modalAddFollowUidButton.textContent = t("gatcha.pulling");
     }
-    if (elements.modalAddFollowUidButton) {
-      elements.modalAddFollowUidButton.textContent = t("gatcha.globalCooldown");
-    }
-    if (elements.modalPullFavlistButton) {
-      elements.modalPullFavlistButton.textContent = t("gatcha.globalCooldown");
+    if (sourceBusy && elements.modalPullFavlistButton) {
+      elements.modalPullFavlistButton.textContent = t("gatcha.pulling");
     }
   }
 }
@@ -4713,24 +10064,35 @@ function disconnectClient() {
 }
 
 function render() {
+  if (state.desktopClosing) return;
+  window.BilikaraAnnouncements?.sync();
+  const sessionChoicePending = window.BilikaraNativeSession?.syncSessionChoice();
   const data = state.data;
   if (!data) {
     return;
   }
+  // Runtime preferences and LAN invitations do not depend on the restored
+  // session. Keep them visible while Rust waits for the Host's choice, without
+  // mounting its player or rendering the unresolved queue/roster.
+  renderCacheSettings(data.bbdown, data.ffmpeg, data.cache_policy);
+  renderRemoteAccess(data.remote_access);
+  if (sessionChoicePending) return;
+  if (window.BilikaraPresentationFeedback) renderPresentationFeedback();
 
   const currentItem = data.current_item;
   const currentTitle = currentItem ? currentItem.display_title : t("player.noSong");
   if (currentTitle !== state.currentTitleRenderSignature) {
     state.currentTitleRenderSignature = currentTitle;
-    setTextContent(elements.currentTitle, currentTitle);
+    setTextContent(elements.currentTitleText || elements.currentTitle, currentTitle);
+    schedulePersistentStageMeasurement();
   }
   renderListHeader(data.playlist, data.history || []);
   renderRequesterSelect(data.session_users || []);
+  renderCurrentRatingButton(currentItem);
   renderSessionUsers(data.session_users || []);
-  renderCacheSettings(data.bbdown, data.ffmpeg, data.cache_policy);
   renderPlaybackRepairControls(currentItem);
-  renderRemoteAccess(data.remote_access);
-  renderLayoutMode();
+  renderHostWorkspaceSelection();
+  renderGatchaWorkspace();
 
   const playbackMode = frontendPlaybackMode(data.playback_mode);
   renderAudioVariantBar(currentItem, playbackMode);
@@ -4739,8 +10101,11 @@ function render() {
   renderKeyShiftControls(playbackMode);
   applyStoredVolumeToMountedPlayer();
   renderPlayer(currentItem, playbackMode);
+  renderCurrentPresentationScene();
   renderPlayerFullscreenButton();
+  renderPresentationOutputControl();
   applyRemotePlayerControl(data.player_control_command, currentItem, playbackMode);
+  publishPresentationPlaybackState().catch(() => {});
   renderQueueCurrent(currentItem);
   if (!state.dragItemId) {
     renderPlaylist(data.playlist, data.current_item, data.cache_policy);
@@ -4753,199 +10118,24 @@ function render() {
     data.playlist.length,
     Boolean(data.session_flags?.auto_restored_backup),
   );
-  syncListStageView();
-  renderSearchCookieFace();
-  if (elements.favlistBrowserView && !elements.favlistBrowserView.classList.contains("hidden")) {
-    renderFavlistBrowse();
-  }
+  syncRequestSubviewSelection();
   renderGatchaUidFace();
   renderConfirmPopover();
   flushPendingSongTransitionOverlay();
   state.lastPollRenderSignature = renderSignatureForData(data);
 }
 
-function parseCssTimeMs(value) {
-  const normalized = String(value || "").trim().toLowerCase();
-  const amount = Number.parseFloat(normalized);
-  if (!Number.isFinite(amount)) {
-    return 0;
-  }
-  return normalized.endsWith("ms") ? amount : amount * 1000;
-}
-
-function transitionTotalMsForProperty(element, propertyName) {
-  if (!element || typeof window.getComputedStyle !== "function") {
-    return 0;
-  }
-  const style = window.getComputedStyle(element);
-  const properties = String(style.transitionProperty || "all").split(",");
-  const durations = String(style.transitionDuration || "0s").split(",");
-  const delays = String(style.transitionDelay || "0s").split(",");
-  let longestMs = 0;
-  properties.forEach((property, index) => {
-    const normalizedProperty = property.trim();
-    if (normalizedProperty !== "all" && normalizedProperty !== propertyName) {
-      return;
-    }
-    const durationMs = parseCssTimeMs(durations[index % durations.length]);
-    const delayMs = parseCssTimeMs(delays[index % delays.length]);
-    longestMs = Math.max(longestMs, durationMs + delayMs);
-  });
-  return longestMs;
-}
-
-function setListFlipFaceOwnership(view) {
-  const showBack = view === "history";
-  setClassToggle(elements.listStage, "flip-show-front", !showBack);
-  setClassToggle(elements.listStage, "flip-show-back", showBack);
-}
-
-function listFlipViewFromTransform(inner, midpointView) {
-  if (!inner || typeof window.getComputedStyle !== "function") {
-    return midpointView;
-  }
-  const transform = String(window.getComputedStyle(inner).transform || "");
-  const matrix3d = transform.match(/^matrix3d\(([^)]+)\)$/);
-  const matrix2d = transform.match(/^matrix\(([^)]+)\)$/);
-  const values = (matrix3d || matrix2d)?.[1]
-    ?.split(",")
-    .map((value) => Number.parseFloat(value.trim()));
-  const horizontalScale = values?.[0];
-  if (!Number.isFinite(horizontalScale) || Math.abs(horizontalScale) < 0.0001) {
-    return midpointView;
-  }
-  return horizontalScale < 0 ? "history" : "queue";
-}
-
-function clearListFlipCallbacks() {
-  if (state.listFlipTimer) {
-    window.clearTimeout(state.listFlipTimer);
-    state.listFlipTimer = null;
-  }
-  if (state.listFlipFrame) {
-    window.cancelAnimationFrame(state.listFlipFrame);
-    state.listFlipFrame = null;
-  }
-  if (state.listFlipTransitionCleanup) {
-    state.listFlipTransitionCleanup();
-    state.listFlipTransitionCleanup = null;
-  }
-}
-
-function finishListStageFlip(generation, nextView) {
-  if (generation !== state.listFlipGeneration) {
-    return false;
-  }
-  clearListFlipCallbacks();
-  setClassToggle(elements.listStage, "is-history-view", nextView === "history");
-  setListFlipFaceOwnership(nextView);
-  elements.listStage?.classList.remove("is-flipping");
-  return true;
-}
-
-function monitorListFlipFaceOwnership(inner, nextView, generation) {
-  if (generation !== state.listFlipGeneration) {
-    return;
-  }
-  setListFlipFaceOwnership(listFlipViewFromTransform(inner, nextView));
-  let monitorFrame = null;
-  monitorFrame = window.requestAnimationFrame(() => {
-    if (
-      generation !== state.listFlipGeneration
-      || state.listFlipFrame !== monitorFrame
-    ) {
-      return;
-    }
-    state.listFlipFrame = null;
-    monitorListFlipFaceOwnership(inner, nextView, generation);
-  });
-  state.listFlipFrame = monitorFrame;
-}
-
-function syncListStageView() {
-  const nextView = state.listView === "history" ? "history" : "queue";
-  const isInitialRender = !state.listStageView;
-  if (state.listStageView === nextView) {
-    return;
-  }
-  state.listStageView = nextView;
-  state.listFlipGeneration += 1;
-  const generation = state.listFlipGeneration;
-  clearListFlipCallbacks();
-
-  if (isInitialRender) {
-    setClassToggle(elements.listStage, "is-history-view", nextView === "history");
-    setListFlipFaceOwnership(nextView);
-    elements.listStage?.classList.remove("is-flipping");
-    return;
-  }
-
-  const inner = elements.listStage?.querySelector(".list-stage-inner");
-  if (!elements.listStage || !inner) {
-    finishListStageFlip(generation, nextView);
-    return;
-  }
-
-  const currentView = elements.listStage.classList.contains("is-history-view")
-    ? "history"
-    : "queue";
-  setListFlipFaceOwnership(listFlipViewFromTransform(inner, currentView));
-  elements.listStage?.classList.add("is-flipping");
-  const transitionMs = transitionTotalMsForProperty(inner, "transform");
-
-  const handleTransitionEnd = (event) => {
-    if (
-      event.target === inner
-      && (event.propertyName === "transform" || event.propertyName === "-webkit-transform")
-    ) {
-      finishListStageFlip(generation, nextView);
-    }
-  };
-  inner.addEventListener("transitionend", handleTransitionEnd);
-  state.listFlipTransitionCleanup = () => {
-    inner.removeEventListener("transitionend", handleTransitionEnd);
-  };
-
-  state.listFlipFrame = window.requestAnimationFrame(() => {
-    if (generation !== state.listFlipGeneration) {
-      return;
-    }
-    state.listFlipFrame = null;
-    setClassToggle(elements.listStage, "is-history-view", nextView === "history");
-    if (transitionMs <= 0) {
-      finishListStageFlip(generation, nextView);
-      return;
-    }
-    monitorListFlipFaceOwnership(inner, nextView, generation);
-  });
-  state.listFlipTimer = window.setTimeout(() => {
-    finishListStageFlip(generation, nextView);
-  }, transitionMs + listFlipFallbackPaddingMs);
-}
-
-function activeScrollableList() {
-  return state.listView === "history" ? elements.historyList : elements.playlist;
-}
-
-function normalizeWheelDelta(event, container) {
-  if (event.deltaMode === 1) {
-    return event.deltaY * 18;
-  }
-  if (event.deltaMode === 2) {
-    return event.deltaY * container.clientHeight;
-  }
-  return event.deltaY;
-}
-
 function renderRequesterSelect(sessionUsers) {
   const users = Array.isArray(sessionUsers) ? sessionUsers : [];
-  const signature = JSON.stringify(users);
+  const entries = state.data?.session_user_entries || [];
+  const signature = JSON.stringify([users, entries]);
   if (signature === state.requesterSelectRenderSignature) {
     return;
   }
   state.requesterSelectRenderSignature = signature;
 
-  const previousValue = selectedRequesterName();
+  const previousId = elements.requesterSelect.selectedOptions?.[0]?.dataset.userId;
+  const previousValue = entries.find(user => user.id === previousId)?.name || selectedRequesterName();
   elements.requesterSelect.innerHTML = "";
 
   const placeholder = document.createElement("option");
@@ -4956,6 +10146,7 @@ function renderRequesterSelect(sessionUsers) {
   users.forEach((userName) => {
     const option = document.createElement("option");
     option.value = userName;
+    option.dataset.userId = entries.find(user => user.name === userName)?.id || "";
     option.textContent = userName;
     elements.requesterSelect.appendChild(option);
   });
@@ -4968,83 +10159,621 @@ function renderRequesterSelect(sessionUsers) {
     elements.requesterSelect.value = "";
   }
   elements.requesterSelect.disabled = users.length === 0;
+  const empty = users.length === 0;
+  elements.requesterSelect.hidden = empty;
+  elements.requesterSelect.inert = empty;
+  elements.requesterSelect.setAttribute("aria-hidden", String(empty));
+  if (elements.requesterEmptyButton) {
+    elements.requesterEmptyButton.hidden = !empty;
+    elements.requesterEmptyButton.inert = !empty;
+    elements.requesterEmptyButton.setAttribute("aria-hidden", String(!empty));
+  }
+  if (elements.requestSessionUserNotice) {
+    elements.requestSessionUserNotice.hidden = !empty;
+    elements.requestSessionUserNotice.setAttribute("aria-hidden", String(!empty));
+    syncRequestSessionUserNoticePlacement();
+  }
 }
 
-function renderSessionUsers(sessionUsers) {
-  const users = Array.isArray(sessionUsers) ? sessionUsers : [];
-  const signature = JSON.stringify(users);
-  if (signature === state.sessionUsersRenderSignature) {
+function syncSessionUserControls() {
+  state.sessionUserEditor?.sync();
+}
+
+function renderSessionUsers() {
+  if (!state.sessionUserEditor) {
+    state.sessionUserEditor = new window.BilikaraSessionUserEditor({
+      stage: document.getElementById("session-user-stage"),
+      list: elements.sessionUserList,
+      t, post: async (url, payload) => {
+        await apiPostStateSnapshot(url, payload);
+        render();
+      }, message: setAppMessage,
+      bindHelp: info => bindHostContextualInfo(info, { actionHelp: false }),
+    });
+    elements.sessionUserTrash = state.sessionUserEditor.trash;
+  }
+  state.sessionUserEditor.render(state.data);
+}
+
+function syncHostAccountPresentation() {
+  const login = state.data?.bbdown?.login;
+  const compact = Boolean(window.BilikaraHostLayout?.isPortrait());
+  const idle = !login?.state || login.state === "idle";
+  // One account component owns its QR visibility in either placement. Visiting
+  // Android compact account page must not start login; active QR/polling stays shared.
+  elements.bbdownLoginPanel.classList.toggle("hidden", Boolean(login?.logged_in) || (compact && idle));
+  document.getElementById("host-account-settings")?.classList.toggle("is-logged", Boolean(login?.logged_in));
+}
+
+function setRemoteQrPinned(pinned, { dismissTransient = false } = {}) {
+  const nextPinned = Boolean(pinned);
+  const wasPinned = state.remoteQrPinned;
+  const popup = elements.remoteMiniPopover;
+  const control = elements.remoteMiniControl;
+  if (wasPinned !== nextPinned) {
+    control?.classList.add("is-menu-switching");
+    if (popup) {
+      popup.__bilikaraPreviewSequence = (popup.__bilikaraPreviewSequence || 0) + 1;
+      if (typeof popup.hidePopover === "function" && popup.matches(":popover-open")) popup.hidePopover();
+      popup.removeAttribute("popover");
+      popup.getAnimations?.().forEach(animation => animation.cancel());
+    }
+  }
+  if (nextPinned) {
+    state.cacheSettingsOpen = false;
+    state.presentationSettingsOpen = false;
+    syncCachePanelVisibility();
+    syncPresentationPanelVisibility();
+  }
+  const changed = state.remoteQrPinned !== nextPinned;
+  state.remoteQrPinned = nextPinned;
+  elements.remoteMiniControl?.classList.toggle("is-qr-pinned", state.remoteQrPinned);
+  elements.remoteMiniPopover?.querySelector(".remote-access-card")
+    ?.classList.toggle("is-management-layout", state.remoteQrPinned);
+  elements.remoteMiniControl?.classList.toggle(
+    "is-qr-dismissed",
+    !state.remoteQrPinned && Boolean(dismissTransient || wasPinned),
+  );
+  elements.remoteMiniTrigger?.setAttribute("aria-expanded", String(state.remoteQrPinned));
+  syncRemoteQrPreviewLayer();
+  if (changed) {
+    document.dispatchEvent(new CustomEvent("bilikara:remote-access-menu", {
+      detail: { expanded: state.remoteQrPinned },
+    }));
+    if (window.BilikaraAndroidPresentation) publishPresentationOutputState();
+    // Flush the replacement layout while transitions are disabled. Future
+    // hover entries can animate, but this menu close must stay instantaneous.
+    if (popup) void popup.offsetWidth;
+    control?.classList.remove("is-menu-switching");
+  }
+  if (typeof scheduleTopControlPopoverPositionSync === "function") {
+    scheduleTopControlPopoverPositionSync();
+  }
+  if (!state.remoteQrPinned && dismissTransient) {
+    const activeElement = document.activeElement;
+    if (activeElement && elements.remoteMiniControl?.contains(activeElement)) {
+      activeElement.blur();
+    }
+  }
+}
+
+function syncRemoteQrPreviewLayer() {
+  const popup = elements.remoteMiniPopover;
+  const control = elements.remoteMiniControl;
+  if (!popup || !control || typeof popup.showPopover !== "function") return;
+  // A phone tap opens the full menu. A focus-triggered desktop preview can
+  // otherwise cover its trigger between pointerdown and pointerup.
+  const preview = window.matchMedia("(hover: hover) and (pointer: fine)").matches
+    && !window.BilikaraHostLayout?.isPortrait()
+    && !state.remoteQrPinned && !control.classList.contains("is-qr-dismissed")
+    && control.matches(":hover, :focus-within");
+  const sequence = popup.__bilikaraPreviewSequence = (popup.__bilikaraPreviewSequence || 0) + 1;
+  if (preview) {
+    popup.setAttribute("popover", "manual");
+    if (!popup.matches(":popover-open")) popup.showPopover();
+  } else {
+    const finish = () => {
+      if (popup.__bilikaraPreviewSequence !== sequence) return;
+      if (popup.matches(":popover-open")) popup.hidePopover();
+      popup.removeAttribute("popover");
+      scheduleTopControlPopoverPositionSync();
+    };
+    // Pinning changes the same card into a management menu immediately; a
+    // hover dismissal keeps its top-layer position until the fade completes.
+    if (state.remoteQrPinned) finish();
+    else Promise.allSettled((popup.getAnimations?.() || []).map(animation => animation.finished)).then(finish);
+  }
+  scheduleTopControlPopoverPositionSync();
+}
+
+const cacheAdvancedInfoHoverDelayMs = 160;
+const cacheAdvancedInfoLeaveDelayMs = 90;
+let cacheAdvancedInfoHoverTimer = null;
+let cacheAdvancedInfoLeaveTimer = null;
+
+function positionContextualTooltip(info) {
+  const button = info?.querySelector?.(".cache-advanced-info-button, [data-contextual-info-anchor]");
+  const tooltip = info?.querySelector?.(".cache-advanced-tooltip");
+  if (!button || !tooltip || !info.classList.contains("is-visible")) {
+    return false;
+  }
+  const viewportInset = 8;
+  const tooltipGap = 7;
+  const boundaryRect = tooltip.hasAttribute("popover") ? null
+    : info.closest(".confirm-popover, .host-workspace-region")?.getBoundingClientRect();
+  const boundaryLeft = Math.max(viewportInset, boundaryRect?.left ?? viewportInset);
+  const boundaryRight = Math.min(
+    window.innerWidth - viewportInset,
+    boundaryRect?.right ?? (window.innerWidth - viewportInset),
+  );
+  const boundaryTop = Math.max(viewportInset, boundaryRect?.top ?? viewportInset);
+  const boundaryBottom = Math.min(
+    window.innerHeight - viewportInset,
+    boundaryRect?.bottom ?? (window.innerHeight - viewportInset),
+  );
+  const buttonRect = button.getBoundingClientRect();
+  tooltip.style.width = "max-content";
+  tooltip.style.maxWidth = `${Math.round(Math.min(320, Math.max(0, boundaryRight - boundaryLeft)))}px`;
+  const width = tooltip.offsetWidth;
+  tooltip.style.left = "0px";
+  tooltip.style.top = "0px";
+  tooltip.style.bottom = "auto";
+  const height = tooltip.offsetHeight;
+  const buttonCenter = buttonRect.left + (buttonRect.width / 2);
+  const preferredLeft = buttonCenter - (width / 2);
+  const left = Math.max(
+    boundaryLeft,
+    Math.min(preferredLeft, boundaryRight - width),
+  );
+  const spaceAbove = buttonRect.top - boundaryTop - tooltipGap;
+  const spaceBelow = boundaryBottom - buttonRect.bottom - tooltipGap;
+  const direction = spaceAbove >= height || spaceAbove >= spaceBelow ? "up" : "down";
+  const top = direction === "up"
+    ? buttonRect.top - tooltipGap - height
+    : Math.min(
+      boundaryBottom - height,
+      buttonRect.bottom + tooltipGap,
+    );
+  const arrowCenter = Math.max(10, Math.min(width - 10, buttonCenter - left));
+  const clampedTop = Math.max(boundaryTop, top);
+  tooltip.dataset.tooltipDirection = direction;
+  tooltip.style.left = `${Math.round(left)}px`;
+  tooltip.style.top = `${Math.round(clampedTop)}px`;
+  // Top-layer coordinates are viewport coordinates. The bubble's 3px entry
+  // translation belongs to motion, not to its settled anchor position.
+  if (!tooltip.hasAttribute("popover")) {
+    const positionedRect = tooltip.getBoundingClientRect();
+    const transform = new DOMMatrixReadOnly(getComputedStyle(tooltip).transform);
+    const leftCorrection = left - (positionedRect.left - transform.m41);
+    const topCorrection = clampedTop - (positionedRect.top - transform.m42);
+    if (Math.abs(leftCorrection) > 0.5) {
+      tooltip.style.left = `${Math.round(left + leftCorrection)}px`;
+    }
+    if (Math.abs(topCorrection) > 0.5) {
+      tooltip.style.top = `${Math.round(clampedTop + topCorrection)}px`;
+    }
+  }
+  tooltip.style.setProperty("--contextual-tooltip-arrow-left", `${arrowCenter - 6}px`);
+  return true;
+}
+
+function syncVisiblePlaybackContextualTooltipPosition() {
+  state.playbackTooltipPositionFrame = null;
+  document.querySelectorAll(
+    ".cache-advanced-info.is-visible",
+  ).forEach(positionContextualTooltip);
+}
+
+function schedulePlaybackContextualTooltipPositionSync() {
+  if (state.playbackTooltipPositionFrame !== null) {
     return;
   }
-  state.sessionUsersRenderSignature = signature;
+  state.playbackTooltipPositionFrame = window.requestAnimationFrame(
+    syncVisiblePlaybackContextualTooltipPosition,
+  );
+}
 
-  elements.sessionUserList.innerHTML = "";
+function compactTopControlPopoverEntries() {
+  return [
+    [elements.remoteMiniTrigger, elements.remoteMiniPopover],
+    [elements.presentationSettingsToggle, elements.presentationSettingsPanel],
+    [elements.cacheSettingsToggle, elements.cachePanel],
+  ];
+}
 
-  if (!users.length) {
-    elements.sessionUserList.innerHTML = `<div class="queue-empty session-user-empty">${htmlT("session.empty")}</div>`;
-    return;
-  }
-
-  users.forEach((userName, index) => {
-    const item = document.createElement("div");
-    item.className = "session-user-badge";
-    item.draggable = true;
-    item.dataset.index = index;
-    item.dataset.name = userName;
-    item.innerHTML = `
-      <span class="session-user-order-number">${index + 1}</span>
-      <span class="session-user-name">${escapeHtml(userName)}</span>
-    `;
-
-    elements.sessionUserList.appendChild(item);
+function syncTopControlPopoverPositions() {
+  state.topControlPopoverPositionFrame = null;
+  const viewportInset = 12;
+  const popupGap = 8;
+  compactTopControlPopoverEntries().forEach(([trigger, popup]) => {
+    if (!trigger || !popup) {
+      return;
+    }
+    if (popup === elements.cachePanel && globalThis.BilikaraHostLayout?.isPortrait()) return;
+    if (popup === elements.presentationSettingsPanel && popup.closest(".android-display-settings")) return;
+    if (popup === elements.cachePanel && popup.offsetWidth > 0) {
+      const style = window.getComputedStyle(popup);
+      const borders = (parseFloat(style.borderLeftWidth) || 0)
+        + (parseFloat(style.borderRightWidth) || 0);
+      const scrollbarWidth = Math.max(0, popup.offsetWidth - popup.clientWidth - borders);
+      popup.style.setProperty("--cache-panel-scrollbar-width", `${scrollbarWidth}px`);
+    }
+    // Border-box layout size stays stable throughout the entrance/exit scale.
+    // Hover previews and management menus use the same viewport anchor.
+    popup.style.position = "fixed";
+    const triggerRect = trigger.getBoundingClientRect();
+    const popupWidth = popup.offsetWidth;
+    if (!popupWidth) return;
+    const preferredLeft = triggerRect.right - popupWidth;
+    const left = Math.max(
+      viewportInset,
+      Math.min(preferredLeft, window.innerWidth - viewportInset - popupWidth),
+    );
+    popup.style.left = `${Math.round(left)}px`;
+    popup.style.right = "auto";
+    popup.style.top = `${Math.round(triggerRect.bottom + popupGap)}px`;
   });
 }
 
+function scheduleTopControlPopoverPositionSync() {
+  if (state.topControlPopoverPositionFrame !== null) {
+    return;
+  }
+  state.topControlPopoverPositionFrame = window.requestAnimationFrame(
+    syncTopControlPopoverPositions,
+  );
+}
+
+document.addEventListener("bilikara:top-control-popover", scheduleTopControlPopoverPositionSync);
+
+function resetContextualTooltipPosition(info) {
+  const tooltip = info?.querySelector?.(".cache-advanced-tooltip");
+  if (!tooltip) {
+    return;
+  }
+  // Keep the top-layer bubble and its anchor until the exit transition ends.
+  // A quick reopen owns the same node and must not be hidden by a stale close.
+  const animations = tooltip.getAnimations?.() || [];
+  const closing = tooltip.__bilikaraCloseSequence = (tooltip.__bilikaraCloseSequence || 0) + 1;
+  Promise.allSettled(animations.map(animation => animation.finished)).then(() => {
+    if (info.classList.contains("is-visible") || tooltip.__bilikaraCloseSequence !== closing) return;
+    if (typeof tooltip.hidePopover === "function" && tooltip.matches(":popover-open")) tooltip.hidePopover();
+    for (const property of ["left", "right", "top", "bottom", "width", "max-width", "--contextual-tooltip-arrow-left"]) {
+      tooltip.style.removeProperty(property);
+    }
+    delete tooltip.dataset.tooltipDirection;
+  });
+}
+
+function setCacheAdvancedInfoVisible(info, { pinned = false } = {}) {
+  if (!info) {
+    return false;
+  }
+  document.querySelectorAll(".cache-advanced-info.is-visible").forEach((candidate) => {
+    if (candidate === info) {
+      return;
+    }
+    candidate.classList.remove("is-visible", "is-pinned");
+    candidate.querySelector(".cache-advanced-info-button")?.setAttribute("aria-expanded", "false");
+    resetContextualTooltipPosition(candidate);
+  });
+  const tooltip = info.querySelector(".cache-advanced-tooltip");
+  if (tooltip) tooltip.__bilikaraCloseSequence = (tooltip.__bilikaraCloseSequence || 0) + 1;
+  if (typeof tooltip?.showPopover === "function") {
+    tooltip.setAttribute("popover", "manual");
+    if (!tooltip.matches(":popover-open")) tooltip.showPopover();
+  }
+  // Establish the hidden style after showPopover's display change so the
+  // existing opacity/transform transition also runs inside export dialogs.
+  if (tooltip) getComputedStyle(tooltip).opacity;
+  info.classList.add("is-visible");
+  info.classList.toggle("is-pinned", pinned);
+  info.querySelector(".cache-advanced-info-button")?.setAttribute("aria-expanded", "true");
+  positionContextualTooltip(info);
+  return true;
+}
+
+function closeCacheAdvancedInfo({ includePinned = true } = {}) {
+  if (cacheAdvancedInfoHoverTimer) {
+    window.clearTimeout(cacheAdvancedInfoHoverTimer);
+    cacheAdvancedInfoHoverTimer = null;
+  }
+  if (cacheAdvancedInfoLeaveTimer) {
+    window.clearTimeout(cacheAdvancedInfoLeaveTimer);
+    cacheAdvancedInfoLeaveTimer = null;
+  }
+  let closed = false;
+  document.querySelectorAll(".cache-advanced-info.is-visible").forEach((info) => {
+    if (!includePinned && info.classList.contains("is-pinned")) {
+      return;
+    }
+    closed = true;
+    info.classList.remove("is-visible", "is-pinned");
+    info.querySelector(".cache-advanced-info-button")?.setAttribute("aria-expanded", "false");
+    resetContextualTooltipPosition(info);
+  });
+  return closed;
+}
+
+function showCacheAdvancedInfoTransient(info, source) {
+  if (info?.classList.contains("is-pinned")) {
+    return true;
+  }
+  const pinned = document.querySelector(".cache-advanced-info.is-pinned");
+  if (source === "pointer" && pinned && pinned !== info) {
+    return false;
+  }
+  return setCacheAdvancedInfoVisible(info);
+}
+
+function cacheAdvancedInfoSupportsHover(event) {
+  if (event.pointerType === "touch") {
+    return false;
+  }
+  return window.matchMedia?.("(any-hover: hover) and (any-pointer: fine)").matches !== false;
+}
+
+
+function renderProvidedRemoteQr(source, { image, placeholder }, emptyMessage = "") {
+  if (!image || !placeholder) {
+    return;
+  }
+  const normalizedSource = String(source || "").trim();
+  if (image.__bilikaraQrImage === normalizedSource) {
+    return;
+  }
+  image.__bilikaraQrImage = normalizedSource;
+  image.classList.add("hidden");
+  if (!normalizedSource) {
+    image.removeAttribute("src");
+    placeholder.textContent = emptyMessage || t("remote.noAddress");
+    placeholder.classList.remove("hidden");
+    return;
+  }
+  placeholder.textContent = t("remote.qrLoading");
+  placeholder.classList.remove("hidden");
+  image.onload = () => {
+    if (image.__bilikaraQrImage !== normalizedSource) return;
+    placeholder.classList.add("hidden");
+    image.classList.remove("hidden");
+  };
+  image.onerror = () => {
+    if (image.__bilikaraQrImage !== normalizedSource) return;
+    image.classList.add("hidden");
+    placeholder.textContent = t("remote.qrImageFailed");
+    placeholder.classList.remove("hidden");
+  };
+  image.src = normalizedSource;
+}
+
+function renderPlayerFullscreenRemoteAccess({
+  localQrUrl,
+  localDisplayUrl,
+  localHint,
+  internetActive,
+  internetQrImage,
+  internetPassword,
+  internetConnectedCount,
+}) {
+  const normalizedLocalQrUrl = String(localQrUrl || "").trim();
+  const normalizedLocalDisplayUrl = String(localDisplayUrl || "").trim();
+  elements.playerFullscreenRemotePopover?.querySelector(".remote-access-card")
+    ?.classList.toggle("is-local-only-preview", !internetActive);
+  setTextContent(elements.playerFullscreenRemoteUrl,
+    normalizedLocalDisplayUrl ? (new URL(normalizedLocalDisplayUrl).origin + new URL(normalizedLocalDisplayUrl).pathname) : "");
+  elements.playerFullscreenRemoteUrl?.classList.remove("hidden");
+  elements.playerFullscreenRemoteUrl?.setAttribute("aria-disabled", String(!normalizedLocalDisplayUrl));
+  if (elements.playerFullscreenRemoteUrl) {
+    if (normalizedLocalDisplayUrl) elements.playerFullscreenRemoteUrl.href = normalizedLocalDisplayUrl;
+    else elements.playerFullscreenRemoteUrl.removeAttribute("href");
+    elements.playerFullscreenRemoteUrl.tabIndex = normalizedLocalDisplayUrl ? 0 : -1;
+  }
+  if (!normalizedLocalDisplayUrl) setTextContent(elements.playerFullscreenRemoteUrl, t("remote.noAddress"));
+  setTextContent(elements.playerFullscreenRemoteUrlHint, String(localHint || "").trim());
+  setTextContent(
+    elements.playerFullscreenPublicMeta,
+    internetActive
+      ? t("internetRemote.createdStatus", { count: internetConnectedCount })
+      : t("internetRemote.notCreated"),
+  );
+  elements.playerFullscreenPublicMeta?.classList.toggle("is-active", internetActive);
+  setTextContent(
+    elements.playerFullscreenPublicConnectionCount,
+    String(internetActive ? internetConnectedCount : 0),
+  );
+  elements.playerFullscreenPublicRoom?.classList.toggle("hidden", !internetActive);
+  setTextContent(
+    elements.playerFullscreenPublicPassword,
+    internetActive ? String(internetPassword || "").trim() : "",
+  );
+
+  renderRemoteQr(normalizedLocalQrUrl, [{
+    image: elements.playerFullscreenRemoteQrImage,
+    placeholder: elements.playerFullscreenRemoteQrPlaceholder,
+    size: 220,
+    emptyMessage: localHint || t("internetRemote.notReady"),
+  }]);
+  renderProvidedRemoteQr(
+    internetActive ? internetQrImage : "",
+    {
+      image: elements.playerFullscreenPublicQrImage,
+      placeholder: elements.playerFullscreenPublicQrPlaceholder,
+    },
+    internetActive ? t("remote.qrLoading") : t("internetRemote.notCreated"),
+  );
+}
+
+function normalizedRemoteHttpUrl(value) {
+  const candidate = String(value || "").trim();
+  // An absent snapshot/address is not a link to the current Host page.
+  if (!candidate) return "";
+  try {
+    const parsed = new URL(candidate, window.location.href);
+    return ["http:", "https:"].includes(parsed.protocol) ? parsed.href : "";
+  } catch {
+    return "";
+  }
+}
+
+function remoteUrlUsesLoopback(value) {
+  const normalizedUrl = normalizedRemoteHttpUrl(value);
+  if (!normalizedUrl) return false;
+  const hostname = new URL(normalizedUrl).hostname
+    .replace(/^\[|\]$/gu, "")
+    .replace(/\.$/u, "")
+    .toLowerCase();
+  return hostname === "localhost"
+    || hostname.endsWith(".localhost")
+    || hostname === "::1"
+    || hostname === "0:0:0:0:0:0:0:1"
+    || hostname.startsWith("127.")
+    || hostname.startsWith("::ffff:127.");
+}
+
+function updateRemoteAccessFailure(failure, sequence) {
+  if (sequence < state.remoteAccessOutcomeSequence) return;
+  state.remoteAccessOutcomeSequence = sequence;
+  if (JSON.stringify(failure) === JSON.stringify(state.remoteAccessFailure)) return;
+  state.remoteAccessFailure = failure;
+  renderRemoteAccess(state.data?.remote_access);
+  publishPresentationOutputState();
+}
+
+function localRemoteAccessView(remoteAccess) {
+  const failure = state.remoteAccessFailure;
+  if (failure) {
+    const key = failure.kind === "http" && [401, 403].includes(failure.status)
+      ? "remote.accessDenied" : `remote.access${failure.kind[0].toUpperCase()}${failure.kind.slice(1)}`;
+    return { url: "", hint: t(key, { status: failure.status }) };
+  }
+  if (!remoteAccess) return { url: "", hint: t(state.hasValidStateResponse ? "remote.accessInvalid" : "remote.accessWaiting") };
+  const candidates = [remoteAccess.preferred_url, ...(Array.isArray(remoteAccess.lan_urls) ? remoteAccess.lan_urls : []), remoteAccess.local_url];
+  const urls = candidates.map(normalizedRemoteHttpUrl).filter(value => {
+    if (!value) return false;
+    const url = new URL(value);
+    return !url.username && !url.password && ["/remote", "/remote/", "/remote.html"].includes(url.pathname);
+  });
+  const url = urls.find(value => !remoteUrlUsesLoopback(value)) || "";
+  if (!url) return { url: "", hint: t(urls.length ? "remote.noLanHint" : "remote.accessInvalid") };
+  const source = String(remoteAccess.qr_image || "");
+  const qrKey = JSON.stringify([url, source]);
+  if (state.remoteAccessQrFailure === qrKey || (document.documentElement.dataset.nativeHost === "true" && !source.startsWith("data:image/svg+xml;base64,"))) {
+    return { url: "", hint: t("remote.qrFailed") };
+  }
+  return { url, hint: t("internetRemote.localSameNetwork") };
+}
+
+function remoteAccessForPresentation() {
+  const access = state.data?.remote_access;
+  const view = localRemoteAccessView(access);
+  return { ...access, preferred_url: view.url, local_url: view.url,
+    qr_image: view.url ? access?.qr_image || "" : "", unavailable_message: view.url ? "" : view.hint };
+}
 
 function renderRemoteAccess(remoteAccess) {
-  const preferredUrl = String(remoteAccess?.preferred_url || "");
-  const lanUrls = Array.isArray(remoteAccess?.lan_urls) ? remoteAccess.lan_urls : [];
-  const localUrl = String(remoteAccess?.local_url || "");
-  const displayUrl = preferredUrl || localUrl || `${window.location.origin}/remote`;
-  const displayHint = lanUrls.length > 1
-    ? t("remote.multipleLanHint", { urls: lanUrls.join(" · ") })
-    : lanUrls.length === 1
-      ? t("remote.defaultHint")
-      : t("remote.noLanHint");
-  const signature = JSON.stringify({ displayUrl, displayHint });
+  const view = localRemoteAccessView(remoteAccess);
+  const displayUrl = view.url;
+  const shareableUrl = view.url;
+  const popoverTargetUrl = view.url;
+  const displayHint = view.hint;
+  const internetDisplay = state.internetRemoteDisplay;
+  const localConnectedCount = Math.max(0, Math.trunc(Number(remoteAccess?.connected_count) || 0));
+  const internetActive = Boolean(
+    internetDisplay?.mode === "internet"
+      && internetDisplay?.active
+      && internetDisplay?.url,
+  );
+  const internetQrImage = internetActive ? String(internetDisplay?.qr_image || "") : "";
+  const internetPassword = internetActive ? String(internetDisplay?.password || "") : "";
+  const internetConnectedCount = internetActive
+    ? Math.max(0, Math.trunc(Number(internetDisplay?.connected_count) || 0))
+    : 0;
+  const signature = JSON.stringify({
+    language: state.language,
+    displayUrl,
+    displayHint,
+    shareableUrl,
+    internetActive,
+    internetQrImage,
+    internetPassword,
+    internetConnectedCount,
+    localConnectedCount,
+    // Native QR is provided independently of the URL; missing -> ready must
+    // redraw even when the LAN address has not changed.
+    nativeQrImage: document.documentElement?.dataset?.nativeHost === "true"
+      ? String(remoteAccess?.qr_image || "") : "",
+  });
   if (signature === state.remoteAccessRenderSignature) {
     return;
   }
   state.remoteAccessRenderSignature = signature;
-
-  [elements.remoteUrlLink, elements.remotePopoverUrlLink].forEach((link) => {
-    if (!link) {
-      return;
-    }
-    if (link.getAttribute("href") !== displayUrl) {
-      link.href = displayUrl;
-    }
-    setTextContent(link, displayUrl);
+  document.querySelectorAll("[data-local-connection-count]").forEach(node => {
+    setTextContent(node, String(localConnectedCount));
+  });
+  document.querySelectorAll("[data-local-connection-label]").forEach(node => {
+    setTextContent(node, t("remote.connectionCount", { count: localConnectedCount }));
   });
 
-  [elements.remoteUrlHint, elements.remotePopoverUrlHint].forEach((hint) => {
-    setTextContent(hint, displayHint);
-  });
+  for (const link of [elements.remoteUrlLink, elements.remotePopoverUrlLink]) {
+    if (!link) continue;
+    link.classList.remove("hidden");
+    if (displayUrl) link.setAttribute("href", displayUrl);
+    else link.removeAttribute("href");
+    link.setAttribute("aria-disabled", String(!displayUrl));
+    link.tabIndex = displayUrl ? 0 : -1;
+    link.dataset.shareable = String(Boolean(displayUrl));
+    link.textContent = displayUrl ? new URL(displayUrl).origin + new URL(displayUrl).pathname : t("remote.noAddress");
+    link.title = displayUrl || displayHint;
+  }
+  setTextContent(elements.remoteUrlHint, displayHint);
+  setTextContent(elements.remotePopoverUrlHint, displayHint);
+  for (const button of [elements.copyRemoteUrlButton, elements.remotePopoverCopyLink]) {
+    button?.classList.remove("hidden");
+    if (button) button.disabled = !shareableUrl || button.getAttribute("aria-busy") === "true";
+  }
 
   renderRemoteQr(displayUrl, [
-    { image: elements.remoteQrImage, placeholder: elements.remoteQrPlaceholder, size: 220 },
-    { image: elements.remotePopoverQrImage, placeholder: elements.remotePopoverQrPlaceholder, size: 220 },
-    { image: elements.remoteMiniQrImage, placeholder: elements.remoteMiniQrPlaceholder, size: 132 },
+    { image: elements.remoteQrImage, placeholder: elements.remoteQrPlaceholder, size: 220, emptyMessage: displayHint },
   ]);
+  renderRemoteQr(shareableUrl, [
+    {
+      image: elements.remotePopoverQrImage,
+      placeholder: elements.remotePopoverQrPlaceholder,
+      size: 220,
+      emptyMessage: displayHint,
+    },
+    {
+      image: elements.remoteMiniQrImage,
+      placeholder: elements.remoteMiniQrPlaceholder,
+      size: 132,
+      emptyMessage: displayHint,
+    },
+  ]);
+  renderPlayerFullscreenRemoteAccess({
+    localQrUrl: shareableUrl,
+    localDisplayUrl: popoverTargetUrl,
+    localHint: displayHint,
+    internetActive,
+    internetQrImage,
+    internetPassword,
+    internetConnectedCount,
+  });
 }
 
 function renderRemoteQr(url, targets = []) {
   const normalizedUrl = String(url || "").trim();
   if (!normalizedUrl) {
-    targets.forEach(({ image, placeholder }) => {
-      image?.classList.add("hidden");
+    targets.forEach(({ image, placeholder, emptyMessage = t("remote.noAddress") }) => {
+      if (image) {
+        image.onload = null;
+        image.onerror = null;
+        image.dataset.qrState = "no-address";
+        image.classList.add("hidden");
+        image.removeAttribute("src");
+        delete image.dataset.qrUrl;
+      }
       if (placeholder) {
-        placeholder.textContent = t("remote.noAddress");
+        placeholder.textContent = emptyMessage;
         placeholder.classList.remove("hidden");
       }
     });
@@ -5056,30 +10785,69 @@ function renderRemoteQr(url, targets = []) {
       return;
     }
 
-    const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=${size}x${size}&margin=0&data=${encodeURIComponent(normalizedUrl)}`;
+    const nativeHost = document.documentElement?.dataset?.nativeHost === "true";
+    const qrUrl = nativeHost
+      ? String(state.data?.remote_access?.qr_image || "")
+      : `https://api.qrserver.com/v1/create-qr-code/?size=${size}x${size}&margin=0&data=${encodeURIComponent(normalizedUrl)}`;
+    if (nativeHost && !qrUrl.startsWith("data:image/svg+xml;base64,")) {
+      image.onload = null;
+      image.onerror = null;
+      delete image.dataset.qrUrl;
+      image.dataset.qrState = qrUrl ? "invalid-source" : "missing-source";
+      image.removeAttribute("src");
+      image.classList.add("hidden");
+      placeholder.textContent = t("remote.qrFailed");
+      placeholder.classList.remove("hidden");
+      return;
+    }
     if (image.dataset.qrUrl === qrUrl) {
       return;
     }
 
     image.dataset.qrUrl = qrUrl;
+    image.dataset.qrState = "loading";
     image.classList.add("hidden");
     placeholder.textContent = t("remote.qrLoading");
     placeholder.classList.remove("hidden");
     image.onload = () => {
+      if (image.dataset.qrUrl !== qrUrl) return;
+      image.dataset.qrState = "loaded";
       placeholder.classList.add("hidden");
       image.classList.remove("hidden");
     };
     image.onerror = () => {
+      if (image.dataset.qrUrl !== qrUrl) return;
+      image.dataset.qrState = "failed";
+      image.dataset.qrFailures = String((Number(image.dataset.qrFailures) || 0) + 1);
       image.classList.add("hidden");
       placeholder.textContent = t("remote.qrFailed");
       placeholder.classList.remove("hidden");
+      state.remoteAccessQrFailure = JSON.stringify([normalizedUrl, String(state.data?.remote_access?.qr_image || "")]);
+      renderRemoteAccess(state.data?.remote_access);
+      publishPresentationOutputState();
     };
     image.src = qrUrl;
   });
 }
 
-async function copyRemoteUrl() {
-  const url = elements.remoteUrlLink.href;
+document.addEventListener("bilikara:internet-remote-display", (event) => {
+  const detail = event.detail && typeof event.detail === "object" ? event.detail : {};
+  state.internetRemoteDisplay = {
+    mode: detail.mode === "internet" ? "internet" : "local",
+    active: Boolean(detail.active),
+    url: String(detail.url || "").slice(0, 4096),
+    qr_image: String(detail.qr_image || "").slice(0, 1_000_000),
+    password: String(detail.password || "").slice(0, 32),
+    connected_count: Math.max(0, Math.trunc(Number(detail.connected_count) || 0)),
+    hint: String(detail.hint || "").slice(0, 512),
+  };
+  state.remoteAccessRenderSignature = "";
+  renderRemoteAccess(state.data?.remote_access || null);
+  publishPresentationOutputState();
+});
+
+async function copyRemoteUrlFromLink(link) {
+  const url = normalizedRemoteHttpUrl(link?.getAttribute("href") || "");
   if (!url) {
     setAppMessage(t("remote.copyUnavailable"), true);
     return;
@@ -5102,15 +10870,14 @@ async function copyRemoteUrl() {
   }
 }
 
+async function copyRemoteUrl() {
+  await copyRemoteUrlFromLink(elements.remoteUrlLink);
+}
+
 function renderListHeader(playlist, history) {
-  const isHistoryView = state.listView === "history";
-  const listTag = isHistoryView ? t("history.tag") : t("list.tag");
-  const listTitle = isHistoryView ? t("history.title") : t("list.title");
-  const queueCount = isHistoryView ? t("history.count", { count: history.length }) : t("list.count", { count: playlist.length });
-  const historyButtonText = isHistoryView ? t("list.title") : t("history.title");
   const signature = JSON.stringify({
-    isHistoryView,
-    queueCount,
+    queueCount: playlist.length,
+    historyCount: history.length,
     language: state.language,
   });
 
@@ -5119,32 +10886,40 @@ function renderListHeader(playlist, history) {
   }
   state.listHeaderRenderSignature = signature;
 
-  setTextContent(elements.listTag, listTag);
-  setTextContent(elements.listTitle, listTitle);
-  setTextContent(elements.queueCount, queueCount);
-  setTextContent(elements.historyToggleButton, historyButtonText);
-  setClassToggle(elements.clearPlaylistButton, "hidden", isHistoryView);
-  setClassToggle(elements.historyExportButton, "hidden", !isHistoryView);
-  setClassToggle(elements.clearHistoryButton, "hidden", !isHistoryView || !history.length);
-  setClassToggle(elements.nextButton, "hidden", isHistoryView);
+  setTextContent(elements.listTag, t("list.tag"));
+  setTextContent(elements.listTitle, t("list.title"));
+  setTextContent(elements.queueCount, t("list.count", { count: playlist.length }));
+  setTextContent(elements.historyCount, t("history.count", { count: history.length }));
+  setClassToggle(elements.clearHistoryButton, "hidden", !history.length);
 }
 
 function renderCacheSettings(bbdown, ffmpeg, cachePolicy) {
-  const serviceState = aggregateToolStatusState(bbdown, ffmpeg);
+  const login = bbdown?.login || { logged_in: Boolean(bbdown?.logged_in) };
+  // Legacy Host transports can still report an actual media-tool failure.
+  // Native libav is checked before Host startup; it has no separate UI lamp.
+  const mediaStatus = ffmpeg?.state === "disabled" ? { state: "ready" } : ffmpeg;
+  const native = (cachePolicy?.download_source || bbdown?.download_source) === "native";
+  const nativeReady = bbdown?.native_runtime_ready ?? bbdown?.ready;
+  const downloadState = native
+    ? (nativeReady === true ? "ready" : nativeReady === false ? "failed" : "idle")
+    : bbdown?.state;
+  const serviceState = aggregateToolStatusState(
+    { state: downloadState }, mediaStatus,
+    // Login is optional for ordinary playback. QR expiry is never a runtime failure.
+    { state: login.logged_in ? "ready" : "warning" },
+  );
   const currentQuality = String(cachePolicy?.video_quality || "1080P 高码率");
   const playbackModeText = formatQualityLabel(currentQuality);
   const cacheChipMeta = formatCacheChipMeta(cachePolicy);
   const cacheUsageDetail = formatCacheUsage(cachePolicy);
-  const bbdownTitle = `BBDown ${formatBBDownHint(bbdown)}`;
-  const ffmpegTitle = `FFmpeg ${formatFFmpegHint(ffmpeg)}`;
+  const bbdownTitle = `Bilibili ${localizedBBDownLoginMessage(login.message) || t(login.logged_in ? "service.loggedIn" : "service.notLoggedIn")}`;
   const signature = JSON.stringify({
     serviceState,
     playbackModeText,
-    bbdownState: bbdown?.state,
-    ffmpegState: ffmpeg?.state,
+    downloadState,
     bbdownTitle,
-    ffmpegTitle,
     login: bbdown?.login || { logged_in: Boolean(bbdown?.logged_in) },
+    sessionChoicePending: Boolean(state.data?.session_flags?.startup_choice_pending),
     language: state.language,
   });
 
@@ -5154,14 +10929,9 @@ function renderCacheSettings(bbdown, ffmpeg, cachePolicy) {
     syncToolIndicator(elements.serviceStatusIndicator, serviceState);
     setTextContent(elements.playbackModeSummary, playbackModeText);
     setTextContent(elements.playbackModeCurrent, playbackModeText);
-    syncToolIndicator(elements.bbdownPanelStatusIndicator, bbdown?.state);
-    syncToolIndicator(elements.ffmpegPanelStatusIndicator, ffmpeg?.state);
     renderBBDownLogin(bbdown?.login || { logged_in: Boolean(bbdown?.logged_in) });
     if (elements.bbdownStatusRow && elements.bbdownStatusRow.title !== bbdownTitle) {
       elements.bbdownStatusRow.title = bbdownTitle;
-    }
-    if (elements.ffmpegStatusRow && elements.ffmpegStatusRow.title !== ffmpegTitle) {
-      elements.ffmpegStatusRow.title = ffmpegTitle;
     }
   }
 
@@ -5186,7 +10956,48 @@ function appUpdateStatus() {
 }
 
 function isAppUpdateBusy(update = appUpdateStatus()) {
-  return ["checking", "downloading", "installing", "restarting"].includes(String(update?.state || ""));
+  return Boolean(state.updateInstallRequestInFlight) || ["checking", "downloading", "installing", "prepared", "restarting"].includes(String(update?.state || ""));
+}
+
+function appUpdateMatchesSelectedChannel(update = appUpdateStatus()) {
+  return typeof update?.include_preview === "boolean"
+    && update.include_preview === state.updatePreviewEnabled;
+}
+
+function isEligibleCurrentChannelUpdate(update = appUpdateStatus()) {
+  if (
+    !appUpdateMatchesSelectedChannel(update)
+    || String(update?.state || "") !== "available"
+    || update?.error
+    || update?.requires_recheck
+  ) {
+    return false;
+  }
+  const eligibleActions = new Set([
+    "normal_upgrade",
+    "preview_to_stable",
+    "development_to_stable",
+    "development_to_preview",
+  ]);
+  if (!eligibleActions.has(String(update?.update_action || ""))) {
+    return false;
+  }
+  return Boolean(
+    update?.eligible_update
+    ?? (update?.update_available || update?.switch_to_release_available),
+  );
+}
+
+function selectedUpdateChannel() {
+  return state.updatePreviewEnabled ? "preview" : "stable";
+}
+
+function shouldPresentCurrentChannelUpdate(update = appUpdateStatus()) {
+  if (!isEligibleCurrentChannelUpdate(update)) {
+    return false;
+  }
+  return state.updateAutomaticEnabled
+    || state.updateManualVisibleChannel === selectedUpdateChannel();
 }
 
 function appUpdateProgressPercent(update = appUpdateStatus()) {
@@ -5204,7 +11015,7 @@ function appUpdateProgressPercent(update = appUpdateStatus()) {
 
 function appUpdateButtonText(update = appUpdateStatus()) {
   const stateValue = String(update?.state || "");
-  if (state.updateChecking || stateValue === "checking") {
+  if (state.updateCheckRequestInFlight || stateValue === "checking") {
     return t("status.checking");
   }
   if (stateValue === "downloading") {
@@ -5213,29 +11024,150 @@ function appUpdateButtonText(update = appUpdateStatus()) {
       ? t("service.updateDownloadingPercent", { percent })
       : t("service.updateDownloading");
   }
-  if (stateValue === "installing") {
+  if (stateValue === "installing" || stateValue === "prepared") {
     return t("service.updateInstalling");
   }
   if (stateValue === "restarting") {
     return t("service.updateRestarting");
   }
+  if (shouldPresentCurrentChannelUpdate(update)) {
+    const version = String(update?.latest_version || "").trim();
+    return update?.auto_update_supported
+      ? t("service.update")
+      : t("service.viewVersion", { version });
+  }
   return t("service.checkUpdate");
+}
+
+function updateIndicatorAccessibleText(update = appUpdateStatus()) {
+  const version = String(update?.latest_version || "").trim();
+  const action = update?.auto_update_supported
+    ? t("service.update")
+    : t("service.viewVersion", { version });
+  return t("service.updateAvailableAction", { version, action });
+}
+
+function syncUpdateIndicator(element, visible, accessibleText) {
+  if (!element) {
+    return;
+  }
+  setClassToggle(element, "hidden", !visible);
+  if (visible) {
+    element.setAttribute("aria-label", accessibleText);
+  } else {
+    element.removeAttribute("aria-label");
+  }
+}
+
+function maybeReportManualUpdateCheckOutcome(update) {
+  const pending = state.manualUpdateCheck;
+  if (
+    !pending
+    || !appUpdateMatchesSelectedChannel(update)
+    || Boolean(update?.include_preview) !== pending.includePreview
+    || Number(update?.updated_at || 0) <= pending.startedAt
+    || String(update?.state || "") === "checking"
+  ) {
+    return;
+  }
+  state.manualUpdateCheck = null;
+  state.updateManualVisibleChannel = isEligibleCurrentChannelUpdate(update)
+    ? selectedUpdateChannel()
+    : "";
+  if (String(update?.state || "") === "failed") {
+    setAppMessage(update?.error || update?.message || t("service.updateFailed"), true);
+    return;
+  }
+  if (update?.requires_recheck) return;
+  if (!isEligibleCurrentChannelUpdate(update)) {
+    setAppMessage(t("service.upToDate"));
+  }
+}
+
+// A previous helper's kept outcome arrives once, in the Host's first status.
+function maybeReportLastInstall(update) {
+  const last = update?.last_install;
+  if (!last?.operation || state.reportedLastInstall === last.operation) return;
+  state.reportedLastInstall = last.operation;
+  const log = String(last.log || "");
+  if (last.relaunch_failed === true) {
+    const key = last.result === "installed" ? "service.updateLastInstalledRestartFailed" : "service.updateLastFailedRestartFailed";
+    setAppMessage(t(key, { log, version: String(update.current_version || "") }), true);
+  } else if (last.result === "installed") {
+    setAppMessage(t("service.updateLastInstalled", { version: String(update.current_version || "") }));
+  } else {
+    const key = last.result === "owners_running" ? "service.updateLastOwnersRunning" : "service.updateLastFailed";
+    setAppMessage(t(key, { log }), true);
+  }
 }
 
 function renderUpdatePreviewControl() {
   const update = appUpdateStatus();
-  const busy = state.updateChecking || isAppUpdateBusy(update);
+  maybeReportLastInstall(update);
+  if (update.state === "prepared") {
+    globalThis.BilikaraHostUpdates?.applyPrepared?.(update).catch((error) => setAppMessage(error.message, true));
+  }
+  const cancelButton = elements.updateCancelButton;
+  if (cancelButton) cancelButton.hidden = update.cancellable !== true;
+  maybeReportManualUpdateCheckOutcome(update);
+  const busy = state.updateCheckRequestInFlight || isAppUpdateBusy(update);
+  const eligible = shouldPresentCurrentChannelUpdate(update);
+  const accessibleText = eligible ? updateIndicatorAccessibleText(update) : "";
+  if (elements.updateAutomaticCheckbox) {
+    elements.updateAutomaticCheckbox.checked = state.updateAutomaticEnabled;
+    elements.updateAutomaticCheckbox.disabled = state.updatePreferenceSaveInFlight;
+  }
   if (elements.updatePreviewCheckbox) {
     elements.updatePreviewCheckbox.checked = state.updatePreviewEnabled;
-    elements.updatePreviewCheckbox.disabled = busy;
+    elements.updatePreviewCheckbox.disabled = busy || state.updatePreferenceSaveInFlight;
   }
   if (elements.updateCheckButton) {
     elements.updateCheckButton.disabled = busy;
+    if (busy) {
+      elements.updateCheckButton.setAttribute("aria-busy", "true");
+    } else {
+      elements.updateCheckButton.removeAttribute("aria-busy");
+    }
     setTextContent(elements.updateCheckButton, appUpdateButtonText(update));
     setElementTitle(
       elements.updateCheckButton,
-      update?.message || update?.error || t("service.checkUpdateTitle"),
+      appUpdateMatchesSelectedChannel(update)
+        ? update?.message || update?.error || t("service.checkUpdateTitle")
+        : t("service.checkUpdateTitle"),
     );
+  }
+  syncUpdateIndicator(elements.settingsUpdateIndicator, eligible, accessibleText);
+  if (elements.updateVersionBadge) {
+    setClassToggle(elements.updateVersionBadge, "hidden", !eligible);
+    setTextContent(
+      elements.updateVersionBadge,
+      eligible
+        ? t("service.newVersionBadge", { version: String(update?.latest_version || "") })
+        : "",
+    );
+    if (eligible) {
+      elements.updateVersionBadge.setAttribute("aria-label", accessibleText);
+    } else {
+      elements.updateVersionBadge.removeAttribute("aria-label");
+    }
+  }
+  if (elements.appUpdateStatus) {
+    let statusText = "";
+    if (eligible) {
+      statusText = "";
+    } else if (!state.updateAutomaticEnabled && !state.manualUpdateCheck) {
+      statusText = "";
+    } else if (state.updateCheckRequestInFlight || update.state === "checking"
+      || update?.requires_recheck || !appUpdateMatchesSelectedChannel(update)) {
+      // The action already communicates checking; channel changes are not errors.
+      statusText = "";
+    } else {
+      statusText = globalThis.document?.documentElement?.dataset?.hostPlatform === "android" && !update?.error
+        ? update?.state === "up_to_date" ? t("service.noUpdateAvailable")
+          : update?.supported === false ? t("service.featureUnavailable") : String(update?.message || "")
+        : String(update?.error || update?.message || "");
+    }
+    setTextContent(elements.appUpdateStatus, statusText);
   }
 }
 
@@ -5245,15 +11177,15 @@ function renderPlaybackRepairControls(currentItem) {
     return;
   }
   const hasCurrentItem = Boolean(currentItem?.id);
-  button.disabled = !hasCurrentItem;
+  button.disabled = !hasCurrentItem || button.getAttribute("aria-busy") === "true";
   button.title = hasCurrentItem
     ? t("service.retryCurrentTitle")
     : t("service.noCurrentSong");
 }
 
-function renderBBDownLogin(login) {
+function renderBBDownLogin(login, { startIfNeeded = true } = {}) {
   const loggedIn = Boolean(login?.logged_in);
-  const signature = JSON.stringify(login || {});
+  const signature = JSON.stringify([login || {}, state.bbdownLoginRequesting]);
   if (signature !== state.bbdownLoginRenderSignature) {
     state.bbdownLoginRenderSignature = signature;
     if (elements.bbdownLoginButton) {
@@ -5266,6 +11198,22 @@ function renderBBDownLogin(login) {
     }
 
     setClassToggle(elements.bbdownLoginPanel, "hidden", loggedIn);
+    if (elements.bbdownLoginLink) {
+      let loginUrl = "";
+      const desktopLogin = document.documentElement.dataset.hostPlatform === "desktop"
+        && Boolean(window.BilikaraDesktopPlatform?.openBilibiliLogin);
+      try {
+        const url = new URL(login?.login_url || "");
+        if (!state.bbdownLoginRequesting && !loggedIn && login?.state === "waiting" && url.href.length <= 4096 && url.protocol === "https:"
+          && ["account.bilibili.com", "passport.bilibili.com"].includes(url.hostname)
+          && !url.username && !url.password && (!url.port || url.port === "443")) loginUrl = url.href;
+      } catch { /* Older Hosts do not publish a login link. */ }
+      if (desktopLogin && !loggedIn && !state.bbdownLoginRequesting) loginUrl = "https://account.bilibili.com/login";
+      elements.bbdownLoginLink.hidden = !loginUrl;
+      document.getElementById("bbdown-login-alternative").hidden = !loginUrl;
+      if (loginUrl) elements.bbdownLoginLink.href = loginUrl;
+      else elements.bbdownLoginLink.removeAttribute("href");
+    }
     if (!loggedIn) {
       const qrImage = String(login?.qr_image || "");
       const qrText = String(login?.qr_text || "");
@@ -5288,31 +11236,70 @@ function renderBBDownLogin(login) {
     }
   }
 
+  syncHostAccountPresentation();
+  syncAndroidLoginLabel();
   if (loggedIn) {
     return;
   }
-  maybeStartBBDownLogin(login);
+  if (startIfNeeded) maybeStartBBDownLogin(login);
+}
+
+function syncAndroidLoginLabel() {
+  if (document.documentElement.dataset.hostPlatform !== "android") return;
+  const button = elements.bbdownLoginButton;
+  const loggedIn = Boolean(state.data?.bbdown?.login?.logged_in || state.data?.bbdown?.logged_in);
+  if (!loggedIn) delete button.dataset.logoutArmed;
+  setTextContent(button.querySelector(".bbdown-login-label"), t(loggedIn
+    ? button.dataset.logoutArmed === "true" ? "service.logout" : "service.loggedIn"
+    : "service.notLoggedIn"));
 }
 
 function maybeStartBBDownLogin(login, options = {}) {
-  if (!state.cacheSettingsOpen || state.bbdownLoginRequesting || login?.logged_in) {
+  // The settings view can render before the restored session is resolved.
+  // Defer login side effects until Rust admits them; ordinary LAN QR rendering
+  // uses the existing snapshot and needs no provider request.
+  if (state.data?.session_flags?.startup_choice_pending) return;
+  const loginState = String(login?.state || "idle");
+  if (loginState !== "failed") state.bbdownExpiredRetryHandled = false;
+  if (!state.cacheSettingsOpen || state.bbdownLoginRequesting || state.bbdownWebLoginRequesting || login?.logged_in) {
+    return;
+  }
+  // Refresh only the backend's explicit expiry result. Network/API failures
+  // remain manual, and a failed refresh cannot loop on the same snapshot.
+  if (loginState === "failed" && login?.message === "二维码已过期，请重新生成"
+    && !state.bbdownExpiredRetryHandled) {
+    state.bbdownExpiredRetryHandled = true;
+    void startBBDownLogin({ force: true });
     return;
   }
   const force = Boolean(options.force);
-  const loginState = String(login?.state || "idle");
+  // Android's compact account page requires an explicit login action. Window
+  // width alone must not disable the desktop Settings login workflow.
+  if (!force && document.documentElement.dataset.hostPlatform === "android"
+    && globalThis.BilikaraHostLayout?.isPortrait?.()) return;
   if (!force && (loginState === "starting" || loginState === "waiting")) {
     return;
   }
-  if (!force && loginState !== "idle") {
+  if (!force && loginState !== "idle" && !options.reopen) {
     return;
   }
   startBBDownLogin({ force });
 }
 
 async function startBBDownLogin(options = {}) {
+  if (state.bbdownLoginRequesting || state.bbdownWebLoginRequesting) return;
   state.bbdownLoginRequesting = true;
+  const controls = [elements.bbdownLoginButton, elements.bbdownLoginRefresh]
+    .filter(Boolean).map(button => ({button, disabled: button.disabled}));
+  for (const {button} of controls) {
+    button.disabled = true;
+    button.setAttribute("aria-busy", "true");
+  }
+  // QR and browser login belong to the same generation. Remove the previous
+  // link immediately, including while a manual or automatic refresh is pending.
+  renderBBDownLogin(state.data?.bbdown?.login, { startIfNeeded: false });
   try {
-    state.data = await apiPost("/api/bbdown/login/start", {
+    await apiPostStateSnapshot("/api/bbdown/login/start", {
       force: Boolean(options.force),
     });
     render();
@@ -5320,6 +11307,11 @@ async function startBBDownLogin(options = {}) {
     setAppMessage(error.message, true);
   } finally {
     state.bbdownLoginRequesting = false;
+    for (const {button, disabled} of controls) {
+      button.disabled = disabled;
+      button.removeAttribute("aria-busy");
+    }
+    renderBBDownLogin(state.data?.bbdown?.login, { startIfNeeded: false });
   }
 }
 
@@ -5332,27 +11324,27 @@ function syncToolIndicator(indicator, state) {
     return;
   }
   indicator.dataset.toolState = normalizedState;
-  indicator.classList.remove("is-ready", "is-failed", "is-loading", "is-pending");
+  indicator.classList.remove("is-ready", "is-failed", "is-loading", "is-pending", "is-warning");
   setTextContent(indicator, "");
   if (normalizedState === "ready") {
     indicator.classList.add("is-ready");
-    setTextContent(indicator, "✓");
-  } else if (normalizedState === "failed") {
+  } else if (normalizedState === "failed" || normalizedState === "error") {
     indicator.classList.add("is-failed");
-    setTextContent(indicator, "×");
+  } else if (normalizedState === "warning") {
+    indicator.classList.add("is-warning");
   } else if (normalizedState === "checking" || normalizedState === "installing" || normalizedState === "loading") {
     indicator.classList.add("is-loading");
   } else {
     indicator.classList.add("is-pending");
-    setTextContent(indicator, "·");
   }
 }
 
-function aggregateToolStatusState(bbdown, ffmpeg) {
-  const states = [bbdown?.state, ffmpeg?.state].map((value) => String(value || "idle"));
-  if (states.includes("failed")) {
+function aggregateToolStatusState(...services) {
+  const states = services.map(service => String(service?.state || "idle"));
+  if (states.includes("failed") || states.includes("error")) {
     return "failed";
   }
+  if (states.includes("warning")) return "warning";
   if (states.every((stateValue) => stateValue === "ready")) {
     return "ready";
   }
@@ -5376,17 +11368,14 @@ function formatQualityLabel(value) {
   return labels[normalized] || normalized;
 }
 
-function formatPlaybackMode(_mode) {
-  return t("service.localPlayback");
-}
-
 function renderCacheSlider(cachePolicy) {
   const choices = Array.isArray(cachePolicy?.choices) && cachePolicy.choices.length
     ? cachePolicy.choices
     : [1, 2, 3, 4, 5];
   const minValue = Number(choices[0] || 1);
   const maxValue = Number(choices[choices.length - 1] || 5);
-  const currentValue = Number(cachePolicy?.max_cache_items || minValue);
+  const confirmedValue = Number(cachePolicy?.max_cache_items || minValue);
+  const currentValue = state.cacheLimitDraftValue ?? confirmedValue;
   const signature = JSON.stringify({
     choices,
     currentValue,
@@ -5402,7 +11391,12 @@ function renderCacheSlider(cachePolicy) {
   elements.cacheLimitSlider.max = String(maxValue);
   elements.cacheLimitSlider.step = "1";
   elements.cacheLimitSlider.value = String(currentValue);
-  elements.cacheLimitSlider.disabled = state.cacheLimitSaving;
+  elements.cacheLimitSlider.disabled = false;
+  if (state.cacheLimitSaving) {
+    elements.cacheLimitSlider.setAttribute("aria-busy", "true");
+  } else {
+    elements.cacheLimitSlider.removeAttribute("aria-busy");
+  }
   updateCacheSliderFill(currentValue, minValue, maxValue);
 
   elements.cacheLimitScale.innerHTML = "";
@@ -5418,7 +11412,8 @@ function renderAdvanceDelaySlider(playerSettings) {
   if (!elements.advanceDelaySlider) {
     return;
   }
-  const currentValue = currentSongAdvanceDelaySeconds(playerSettings);
+  const confirmedValue = currentSongAdvanceDelaySeconds(playerSettings);
+  const currentValue = state.advanceDelayDraftValue ?? confirmedValue;
   const signature = JSON.stringify({
     currentValue,
     saving: state.advanceDelaySaving,
@@ -5433,7 +11428,12 @@ function renderAdvanceDelaySlider(playerSettings) {
   elements.advanceDelaySlider.max = "5";
   elements.advanceDelaySlider.step = "1";
   elements.advanceDelaySlider.value = String(currentValue);
-  elements.advanceDelaySlider.disabled = state.advanceDelaySaving;
+  elements.advanceDelaySlider.disabled = false;
+  if (state.advanceDelaySaving) {
+    elements.advanceDelaySlider.setAttribute("aria-busy", "true");
+  } else {
+    elements.advanceDelaySlider.removeAttribute("aria-busy");
+  }
   updateAdvanceDelaySliderFill(currentValue);
 
   elements.advanceDelayScale.querySelectorAll("span").forEach((mark) => {
@@ -5490,10 +11490,16 @@ function renderCachePolicyControls(cachePolicy) {
       };
     }).filter((choice) => choice.value)
     : [
+      { value: "native", label: "Rust Native" },
       { value: "bbdown", label: "BBDown" },
       { value: "downkyi", label: "Downkyi (aria2c)" },
     ];
-  const currentDownloadSource = String(cachePolicy?.download_source || sourceChoices[0]?.value || "bbdown");
+  const sourceOrder = new Map([["native", 0], ["bbdown", 1], ["downkyi", 2]]);
+  sourceChoices.sort((left, right) => (
+    (sourceOrder.get(left.value) ?? Number.MAX_SAFE_INTEGER)
+      - (sourceOrder.get(right.value) ?? Number.MAX_SAFE_INTEGER)
+  ));
+  const currentDownloadSource = String(cachePolicy?.download_source || sourceChoices[0]?.value || "native");
   const signature = JSON.stringify({
     choices,
     currentQuality,
@@ -5551,189 +11557,349 @@ function renderCachePolicyControls(cachePolicy) {
     elements.resetOffsetCheckbox.checked = resetOffsetOnNext;
     elements.resetOffsetCheckbox.disabled = state.cachePolicySaving;
   }
-  renderPlaybackSelectorControl();
 }
 
-function hostStateRevision(snapshot = state.data) {
-  const revision = Number(snapshot?.state_revision || 0);
-  return Number.isFinite(revision) && revision >= 0 ? revision : 0;
+function isSafeHostSnapshotInteger(value, minimum = 0) {
+  return Number.isSafeInteger(value) && value >= minimum;
 }
 
-function applyFreshStateSnapshot(snapshot) {
-  if (!snapshot || typeof snapshot !== "object") {
+function playbackProgramDescriptorsEqual(left, right) {
+  if (left === null || right === null) {
+    return left === right;
+  }
+  return Boolean(
+    left
+    && right
+    && left.item_id === right.item_id
+    && left.item_incarnation_id === right.item_incarnation_id
+    && left.selected_audio_variant_id === right.selected_audio_variant_id
+    && left.artifact_set_id === right.artifact_set_id
+  );
+}
+
+function isValidHostMediaLocator(value) {
+  if (typeof value !== "string" || !value.trim()) {
     return false;
   }
-  const currentRevision = hostStateRevision(state.data);
-  const nextRevision = hostStateRevision(snapshot);
-  if (currentRevision > 0 && (nextRevision === 0 || nextRevision < currentRevision)) {
+  try {
+    const locator = new URL(value, window.location.href);
+    if (locator.protocol !== "http:" && locator.protocol !== "https:") {
+      return false;
+    }
+    const decodedPath = decodeURIComponent(locator.pathname);
+    if (!decodedPath.startsWith("/media/")) {
+      return false;
+    }
+    const segments = decodedPath.slice("/media/".length).split("/");
+    return segments.length > 0
+      && segments.every((segment) => segment && segment !== "." && segment !== "..");
+  } catch {
     return false;
   }
+}
+
+function validatedHostSnapshotIdentity(snapshot) {
+  if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) {
+    return null;
+  }
+  const stateRevision = snapshot.state_revision;
+  const rustRevision = snapshot.revision;
+  const playbackGeneration = snapshot.playback_generation;
+  if (
+    !isSafeHostSnapshotInteger(stateRevision)
+    || !isSafeHostSnapshotInteger(rustRevision, 1)
+    || !isSafeHostSnapshotInteger(playbackGeneration, 1)
+    || !Object.hasOwn(snapshot, "playback_program")
+    || !Object.hasOwn(snapshot, "current_item")
+  ) {
+    return null;
+  }
+
+  const program = snapshot.playback_program;
+  const currentItem = snapshot.current_item;
+  if ((program === null) !== (currentItem === null)) {
+    return null;
+  }
+  if (program === null) {
+    return { stateRevision, rustRevision, playbackGeneration, program: null };
+  }
+  if (
+    typeof program !== "object"
+    || Array.isArray(program)
+    || Object.keys(program).length !== 4
+    || !Object.hasOwn(program, "item_id")
+    || !Object.hasOwn(program, "item_incarnation_id")
+    || !Object.hasOwn(program, "selected_audio_variant_id")
+    || !Object.hasOwn(program, "artifact_set_id")
+    || typeof program.item_id !== "string"
+    || !program.item_id
+    || typeof program.item_incarnation_id !== "string"
+    || !program.item_incarnation_id
+    || typeof program.selected_audio_variant_id !== "string"
+    || (program.artifact_set_id !== null
+      && (typeof program.artifact_set_id !== "string" || !program.artifact_set_id))
+    || !currentItem
+    || typeof currentItem !== "object"
+    || Array.isArray(currentItem)
+    || currentItem.id !== program.item_id
+    || currentItem.item_incarnation_id !== program.item_incarnation_id
+    || currentItem.selected_audio_variant_id !== program.selected_audio_variant_id
+    || typeof currentItem.artifact_set_id !== "string"
+    || !Array.isArray(currentItem.audio_variants)
+  ) {
+    return null;
+  }
+
+  if (program.artifact_set_id === null) {
+    if (
+      currentItem.artifact_set_id
+      || String(currentItem.video_media_url || "").trim()
+      || currentItem.audio_variants.length > 0
+    ) {
+      return null;
+    }
+  } else {
+    if (
+      currentItem.artifact_set_id !== program.artifact_set_id
+      || !isValidHostMediaLocator(currentItem.video_media_url)
+    ) {
+      return null;
+    }
+    const selectedVariants = currentItem.audio_variants.filter(
+      (variant) => variant
+        && typeof variant === "object"
+        && !Array.isArray(variant)
+        && variant.id === program.selected_audio_variant_id,
+    );
+    if (
+      selectedVariants.length !== 1
+      || !isValidHostMediaLocator(selectedVariants[0].audio_url)
+    ) {
+      return null;
+    }
+  }
+
+  return { stateRevision, rustRevision, playbackGeneration, program };
+}
+
+const hostReadinessSnapshotFields = Object.freeze([
+  "remote_access",
+  "bbdown",
+  "ffmpeg",
+  "cache_policy",
+  "gatcha",
+  "gatcha_pool_config",
+  "gatcha_favlist_updated_at",
+  "app_update",
+]);
+
+function hostReadinessSnapshotSignature(snapshot) {
+  return JSON.stringify(Object.fromEntries(
+    hostReadinessSnapshotFields.map((field) => [field, snapshot?.[field]]),
+  ));
+}
+
+function mergeHostReadinessSnapshot(snapshot) {
+  const merged = { ...state.data };
+  hostReadinessSnapshotFields.forEach((field) => {
+    if (Object.prototype.hasOwnProperty.call(snapshot, field)) {
+      merged[field] = snapshot[field];
+    }
+  });
+  return merged;
+}
+
+function acceptHostStateSnapshot(snapshot) {
+  const next = validatedHostSnapshotIdentity(snapshot);
+  if (!next) {
+    return false;
+  }
+  const previousSnapshot = state.data;
+  const current = state.data ? validatedHostSnapshotIdentity(state.data) : null;
+  if (state.data && !current) {
+    return false;
+  }
+  const sameProgram = current
+    ? playbackProgramDescriptorsEqual(current.program, next.program)
+    : false;
+  let readinessOnly = false;
+  if (current) {
+    if (next.stateRevision < current.stateRevision) {
+      return false;
+    }
+    if (next.stateRevision === current.stateRevision) {
+      if (
+        next.rustRevision !== current.rustRevision
+        || next.playbackGeneration !== current.playbackGeneration
+        || !sameProgram
+      ) {
+        return false;
+      }
+      if (hostReadinessSnapshotSignature(snapshot) === hostReadinessSnapshotSignature(state.data)) {
+        return false;
+      }
+      snapshot = mergeHostReadinessSnapshot(snapshot);
+      readinessOnly = true;
+    }
+    if (
+      next.rustRevision < current.rustRevision
+      || next.playbackGeneration < current.playbackGeneration
+      || (next.rustRevision === current.rustRevision
+        && (next.playbackGeneration !== current.playbackGeneration || !sameProgram))
+      || (next.playbackGeneration === current.playbackGeneration && !sameProgram)
+      || (next.playbackGeneration > current.playbackGeneration
+        && next.rustRevision <= current.rustRevision)
+    ) {
+      return false;
+    }
+  }
+  const loginFailure = [snapshot.current_item, ...(snapshot.playlist || [])].find((item) => {
+    if (!item || item.cache_status !== "failed" || !String(item.cache_message).includes("下载需要登录 Bilibili")) return false;
+    const previous = [state.data?.current_item, ...(state.data?.playlist || [])]
+      .find((entry) => entry?.item_incarnation_id === item.item_incarnation_id);
+    return !previous || previous.cache_status !== "failed" || previous.cache_message !== item.cache_message;
+  });
+  if (loginFailure) setAppMessage(localizedCacheMessage(loginFailure.cache_message, "failed"), true);
   state.data = snapshot;
+  if (snapshot.startup_warning && state.startupWarningSeen !== snapshot.startup_warning) {
+    state.startupWarningSeen = snapshot.startup_warning;
+    setAppMessage(snapshot.startup_warning, true);
+  }
+  if (previousSnapshot?.current_item?.item_incarnation_id !== snapshot.current_item?.item_incarnation_id) {
+    state.playerSettingsEchoSuppressUntil = 0;
+    state.volumeSaveSeq += 1;
+    syncLocalPlayerSettingsFromSnapshot(snapshot.player_settings);
+    globalThis.BilikaraVolumeControl?.resetForSong(elements.volumeSlider, snapshot.player_settings.volume_percent);
+  }
+  if (readinessOnly) {
+    return true;
+  }
+  maybeShowIncomingRequestToast(previousSnapshot, snapshot);
+  if (
+    !current
+    || next.playbackGeneration !== current.playbackGeneration
+    || !sameProgram
+  ) {
+    maybeShowSongTransitionOverlay(previousSnapshot, snapshot);
+    scheduleAcceptedHostPlaybackProgramReconciliation(
+      next.playbackGeneration,
+      next.program,
+    );
+  }
   return true;
 }
 
-function validatedPlaybackSelectorCapability(payload) {
-  if (!payload || typeof payload !== "object") {
-    return null;
-  }
-  const selector = payload.playback_selector;
-  const modes = selector?.modes;
-  const revision = Number(payload.state_revision);
+function scheduleAcceptedHostPlaybackProgramReconciliation(
+  playbackGeneration,
+  playbackProgram,
+) {
+  const pending = state.pendingHostPlaybackProgramReconciliation;
   if (
-    !selector
-    || typeof selector !== "object"
-    || !["python", "rust"].includes(selector.mode)
-    || !Array.isArray(modes)
-    || modes.length !== 2
-    || modes[0] !== "python"
-    || modes[1] !== "rust"
-    || typeof selector.rust_available !== "boolean"
-    || typeof selector.warning !== "string"
-    || !Number.isInteger(revision)
-    || revision < 0
+    pending
+    && pending.playbackGeneration === playbackGeneration
+    && playbackProgramDescriptorsEqual(pending.playbackProgram, playbackProgram)
   ) {
-    return null;
-  }
-  return { selector: { ...selector }, revision };
-}
-
-function authorizedPlaybackSelectorState() {
-  if (!state.playbackSelectorAuthorized) {
-    return null;
-  }
-  const stateSelector = state.data?.playback_selector;
-  if (
-    stateSelector
-    && ["python", "rust"].includes(stateSelector.mode)
-    && hostStateRevision(state.data) >= state.playbackSelectorCapabilityRevision
-  ) {
-    return stateSelector;
-  }
-  return state.playbackSelectorCapability;
-}
-
-function renderPlaybackSelectorControl() {
-  if (!elements.playbackSelectorContainer || !elements.playbackSelectorSelect) {
-    return;
-  }
-  const selector = authorizedPlaybackSelectorState();
-  const authorized = Boolean(selector);
-  elements.playbackSelectorContainer.hidden = !authorized;
-  if (!authorized) {
-    elements.playbackSelectorSelect.disabled = true;
-    elements.playbackSelectorSelect.removeAttribute("aria-busy");
-    return;
-  }
-  const mode = String(selector?.mode || "python");
-  elements.playbackSelectorSelect.value = mode;
-  elements.playbackSelectorSelect.disabled = Boolean(
-    state.playbackSelectorSaving || (selector.rust_available === false && mode !== "rust")
-  );
-  elements.playbackSelectorSelect.toggleAttribute(
-    "aria-busy",
-    Boolean(state.playbackSelectorSaving)
-  );
-  const rustOption = elements.playbackSelectorSelect.querySelector('option[value="rust"]');
-  if (rustOption) {
-    rustOption.disabled = selector.rust_available === false;
-  }
-  if (elements.playbackSelectorHint) {
-    const warning = String(selector.warning || "").trim();
-    elements.playbackSelectorHint.textContent = warning || t("service.playbackSelectorHint");
-    elements.playbackSelectorHint.classList.toggle("is-warning", Boolean(warning));
-  }
-}
-
-async function loadPlaybackSelectorCapability() {
-  const requestId = ++state.playbackSelectorCapabilityRequestId;
-  state.playbackSelectorAuthorized = false;
-  state.playbackSelectorCapability = null;
-  state.playbackSelectorCapabilityRevision = -1;
-  renderPlaybackSelectorControl();
-  try {
-    const payload = await apiGet("/api/player/playback-selector");
-    if (requestId !== state.playbackSelectorCapabilityRequestId) {
-      return false;
-    }
-    const capability = validatedPlaybackSelectorCapability(payload);
-    if (!capability) {
-      renderPlaybackSelectorControl();
-      return false;
-    }
-    state.playbackSelectorAuthorized = true;
-    state.playbackSelectorCapability = capability.selector;
-    state.playbackSelectorCapabilityRevision = capability.revision;
-    renderPlaybackSelectorControl();
-    return true;
-  } catch {
-    if (requestId === state.playbackSelectorCapabilityRequestId) {
-      state.playbackSelectorAuthorized = false;
-      state.playbackSelectorCapability = null;
-      state.playbackSelectorCapabilityRevision = -1;
-      renderPlaybackSelectorControl();
-    }
     return false;
   }
+  const reconciliation = { playbackGeneration, playbackProgram };
+  state.pendingHostPlaybackProgramReconciliation = reconciliation;
+  queueMicrotask(() => {
+    if (state.pendingHostPlaybackProgramReconciliation !== reconciliation) {
+      return;
+    }
+    state.pendingHostPlaybackProgramReconciliation = null;
+    const accepted = validatedHostSnapshotIdentity(state.data);
+    if (
+      !accepted
+      || accepted.playbackGeneration !== playbackGeneration
+      || !playbackProgramDescriptorsEqual(accepted.program, playbackProgram)
+    ) {
+      return;
+    }
+    const session = state.hostPlaybackSession;
+    if (
+      session
+      && session.playbackGeneration === playbackGeneration
+      && playbackProgramDescriptorsEqual(session.playbackProgram, playbackProgram)
+      && isCurrentHostPlaybackSession(session)
+    ) {
+      return;
+    }
+    renderPlayer(
+      state.data?.current_item ?? null,
+      frontendPlaybackMode(state.data?.playback_mode),
+    );
+    // A snapshot render may precede this microtask's media mount. Only consume
+    // its transition once the matching session can actually own the countdown.
+    if (typeof flushPendingSongTransitionOverlay === "function") {
+      flushPendingSongTransitionOverlay();
+    }
+  });
+  return true;
 }
 
-async function setPlaybackSelectorMode(mode) {
-  if (state.playbackSelectorSaving || !state.playbackSelectorAuthorized) {
-    return;
+async function apiPostStateSnapshot(url, payload = {}, options = {}) {
+  const { onAccepted, ...requestOptions } = options;
+  const accepted = acceptHostStateSnapshot(await apiPost(url, payload, requestOptions));
+  if (accepted && typeof onAccepted === "function") {
+    onAccepted();
   }
-  const currentMode = String(authorizedPlaybackSelectorState()?.mode || "python");
-  if (!mode || mode === currentMode) {
-    renderPlaybackSelectorControl();
-    return;
+  return accepted;
+}
+
+async function apiPostExactStateCommand(url, payload = {}, options = {}) {
+  const { onAccepted, ...requestOptions } = options;
+  const envelope = await apiPost(url, payload, {
+    ...requestOptions,
+    returnEnvelope: true,
+  });
+  const snapshotAccepted = acceptHostStateSnapshot(envelope.data);
+  if (snapshotAccepted && typeof onAccepted === "function") {
+    onAccepted();
   }
-  state.playbackSelectorSaving = true;
-  renderPlaybackSelectorControl();
-  try {
-    const snapshot = await apiPost("/api/player/playback-selector", { mode });
-    if (applyFreshStateSnapshot(snapshot)) {
-      const capability = validatedPlaybackSelectorCapability(snapshot);
-      if (capability) {
-        state.playbackSelectorCapability = capability.selector;
-        state.playbackSelectorCapabilityRevision = capability.revision;
-      }
-    }
-    setAppMessage(t("service.playbackSelectorUpdated", { mode: mode === "rust" ? "Rust" : "Python" }));
-    render();
-  } catch (error) {
-    setAppMessage(error.message, true);
-    renderPlaybackSelectorControl();
-  } finally {
-    state.playbackSelectorSaving = false;
-    renderPlaybackSelectorControl();
-  }
+  return {
+    snapshotAccepted,
+    commandApplied: envelope.stale !== true,
+  };
 }
 
 function syncCachePanelVisibility(options = {}) {
+  if (globalThis.BilikaraHostLayout?.settingsEmbedded()) state.cacheSettingsOpen = true;
   const expanded = String(state.cacheSettingsOpen);
   if (elements.cacheSettingsToggle.getAttribute("aria-expanded") !== expanded) {
     elements.cacheSettingsToggle.setAttribute("aria-expanded", expanded);
   }
   setClassToggle(elements.cachePanel, "hidden", !state.cacheSettingsOpen);
-  if (!state.cacheSettingsOpen) {
-    state.cacheAdvancedOpen = false;
-  }
-  setClassToggle(elements.cacheAdvancedInlineView, "hidden", !state.cacheAdvancedOpen);
-  if (elements.cachePanelAdvancedTrigger) {
-    elements.cachePanelAdvancedTrigger.setAttribute("aria-expanded", String(state.cacheAdvancedOpen));
-  }
   maybeStartBBDownLogin(state.data?.bbdown?.login, {
     force: Boolean(options.forceLoginRefresh),
+    reopen: Boolean(options.reopen),
   });
+  if (state.cacheSettingsOpen && typeof scheduleTopControlPopoverPositionSync === "function") {
+    scheduleTopControlPopoverPositionSync();
+  }
 }
 
-function syncDisplayPanelVisibility() {
-  const expanded = String(state.displaySettingsOpen);
-  if (elements.displaySettingsToggle && elements.displaySettingsToggle.getAttribute("aria-expanded") !== expanded) {
-    elements.displaySettingsToggle.setAttribute("aria-expanded", expanded);
+function syncPresentationPanelVisibility() {
+  const expanded = String(state.presentationSettingsOpen);
+  if (elements.presentationSettingsToggle?.getAttribute("aria-expanded") !== expanded) {
+    elements.presentationSettingsToggle?.setAttribute("aria-expanded", expanded);
   }
-  setClassToggle(elements.displaySettingsPanel, "hidden", !state.displaySettingsOpen);
+  setClassToggle(
+    elements.presentationSettingsPanel,
+    "hidden",
+    !state.presentationSettingsOpen,
+  );
+  if (state.presentationSettingsOpen && typeof scheduleTopControlPopoverPositionSync === "function") {
+    scheduleTopControlPopoverPositionSync();
+  } else if (!state.presentationSettingsOpen) {
+    dismissPresentationDisplayIdentifiers();
+  }
 }
+
+let currentQueueDefer = null;
 
 function renderQueueCurrent(currentItem) {
+  currentQueueDefer?.sync();
   if (!currentItem) {
     const signature = `empty|${state.language}`;
     if (signature === state.queueCurrentRenderSignature) {
@@ -6061,26 +12227,6 @@ function currentItemIdFromData(data) {
   return String(data?.current_item?.id || "");
 }
 
-function durationSecondsForItemPage(item, page) {
-  if (!item) {
-    return 0;
-  }
-  const targetPage = Number(page || 0);
-  for (const [pagesKey, durationsKey] of [
-    ["selected_pages", "selected_durations"],
-    ["available_pages", "available_durations"],
-  ]) {
-    const pages = Array.isArray(item[pagesKey]) ? item[pagesKey] : [];
-    const durations = Array.isArray(item[durationsKey]) ? item[durationsKey] : [];
-    const index = pages.findIndex((candidate) => Number(candidate) === targetPage);
-    const duration = Number(durations[index] || 0);
-    if (index >= 0 && Number.isFinite(duration) && duration > 0) {
-      return duration;
-    }
-  }
-  return 0;
-}
-
 function durationSecondsForItem(item) {
   if (!item) {
     return 0;
@@ -6133,25 +12279,13 @@ function delayOverlayTitleForItem(item, fallback = t("player.untitledSong")) {
   return title || originalTitle || fallback;
 }
 
-function delayOverlayItemSignature(item) {
-  if (!item) {
-    return "";
-  }
-  return [
-    item.id || "",
-    delayOverlayTitleForItem(item, ""),
-    item.requester_name || "",
-    durationSecondsForItem(item),
-  ].join("|");
-}
-
 function manualTransitionOverlaySeconds(data = state.data) {
   return currentSongAdvanceDelaySeconds(data?.player_settings);
 }
 
 function clampMediaTime(media, nextTime) {
   const target = Math.max(0, Number(nextTime || 0));
-  if (!Number.isFinite(media?.duration)) {
+  if (!Number.isFinite(media?.duration) || !(media.duration > 0)) {
     return target;
   }
   return Math.min(target, Number(media.duration));
@@ -6174,28 +12308,41 @@ function setMediaCurrentTime(media, nextTime, toleranceSeconds = localPlayerForc
   }
 }
 
-function clearSplitPlaybackStartupWatchdog() {
-  if (!state.localPlaybackStartupWatchdogTimer) {
+function clearSplitPlaybackStartupWatchdog(session = state.hostPlaybackSession) {
+  if (!session?.startupWatchdogTimer) {
     return;
   }
-  window.clearTimeout(state.localPlaybackStartupWatchdogTimer);
-  state.localPlaybackStartupWatchdogTimer = null;
+  window.clearTimeout(session.startupWatchdogTimer);
+  session.startupWatchdogTimer = null;
 }
 
-function clearLocalPlayerSyncTimer() {
-  if (state.localPlayerSyncTimer) {
-    window.clearInterval(state.localPlayerSyncTimer);
-    state.localPlayerSyncTimer = null;
+function clearLocalPlayerSyncTimer(session = state.hostPlaybackSession) {
+  if (!session) {
+    return;
   }
-  if (state.localPlayerStartupTimer) {
-    window.clearTimeout(state.localPlayerStartupTimer);
-    state.localPlayerStartupTimer = null;
+  clearAndroidAudioClockRecovery(session);
+  if (session.syncTimer) {
+    window.clearInterval(session.syncTimer);
+    session.syncTimer = null;
   }
-  clearSplitPlaybackStartupWatchdog();
+  if (session.startupTimer) {
+    window.clearTimeout(session.startupTimer);
+    session.startupTimer = null;
+  }
+  if (session.webkitRetryTimer) {
+    window.clearTimeout(session.webkitRetryTimer);
+    session.webkitRetryTimer = null;
+  }
+  if (session.hiddenPauseTimer) {
+    window.clearTimeout(session.hiddenPauseTimer);
+    session.hiddenPauseTimer = null;
+  }
+  clearSplitPlaybackStartupWatchdog(session);
 }
 
-function clearLocalPlayerEventListeners() {
-  state.localPlayerEventCleanups.splice(0).forEach((cleanup) => {
+function clearLocalPlayerEventListeners(session = state.hostPlaybackSession) {
+  const cleanups = Array.isArray(session?.eventCleanups) ? session.eventCleanups : [];
+  cleanups.splice(0).forEach((cleanup) => {
     try {
       cleanup();
     } catch {
@@ -6205,26 +12352,64 @@ function clearLocalPlayerEventListeners() {
 }
 
 function addMountedPlayerListener(media, eventName, listener, options) {
-  media.addEventListener(eventName, listener, options);
-  state.localPlayerEventCleanups.push(() => {
-    media.removeEventListener(eventName, listener, options);
+  const session = state.hostPlaybackSession;
+  if (
+    !isCurrentHostPlaybackSession(session)
+    || (media !== session.video && media !== session.audio)
+  ) {
+    return false;
+  }
+  const guardedListener = (event) => {
+    if (
+      !isCurrentHostPlaybackSession(session, session.video, session.audio)
+      || (media !== session.video && media !== session.audio)
+    ) {
+      return;
+    }
+    listener.call(media, event);
+  };
+  media.addEventListener(eventName, guardedListener, options);
+  session.eventCleanups.push(() => {
+    media.removeEventListener(eventName, guardedListener, options);
   });
+  return true;
 }
 
-function clearLocalPlayerSeekState() {
-  if (state.localSeekSettleTimer) {
-    window.clearTimeout(state.localSeekSettleTimer);
-    state.localSeekSettleTimer = null;
+function takeLocalPlayerSeekCompletion(session) {
+  if (!session) {
+    return null;
   }
-  state.localSeekSettling = false;
-  state.localSeekResumeAfterSettle = false;
-  state.localSeekSettleStartedAt = 0;
-  state.localSeekSettleCallback = null;
-  state.localSeekResumePending = false;
+  if (session.seekSettleTimer) {
+    window.clearTimeout(session.seekSettleTimer);
+    session.seekSettleTimer = null;
+  }
+  const completion = session.seekSettleCallback;
+  session.seekSettleCallback = null;
+  session.presentationFeedbackSeekTarget = null;
+  session.seekSettling = false;
+  session.seekResumeAfterSettle = false;
+  session.seekSettleStartedAt = 0;
+  session.seekResumePending = false;
+  session.seekUpdatesLogicalIntent = true;
+  return completion;
+}
+
+function clearLocalPlayerSeekState(session = state.hostPlaybackSession) {
+  clearAndroidAudioClockRecovery(session);
+  const completion = takeLocalPlayerSeekCompletion(session);
+  if (typeof completion === "function") {
+    try {
+      completion(false);
+    } catch {
+      // Session retirement must finish even if a local completion observer fails.
+    }
+  }
 }
 
 function playerDelayOverlay() {
-  return elements.playerFrame?.querySelector(".player-delay-overlay") || null;
+  return Array.from(elements.playerFrame?.children || []).find(
+    (child) => child.classList?.contains("player-delay-overlay"),
+  ) || null;
 }
 
 function ensurePlayerDelayOverlay() {
@@ -6232,40 +12417,22 @@ function ensurePlayerDelayOverlay() {
   if (overlay) {
     return overlay;
   }
-
-  overlay = document.createElement("div");
-  overlay.className = "player-delay-overlay hidden";
-  overlay.setAttribute("aria-live", "polite");
-  overlay.setAttribute("aria-hidden", "true");
-  overlay.innerHTML = `
-    <div class="player-delay-card">
-      <div class="player-delay-head">
-        <p class="player-delay-heading" data-i18n="player.upNext">即将播放</p>
-        <div class="player-delay-countdown" aria-label="切歌倒计时" data-i18n-aria-label="player.advanceCountdown">
-          <svg class="player-delay-count-ring" viewBox="0 0 44 44" aria-hidden="true">
-            <circle class="player-delay-count-track" cx="22" cy="22" r="19"></circle>
-            <circle class="player-delay-count-progress" cx="22" cy="22" r="19"></circle>
-          </svg>
-          <span class="player-delay-count-text"><span data-delay-count>0</span>s</span>
-        </div>
-      </div>
-      <div class="player-delay-now-row">
-        <span class="player-delay-play-icon" aria-hidden="true">\u25b6</span>
-        <p class="player-delay-song-title" data-delay-next-title>${htmlT("player.prepareNext")}</p>
-        <p class="player-delay-requester" data-delay-next-requester>${htmlT("request.requester")}</p>
-        <p class="player-delay-duration" data-delay-next-duration>${htmlT("player.duration")}</p>
-      </div>
-      <p class="player-delay-section-title" data-i18n="player.followingQueue">后续点歌列表</p>
-      <div class="player-delay-list" data-delay-list></div>
-      <p class="player-delay-total" data-delay-total>${htmlT("player.totalSongs", { count: 0 })}</p>
-    </div>
-  `;
-  applyStaticI18n(overlay);
-  elements.playerFrame.appendChild(overlay);
+  const renderer = presentationRendererApi();
+  if (!renderer) {
+    return null;
+  }
+  overlay = renderer.ensureOverlay(elements.playerFrame, {
+    countdownLabel: t("player.advanceCountdown"),
+  });
   return overlay;
 }
 
-function resumeMountedPlayerAfterOverlay(itemId, generation) {
+function resumeMountedPlayerAfterOverlay(itemId, generation, session) {
+  if (
+    !isCurrentHostPlaybackSession(session, session?.video, session?.audio)
+  ) {
+    return false;
+  }
   const currentItemId = currentItemIdFromData(state.data);
   if (
     generation !== state.manualTransitionHoldGeneration
@@ -6276,28 +12443,36 @@ function resumeMountedPlayerAfterOverlay(itemId, generation) {
     if (video && audio) {
       reportSplitSyncDiagnostic(itemId, video, audio, "stale-callback", true);
     }
-    return;
+    return false;
   }
   clearLocalAdvanceDelay({ resetInFlight: true, hideOverlay: true });
   const { video, audio } = activeLocalPlayerElements();
-  if (!video || String(video.dataset.playerItemId || "") !== itemId) {
-    return;
+  if (
+    !video
+    || !audio
+    || String(video.dataset.playerItemId || "") !== itemId
+  ) {
+    return false;
   }
+  session.logicalPlayIntent = true;
   state.localShouldBePlaying = true;
-  if (audio) {
-    if (state.localPlaybackStartState === "established") {
-      syncSplitPlayer(video, audio, currentAvOffsetSeconds(), true);
-    } else if (
-      state.localPlaybackStartState !== "needs-user-gesture"
-      && state.localPlaybackStartState !== "startup-failed"
-    ) {
-      startSplitPlaybackPair(video, audio);
-    } else {
-      updateSplitPlaybackStartOverlay(video, audio);
-    }
-  } else {
-    video.play().catch(() => {});
+  if (!session.readyCommitted) {
+    return true;
   }
+  if (!session.initialIntentApplied) {
+    return applyInitialHostPlaybackIntent(session, video, audio);
+  }
+  if (state.localPlaybackStartState === "established") {
+    setSplitPlaybackIntent(video, audio, true);
+  } else if (
+    state.localPlaybackStartState !== "needs-user-gesture"
+    && state.localPlaybackStartState !== "startup-failed"
+  ) {
+    startSplitPlaybackPair(video, audio);
+  } else {
+    updateSplitPlaybackStartOverlay(video, audio);
+  }
+  return true;
 }
 
 function shouldHoldCurrentItemForTransition(item = state.data?.current_item) {
@@ -6349,6 +12524,7 @@ function stopMountedPlayerForAdvanceDelay(itemId) {
   clearLocalPlayerSeekState();
 
   const { video, audio } = activeLocalPlayerElements();
+  audio?.bilikaraPitch?.reset();
   if (audio && !audio.paused) {
     audio.pause();
   }
@@ -6381,11 +12557,16 @@ function setPlayerDelayOverlayVisible(overlay) {
   // change always starts an animation.
   overlay.getBoundingClientRect();
   overlay.classList.add("is-entering");
-  state.localAdvanceOverlayHideTimer = window.setTimeout(() => {
+  let showTimer = null;
+  showTimer = window.setTimeout(() => {
+    if (state.localAdvanceOverlayHideTimer !== showTimer) {
+      return;
+    }
     overlay.classList.remove("is-entering");
     overlay.classList.add("is-visible");
     state.localAdvanceOverlayHideTimer = null;
   }, localAdvanceOverlayFadeMs);
+  state.localAdvanceOverlayHideTimer = showTimer;
 }
 
 function hidePlayerDelayOverlay({ onHidden = null } = {}) {
@@ -6413,7 +12594,11 @@ function hidePlayerDelayOverlay({ onHidden = null } = {}) {
   overlay.getBoundingClientRect();
   overlay.classList.remove("is-visible");
   overlay.classList.add("is-leaving");
-  state.localAdvanceOverlayHideTimer = window.setTimeout(() => {
+  let hideTimer = null;
+  hideTimer = window.setTimeout(() => {
+    if (state.localAdvanceOverlayHideTimer !== hideTimer) {
+      return;
+    }
     overlay.classList.remove("is-leaving", "is-entering", "is-visible");
     overlay.classList.add("hidden");
     overlay.setAttribute("aria-hidden", "true");
@@ -6422,15 +12607,27 @@ function hidePlayerDelayOverlay({ onHidden = null } = {}) {
       onHidden();
     }
   }, localAdvanceOverlayFadeMs);
+  state.localAdvanceOverlayHideTimer = hideTimer;
 }
 
-function showSongTransitionOverlayForData(data, generation = 0) {
+function showSongTransitionOverlayForData(
+  data,
+  generation = 0,
+  { preserveDeadline = false } = {},
+) {
   if (!data) {
     return;
   }
   const playlist = Array.isArray(data.playlist) ? data.playlist : [];
   const primaryItem = data.current_item || playlist[0] || null;
   if (!primaryItem) {
+    return;
+  }
+  const session = state.hostPlaybackSession;
+  if (
+    !isCurrentHostPlaybackSession(session, session?.video, session?.audio)
+    || String(session.video?.dataset?.playerItemId || "") !== String(primaryItem.id || "")
+  ) {
     return;
   }
   const delaySeconds = manualTransitionOverlaySeconds(data);
@@ -6444,11 +12641,21 @@ function showSongTransitionOverlayForData(data, generation = 0) {
     }
     return;
   }
+  const reuseTiming = Boolean(
+    preserveDeadline
+    && generation > 0
+    && generation === state.manualTransitionHoldGeneration
+    && itemId === state.manualTransitionHoldItemId
+    && itemId === state.localAdvanceDelayItemId
+    && state.localAdvanceDelayDeadline > 0
+  );
+  const preservedStartAt = Number(state.localAdvanceDelayStartAt || 0);
+  const preservedDeadline = Number(state.localAdvanceDelayDeadline || 0);
+  const preservedDurationMs = Number(state.localAdvanceOverlayDurationMs || 0);
   clearLocalAdvanceDelay({ resetInFlight: true, hideOverlay: false });
   const token = state.localAdvanceDelayToken;
   const activeGeneration = generation || registerManualTransitionHold(itemId);
 
-  state.localAdvanceOverlayMode = "manual";
   state.localAdvanceOverlayPrimaryItem = primaryItem;
   state.localAdvanceOverlayFollowItems = data.current_item ? playlist : playlist.slice(1);
   state.localAdvanceOverlayTotalCount = (data.current_item ? 1 : 0) + playlist.length;
@@ -6457,37 +12664,81 @@ function showSongTransitionOverlayForData(data, generation = 0) {
   state.manualTransitionHoldGeneration = activeGeneration;
   state.localAdvanceInFlight = true;
   state.localShouldBePlaying = false;
-  state.localAdvanceOverlayDurationMs = delaySeconds * 1000;
-  state.localAdvanceDelayStartAt = Date.now() + localAdvanceOverlayFadeMs;
-  state.localAdvanceDelayDeadline = state.localAdvanceDelayStartAt + state.localAdvanceOverlayDurationMs;
-  updateLocalAdvanceDelayOverlay();
-  state.localAdvanceCountdownTimer = window.setInterval(updateLocalAdvanceDelayOverlay, 250);
-  state.localAdvanceDelayTimer = window.setTimeout(() => {
+  if (reuseTiming) {
+    state.localAdvanceOverlayDurationMs = preservedDurationMs;
+    state.localAdvanceDelayStartAt = preservedStartAt;
+    state.localAdvanceDelayDeadline = preservedDeadline;
+  } else {
+    state.localAdvanceOverlayDurationMs = delaySeconds * 1000;
+    state.localAdvanceDelayStartAt = Date.now() + localAdvanceOverlayFadeMs;
+    state.localAdvanceDelayDeadline = state.localAdvanceDelayStartAt + state.localAdvanceOverlayDurationMs;
+  }
+  updateLocalAdvanceDelayOverlay(session);
+  let countdownTimer = null;
+  countdownTimer = window.setInterval(() => {
     if (
-      state.localAdvanceDelayToken === token
+      state.localAdvanceCountdownTimer !== countdownTimer
+      || !isCurrentHostPlaybackSession(session, session.video, session.audio)
+    ) {
+      return;
+    }
+    updateLocalAdvanceDelayOverlay(session);
+  }, 250);
+  state.localAdvanceCountdownTimer = countdownTimer;
+  let delayTimer = null;
+  delayTimer = window.setTimeout(() => {
+    if (
+      state.localAdvanceDelayTimer === delayTimer
+      && state.localAdvanceDelayToken === token
       && state.manualTransitionHoldGeneration === activeGeneration
       && state.manualTransitionHoldItemId === itemId
+      && isCurrentHostPlaybackSession(session, session.video, session.audio)
     ) {
-      updateLocalAdvanceDelayOverlay();
+      updateLocalAdvanceDelayOverlay(session);
       state.localAdvanceDelayTimer = null;
       if (state.localAdvanceCountdownTimer) {
         window.clearInterval(state.localAdvanceCountdownTimer);
         state.localAdvanceCountdownTimer = null;
       }
       hidePlayerDelayOverlay({
-        onHidden: () => resumeMountedPlayerAfterOverlay(itemId, activeGeneration),
+        onHidden: () => resumeMountedPlayerAfterOverlay(itemId, activeGeneration, session),
       });
     }
   }, Math.max(0, state.localAdvanceDelayDeadline - Date.now()));
+  state.localAdvanceDelayTimer = delayTimer;
 }
 
 function maybeShowSongTransitionOverlay(previousData, nextData, { force = false, generation = 0 } = {}) {
+  const defer = state.immediateDeferTransition;
+  if (defer
+    && previousData?.playback_generation === defer.playback_generation
+    && nextData?.playback_generation > defer.playback_generation
+    && nextData.current_item?.id === defer.expected_playlist_item_ids[0]
+    && nextData.playlist?.some(item => item.id === defer.item_id
+      && item.item_incarnation_id === defer.expected_item_incarnation_id)) {
+    // This explicit gesture starts B immediately, even if ordinary Next uses
+    // a countdown. Admission precedes the POST so an SSE-first response works.
+    state.immediateDeferTransition = null;
+    clearLocalAdvanceDelay({ resetInFlight: true });
+    return;
+  }
   if (!nextData) {
     return;
   }
   const previousId = currentItemIdFromData(previousData);
   const nextId = currentItemIdFromData(nextData);
   if (!nextId || (!force && previousId === nextId)) {
+    return;
+  }
+  // A delayed command response must not reclaim a completed or superseded hold.
+  // Snapshot acceptance already registers transitions for newly observed songs.
+  if (
+    generation > 0
+    && (
+      generation !== state.manualTransitionHoldGeneration
+      || nextId !== state.manualTransitionHoldItemId
+    )
+  ) {
     return;
   }
   if (
@@ -6541,107 +12792,44 @@ function flushPendingSongTransitionOverlay() {
   if (!selectedVideoUrlForItem(currentItem) || !selectedAudioUrlForItem(currentItem)) {
     return;
   }
+  const session = state.hostPlaybackSession;
+  if (!isCurrentHostPlaybackSession(session, session?.video, session?.audio)
+    || session.video?.dataset?.playerItemId !== currentItemId) {
+    return;
+  }
   const generation = state.pendingSongTransitionGeneration;
   state.pendingSongTransitionOverlayData = null;
   state.pendingSongTransitionGeneration = 0;
   showSongTransitionOverlayForData(state.data, generation);
 }
 
-function renderPlayerDelayItemRow(item, index) {
-  const row = document.createElement("div");
-  row.className = "player-delay-list-row";
-
-  const indexNode = document.createElement("span");
-  indexNode.className = "player-delay-list-index";
-  indexNode.textContent = String(index);
-
-  const titleNode = document.createElement("p");
-  titleNode.className = "player-delay-song-title";
-  titleNode.textContent = delayOverlayTitleForItem(item);
-
-  const requesterNode = document.createElement("p");
-  requesterNode.className = "player-delay-requester";
-  requesterNode.textContent = item?.requester_name || "—";
-
-  const durationNode = document.createElement("p");
-  durationNode.className = "player-delay-duration";
-  durationNode.textContent = formatDurationSeconds(durationSecondsForItem(item));
-
-  row.append(indexNode, titleNode, requesterNode, durationNode);
-  return row;
-}
-
-function renderLocalAdvanceDelayQueue(overlay) {
-  const playlist = Array.isArray(state.data?.playlist) ? state.data.playlist : [];
-  const primaryItem = state.localAdvanceOverlayPrimaryItem || playlist[0] || null;
-  const followItemsSource = Array.isArray(state.localAdvanceOverlayFollowItems)
-    ? state.localAdvanceOverlayFollowItems
-    : playlist.slice(1);
-  const totalCount = Number.isFinite(state.localAdvanceOverlayTotalCount)
-    ? Number(state.localAdvanceOverlayTotalCount)
-    : (state.data?.current_item ? 1 : 0) + playlist.length;
-  const signature = [
-    state.localAdvanceOverlayMode || "auto",
-    delayOverlayItemSignature(primaryItem),
-    ...followItemsSource.map(delayOverlayItemSignature),
-    totalCount,
-    state.language,
-  ].join("||");
-  if (overlay.dataset.queueSignature === signature) {
+function updateLocalAdvanceDelayOverlay(session = state.hostPlaybackSession) {
+  if (
+    session
+    && !isCurrentHostPlaybackSession(session, session.video, session.audio)
+  ) {
+    return false;
+  }
+  const overlay = ensurePlayerDelayOverlay();
+  if (!overlay) {
     return;
   }
-  overlay.dataset.queueSignature = signature;
-
-  setTextContent(overlay.querySelector("[data-delay-next-title]"), delayOverlayTitleForItem(primaryItem, t("player.prepareNext")));
-  setTextContent(overlay.querySelector("[data-delay-next-requester]"), primaryItem?.requester_name || "—");
-  setTextContent(overlay.querySelector("[data-delay-next-duration]"), formatDurationSeconds(durationSecondsForItem(primaryItem)));
-
-  const listNode = overlay.querySelector("[data-delay-list]");
-  if (listNode) {
-    const followItems = followItemsSource.slice(0, localAdvanceOverlayMaxRows);
-    const rows = followItems.map((item, index) => renderPlayerDelayItemRow(item, index + 1));
-    if (!rows.length) {
-      const emptyRow = document.createElement("div");
-      emptyRow.className = "player-delay-list-more";
-      emptyRow.textContent = t("player.followingQueueEmpty");
-      rows.push(emptyRow);
-    }
-    const remainingCount = Math.max(0, followItemsSource.length - followItems.length);
-    if (remainingCount > 0) {
-      const moreRow = document.createElement("div");
-      moreRow.className = "player-delay-list-more";
-      moreRow.textContent = t("player.remainingQueue", { count: remainingCount });
-      rows.push(moreRow);
-    }
-    listNode.replaceChildren(...rows);
-  }
-
-  setTextContent(overlay.querySelector("[data-delay-total]"), t("player.totalSongs", { count: totalCount }));
-}
-
-function updateLocalAdvanceDelayOverlay() {
-  const overlay = ensurePlayerDelayOverlay();
   const now = Date.now();
   const countdownStartAt = Number(state.localAdvanceDelayStartAt || 0);
   const countdownNow = countdownStartAt > 0 ? Math.max(now, countdownStartAt) : now;
-  const totalDurationMs = Math.max(1000, Number(state.localAdvanceOverlayDurationMs || 0));
-  const remainingMs = Math.max(0, state.localAdvanceDelayDeadline - countdownNow);
-  const remainingSeconds = Math.max(
-    0,
-    Math.ceil(remainingMs / 1000),
-  );
-  const countNode = overlay.querySelector("[data-delay-count]");
-  setTextContent(countNode, String(remainingSeconds));
-  const progress = Math.max(0, Math.min(1, remainingMs / totalDurationMs));
-  overlay.style.setProperty("--delay-ring-offset", String(119.38 * (1 - progress)));
-  renderLocalAdvanceDelayQueue(overlay);
-  const isFullscreen = isPlayerPanelFullscreen();
-  overlay.classList.toggle("is-compact", !isFullscreen);
+  const isAudienceSurface = isPlayerPanelFullscreen() || presentationCompositionActive();
+  presentationRendererApi()?.renderOverlay(overlay, presentationOverlayModel(), {
+    compact: !isAudienceSurface,
+    manageVisibility: false,
+    now: countdownNow,
+  });
   if (state.localAdvanceDelayDeadline > 0) {
     setPlayerDelayOverlayVisible(overlay);
   } else {
     hidePlayerDelayOverlay();
   }
+  publishPresentationPlaybackState(session).catch(() => {});
+  return true;
 }
 
 function hasLocalAdvanceDelayOverlay() {
@@ -6651,28 +12839,6 @@ function hasLocalAdvanceDelayOverlay() {
     || state.localAdvanceDelayTimer
     || state.localAdvanceCountdownTimer,
   );
-}
-
-function startLocalAdvanceDelay(delaySeconds) {
-  const currentItemId = String(state.data?.current_item?.id || "");
-  if (!currentItemId) {
-    return;
-  }
-  clearLocalAdvanceDelay();
-  state.localAdvanceInFlight = true;
-  state.localAdvanceDelayItemId = currentItemId;
-  state.localAdvanceDelayToken += 1;
-  const token = state.localAdvanceDelayToken;
-  state.localAdvanceOverlayMode = "auto";
-  state.localAdvanceOverlayDurationMs = delaySeconds * 1000;
-  state.localAdvanceDelayStartAt = Date.now() + localAdvanceOverlayFadeMs;
-  state.localAdvanceDelayDeadline = state.localAdvanceDelayStartAt + state.localAdvanceOverlayDurationMs;
-  stopMountedPlayerForAdvanceDelay(currentItemId);
-  updateLocalAdvanceDelayOverlay();
-  state.localAdvanceCountdownTimer = window.setInterval(updateLocalAdvanceDelayOverlay, 250);
-  state.localAdvanceDelayTimer = window.setTimeout(() => {
-    finishLocalAdvanceDelay(token, currentItemId).catch(() => {});
-  }, Math.max(0, state.localAdvanceDelayDeadline - Date.now()));
 }
 
 function clearLocalAdvanceDelay({ resetInFlight = false, hideOverlay = true, onOverlayHidden = null } = {}) {
@@ -6688,7 +12854,6 @@ function clearLocalAdvanceDelay({ resetInFlight = false, hideOverlay = true, onO
     state.localAdvanceDelayStartAt = 0;
     state.localAdvanceDelayDeadline = 0;
     state.localAdvanceOverlayDurationMs = 0;
-    state.localAdvanceOverlayMode = "";
     state.localAdvanceOverlayPrimaryItem = null;
     state.localAdvanceOverlayFollowItems = null;
     state.localAdvanceOverlayTotalCount = null;
@@ -6703,87 +12868,20 @@ function clearLocalAdvanceDelay({ resetInFlight = false, hideOverlay = true, onO
   }
 }
 
-async function finishLocalAdvanceDelay(token, itemId) {
-  if (token !== state.localAdvanceDelayToken || itemId !== state.localAdvanceDelayItemId) {
-    return;
-  }
-  updateLocalAdvanceDelayOverlay();
-  clearLocalAdvanceDelay({
-    resetInFlight: true,
-    onOverlayHidden: () => {
-      advanceLocalPlayerNow({ showTransition: false }).catch(() => {});
-    },
-  });
-}
-
-function setPlayerFrameContent(html) {
-  const overlay = playerDelayOverlay();
-  const template = document.createElement("template");
-  template.innerHTML = html;
-  const nextNodes = Array.from(template.content.childNodes);
-  Array.from(elements.playerFrame.childNodes).forEach((node) => {
-    if (node !== overlay) {
-      node.remove();
-    }
-  });
-  elements.playerFrame.prepend(...nextNodes);
-  if (overlay && overlay.parentElement !== elements.playerFrame) {
-    elements.playerFrame.appendChild(overlay);
-  }
-}
-
-function syncPlayerFrameCacheHint(currentItem) {
-  const hint = elements.playerFrame.querySelector(".empty-state .empty-hint");
-  if (!hint || !currentItem) {
-    return;
-  }
-  setTextContent(hint, hostCacheDetailTextForItem(currentItem) || t("player.cachingFallback"));
-}
-
 function teardownMountedPlayer({ preserveAdvanceDelayOverlay = false } = {}) {
-  clearWebKitAudioStarvationTimer();
-  state.localWebKitStartRetryDone = false;
-  clearLocalPlayerSyncTimer();
-  clearLocalPlayerControlsHideTimer();
-  clearLocalPlayerSeekState();
-  clearLocalPlayerEventListeners();
-  state.localPlayerSyncLastSeekAt = 0;
-  state.localPlayerSyncLastAction = "";
-  state.localPlayerSyncLastDiagnosticAt = 0;
-  state.localVideoHeldForAudio = false;
-  state.localVideoDeferredRecovery = false;
-  state.localAudioPlaybackBlocked = false;
-  state.localVideoPlaybackBlocked = false;
-  state.localPlaybackStartState = "idle";
-  state.localPlaybackStartGeneration = 0;
-  state.localPlaybackStartPromisesSettled = false;
-  state.localPlaybackEndHandled = false;
-  clearTauriMediaSessionState();
-  if (!preserveAdvanceDelayOverlay) {
-    state.pendingSongTransitionOverlayData = null;
-    state.pendingSongTransitionGeneration = 0;
-    clearLocalAdvanceDelay({ resetInFlight: true });
-  }
-  elements.playerFrame.querySelectorAll("video, audio").forEach((media) => {
-    disposeAudioPitchShifter(media);
-    try {
-      media.pause();
-    } catch {
-      // Ignore pause failures during teardown.
-    }
-    try {
-      media.removeAttribute("src");
-      media.load();
-    } catch {
-      // Ignore cleanup failures and let DOM replacement finish the teardown.
-    }
+  return retireHostPlaybackSession(state.hostPlaybackSession, {
+    preserveAdvanceDelayOverlay,
   });
 }
 
 function activeLocalPlayerElements() {
+  const session = state.hostPlaybackSession;
+  if (!isCurrentHostPlaybackSession(session, session?.video, session?.audio)) {
+    return { video: null, audio: null };
+  }
   return {
-    video: elements.playerFrame.querySelector('video[data-player-role="video"]'),
-    audio: elements.playerFrame.querySelector('audio[data-player-role="audio"]'),
+    video: session.video,
+    audio: session.audio,
   };
 }
 
@@ -6792,12 +12890,15 @@ function activePrimaryVideoElement() {
 }
 
 function isActiveSplitPlayer(video, audio) {
-  const active = activeLocalPlayerElements();
-  return active.video === video && active.audio === audio;
+  return isCurrentHostPlaybackSession(state.hostPlaybackSession, video, audio);
 }
 
 function isSplitPlayerSeekSettling(video, audio) {
-  return state.localSeekSettling && isActiveSplitPlayer(video, audio);
+  const session = state.hostPlaybackSession;
+  return Boolean(
+    session?.seekSettling
+    && isCurrentHostPlaybackSession(session, video, audio),
+  );
 }
 
 function captureLocalPlayerPreferences() {
@@ -6805,16 +12906,16 @@ function captureLocalPlayerPreferences() {
   const primaryVideo = video || activePrimaryVideoElement();
   const mediaWithVolume = audio || primaryVideo;
   if (mediaWithVolume) {
-    const volume = Number(mediaWithVolume.volume);
+    const volume = Number(mediaWithVolume.bilikaraVolume ?? mediaWithVolume.volume);
     if (Number.isFinite(volume)) {
-      state.localPlayerVolume = Math.max(0, Math.min(1, volume));
+      state.localPlayerVolume = Math.max(0, Math.min(5, volume));
     }
     state.localPlayerMuted = Boolean(mediaWithVolume.muted);
     persistLocalVolumePreferences();
   }
   if (
     primaryVideo
-    && !state.localSeekSettling
+    && !state.hostPlaybackSession?.seekSettling
     && !shouldHoldCurrentItemForTransition(state.data?.current_item)
   ) {
     state.localShouldBePlaying = audio ? !audio.paused || state.localShouldBePlaying : !primaryVideo.paused;
@@ -6825,17 +12926,21 @@ function applyStoredVolumeToSplitPlayer(video, audio) {
   if (!video || !audio) {
     return;
   }
-  video.volume = state.localPlayerVolume;
+  // The video carries the native controls; only the selected audio is amplified.
+  video.bilikaraVolume = state.localPlayerVolume;
+  video.volume = Math.min(1, state.localPlayerVolume);
   video.muted = state.localPlayerMuted;
-  audio.volume = state.localPlayerVolume;
-  audio.muted = state.localPlayerMuted;
+  applyMediaVolume(audio);
 }
 
 function syncSplitPlayerVolumeFromVideo(video, audio) {
   if (!video || !audio) {
     return;
   }
-  const nextVolume = Number.isFinite(video.volume)
+  const appliedVolume = Math.min(1, Number(video.bilikaraVolume ?? state.localPlayerVolume));
+  const nextVolume = Math.abs(video.volume - appliedVolume) <= 0.001
+    ? state.localPlayerVolume
+    : Number.isFinite(video.volume)
     ? Math.max(0, Math.min(1, Number(video.volume)))
     : state.localPlayerVolume;
   const nextMuted = Boolean(video.muted);
@@ -6849,12 +12954,8 @@ function syncSplitPlayerVolumeFromVideo(video, audio) {
     renderVolumeControls(frontendPlaybackMode(state.data?.playback_mode));
   }
 
-  if (Math.abs(audio.volume - state.localPlayerVolume) > 0.001) {
-    audio.volume = state.localPlayerVolume;
-  }
-  if (audio.muted !== state.localPlayerMuted) {
-    audio.muted = state.localPlayerMuted;
-  }
+  video.bilikaraVolume = state.localPlayerVolume;
+  applyMediaVolume(audio);
 }
 
 function syncSplitSeekAudioTarget(video, audio) {
@@ -6867,35 +12968,77 @@ function syncSplitSeekAudioTarget(video, audio) {
 }
 
 function scheduleSplitPlayerSeekSettle(video, audio) {
-  if (!isSplitPlayerSeekSettling(video, audio)) {
+  const session = state.hostPlaybackSession;
+  if (
+    !isActiveSplitPlayer(video, audio)
+    || !session.seekSettling
+  ) {
     return;
   }
-  if (state.localSeekSettleTimer) {
-    window.clearTimeout(state.localSeekSettleTimer);
-    state.localSeekSettleTimer = null;
+  if (session.seekSettleTimer) {
+    window.clearTimeout(session.seekSettleTimer);
+    session.seekSettleTimer = null;
   }
-  state.localSeekSettleTimer = window.setTimeout(() => {
-    state.localSeekSettleTimer = null;
+  let seekSettleTimer = null;
+  seekSettleTimer = window.setTimeout(() => {
+    if (
+      session.seekSettleTimer !== seekSettleTimer
+      || !isActiveSplitPlayer(video, audio)
+    ) {
+      return;
+    }
+    session.seekSettleTimer = null;
     settleSplitPlayerSeek(video, audio);
   }, localPlayerSeekSettlePollMs);
+  session.seekSettleTimer = seekSettleTimer;
 }
 
 function beginSplitPlayerSeek(video, audio, options = {}) {
-  if (!video || !audio || !isActiveSplitPlayer(video, audio)) {
-    return;
+  const session = state.hostPlaybackSession;
+  if (
+    !video
+    || !audio
+    || !isActiveSplitPlayer(video, audio)
+    || (!session.readyCommitted && !options.allowUncommitted)
+  ) {
+    return false;
+  }
+
+  audio.bilikaraPitch?.reset();
+  clearLocalPlayerSeekState(session);
+
+  if (session.readyCommitted && ["starting", "start-retry-wait"].includes(session.phase)) {
+    // This seek deliberately pauses the pair, which can reject an outstanding
+    // play(). Retire that attempt BEFORE pausing so its AbortError cannot fail
+    // the current seek or a later resume. The settled seek owns the next start.
+    state.localPlaybackStartGeneration = Number(state.localPlaybackStartGeneration || 0) + 1;
+    clearSplitPlaybackStartupWatchdog(session);
+    if (session.webkitRetryTimer) {
+      window.clearTimeout(session.webkitRetryTimer);
+      session.webkitRetryTimer = null;
+    }
+    state.localPlaybackStartPromisesSettled = false;
+    state.localWebKitStartRetryDone = false;
+    setHostPlaybackSessionPhase(session, "ready-paused");
   }
 
   const resumeAfterSeek = Boolean(
     options.resumeAfterSeek
     && !shouldHoldCurrentItemForTransition(video.dataset.playerItemId),
   );
-  state.localSeekSettling = true;
-  state.localSeekResumeAfterSettle = resumeAfterSeek;
-  state.localSeekSettleStartedAt = Date.now();
-  state.localSeekResumePending = resumeAfterSeek;
-  state.localShouldBePlaying = resumeAfterSeek;
+  session.seekSettling = true;
+  session.seekResumeAfterSettle = resumeAfterSeek;
+  session.seekSettleStartedAt = Date.now();
+  session.seekResumePending = resumeAfterSeek;
+  session.seekUpdatesLogicalIntent = options.updateIntent !== false;
+  session.presentationFeedbackSeekTarget = session.seekUpdatesLogicalIntent && Number.isFinite(options.targetTime)
+    ? options.targetTime : null;
+  if (session.seekUpdatesLogicalIntent) {
+    session.logicalPlayIntent = resumeAfterSeek;
+    state.localShouldBePlaying = resumeAfterSeek;
+  }
   if (typeof options.onSettled === "function") {
-    state.localSeekSettleCallback = options.onSettled;
+    session.seekSettleCallback = options.onSettled;
   }
 
   if (!audio.paused) {
@@ -6917,6 +13060,7 @@ function beginSplitPlayerSeek(video, audio, options = {}) {
     options.diagnosticAction || "manual-video-seek",
   );
   scheduleSplitPlayerSeekSettle(video, audio);
+  return true;
 }
 
 function targetAudioTimeFromVideo(video, audio) {
@@ -6927,7 +13071,11 @@ function targetAudioTimeFromVideo(video, audio) {
 }
 
 function settleSplitPlayerSeek(video, audio, force = false) {
-  if (!isSplitPlayerSeekSettling(video, audio)) {
+  const session = state.hostPlaybackSession;
+  if (
+    !isActiveSplitPlayer(video, audio)
+    || !session.seekSettling
+  ) {
     return false;
   }
 
@@ -6935,7 +13083,7 @@ function settleSplitPlayerSeek(video, audio, force = false) {
   const targetAudioTime = isWebKit
     ? targetAudioTimeFromVideo(video, audio)
     : syncSplitSeekAudioTarget(video, audio);
-  const elapsedMs = Date.now() - state.localSeekSettleStartedAt;
+  const elapsedMs = Date.now() - session.seekSettleStartedAt;
   const audioNeedsData = targetAudioTime > 0 && audio.readyState < 2;
   const waitingForMedia = video.seeking || audio.seeking || video.readyState < 2 || audio.readyState < 1 || audioNeedsData;
   if (!force && waitingForMedia && elapsedMs < localPlayerSeekSettleMaxMs) {
@@ -6946,21 +13094,26 @@ function settleSplitPlayerSeek(video, audio, force = false) {
   if (isWebKit) {
     syncSplitSeekAudioTarget(video, audio);
   }
-  const resumeAfterSettle = state.localSeekResumeAfterSettle;
-  const onSettled = state.localSeekSettleCallback;
-  clearLocalPlayerSeekState();
+  const resumeAfterSettle = session.seekResumeAfterSettle;
+  const updateIntent = session.seekUpdatesLogicalIntent;
+  const feedbackTarget = session.presentationFeedbackSeekTarget;
+  const onSettled = takeLocalPlayerSeekCompletion(session);
 
   if (
+    updateIntent
+    &&
     resumeAfterSettle
     && !shouldHoldCurrentItemForTransition(video.dataset.playerItemId)
   ) {
+    session.logicalPlayIntent = true;
     state.localShouldBePlaying = true;
     if (state.localPlaybackStartState === "pending") {
       startSplitPlaybackPair(video, audio);
     } else {
       syncSplitPlayer(video, audio, currentAvOffsetSeconds(), !isWebKit);
     }
-  } else {
+  } else if (updateIntent) {
+    session.logicalPlayIntent = false;
     state.localShouldBePlaying = false;
     if (!audio.paused) {
       audio.pause();
@@ -6968,7 +13121,10 @@ function settleSplitPlayerSeek(video, audio, force = false) {
   }
 
   if (typeof onSettled === "function") {
-    onSettled();
+    onSettled(true);
+  }
+  if (Number.isFinite(feedbackTarget)) {
+    showPresentationOperationFeedback({ kind: "seek", value: feedbackTarget === 0 ? "0:00" : formatDurationSeconds(feedbackTarget) });
   }
   return true;
 }
@@ -7012,13 +13168,14 @@ function splitVideoFrameStats(video) {
 function splitSyncSnapshot(video, audio, offsetSeconds, action) {
   const audioTime = Number(audio?.currentTime || 0);
   const videoTime = Number(video?.currentTime || 0);
-  const targetVideoTime = clampMediaTime(video, audioTime + offsetSeconds);
+  const targetVideoTime = clampMediaTime(video, audioTime - (audio?.bilikaraPitch?.delay() || 0) + offsetSeconds);
   return {
     audio_current_time: audioTime,
     video_current_time: videoTime,
     target_video_time: targetVideoTime,
     drift_seconds: videoTime - targetVideoTime,
     effective_av_delay_seconds: offsetSeconds,
+    pitch: audio?.bilikaraPitch?.snapshot() || null,
     audio_playback_rate: Number(audio?.playbackRate || 1),
     video_playback_rate: Number(video?.playbackRate || 1),
     audio_ready_state: Number(audio?.readyState || 0),
@@ -7038,6 +13195,8 @@ function splitSyncSnapshot(video, audio, offsetSeconds, action) {
     local_should_be_playing: state.localShouldBePlaying,
     local_audio_playback_blocked: state.localAudioPlaybackBlocked,
     local_video_playback_blocked: state.localVideoPlaybackBlocked,
+    local_video_held_for_audio: state.localVideoHeldForAudio,
+    local_video_deferred_recovery: state.localVideoDeferredRecovery,
     is_webkit_runtime: isWebKitPlaybackRuntime(),
     is_tauri_runtime: Boolean(window.__TAURI__),
     is_tauri_webkit_runtime: isTauriWebKitRuntime(),
@@ -7065,9 +13224,16 @@ function reportMediaDiagnostic(
   audio = null,
   action = "none",
   playRejection = null,
+  syncDecision = null,
 ) {
-  if (!media) {
-    return;
+  if (
+    !media
+    || !video
+    || !audio
+    || !isActiveSplitPlayer(video, audio)
+    || (media !== video && media !== audio)
+  ) {
+    return false;
   }
   const mediaError = media.error;
   const payload = {
@@ -7092,26 +13258,32 @@ function reportMediaDiagnostic(
     play_rejection_name: playRejection ? String(playRejection.name || "Error") : "",
     url_basename: mediaUrlBasename(media),
     ...(video && audio ? splitSyncSnapshot(video, audio, currentAvOffsetSeconds(), action) : {}),
+    ...syncDecision,
   };
   console.info("[player-media]", payload);
   apiPost("/api/player/diagnostic", payload).catch(() => {});
+  return true;
 }
 
 function reportSplitStartupDiagnostic(itemId, video, audio, eventName) {
   reportMediaDiagnostic(itemId, "split", audio, eventName, video, audio, eventName);
 }
 
-function reportSplitSyncDiagnostic(itemId, video, audio, action, force = false) {
+function reportSplitSyncDiagnostic(itemId, video, audio, action, force = false, syncDecision = null) {
+  if (!isActiveSplitPlayer(video, audio)) {
+    return false;
+  }
   const now = Date.now();
   if (
     !force
     && now - state.localPlayerSyncLastDiagnosticAt < localPlayerSyncDiagnosticThrottleMs
   ) {
-    return;
+    return false;
   }
   state.localPlayerSyncLastAction = action;
   state.localPlayerSyncLastDiagnosticAt = now;
-  reportMediaDiagnostic(itemId, "split", audio, `sync-${action}`, video, audio, action);
+  reportMediaDiagnostic(itemId, "split", audio, `sync-${action}`, video, audio, action, null, syncDecision);
+  return true;
 }
 
 function attachSplitPlayerDiagnostics(itemId, video, audio) {
@@ -7127,28 +13299,49 @@ function attachSplitPlayerDiagnostics(itemId, video, audio) {
 }
 
 async function handleSplitVideoEnded(currentItem, video, audio, reportStatus) {
+  if (
+    !isActiveSplitPlayer(video, audio)
+    || !state.hostPlaybackSession?.readyCommitted
+  ) {
+    return false;
+  }
   reportStatus();
   if (!audio.ended) {
     state.localVideoDeferredRecovery = true;
     reportSplitSyncDiagnostic(currentItem.id, video, audio, "defer-video-recovery", true);
-    return;
+    return false;
   }
-  await handleSplitAudioEnded(currentItem, video, audio, reportStatus);
+  return handleSplitAudioEnded(currentItem, video, audio, reportStatus);
 }
 
 async function handleSplitAudioEnded(currentItem, video, audio, reportStatus) {
-  if (state.localPlaybackEndHandled || !isActiveSplitPlayer(video, audio)) {
+  if (
+    state.localPlaybackEndHandled
+    || !isActiveSplitPlayer(video, audio)
+    || !state.hostPlaybackSession?.readyCommitted
+  ) {
     return;
   }
+  const endingSession = state.hostPlaybackSession;
+  if (endingSession.pitchDraining) return;
+  endingSession.pitchDraining = true;
+  if (audio.bilikaraPitch && !await audio.bilikaraPitch.drain()) {
+    endingSession.pitchDraining = false;
+    return;
+  }
+  endingSession.pitchDraining = false;
+  if (!isActiveSplitPlayer(video, audio) || state.localPlaybackEndHandled || !audio.ended
+    || shouldHoldCurrentItemForTransition(currentItem)) return;
   state.localPlaybackEndHandled = true;
   state.localShouldBePlaying = false;
-  state.localSeekResumePending = false;
+  state.hostPlaybackSession.seekResumePending = false;
   if (!video.paused) {
     video.dataset.bilikaraInternalPause = "true";
     video.pause();
   }
   reportStatus();
-  await handleLocalPlaybackEnded("media-ended");
+  await handleLocalPlaybackEnded("media-ended", endingSession);
+  return true;
 }
 
 function holdVideoForAudio(video) {
@@ -7157,6 +13350,26 @@ function holdVideoForAudio(video) {
     video.dataset.bilikaraInternalPause = "true";
     video.pause();
   }
+}
+
+function scheduleAndroidAudioClockRecovery(video, audio) {
+  const session = state.hostPlaybackSession;
+  if (session.audioClockRecoveryFrame != null) {
+    return;
+  }
+  // The normal 120 ms tick is too coarse to release a held video in sync.
+  // Use frame cadence only while catching up, never a fixed audio delay.
+  const frame = window.requestAnimationFrame(() => {
+    if (
+      session.audioClockRecoveryFrame !== frame
+      || !isCurrentHostPlaybackSession(session, video, audio)
+    ) {
+      return;
+    }
+    session.audioClockRecoveryFrame = null;
+    syncSplitPlayer(video, audio, currentAvOffsetSeconds(), false);
+  });
+  session.audioClockRecoveryFrame = frame;
 }
 
 function splitPlaybackStartOverlay() {
@@ -7169,6 +13382,80 @@ function splitPlaybackPairCanStartAutomatically(video, audio) {
   }
   const minimumReadyState = isWebKitPlaybackRuntime() ? 1 : 2;
   return video.readyState >= minimumReadyState && audio.readyState >= minimumReadyState;
+}
+
+function applyInitialHostPlaybackIntent(session, video, audio) {
+  if (
+    state.hostPlaybackSession !== session
+    || !isActiveSplitPlayer(video, audio)
+    || !session.readyCommitted
+    || session.phase !== "ready-paused"
+    || session.initialIntentApplied
+    || shouldHoldCurrentItemForTransition(video.dataset.playerItemId)
+  ) {
+    return false;
+  }
+  session.initialIntentApplied = true;
+  state.localShouldBePlaying = Boolean(session.logicalPlayIntent);
+  if (session.logicalPlayIntent) {
+    return startSplitPlaybackPair(video, audio);
+  }
+  reportSplitStartupDiagnostic(
+    video.dataset.playerItemId || "",
+    video,
+    audio,
+    "startup-ready-no-play-intent",
+  );
+  setHostPlaybackSessionPhase(session, "paused");
+  syncTauriMediaSessionState(video, { forcePosition: true });
+  publishPresentationPlaybackState(session).catch(() => {});
+  return true;
+}
+
+function commitHostPlaybackSessionReadyPaused(session, video, audio) {
+  if (
+    state.hostPlaybackSession !== session
+    || !isActiveSplitPlayer(video, audio)
+    || session.readyCommitted
+    || session.phase !== "binding"
+    || session.seekSettling
+    || !splitPlaybackPairCanStartAutomatically(video, audio)
+  ) {
+    return false;
+  }
+  if (!audio.paused) {
+    audio.pause();
+  }
+  if (!video.paused) {
+    video.dataset.bilikaraInternalPause = "true";
+    video.pause();
+  }
+  session.readyCommitted = true;
+  session.readyCommitCount += 1;
+  setHostPlaybackSessionPhase(session, "ready-paused");
+  clearSplitPlaybackStartupWatchdog(session);
+  syncTauriMediaSessionState(video, { forcePosition: true });
+  publishPresentationPlaybackState(session).catch(() => {});
+  applyInitialHostPlaybackIntent(session, video, audio);
+  return true;
+}
+
+function failHostPlaybackCandidate(session, video, audio, diagnosticAction) {
+  if (
+    state.hostPlaybackSession !== session
+    || !isActiveSplitPlayer(video, audio)
+    || session.readyCommitted
+    || session.phase !== "binding"
+  ) {
+    return false;
+  }
+  session.failureStage = "media-readiness";
+  session.playbackRestore = null;
+  clearLocalPlayerSeekState(session);
+  clearLocalPlayerSyncTimer(session);
+  return failSplitPlaybackStartup(video, audio, "media-readiness", {
+    diagnosticAction,
+  });
 }
 
 function isRecoverableSplitPlaybackStartState(startState = state.localPlaybackStartState) {
@@ -7206,15 +13493,18 @@ function updateSplitPlaybackStartOverlay(video, audio) {
 }
 
 function scheduleSplitPlaybackStartupWatchdog(video, audio) {
-  clearSplitPlaybackStartupWatchdog();
+  const session = state.hostPlaybackSession;
+  if (!isActiveSplitPlayer(video, audio)) {
+    return false;
+  }
+  clearSplitPlaybackStartupWatchdog(session);
   if (
     !video
     || !audio
     || !isActiveSplitPlayer(video, audio)
-    || (
-      state.localPlaybackStartState !== "pending"
-      && state.localPlaybackStartState !== "starting"
-    )
+    || !session.ownershipClaimed
+    || !session.loadingStarted
+    || !["binding", "starting", "start-retry-wait"].includes(session.phase)
   ) {
     return false;
   }
@@ -7223,25 +13513,21 @@ function scheduleSplitPlaybackStartupWatchdog(video, audio) {
   const watchdogItemId = String(video.dataset.playerItemId || "");
   let watchdogTimer = null;
   watchdogTimer = window.setTimeout(() => {
-    if (state.localPlaybackStartupWatchdogTimer !== watchdogTimer) {
+    if (session.startupWatchdogTimer !== watchdogTimer) {
       return;
     }
-    state.localPlaybackStartupWatchdogTimer = null;
+    session.startupWatchdogTimer = null;
     if (
       !isActiveSplitPlayer(video, audio)
       || state.localPlaybackStartGeneration !== watchdogGeneration
       || String(video.dataset.playerItemId || "") !== watchdogItemId
-      || !state.localShouldBePlaying
-      || (
-        state.localPlaybackStartState !== "pending"
-        && state.localPlaybackStartState !== "starting"
-      )
+      || !["binding", "starting", "start-retry-wait"].includes(session.phase)
     ) {
       return;
     }
 
     let diagnosticAction = "startup-timeout-before-play-attempt";
-    if (state.localPlaybackStartState === "starting") {
+    if (session.phase === "starting" || session.phase === "start-retry-wait") {
       if (!state.localPlaybackStartPromisesSettled) {
         diagnosticAction = "startup-play-promise-timeout";
       } else if (video.paused || audio.paused) {
@@ -7250,21 +13536,48 @@ function scheduleSplitPlaybackStartupWatchdog(video, audio) {
         diagnosticAction = "startup-timeout-after-play-resolution";
       }
     }
-    failSplitPlaybackStartup(video, audio, "startup-timeout", { diagnosticAction });
+    if (session.phase === "binding") {
+      failHostPlaybackCandidate(session, video, audio, diagnosticAction);
+    } else {
+      failSplitPlaybackStartup(video, audio, "startup-timeout", { diagnosticAction });
+    }
   }, splitPlaybackStartupWatchdogMs);
-  state.localPlaybackStartupWatchdogTimer = watchdogTimer;
+  session.startupWatchdogTimer = watchdogTimer;
   return true;
 }
 
 function setSplitPlaybackStartState(nextState, video, audio) {
-  state.localPlaybackStartState = nextState;
+  const session = state.hostPlaybackSession;
+  if (!isActiveSplitPlayer(video, audio)) {
+    return false;
+  }
+  if (nextState === "pending") {
+    setHostPlaybackSessionPhase(
+      session,
+      session.readyCommitted ? "ready-paused" : "binding",
+    );
+  } else if (nextState === "starting") {
+    setHostPlaybackSessionPhase(session, "starting");
+  } else if (nextState === "established") {
+    setHostPlaybackSessionPhase(
+      session,
+      video.paused || audio.paused ? "paused" : "playing",
+    );
+  } else if (nextState === "needs-user-gesture") {
+    setHostPlaybackSessionPhase(session, "needs-user-gesture");
+  } else if (nextState === "startup-failed") {
+    setHostPlaybackSessionPhase(session, "failed");
+  } else {
+    return false;
+  }
   if (nextState === "pending" || nextState === "starting") {
     state.localPlaybackStartPromisesSettled = false;
     scheduleSplitPlaybackStartupWatchdog(video, audio);
   } else {
-    clearSplitPlaybackStartupWatchdog();
+    clearSplitPlaybackStartupWatchdog(session);
   }
   updateSplitPlaybackStartOverlay(video, audio);
+  return true;
 }
 
 function isPlaybackPolicyRejection(error) {
@@ -7276,6 +13589,7 @@ function requestSplitPlaybackStart(
   audio,
   { source = "", userGesture = false } = {},
 ) {
+  if (window.BilikaraAndroidPlayback?.blockStart()) return true;
   if (
     !splitPlaybackPairNeedsStart(video, audio)
     || shouldHoldCurrentItemForTransition(video.dataset.playerItemId)
@@ -7289,12 +13603,15 @@ function requestSplitPlaybackStart(
   }
 
   if (state.localPlaybackStartState === "needs-user-gesture" && !userGesture) {
+    state.hostPlaybackSession.logicalPlayIntent = true;
     state.localShouldBePlaying = false;
     updateSplitPlaybackStartOverlay(video, audio);
     syncTauriMediaSessionState(video, { forcePosition: true });
     return true;
   }
 
+  state.hostPlaybackSession.logicalPlayIntent = true;
+  if (userGesture) state.hostPlaybackSession.presentationFeedbackPlayPending = true;
   state.localShouldBePlaying = true;
   if (state.localPlaybackStartState === "starting" && !userGesture) {
     syncTauriMediaSessionState(video, { forcePosition: true });
@@ -7359,16 +13676,43 @@ function setSplitPlaybackIntent(
     userGesture = false,
   } = {},
 ) {
+  const session = state.hostPlaybackSession;
   if (!video || !audio || !isActiveSplitPlayer(video, audio)) {
     return false;
   }
+  if (window.BilikaraAndroidPlayback?.interceptIntent(shouldPlay, source)) return true;
 
   const itemId = video.dataset.playerItemId || "";
   const nextIntent = Boolean(shouldPlay);
+  const changedIntent = session.logicalPlayIntent !== nextIntent;
+  session.logicalPlayIntent = nextIntent;
+  if (!nextIntent) {
+    session.presentationFeedbackPlayPending = false;
+    audio.bilikaraPitch?.reset();
+    clearAndroidAudioClockRecovery(session);
+  }
+  if (!session.readyCommitted) {
+    state.localShouldBePlaying = shouldHoldCurrentItemForTransition(itemId)
+      ? false
+      : nextIntent;
+    session.seekResumeAfterSettle = false;
+    session.seekResumePending = false;
+    if (!audio.paused) {
+      audio.pause();
+    }
+    if (!video.paused) {
+      video.dataset.bilikaraInternalPause = "true";
+      video.pause();
+    }
+    if (source) {
+      reportSplitStartupDiagnostic(itemId, video, audio, source);
+    }
+    return true;
+  }
   if (shouldHoldCurrentItemForTransition(itemId)) {
     state.localShouldBePlaying = false;
-    state.localSeekResumeAfterSettle = false;
-    state.localSeekResumePending = false;
+    session.seekResumeAfterSettle = false;
+    session.seekResumePending = false;
     if (!audio.paused) {
       audio.pause();
     }
@@ -7384,13 +13728,14 @@ function setSplitPlaybackIntent(
   }
 
   state.localShouldBePlaying = nextIntent;
+  if (changedIntent) session.presentationFeedbackPlayPending = nextIntent;
   if (source) {
     reportSplitStartupDiagnostic(itemId, video, audio, source);
   }
 
   if (!nextIntent) {
-    state.localSeekResumeAfterSettle = false;
-    state.localSeekResumePending = false;
+    session.seekResumeAfterSettle = false;
+    session.seekResumePending = false;
     if (!audio.paused) {
       audio.pause();
     }
@@ -7398,13 +13743,16 @@ function setSplitPlaybackIntent(
       video.dataset.bilikaraInternalPause = "true";
       video.pause();
     }
+    setHostPlaybackSessionPhase(session, "paused");
+    clearSplitPlaybackStartupWatchdog(session);
     syncTauriMediaSessionState(video, { forcePosition: true });
+    if (changedIntent) showPresentationOperationFeedback({ kind: "pause", value: "" });
     return true;
   }
 
   if (isSplitPlayerSeekSettling(video, audio)) {
-    state.localSeekResumeAfterSettle = true;
-    state.localSeekResumePending = true;
+    session.seekResumeAfterSettle = true;
+    session.seekResumePending = true;
     if (!audio.paused) {
       audio.pause();
     }
@@ -7421,7 +13769,10 @@ function setSplitPlaybackIntent(
     return true;
   }
 
-  if (state.localPlaybackStartState !== "established") {
+  if (session.phase === "paused" || session.phase === "ready-paused") {
+    setHostPlaybackSessionPhase(session, "ready-paused");
+    startSplitPlaybackPair(video, audio, { userGesture });
+  } else if (state.localPlaybackStartState !== "established") {
     if (state.localPlaybackStartState !== "starting") {
       if (typeof synchronizeStartupPlayer === "function") {
         synchronizeStartupPlayer();
@@ -7472,9 +13823,17 @@ function syncTauriMediaSessionState(video, { forcePosition = false } = {}) {
   if (!mediaSession || !video || video !== activeVideo || !audio) {
     return false;
   }
+  if (!state.hostPlaybackSession?.readyCommitted) {
+    clearTauriMediaSessionState();
+    return false;
+  }
 
   try {
-    mediaSession.playbackState = state.localShouldBePlaying ? "playing" : "paused";
+    mediaSession.playbackState = hostPlaybackSessionObservedPlaying(
+      state.hostPlaybackSession,
+      video,
+      audio,
+    ) ? "playing" : "paused";
   } catch {
     // Ignore incomplete Media Session implementations.
   }
@@ -7525,6 +13884,7 @@ function handleTauriMediaSessionAction(action, details = {}) {
     return false;
   }
   const { video, audio } = activeLocalPlayerElements();
+  const playbackSession = state.hostPlaybackSession;
   if (!video || !audio) {
     clearTauriMediaSessionState();
     return false;
@@ -7561,7 +13921,15 @@ function handleTauriMediaSessionAction(action, details = {}) {
       resumeAfterSeek,
       targetTime: clampedTarget,
       diagnosticAction: eventName,
-      onSettled: () => reportPlayerStatus(video.dataset.playerItemId || "", video),
+      onSettled: (applied) => {
+        if (applied) {
+          reportPlayerStatus(
+            video.dataset.playerItemId || "",
+            video,
+            playbackSession,
+          );
+        }
+      },
     });
   } else if (action === "nexttrack") {
     requestNextTrack().catch(() => {});
@@ -7649,11 +14017,14 @@ function failSplitPlaybackStartup(
 }
 
 function scheduleWebKitSplitPlaybackRetry(video, audio, { userGesture, prefix }) {
+  const session = state.hostPlaybackSession;
   if (!isActiveSplitPlayer(video, audio)) {
     return false;
   }
   pauseSplitPlaybackForStartupRecovery(video, audio);
-  setSplitPlaybackStartState("pending", video, audio);
+  setHostPlaybackSessionPhase(session, "start-retry-wait");
+  state.localPlaybackStartPromisesSettled = false;
+  scheduleSplitPlaybackStartupWatchdog(video, audio);
   reportSplitStartupDiagnostic(
     video.dataset.playerItemId || "",
     video,
@@ -7666,7 +14037,7 @@ function scheduleWebKitSplitPlaybackRetry(video, audio, { userGesture, prefix })
     if (
       retryStarted
       || !isActiveSplitPlayer(video, audio)
-      || state.localPlaybackStartState !== "pending"
+      || session.phase !== "start-retry-wait"
       || !state.localShouldBePlaying
       || isSplitPlayerSeekSettling(video, audio)
       || video.seeking
@@ -7677,6 +14048,10 @@ function scheduleWebKitSplitPlaybackRetry(video, audio, { userGesture, prefix })
       return false;
     }
     retryStarted = true;
+    if (session.webkitRetryTimer) {
+      window.clearTimeout(session.webkitRetryTimer);
+      session.webkitRetryTimer = null;
+    }
     reportSplitStartupDiagnostic(
       video.dataset.playerItemId || "",
       video,
@@ -7692,15 +14067,33 @@ function scheduleWebKitSplitPlaybackRetry(video, audio, { userGesture, prefix })
       addMountedPlayerListener(media, eventName, retryWhenReady);
     });
   });
-  window.setTimeout(retryWhenReady, 50);
+  let webkitRetryTimer = null;
+  webkitRetryTimer = window.setTimeout(() => {
+    if (session.webkitRetryTimer !== webkitRetryTimer) {
+      return;
+    }
+    session.webkitRetryTimer = null;
+    retryWhenReady();
+  }, 50);
+  session.webkitRetryTimer = webkitRetryTimer;
   return true;
 }
 
 function startSplitPlaybackPair(video, audio, { userGesture = false } = {}) {
+  if (window.BilikaraAndroidPlayback?.blockStart()) return false;
+  const session = state.hostPlaybackSession;
   if (
     !video
     || !audio
     || !isActiveSplitPlayer(video, audio)
+    || !session?.readyCommitted
+    || ![
+      "ready-paused",
+      "start-retry-wait",
+      "needs-user-gesture",
+      "failed",
+    ].includes(session.phase)
+    || (session.phase === "failed" && !userGesture)
     || shouldHoldCurrentItemForTransition(video.dataset.playerItemId)
     || isSplitPlayerSeekSettling(video, audio)
     || video.seeking
@@ -7720,6 +14113,7 @@ function startSplitPlaybackPair(video, audio, { userGesture = false } = {}) {
   }
 
   state.localShouldBePlaying = true;
+  session.logicalPlayIntent = true;
   state.localAudioPlaybackBlocked = false;
   state.localVideoPlaybackBlocked = false;
   state.localPlaybackStartGeneration = Number(state.localPlaybackStartGeneration || 0) + 1;
@@ -8006,6 +14400,7 @@ function playMediaBestEffort(
   media,
   { internalVideo = false, video = null, audio = null, mediaKind = "media" } = {},
 ) {
+  if (window.BilikaraAndroidPlayback?.blockStart()) return false;
   const guardPendingPlay = isWebKitPlaybackRuntime();
   if (
     !media
@@ -8059,10 +14454,12 @@ function seekVideoForNavigation(video, targetTime) {
 }
 
 function syncSplitPlayer(video, audio, offsetSeconds, forceCorrection = false) {
-  if (!video || !audio) {
+  if (window.BilikaraAndroidPlayback?.blockStart()) return "pause";
+  if (!video || !audio || !isActiveSplitPlayer(video, audio)) {
     return "none";
   }
   if (audio.ended) {
+    clearAndroidAudioClockRecovery();
     return "none";
   }
 
@@ -8075,13 +14472,19 @@ function syncSplitPlayer(video, audio, offsetSeconds, forceCorrection = false) {
     video.playbackRate = requestedRate;
   }
 
-  const reportAction = (action, force = false) => {
-    reportSplitSyncDiagnostic(video.dataset.playerItemId || "", video, audio, action, force);
+  const reportAction = (action, force = false, correction = null) => {
+    reportSplitSyncDiagnostic(video.dataset.playerItemId || "", video, audio, action, force, {
+      sync_force_correction: Boolean(forceCorrection),
+      ...correction,
+    });
     return action;
   };
   const isWebKit = isWebKitPlaybackRuntime();
 
+  const isAndroid = isAndroidNativePlaybackRuntime();
+
   if (shouldHoldCurrentItemForTransition(video.dataset.playerItemId)) {
+    clearAndroidAudioClockRecovery();
     state.localShouldBePlaying = false;
     if (!audio.paused) {
       audio.pause();
@@ -8107,6 +14510,9 @@ function syncSplitPlayer(video, audio, offsetSeconds, forceCorrection = false) {
     return reportAction("pause");
   }
   if (audio.seeking) {
+    if (isAndroid && state.localShouldBePlaying) {
+      holdVideoForAudio(video);
+    }
     return reportAction("wait-for-audio");
   }
 
@@ -8124,12 +14530,32 @@ function syncSplitPlayer(video, audio, offsetSeconds, forceCorrection = false) {
   }
 
   if (!state.localShouldBePlaying) {
+    clearAndroidAudioClockRecovery();
     if (!audio.paused) {
       audio.pause();
     }
     return reportAction("pause");
   }
 
+  // waiting/stalled can be queued by a seek that has already been superseded.
+  // Reconcile the sticky event flag with the live media state so a missed
+  // canplay event cannot leave an otherwise-ready audio track paused forever.
+  if (!audio.seeking && audio.readyState >= 3) {
+    state.localAudioPlaybackBlocked = false;
+  }
+
+  const pitch = audio.bilikaraPitch;
+  if (pitch?.sync({
+    video, offset: offsetSeconds, rate: requestedRate,
+    hold: () => holdVideoForAudio(video),
+    play: () => playMediaBestEffort(audio, { video, audio, mediaKind: "audio" }),
+    // A route change deliberately pauses media. Retire pending play promises
+    // before that pause so their AbortError cannot fail the new prime.
+    beforePrime: () => { state.localPlaybackStartGeneration += 1; },
+  })) {
+    scheduleAndroidAudioClockRecovery(video, audio);
+    return reportAction("pitch-priming");
+  }
   const videoTime = Number(video.currentTime || 0);
   if (video.ended) {
     if (audio.readyState >= 2 && !state.localAudioPlaybackBlocked) {
@@ -8146,7 +14572,7 @@ function syncSplitPlayer(video, audio, offsetSeconds, forceCorrection = false) {
     return reportAction("wait-for-video");
   }
 
-  const rawTargetAudioTime = videoTime - offsetSeconds;
+  const rawTargetAudioTime = videoTime - offsetSeconds + (audio.bilikaraPitch?.delay(requestedRate) || 0);
   if (rawTargetAudioTime < 0) {
     if (!audio.paused) {
       audio.pause();
@@ -8172,25 +14598,73 @@ function syncSplitPlayer(video, audio, offsetSeconds, forceCorrection = false) {
   const drift = audioTime - targetAudioTime;
   const absoluteDrift = Math.abs(drift);
 
+  const session = state.hostPlaybackSession;
+  if (isAndroid) {
+    const catchUpThreshold = session.audioClockRecovering || state.localVideoHeldForAudio || forceCorrection
+      ? localPlayerForceSyncEpsilonSeconds
+      : localPlayerDriftToleranceSeconds;
+    if (drift < -catchUpThreshold) {
+      // seeked/canplay only establish decoder readiness. Android's separate
+      // audio output clock can still stall after seek/play while video runs.
+      // Seeking audio again restarts that stall. Let audio catch the held
+      // video instead, preserving both the audio timeline and the AV offset.
+      session.audioClockRecovering = true;
+      holdVideoForAudio(video);
+      playMediaBestEffort(audio, { video, audio, mediaKind: "audio" });
+      if (absoluteDrift < localPlayerHardSyncThresholdSeconds) {
+        scheduleAndroidAudioClockRecovery(video, audio);
+      }
+      return reportAction("wait-for-audio-clock");
+    }
+    if (session.audioClockRecovering) {
+      clearAndroidAudioClockRecovery(session);
+      state.localVideoDeferredRecovery = false;
+      state.localVideoHeldForAudio = false;
+      playMediaBestEffort(video, { internalVideo: true, video, audio, mediaKind: "video" });
+      return reportAction("audio-clock-aligned", true);
+    }
+  }
+
   const recovering = state.localVideoDeferredRecovery || state.localVideoHeldForAudio;
   const recoveringFromWebKitVideoStarvation = isWebKit && state.localVideoDeferredRecovery;
   const now = Date.now();
-  const seekThreshold = isWebKit
-    ? localPlayerHardSyncThresholdSeconds
-    : forceCorrection
-      ? localPlayerForceSyncEpsilonSeconds
-      : recovering
-        ? localPlayerDriftToleranceSeconds
-        : absoluteDrift >= localPlayerHardSyncThresholdSeconds
-          ? localPlayerHardSyncThresholdSeconds
-          : localPlayerModerateSyncThresholdSeconds;
-  const seekAllowed = (!isWebKit && forceCorrection)
+  // Android recovery/playing events are not explicit user seeks. A single
+  // audio packet can appear ahead while video resumes. Do not lower the
+  // threshold to 15 ms or bypass cooldown: that seeks audio again, queues
+  // waiting/canplay, and can feed the same recovery loop indefinitely.
+  // Manual seek and AV-offset changes have their own immediate positioning.
+  const seekThreshold = isAndroid
+    ? localPlayerModerateSyncThresholdSeconds
+    : isWebKit
+      ? localPlayerHardSyncThresholdSeconds
+      : forceCorrection
+        ? localPlayerForceSyncEpsilonSeconds
+        : recovering
+          ? localPlayerDriftToleranceSeconds
+          : absoluteDrift >= localPlayerHardSyncThresholdSeconds
+            ? localPlayerHardSyncThresholdSeconds
+            : localPlayerModerateSyncThresholdSeconds;
+  const seekAllowed = (!isWebKit && !isAndroid && forceCorrection)
     || now - state.localPlayerSyncLastSeekAt >= localPlayerSyncSeekCooldownMs;
   let action = "none";
+  let correction = null;
   if (!recoveringFromWebKitVideoStarvation && absoluteDrift >= seekThreshold && seekAllowed) {
+    if (audio.bilikaraPitch?.phase === "active") {
+      audio.bilikaraPitch.reset();
+      holdVideoForAudio(video);
+      audio.pause();
+      state.localPlayerSyncLastSeekAt = now;
+      return reportAction("pitch-reprime");
+    }
     if (setMediaCurrentTime(audio, targetAudioTime)) {
       state.localPlayerSyncLastSeekAt = now;
       action = "audio-drift-correction";
+      correction = {
+        // Same sign as drift_seconds (video minus offset-adjusted audio).
+        // The post-seek snapshot alone misleadingly reports zero drift.
+        drift_before_correction_seconds: -drift,
+        correction_target_audio_time: targetAudioTime,
+      };
     }
   }
 
@@ -8208,7 +14682,7 @@ function syncSplitPlayer(video, audio, offsetSeconds, forceCorrection = false) {
   if (action === "none" && recovering) {
     action = "resume";
   }
-  return reportAction(action, action === "audio-drift-correction");
+  return reportAction(action, action === "audio-drift-correction", correction);
 }
 
 function syncMountedLocalPlayer(forceCorrection = false) {
@@ -8224,6 +14698,7 @@ function resyncMountedLocalPlayerForOffsetChange() {
   if (!video || !audio) {
     return;
   }
+  audio.bilikaraPitch?.reset();
   const rawTargetAudioTime = Number(video.currentTime || 0) - currentAvOffsetSeconds();
   const targetAudioTime = clampMediaTime(audio, rawTargetAudioTime);
   const audioRepositioned = audio.readyState >= 1
@@ -8272,8 +14747,7 @@ function applyStoredVolumeToSinglePlayer(video) {
   if (!video) {
     return;
   }
-  video.volume = state.localPlayerVolume;
-  video.muted = state.localPlayerMuted;
+  applyMediaVolume(video);
 }
 
 function applyStoredVolumeToMountedPlayer() {
@@ -8287,10 +14761,6 @@ function applyStoredVolumeToMountedPlayer() {
 
 function volumePercentText() {
   return `${Math.round(state.localPlayerVolume * 100)}%`;
-}
-
-function muteIcon(isMuted) {
-  return isMuted ? "🔇" : "🔊";
 }
 
 function setRangeFillPercent(input, percent) {
@@ -8310,16 +14780,15 @@ function renderVolumeControls(playbackMode) {
   }
 
   const isLocalMode = playbackMode === "local";
+  globalThis.BilikaraVolumeControl?.refreshAutomatic(elements.volumeSlider);
   const volumePercent = Math.round(state.localPlayerVolume * 100);
   const label = volumePercentText();
   const muteLabel = state.localPlayerMuted ? t("player.unmute") : t("player.mute");
-  const muteButtonText = muteIcon(state.localPlayerMuted);
   const signature = JSON.stringify({
     isLocalMode,
     volumePercent,
     label,
     muteLabel,
-    muteButtonText,
     muted: state.localPlayerMuted,
   });
 
@@ -8329,12 +14798,10 @@ function renderVolumeControls(playbackMode) {
   state.volumeControlsRenderSignature = signature;
 
   setClassToggle(elements.volumePanel, "hidden", !isLocalMode);
-  if (elements.volumeSlider.value !== String(volumePercent)) {
-    elements.volumeSlider.value = String(volumePercent);
-  }
-  setRangeFillPercent(elements.volumeSlider, volumePercent);
-  setTextContent(elements.volumeValue, label);
-  setTextContent(elements.volumeMuteButton, muteButtonText);
+  globalThis.BilikaraVolumeControl?.render(elements.volumeSlider, elements.volumeValue, volumePercent);
+  elements.volumeMuteButton.querySelectorAll("[data-volume-icon]").forEach((icon) => {
+    icon.classList.toggle("hidden", icon.dataset.volumeIcon !== (state.localPlayerMuted ? "muted" : "unmuted"));
+  });
   elements.volumeMuteButton.setAttribute("aria-label", muteLabel);
   elements.volumeMuteButton.setAttribute("title", muteLabel);
   setClassToggle(elements.volumeMuteButton, "is-muted", state.localPlayerMuted);
@@ -8354,8 +14821,18 @@ function renderKeyShiftControls(playbackMode) {
   }
 
   if (elements.keyShiftResetButton) {
-    elements.keyShiftResetButton.disabled = keyShift === 0;
+    elements.keyShiftResetButton.disabled = keyShift === 0
+      || elements.keyShiftResetButton.getAttribute("aria-busy") === "true";
   }
+  const pitchStatus = document.getElementById("pitch-status");
+  const { audio } = activeLocalPlayerElements();
+  const pitch = audio?.bilikaraPitch;
+  if (pitchStatus) {
+    const failed = audio?.bilikaraPitchFailure || pitch?.failure;
+    pitchStatus.textContent = keyShift && failed ? t("player.pitchUnavailable") : "";
+    pitchStatus.hidden = !pitchStatus.textContent;
+  }
+  globalThis.BilikaraHostLayout?.syncPlayerFieldWidths?.();
 }
 
 async function setLocalPlayerKeyShift(keyShift) {
@@ -8374,28 +14851,40 @@ async function setLocalPlayerKeyShift(keyShift) {
 
   try {
     const nextData = await apiPost("/api/player/key-shift", { key_shift: boundedKeyShift });
+    const accepted = acceptHostStateSnapshot(nextData);
     if (requestSeq !== state.volumeSaveSeq) {
       return;
     }
-    state.data = nextData;
-    syncLocalPlayerSettingsFromSnapshot(state.data?.player_settings);
+    // Once this write is acknowledged, newer Remote volume/mute settings
+    // must no longer be hidden by the optimistic-update suppression window.
+    state.playerSettingsEchoSuppressUntil = 0;
+  if (accepted) {
+      syncLocalPlayerSettingsFromSnapshot(state.data?.player_settings);
+    }
+    if (accepted) renderPresentationFeedback();
     renderKeyShiftControls(frontendPlaybackMode(state.data?.playback_mode));
   } catch (error) {
     // Ignore or handle errors gracefully
   }
 }
 
-function disposeAudioPitchProcessor(audio) {
-  if (!audio?.jungle) {
-    return;
-  }
+async function applyKeyShiftControl(control, keyShift) {
+  if (control.disabled || control.getAttribute("aria-busy") === "true") return;
+  const disabled = control.disabled;
+  control.disabled = true;
+  control.setAttribute("aria-busy", "true");
   try {
-    audio.jungle.dispose();
-  } catch {
-    // A partially initialized or already-disposed graph must not block playback cleanup.
+    await setLocalPlayerKeyShift(keyShift);
+  } finally {
+    control.disabled = disabled;
+    control.removeAttribute("aria-busy");
+    renderKeyShiftControls(frontendPlaybackMode(state.data?.playback_mode));
   }
-  audio.jungle = null;
-  audio.bilikaraPitchRoute = "";
+}
+
+function disposeAudioPitchProcessor(audio) {
+  audio?.bilikaraPitch?.dispose();
+  if (audio) audio.bilikaraPitch = null;
 }
 
 function disconnectAudioPitchSource(audio) {
@@ -8416,7 +14905,10 @@ function disposeAudioPitchShifter(audio) {
   }
   disposeAudioPitchProcessor(audio);
   disconnectAudioPitchSource(audio);
-  audio.bilikaraPitchSource = null;
+  // Retain the source identity: an element cannot be wrapped a second time.
+  audio.bilikaraPitchRetired = true;
+  audio.bilikaraVolumeGain?.disconnect();
+  audio.bilikaraVolumeGain = null;
 }
 
 function disposeSharedAudioContext() {
@@ -8447,6 +14939,7 @@ function resumeAudioContextBestEffort() {
 }
 
 function ensureAudioPitchSource(audio) {
+  if (audio.bilikaraPitchRetired) return null;
   if (audio.bilikaraPitchSource) {
     return audio.bilikaraPitchSource;
   }
@@ -8458,70 +14951,129 @@ function ensureAudioPitchSource(audio) {
   }
 
   addMountedPlayerListener(audio, "play", resumeAudioContextBestEffort);
-  audio.bilikaraPitchSource = state.audioContext.createMediaElementSource(audio);
+  const gain = state.audioContext.createGain();
+  gain.gain.value = state.localPlayerVolume;
+  gain.bilikaraTarget = gain.gain.value;
+  gain.connect(state.audioContext.destination);
+  try {
+    audio.bilikaraPitchSource = state.audioContext.createMediaElementSource(audio);
+  } catch (error) {
+    gain.disconnect();
+    throw error;
+  }
+  audio.bilikaraVolumeGain = gain;
+  // Once routed through Web Audio, gain owns the full level. This also avoids
+  // relying on writable HTMLMediaElement.volume in mobile WebKit.
+  audio.volume = 1;
+  audio.bilikaraPitchSource.connect(gain);
+  audio.bilikaraPitchRoute = "direct";
   return audio.bilikaraPitchSource;
+}
+
+function applyMediaVolume(media) {
+  if (!media) return;
+  const volume = Math.max(0, Math.min(5, state.localPlayerVolume));
+  media.bilikaraVolume = volume;
+  media.volume = media.bilikaraVolumeGain ? 1 : Math.min(1, volume);
+  media.muted = state.localPlayerMuted;
+  if (volume > 1 && !media.bilikaraPitchSource && !media.bilikaraGainErrorReported) {
+    try {
+      if (state.pitchContextFailure === "media-clock") throw new Error("Media source clock unavailable");
+      if (!ensureAudioPitchSource(media)) throw new Error("Web Audio unavailable");
+      if (media.paused === false) resumeAudioContextBestEffort();
+    } catch (error) {
+      if (!media.bilikaraGainErrorReported) {
+        media.bilikaraGainErrorReported = true;
+        console.error("Failed to enable playback gain:", error);
+        setAppMessage(t("player.volumeUnavailable"), true);
+      }
+    }
+  }
+  const gain = media.bilikaraVolumeGain;
+  if (gain) {
+    const target = volume;
+    if (gain.bilikaraTarget !== target) {
+      gain.gain.setTargetAtTime(target, state.audioContext.currentTime, 0.015);
+      gain.bilikaraTarget = target;
+    }
+  }
 }
 
 function setupAudioPitchShifter(audio) {
   applyKeyShiftToAudio(audio);
 }
 
+function recoverAudioPitchOutput(audio, kind) {
+  state.pitchContextFailure = kind;
+  const session = state.hostPlaybackSession;
+  queueMicrotask(() => {
+    if (!isCurrentHostPlaybackSession(session, session?.video, audio)) return;
+    const item = state.data?.current_item;
+    state.pendingPlaybackRestore = {
+      itemId: item.id, itemIncarnationId: item.item_incarnation_id,
+      variantId: session.playbackProgram.selected_audio_variant_id,
+      currentTime: Number(session.video.currentTime || 0),
+      wasPlaying: Boolean(session.logicalPlayIntent),
+    };
+    // A captured element cannot regain native output by disconnecting its source.
+    // Use the existing session restore path when its context/clock is unusable.
+    if (state.audioContext?.state === "closed") state.audioContext = null;
+    // Replace only the unusable media graph. Retiring its still-current native
+    // program would prevent the same owner from claiming the replacement pair.
+    retireHostPlaybackSession(session, {
+      preserveAdvanceDelayOverlay: true,
+      releaseProgramOwnership: false,
+    });
+    renderPlayer(item, frontendPlaybackMode(state.data?.playback_mode));
+  });
+}
+
 function applyKeyShiftToAudio(audio, overrideKeyShift = null) {
-  if (!audio) {
-    return;
-  }
-  const rawKeyShift = overrideKeyShift !== null
-    ? Number(overrideKeyShift)
-    : Number(state.data?.player_settings?.key_shift ?? 0);
+  if (!audio || audio.bilikaraPitchRetired) return;
+  const rawKeyShift = Number(overrideKeyShift ?? state.data?.player_settings?.key_shift ?? 0);
   const keyShift = Number.isFinite(rawKeyShift) ? Math.max(-6, Math.min(6, rawKeyShift)) : 0;
-
-  if (keyShift === 0) {
-    if (!audio.jungle) {
+  if (!keyShift && !audio.bilikaraPitch) return; // native zero-shift path
+  const unavailable = (kind) => {
+    audio.bilikaraPitchFailure = kind;
+    if (!audio.bilikaraPitchErrorReported) {
+      audio.bilikaraPitchErrorReported = true;
+      setAppMessage(t("player.pitchUnavailable"), true);
+    }
+    renderKeyShiftControls(frontendPlaybackMode(state.data?.playback_mode));
+    if (kind === "context-closed" || kind === "media-clock") recoverAudioPitchOutput(audio, kind);
+  };
+  if (!audio.bilikaraPitch) {
+    if (audio.bilikaraPitchFailure) return;
+    if (state.pitchContextFailure || !globalThis.BilikaraPitch || !globalThis.isSecureContext
+      || typeof WebAssembly !== "object" || typeof AudioWorkletNode !== "function") {
+      unavailable("unsupported-context");
       return;
     }
-    disposeAudioPitchProcessor(audio);
-    const source = audio.bilikaraPitchSource;
-    if (!source || !state.audioContext) {
-      return;
-    }
-    disconnectAudioPitchSource(audio);
-    source.connect(state.audioContext.destination);
-    audio.bilikaraPitchRoute = "direct";
-    return;
-  }
-
-  try {
-    const source = ensureAudioPitchSource(audio);
-    if (!source || !state.audioContext) {
-      return;
-    }
-    if (!audio.jungle) {
-      disconnectAudioPitchSource(audio);
-      const jungle = new Jungle(state.audioContext);
-      audio.jungle = jungle;
-      source.connect(jungle.input);
-      jungle.output.connect(state.audioContext.destination);
-      audio.bilikaraPitchRoute = "processor";
-      if (audio.paused === false) {
-        resumeAudioContextBestEffort();
+    try {
+      if (!state.audioContext) {
+        state.audioContext = new (window.AudioContext || window.webkitAudioContext)();
       }
+      const session = state.hostPlaybackSession;
+      audio.bilikaraPitch = new BilikaraPitch.PlayerPitch({
+        audio, context: state.audioContext,
+        source: audio.bilikaraPitchSource, destination: audio.bilikaraVolumeGain,
+        connectInput: () => {
+          const source = ensureAudioPitchSource(audio);
+          if (!source) throw new Error("media-source");
+          return { source, destination: audio.bilikaraVolumeGain };
+        },
+        current: () => isCurrentHostPlaybackSession(session, session.video, audio),
+        changed: () => renderKeyShiftControls(frontendPlaybackMode(state.data?.playback_mode)),
+        unavailable,
+      });
+    } catch {
+      unavailable("initialization");
+      return;
     }
-    const ratio = Math.pow(2, keyShift / 12);
-    audio.jungle.setPitchOffset(ratio - 1);
-  } catch (error) {
-    disposeAudioPitchProcessor(audio);
-    const source = audio.bilikaraPitchSource;
-    if (source && state.audioContext) {
-      disconnectAudioPitchSource(audio);
-      try {
-        source.connect(state.audioContext.destination);
-        audio.bilikaraPitchRoute = "direct";
-      } catch {
-        // If Web Audio setup failed, leave the native media lifecycle intact.
-      }
-    }
-    console.error("Failed to setup Web Audio pitch shifter:", error);
   }
+  const previousShift = audio.bilikaraPitch.requested;
+  audio.bilikaraPitch.setShift(keyShift);
+  if (!audio.paused && previousShift !== keyShift) resumeAudioContextBestEffort();
 }
 
 function persistLocalVolumePreferences() {
@@ -8529,28 +15081,36 @@ function persistLocalVolumePreferences() {
   writeLocalPreference(storageKeys.playerMuted, state.localPlayerMuted);
 }
 
-async function setLocalPlayerVolume(nextVolume, { unmute = true } = {}) {
-  const normalizedVolume = Math.max(0, Math.min(1, Number(nextVolume || 0)));
+async function setLocalPlayerVolumeAndMuted(
+  nextVolume,
+  nextMuted,
+  { reportError = true, volumeIntent = true } = {},
+) {
+  const normalizedVolume = Math.max(0, Math.min(5, Number(nextVolume || 0)));
+  const normalizedMuted = Boolean(nextMuted);
   const previousVolume = state.localPlayerVolume;
   const previousMuted = state.localPlayerMuted;
   const requestSeq = markLocalVolumeWrite();
   state.localPlayerVolume = normalizedVolume;
-  if (unmute && normalizedVolume > 0) {
-    state.localPlayerMuted = false;
-  }
+  state.localPlayerMuted = normalizedMuted;
   persistLocalVolumePreferences();
   applyStoredVolumeToMountedPlayer();
   renderVolumeControls(frontendPlaybackMode(state.data?.playback_mode));
   try {
     const nextData = await apiPost("/api/player/volume", {
-      volume_percent: Math.round(normalizedVolume * 100),
+      ...(volumeIntent ? { volume_percent: Math.round(normalizedVolume * 100) } : {}),
       is_muted: state.localPlayerMuted,
+      expected_item_incarnation_id: state.data?.current_item?.item_incarnation_id || "",
     });
+    const accepted = acceptHostStateSnapshot(nextData);
     if (requestSeq !== state.volumeSaveSeq) {
       return;
     }
-    state.data = nextData;
-    render();
+    state.playerSettingsEchoSuppressUntil = 0;
+    syncLocalPlayerSettingsFromSnapshot(state.data?.player_settings);
+    if (accepted) {
+      render();
+    }
   } catch (error) {
     if (requestSeq !== state.volumeSaveSeq) {
       return;
@@ -8561,37 +15121,28 @@ async function setLocalPlayerVolume(nextVolume, { unmute = true } = {}) {
     persistLocalVolumePreferences();
     applyStoredVolumeToMountedPlayer();
     renderVolumeControls(frontendPlaybackMode(state.data?.playback_mode));
-    setAppMessage(error.message, true);
+    if (reportError) {
+      setAppMessage(error.message, true);
+    }
+    throw error;
+  }
+}
+
+async function setLocalPlayerVolume(nextVolume, { unmute = true } = {}) {
+  const normalizedVolume = Math.max(0, Math.min(5, Number(nextVolume || 0)));
+  const nextMuted = unmute && normalizedVolume > 0 ? false : state.localPlayerMuted;
+  try {
+    await setLocalPlayerVolumeAndMuted(normalizedVolume, nextMuted);
+  } catch {
+    // The shared setter already restored the previous state and reported the error.
   }
 }
 
 async function toggleLocalPlayerMute() {
-  const previousMuted = state.localPlayerMuted;
-  const requestSeq = markLocalVolumeWrite();
-  state.localPlayerMuted = !state.localPlayerMuted;
-  persistLocalVolumePreferences();
-  applyStoredVolumeToMountedPlayer();
-  renderVolumeControls(frontendPlaybackMode(state.data?.playback_mode));
   try {
-    const nextData = await apiPost("/api/player/volume", {
-      volume_percent: Math.round(state.localPlayerVolume * 100),
-      is_muted: state.localPlayerMuted,
-    });
-    if (requestSeq !== state.volumeSaveSeq) {
-      return;
-    }
-    state.data = nextData;
-    render();
-  } catch (error) {
-    if (requestSeq !== state.volumeSaveSeq) {
-      return;
-    }
-    state.playerSettingsEchoSuppressUntil = 0;
-    state.localPlayerMuted = previousMuted;
-    persistLocalVolumePreferences();
-    applyStoredVolumeToMountedPlayer();
-    renderVolumeControls(frontendPlaybackMode(state.data?.playback_mode));
-    setAppMessage(error.message, true);
+    await setLocalPlayerVolumeAndMuted(state.localPlayerVolume, !state.localPlayerMuted, { volumeIntent: false });
+  } catch {
+    // The shared setter already restored the previous state and reported the error.
   }
 }
 
@@ -8614,6 +15165,125 @@ function scheduleAudioVariantSwitchUnlock() {
   }, remainingMs);
 }
 
+function preferredAudioVariantPopoverDirection(naturalHeight = 220) {
+  const anchor = elements.audioVariantToggle?.getBoundingClientRect?.()
+    || elements.audioVariantAnchor?.getBoundingClientRect?.();
+  if (!anchor) {
+    return "down";
+  }
+  const toolbarBottom = elements.topbar?.getBoundingClientRect?.().bottom || 0;
+  const inset = 12;
+  const gap = 8;
+  const spaceBelow = Math.max(0, window.innerHeight - anchor.bottom - inset - gap);
+  const spaceAbove = Math.max(0, anchor.top - Math.max(inset, toolbarBottom + 8) - gap);
+  if (spaceBelow >= naturalHeight) {
+    return "down";
+  }
+  return spaceAbove > spaceBelow ? "up" : "down";
+}
+
+function clearAudioVariantPopoverPosition() {
+  const popover = elements.audioVariantPopover;
+  if (!popover) return;
+  for (const property of ["left", "top", "width", "maxHeight", "transformOrigin"]) {
+    popover.style[property] = "";
+  }
+  delete popover.dataset.popoverDirection;
+}
+
+function positionAudioVariantPopover() {
+  const popover = elements.audioVariantPopover;
+  if (!state.audioVariantBarExpanded || !popover) return;
+  const row = elements.audioVariantAnchor.getBoundingClientRect();
+  const anchor = elements.audioVariantToggle.getBoundingClientRect();
+  const inset = 12;
+  const gap = 8;
+  const topBoundary = Math.max(inset, (elements.topbar?.getBoundingClientRect().bottom || 0) + gap);
+  const width = Math.min(640, window.innerWidth - inset * 2, Math.max(320, row.width));
+  popover.style.width = `${width}px`;
+  popover.style.maxHeight = "none";
+  const naturalHeight = Math.ceil(popover.scrollHeight + 2);
+  const direction = preferredAudioVariantPopoverDirection(Math.min(naturalHeight, 240));
+  const availableHeight = direction === "down"
+    ? window.innerHeight - anchor.bottom - inset - gap
+    : anchor.top - topBoundary - gap;
+  const maxHeight = Math.max(44, Math.min(naturalHeight, availableHeight, 240));
+  const left = Math.max(inset, Math.min(anchor.right - width, window.innerWidth - inset - width));
+  const top = direction === "down" ? anchor.bottom + gap : anchor.top - gap - maxHeight;
+  state.audioVariantPopoverDirection = direction;
+  popover.dataset.popoverDirection = direction;
+  popover.style.left = `${left}px`;
+  popover.style.top = `${Math.max(inset, Math.round(top))}px`;
+  popover.style.maxHeight = `${Math.round(maxHeight)}px`;
+  window.BilikaraPartSelector?.syncLabels(popover);
+}
+
+function setAudioVariantPopoverOpen(open, { restoreFocus = false } = {}) {
+  const nextOpen = Boolean(open) && !elements.audioVariantBar.classList.contains("is-inline");
+  const wasOpen = state.audioVariantBarExpanded;
+  state.audioVariantBarExpanded = nextOpen;
+  elements.audioVariantBar.classList.toggle("is-expanded", nextOpen);
+  const toggle = elements.audioVariantToggle;
+  toggle.classList.toggle("is-expanded", nextOpen);
+  toggle.setAttribute("aria-expanded", String(nextOpen));
+  toggle.setAttribute("aria-label", nextOpen ? t("player.collapseParts") : t("player.expandParts"));
+  elements.audioVariantPopover.hidden = !nextOpen;
+  elements.audioVariantBackdrop.hidden = !nextOpen;
+  elements.audioVariantBackdrop.inert = !nextOpen;
+  elements.audioVariantBackdrop.setAttribute("aria-hidden", String(!nextOpen));
+  if (!nextOpen) {
+    // Keep geometry through the exit animation; clearing it immediately
+    // changes wrapping and panel size while the panel is still visible.
+    const closing = elements.audioVariantPopover;
+    const sequence = closing.__closeSequence = (closing.__closeSequence || 0) + 1;
+    Promise.allSettled((closing.getAnimations?.() || []).map(animation => animation.finished)).then(() => {
+      if (!state.audioVariantBarExpanded && closing.__closeSequence === sequence) clearAudioVariantPopoverPosition();
+    });
+    if (restoreFocus) toggle.focus({ preventScroll: true });
+    return;
+  }
+  if (state.stageControlTrayOpen && !stageControlsAreInline()) setStageControlTrayOpen(false);
+  closeCacheAdvancedInfo();
+  setRemoteQrPinned(false, { dismissTransient: true });
+  positionAudioVariantPopover();
+  // Every opening begins with P1; resize/snapshot updates preserve the reader's position.
+  if (!wasOpen) elements.audioVariantPopover.scrollTop = 0;
+}
+
+function syncAudioVariantOverflow() {
+  const bar = elements.audioVariantBar;
+  const popover = elements.audioVariantPopover;
+  const list = bar?.querySelector(".audio-variant-list");
+  if (!list || elements.audioVariantAnchor.hidden || !bar.clientWidth) return false;
+  bar.classList.add("is-inline");
+  elements.audioVariantToggle.classList.add("hidden");
+  const buttons = [...list.children];
+  buttons.forEach(button => button.classList.remove("hidden"));
+  const fits = list.scrollWidth <= bar.clientWidth + 1;
+  if (fits) {
+    setAudioVariantPopoverOpen(false);
+  } else {
+    bar.classList.remove("is-inline");
+    elements.audioVariantToggle.classList.remove("hidden");
+    const available = list.clientWidth;
+    const gap = Number.parseFloat(getComputedStyle(list).columnGap) || 0;
+    const selected = buttons.find(button => button.classList.contains("active")) || buttons[0];
+    let used = selected?.getBoundingClientRect().width || 0;
+    for (const button of buttons) {
+      if (button === selected) continue;
+      const width = button.getBoundingClientRect().width;
+      const show = used + gap + width <= available + 1;
+      button.classList.toggle("hidden", !show);
+      if (show) used += gap + width;
+    }
+    if (state.audioVariantBarExpanded) positionAudioVariantPopover();
+  }
+  window.BilikaraPartSelector?.syncLabels(bar);
+  return !fits;
+}
+
+document.fonts?.ready?.then(syncAudioVariantOverflow);
+
 function renderAudioVariantBar(currentItem, playbackMode) {
   if (playbackMode !== "local" || !currentItem) {
     const signature = JSON.stringify({ hidden: true, playbackMode, itemId: currentItem?.id || "", language: state.language });
@@ -8624,8 +15294,13 @@ function renderAudioVariantBar(currentItem, playbackMode) {
     if (elements.audioVariantBar.childElementCount) {
       elements.audioVariantBar.replaceChildren();
     }
+    elements.audioVariantPopover.replaceChildren();
+    setAudioVariantPopoverOpen(false);
     setClassToggle(elements.audioVariantBar, "hidden", true);
-    state.audioVariantBarExpanded = false;
+    if (elements.audioVariantAnchor) {
+      elements.audioVariantAnchor.hidden = true;
+    }
+    setClassToggle(elements.audioVariantToggle, "hidden", true);
     state.audioVariantBarItemId = "";
     return;
   }
@@ -8646,14 +15321,19 @@ function renderAudioVariantBar(currentItem, playbackMode) {
     if (elements.audioVariantBar.childElementCount) {
       elements.audioVariantBar.replaceChildren();
     }
+    elements.audioVariantPopover.replaceChildren();
+    setAudioVariantPopoverOpen(false);
     setClassToggle(elements.audioVariantBar, "hidden", true);
-    state.audioVariantBarExpanded = false;
+    if (elements.audioVariantAnchor) {
+      elements.audioVariantAnchor.hidden = true;
+    }
+    setClassToggle(elements.audioVariantToggle, "hidden", true);
     state.audioVariantBarItemId = currentItem.id;
     return;
   }
 
   if (state.audioVariantBarItemId !== currentItem.id) {
-    state.audioVariantBarExpanded = false;
+    setAudioVariantPopoverOpen(false);
     state.audioVariantBarItemId = currentItem.id;
   }
 
@@ -8664,7 +15344,6 @@ function renderAudioVariantBar(currentItem, playbackMode) {
     itemId: currentItem.id,
     selectedVariantId: selectedVariant?.id || "",
     buttonsDisabled,
-    expanded: state.audioVariantBarExpanded,
     language: state.language,
     variants: variants.map((variant) => ({
       id: variant.id,
@@ -8679,13 +15358,21 @@ function renderAudioVariantBar(currentItem, playbackMode) {
   state.audioVariantBarRenderSignature = signature;
 
   elements.audioVariantBar.replaceChildren();
+  elements.audioVariantPopover.replaceChildren();
   const list = document.createElement("div");
   list.className = "audio-variant-list";
   variants.forEach((variant) => {
     const button = document.createElement("button");
     button.type = "button";
     button.className = "audio-variant-button";
-    button.textContent = variant.label || variant.id;
+    const label = document.createElement("span");
+    label.className = "audio-variant-button-label";
+    const text = document.createElement("span");
+    text.className = "audio-variant-button-text";
+    text.textContent = variant.label || variant.id;
+    label.append(text);
+    button.append(label);
+    button.title = text.textContent;
     button.dataset.itemId = currentItem.id;
     button.dataset.variantId = variant.id;
     button.dataset.page = String(variant.page || "");
@@ -8696,40 +15383,26 @@ function renderAudioVariantBar(currentItem, playbackMode) {
     list.appendChild(button);
   });
 
-  const toggleButton = document.createElement("button");
-  toggleButton.type = "button";
-  toggleButton.className = "audio-variant-toggle";
-  toggleButton.dataset.action = "toggle-audio-variants";
-  toggleButton.setAttribute("aria-label", state.audioVariantBarExpanded ? t("player.collapseParts") : t("player.expandParts"));
-  toggleButton.setAttribute("aria-expanded", String(state.audioVariantBarExpanded));
-  const toggleIcon = document.createElement("span");
-  toggleIcon.setAttribute("aria-hidden", "true");
-  toggleIcon.textContent = "▾";
-  toggleButton.appendChild(toggleIcon);
+  elements.audioVariantToggle.setAttribute(
+    "aria-label",
+    state.audioVariantBarExpanded ? t("player.collapseParts") : t("player.expandParts"),
+  );
+  elements.audioVariantToggle.setAttribute("aria-expanded", String(state.audioVariantBarExpanded));
 
-  elements.audioVariantBar.append(list, toggleButton);
-  elements.audioVariantBar.classList.remove("is-collapsed", "is-expanded");
+  elements.audioVariantPopover.append(list.cloneNode(true));
+  elements.audioVariantBar.append(list);
+  elements.audioVariantBar.classList.toggle("is-expanded", state.audioVariantBarExpanded);
   setClassToggle(elements.audioVariantBar, "hidden", false);
+  if (elements.audioVariantAnchor) {
+    elements.audioVariantAnchor.hidden = false;
+  }
 
   requestAnimationFrame(() => {
-    if (!elements.audioVariantBar.contains(list)) {
+    if (!elements.audioVariantBar.contains(list) && !elements.audioVariantPopover.contains(list)) {
       return;
     }
-    const firstButton = list.querySelector(".audio-variant-button");
-    const firstRowHeight = firstButton
-      ? Math.ceil(firstButton.getBoundingClientRect().height) + 6
-      : 44;
-    const isWrapped = list.scrollHeight > firstRowHeight + 2;
-
-    elements.audioVariantBar.classList.toggle("is-collapsed", isWrapped && !state.audioVariantBarExpanded);
-    elements.audioVariantBar.classList.toggle("is-expanded", isWrapped && state.audioVariantBarExpanded);
-    toggleButton.classList.toggle("hidden", !isWrapped);
-    if (isWrapped) {
-      list.style.setProperty("--audio-variant-collapsed-height", `${firstRowHeight}px`);
-      toggleButton.classList.toggle("is-expanded", state.audioVariantBarExpanded);
-    } else {
-      state.audioVariantBarExpanded = false;
-    }
+    syncAudioVariantOverflow();
+    schedulePersistentStageMeasurement();
   });
 }
 
@@ -8752,7 +15425,9 @@ function renderAvSyncControls(playbackMode, playerSettings) {
   if (elements.avDelayLockButton) {
     const locked = Boolean(delayState.locked);
     const hasLocal = Boolean(delayState.has_local_adjustment);
-    elements.avDelayLockButton.textContent = locked ? "🔒" : "🔓";
+    elements.avDelayLockButton.querySelectorAll("[data-av-lock-icon]").forEach((icon) => {
+      icon.classList.toggle("hidden", icon.dataset.avLockIcon !== (locked ? "locked" : "unlocked"));
+    });
     elements.avDelayLockButton.disabled = state.avOffsetSaving || !Boolean(delayState.lock_button_enabled);
     elements.avDelayLockButton.dataset.locked = String(locked);
     elements.avDelayLockButton.dataset.hasLocal = String(hasLocal);
@@ -8766,184 +15441,533 @@ function renderAvSyncControls(playbackMode, playerSettings) {
   if (document.activeElement !== elements.avOffsetInput || state.avOffsetSaving) {
     elements.avOffsetInput.value = String(offsetMs);
   }
+  globalThis.BilikaraHostLayout?.syncPlayerFieldWidths?.();
 }
 
 function createSplitPlayerStartupSynchronizer(video, audio, maybeRestorePlayback) {
-  let synchronizationStarted = false;
   return () => {
-    if (!synchronizationStarted && maybeRestorePlayback()) {
-      synchronizationStarted = true;
+    const session = state.hostPlaybackSession;
+    if (state.hostPlaybackSession !== session || !isActiveSplitPlayer(video, audio)) {
+      return false;
     }
     if (isSplitPlayerSeekSettling(video, audio)) {
       settleSplitPlayerSeek(video, audio);
       return true;
     }
-    if (synchronizationStarted) {
+    if (session.readyCommitted || session.phase !== "binding") {
       return false;
     }
     if (!splitPlaybackPairCanStartAutomatically(video, audio)) {
       updateSplitPlaybackStartOverlay(video, audio);
       return true;
     }
-    synchronizationStarted = true;
-    if (state.localShouldBePlaying) {
-      startSplitPlaybackPair(video, audio);
-    } else {
-      reportSplitStartupDiagnostic(
-        video.dataset.playerItemId || "",
-        video,
-        audio,
-        "startup-ready-no-play-intent",
-      );
-      updateSplitPlaybackStartOverlay(video, audio);
+    if (!session.restoreStarted && maybeRestorePlayback()) {
+      session.restoreStarted = true;
+      return true;
     }
-    return true;
+    return commitHostPlaybackSessionReadyPaused(session, video, audio);
   };
+}
+
+function hostPlaybackMountData(currentItem, program = state.data?.playback_program) {
+  return {
+    videoUrl: selectedVideoUrlForItem(currentItem),
+    audioUrl: selectedAudioUrlForItem(currentItem),
+    mountable: Boolean(program?.artifact_set_id),
+  };
+}
+
+function createHostPlaybackSession(playbackGeneration, playbackProgram) {
+  return {
+    playbackGeneration,
+    playbackProgram,
+    phase: "requested",
+    video: null,
+    audio: null,
+    mountData: null,
+    loadingStarted: false,
+    readyCommitted: false,
+    readyCommitCount: 0,
+    statusSequence: 0,
+    lastReportedStatusSignature: "",
+    lastStatusHeartbeatAt: 0,
+    logicalPlayIntent: true,
+    initialIntentApplied: false,
+    restoreStarted: false,
+    failureStage: "",
+    eventCleanups: [],
+    syncTimer: null,
+    startupTimer: null,
+    startupWatchdogTimer: null,
+    webkitRetryTimer: null,
+    audioStarvationTimer: null,
+    audioClockRecoveryFrame: null,
+    audioClockRecovering: false,
+    hiddenPauseTimer: null,
+    frameClickTimer: null,
+    seekSettling: false,
+    seekResumeAfterSettle: false,
+    seekSettleStartedAt: 0,
+    seekSettleTimer: null,
+    seekSettleCallback: null,
+    seekResumePending: false,
+    seekUpdatesLogicalIntent: true,
+    playbackRestore: null,
+    ownershipClaimStarted: false,
+    ownershipClaimed: false,
+    ownershipClaimFailed: false,
+    ownershipClaimRequest: null,
+    retirementReleaseSent: false,
+  };
+}
+
+function isCurrentHostPlaybackSession(session, video, audio) {
+  if (
+    !session
+    || state.hostPlaybackSession !== session
+    || session.phase === "retiring"
+    || session.phase === "retired"
+    || state.data?.playback_generation !== session.playbackGeneration
+    || !playbackProgramDescriptorsEqual(
+      state.data?.playback_program ?? null,
+      session.playbackProgram,
+    )
+  ) {
+    return false;
+  }
+  if (video !== undefined && session.video !== video) {
+    return false;
+  }
+  if (audio !== undefined && session.audio !== audio) {
+    return false;
+  }
+  return true;
+}
+
+function retireHostPlaybackSession(
+  session,
+  { preserveAdvanceDelayOverlay = false, releaseProgramOwnership = true } = {},
+) {
+  if (
+    !session
+    || session.phase === "retiring"
+    || session.phase === "retired"
+  ) {
+    return false;
+  }
+  const ownsCurrentSession = state.hostPlaybackSession === session;
+  setHostPlaybackSessionPhase(session, "retiring");
+  clearLocalPlayerEventListeners(session);
+  clearWebKitAudioStarvationTimer(session);
+  clearLocalPlayerSyncTimer(session);
+  clearPlayerFrameClickTimer(session);
+  clearLocalPlayerSeekState(session);
+  session.playbackRestore = null;
+
+  if (ownsCurrentSession) {
+    state.localWebKitStartRetryDone = false;
+    clearLocalPlayerControlsHideTimer();
+    state.localPlayerSyncLastSeekAt = 0;
+    state.localPlayerSyncLastAction = "";
+    state.localPlayerSyncLastDiagnosticAt = 0;
+    state.localVideoHeldForAudio = false;
+    state.localVideoDeferredRecovery = false;
+    state.localAudioPlaybackBlocked = false;
+    state.localVideoPlaybackBlocked = false;
+    state.localPlaybackStartGeneration = 0;
+    state.localPlaybackStartPromisesSettled = false;
+    state.localPlaybackEndHandled = false;
+    clearTauriMediaSessionState();
+    if (!preserveAdvanceDelayOverlay) {
+      state.pendingSongTransitionOverlayData = null;
+      state.pendingSongTransitionGeneration = 0;
+      clearLocalAdvanceDelay({ resetInFlight: true });
+    }
+  }
+
+  const retiredMedia = [session.video, session.audio].filter(Boolean);
+  retiredMedia.forEach((media) => {
+    disposeAudioPitchShifter(media);
+    try {
+      media.pause();
+    } catch {
+      // Ignore pause failures during exact session retirement.
+    }
+    try {
+      media.removeAttribute("src");
+      media.load();
+    } catch {
+      // Detached media can finish retiring without further cleanup.
+    }
+  });
+  session.video = null;
+  session.audio = null;
+  session.mountData = null;
+  setHostPlaybackSessionPhase(session, "retired");
+  if (state.hostPlaybackSession === session) {
+    state.hostPlaybackSession = null;
+  }
+  if (releaseProgramOwnership) acknowledgeRetiredHostPlaybackSession(session);
+  return true;
+}
+
+function acknowledgeRetiredHostPlaybackSession(session) {
+  const identity = exactHostPlaybackOwnershipIdentity(session);
+  if (
+    !identity
+    || !session.ownershipClaimStarted
+    || session.retirementReleaseSent
+  ) {
+    return false;
+  }
+  session.retirementReleaseSent = true;
+  apiPost("/api/player/retire-program", identity).catch(() => {
+    // A lost retirement acknowledgement fails closed on the Host server.
+  });
+  return true;
+}
+
+function exactHostPlaybackOwnershipIdentity(session) {
+  const playbackGeneration = Number(session?.playbackGeneration);
+  const itemIncarnationId = String(
+    session?.playbackProgram?.item_incarnation_id || "",
+  );
+  const artifactSetId = String(
+    session?.playbackProgram?.artifact_set_id || "",
+  );
+  if (
+    !session
+    || !Number.isSafeInteger(playbackGeneration)
+    || playbackGeneration < 1
+    || !itemIncarnationId
+    || !artifactSetId
+  ) {
+    return null;
+  }
+  return {
+    playback_generation: playbackGeneration,
+    item_incarnation_id: itemIncarnationId,
+    artifact_set_id: artifactSetId,
+  };
+}
+
+function failHostPlaybackOwnershipClaim(session) {
+  if (
+    !isCurrentHostPlaybackSession(session, session?.video, session?.audio)
+    || session.phase !== "binding"
+    || session.loadingStarted
+  ) {
+    return false;
+  }
+  session.ownershipClaimFailed = true;
+  session.failureStage = "artifact-ownership";
+  retireHostPlaybackSession(session);
+  state.hostPlaybackSession = session;
+  renderPreparingHostPlaybackState(state.data?.current_item ?? null);
+  return true;
+}
+
+function beginHostPlaybackSessionOwnershipClaim(session) {
+  if (
+    !isCurrentHostPlaybackSession(session, session?.video, session?.audio)
+    || session.phase !== "binding"
+    || session.loadingStarted
+    || session.ownershipClaimStarted
+  ) {
+    return false;
+  }
+  const identity = exactHostPlaybackOwnershipIdentity(session);
+  if (!identity) {
+    failHostPlaybackOwnershipClaim(session);
+    return false;
+  }
+  session.ownershipClaimStarted = true;
+  session.ownershipClaimRequest = Promise.resolve()
+    .then(() => apiPost("/api/player/claim-program", identity))
+    .then(
+      (result) => {
+        if (result?.claimed !== true) {
+          failHostPlaybackOwnershipClaim(session);
+          return;
+        }
+        session.ownershipClaimed = true;
+        if (!isCurrentHostPlaybackSession(session, session.video, session.audio)) {
+          return;
+        }
+        if (!beginHostPlaybackSessionElementLoading(session)) {
+          failHostPlaybackCandidate(
+            session,
+            session.video,
+            session.audio,
+            "media-loading-could-not-start",
+          );
+        }
+      },
+      () => {
+        failHostPlaybackOwnershipClaim(session);
+      },
+    );
+  return true;
+}
+
+function replaceHostPlayerView(...nodes) {
+  const overlay = playerDelayOverlay();
+  const download = elements.playerFrame.querySelector(".presentation-download-status");
+  const announcement = elements.presentationHostAnnouncement;
+  elements.playerFrame.replaceChildren(...nodes);
+  if (overlay) {
+    elements.playerFrame.appendChild(overlay);
+  }
+  if (download) elements.playerFrame.appendChild(download);
+  if (announcement) {
+    elements.playerFrame.appendChild(announcement);
+  }
+}
+
+function renderEmptyHostPlaybackState() {
+  const empty = document.createElement("div");
+  empty.className = "empty-state";
+  const text = document.createElement("p");
+  text.textContent = t("player.empty");
+  empty.appendChild(text);
+  replaceHostPlayerView(empty);
+}
+
+function renderPreparingHostPlaybackState(currentItem) {
+  const empty = document.createElement("div");
+  empty.className = "empty-state";
+  const text = document.createElement("p");
+  text.textContent = t("player.preparingTracks");
+  const hint = document.createElement("p");
+  hint.className = "empty-hint";
+  hint.textContent = hostCacheDetailTextForItem(currentItem) || t("player.cachingFallback");
+  empty.append(text, hint);
+  replaceHostPlayerView(empty);
+}
+
+function captureHostPlaybackRestoreForReplacement(session, nextProgram, currentItem) {
+  if (
+    state.pendingPlaybackRestore
+    || !session
+    || !session.readyCommitted
+    || session.phase === "retiring"
+    || session.phase === "retired"
+    || state.hostPlaybackSession !== session
+    || !session.video
+    || !session.audio
+    || !session.playbackProgram?.artifact_set_id
+    || !nextProgram?.artifact_set_id
+    || session.playbackProgram.item_id !== nextProgram.item_id
+    || session.playbackProgram.item_incarnation_id !== nextProgram.item_incarnation_id
+    || playbackProgramDescriptorsEqual(session.playbackProgram, nextProgram)
+  ) {
+    return;
+  }
+  captureLocalPlayerPreferences();
+  state.pendingPlaybackRestore = {
+    itemId: currentItem.id,
+    itemIncarnationId: nextProgram.item_incarnation_id,
+    variantId: nextProgram.selected_audio_variant_id,
+    currentTime: Number(session.video.currentTime || 0),
+    wasPlaying: Boolean(session.logicalPlayIntent),
+  };
+}
+
+function claimPendingHostPlaybackRestore(session, currentItem) {
+  const pendingRestore = state.pendingPlaybackRestore;
+  if (!pendingRestore) {
+    return null;
+  }
+  if (
+    pendingRestore.itemIncarnationId !== currentItem.item_incarnation_id
+    || pendingRestore.itemIncarnationId !== session.playbackProgram?.item_incarnation_id
+  ) {
+    state.pendingPlaybackRestore = null;
+    return null;
+  }
+  if (
+    pendingRestore.itemId !== currentItem.id
+    || pendingRestore.variantId !== session.playbackProgram?.selected_audio_variant_id
+  ) {
+    return null;
+  }
+  state.pendingPlaybackRestore = null;
+  return pendingRestore;
+}
+
+function mountHostPlaybackSessionElements(session, currentItem, mountData) {
+  const video = document.createElement("video");
+  video.dataset.playerRole = "video";
+  video.controls = false;
+  video.removeAttribute("controls");
+  video.setAttribute("controlsList", "nofullscreen");
+  // Start the split pair together once both streams expose metadata. Waiting
+  // for canplay deadlocks WebKit when the video intentionally preloads metadata.
+  video.autoplay = false;
+  video.playsInline = true;
+  video.tabIndex = 0;
+  video.preload = "metadata";
+  const audio = document.createElement("audio");
+  audio.dataset.playerRole = "audio";
+  audio.preload = "auto";
+  video.dataset.playerItemId = currentItem.id;
+  session.video = video;
+  session.audio = audio;
+  session.mountData = mountData;
+  replaceHostPlayerView(video, audio);
+  return { video, audio };
+}
+
+function beginHostPlaybackSessionElementLoading(session) {
+  if (
+    !isCurrentHostPlaybackSession(session, session?.video, session?.audio)
+    || session.phase !== "binding"
+    || session.loadingStarted
+    || !session.mountData?.videoUrl
+    || !session.mountData?.audioUrl
+  ) {
+    return false;
+  }
+  session.loadingStarted = true;
+  session.video.src = session.mountData.videoUrl;
+  session.audio.src = session.mountData.audioUrl;
+  session.video.load();
+  session.audio.load();
+  scheduleSplitPlaybackStartupWatchdog(session.video, session.audio);
+  return true;
+}
+
+function reconcileHostPlaybackSession(currentItem) {
+  const playbackGeneration = state.data?.playback_generation;
+  const playbackProgram = state.data?.playback_program ?? null;
+  const existing = state.hostPlaybackSession;
+
+  if (!playbackProgram || !currentItem) {
+    retireHostPlaybackSession(existing);
+    state.pendingPlaybackRestore = null;
+    renderEmptyHostPlaybackState();
+    return { kind: "empty", session: null, video: null, audio: null };
+  }
+
+  if (
+    state.hostPlaybackBootstrapRestartPending
+    || state.pageHidePlaybackRestartRequired
+  ) {
+    if (
+      !existing
+      || existing.playbackGeneration !== playbackGeneration
+      || !playbackProgramDescriptorsEqual(existing.playbackProgram, playbackProgram)
+    ) {
+      retireHostPlaybackSession(existing);
+      const retiredSession = createHostPlaybackSession(
+        playbackGeneration,
+        playbackProgram,
+      );
+      setHostPlaybackSessionPhase(retiredSession, "retired");
+      state.hostPlaybackSession = retiredSession;
+      return {
+        kind: "retired",
+        session: retiredSession,
+        video: null,
+        audio: null,
+      };
+    }
+    retireHostPlaybackSession(existing);
+    return { kind: "retired", session: existing, video: null, audio: null };
+  }
+
+  const sameAcceptedProgram = Boolean(
+    existing
+    && existing.playbackGeneration === playbackGeneration
+    && playbackProgramDescriptorsEqual(existing.playbackProgram, playbackProgram)
+  );
+  if (sameAcceptedProgram) {
+    if (existing.phase === "retiring" || existing.phase === "retired") {
+      return { kind: "retired", session: existing, video: null, audio: null };
+    }
+    if (existing.video || existing.audio) {
+      if (!existing.video || !existing.audio) {
+        return { kind: "inconsistent", session: existing, video: null, audio: null };
+      }
+      return {
+        kind: "reused",
+        session: existing,
+        video: existing.video,
+        audio: existing.audio,
+      };
+    }
+    renderPreparingHostPlaybackState(currentItem);
+    return { kind: "pending", session: existing, video: null, audio: null };
+  }
+
+  if (existing && playbackGeneration <= existing.playbackGeneration) {
+    return {
+      kind: "stale",
+      session: existing,
+      video: existing.video,
+      audio: existing.audio,
+    };
+  }
+  if (
+    state.pendingPlaybackRestore
+    && state.pendingPlaybackRestore.itemId !== currentItem.id
+  ) {
+    state.pendingPlaybackRestore = null;
+  }
+  captureHostPlaybackRestoreForReplacement(existing, playbackProgram, currentItem);
+  const preserveAdvanceDelayOverlay = Boolean(
+    hasPendingSongTransitionOverlayForItem(currentItem)
+    || hasLocalAdvanceDelayOverlay()
+    || (
+      state.localAdvanceInFlight
+      && state.manualTransitionHoldGeneration > 0
+      && state.manualTransitionHoldItemId
+    )
+  );
+  const preservedTransitionGeneration = (
+    existing
+    && hasLocalAdvanceDelayOverlay()
+    && state.localAdvanceDelayItemId === currentItem.id
+    && state.manualTransitionHoldItemId === currentItem.id
+    && state.manualTransitionHoldGeneration > 0
+  ) ? state.manualTransitionHoldGeneration : 0;
+  const mountData = hostPlaybackMountData(currentItem, playbackProgram);
+  retireHostPlaybackSession(existing, { preserveAdvanceDelayOverlay });
+
+  const session = createHostPlaybackSession(playbackGeneration, playbackProgram);
+  state.hostPlaybackSession = session;
+  session.playbackRestore = mountData.mountable
+    ? claimPendingHostPlaybackRestore(session, currentItem)
+    : null;
+  session.logicalPlayIntent = session.playbackRestore
+    ? Boolean(session.playbackRestore.wasPlaying)
+    : true;
+  state.localShouldBePlaying = shouldHoldCurrentItemForTransition(currentItem)
+    ? false
+    : session.logicalPlayIntent;
+  if (!mountData.mountable) {
+    setHostPlaybackSessionPhase(session, "requested");
+    renderPreparingHostPlaybackState(currentItem);
+    return { kind: "pending", session, video: null, audio: null };
+  }
+  setHostPlaybackSessionPhase(session, "binding");
+  const pair = mountHostPlaybackSessionElements(session, currentItem, mountData);
+  if (preservedTransitionGeneration) {
+    showSongTransitionOverlayForData(state.data, preservedTransitionGeneration, {
+      preserveDeadline: true,
+    });
+  }
+  return { kind: "mounted", session, ...pair };
 }
 
 function renderPlayer(currentItem, playbackMode) {
   handleRatingCurrentItemChange(currentItem);
-  const selectedVideoUrl = currentItem ? selectedVideoUrlForItem(currentItem) : "";
-  const selectedAudioUrl = currentItem ? selectedAudioUrlForItem(currentItem) : "";
-  const hasSplitPlayback = Boolean(selectedVideoUrl && selectedAudioUrl);
-  const playerCacheDetailText = currentItem ? hostCacheDetailTextForItem(currentItem) : "";
-
-  const signature = [
-    currentItem ? currentItem.id : "none",
-    playbackMode,
-    selectedVideoUrl,
-    selectedAudioUrl,
-    currentItem ? currentItem.cache_status : "",
-    playerCacheDetailText,
-    state.language,
-  ].join("|");
-
-  if (signature === state.playerSignature) {
-    if (!hasSplitPlayback) {
-      syncPlayerFrameCacheHint(currentItem);
-    }
+  const reconciliation = reconcileHostPlaybackSession(currentItem);
+  if (reconciliation.kind !== "mounted") {
     return;
   }
+  const { session, video, audio } = reconciliation;
 
-  const previousPlayerContext = state.playerContext;
-  if (!currentItem || previousPlayerContext?.itemId !== currentItem.id) {
-    state.pendingPlaybackRestore = null;
-  }
-  if (
-    !state.pendingPlaybackRestore
-    && playbackMode === "local"
-    && currentItem
-    && hasSplitPlayback
-    && previousPlayerContext?.playbackMode === "local"
-    && previousPlayerContext.itemId === currentItem.id
-    && (
-      previousPlayerContext.videoUrl !== selectedVideoUrl
-      || previousPlayerContext.audioUrl !== selectedAudioUrl
-    )
-  ) {
-    const currentVideo = elements.playerFrame.querySelector('video[data-player-role="video"]')
-      || elements.playerFrame.querySelector("video");
-
-    if (currentVideo) {
-      captureLocalPlayerPreferences();
-      state.pendingPlaybackRestore = {
-        itemId: currentItem.id,
-        variantId: selectedAudioVariantForItem(currentItem)?.id || "",
-        currentTime: Number(currentVideo.currentTime || 0),
-        wasPlaying: state.localShouldBePlaying || !currentVideo.paused,
-      };
-    }
-  }
-
-  state.playerSignature = signature;
-  state.playerContext = {
-    itemId: currentItem ? currentItem.id : "",
-    videoUrl: selectedVideoUrl,
-    audioUrl: selectedAudioUrl,
-    playbackMode,
-  };
-
-  captureLocalPlayerPreferences();
-  if (shouldHoldCurrentItemForTransition(currentItem)) {
-    state.localShouldBePlaying = false;
-  }
-  const preserveAdvanceDelayOverlay = Boolean(
-    currentItem
-    && (
-      hasPendingSongTransitionOverlayForItem(currentItem)
-      || hasLocalAdvanceDelayOverlay()
-    ),
-  );
-  teardownMountedPlayer({ preserveAdvanceDelayOverlay });
-
-  if (!currentItem) {
-    const empty = document.createElement("div");
-    empty.className = "empty-state";
-    const text = document.createElement("p");
-    text.textContent = t("player.emptyShort");
-    empty.appendChild(text);
-    elements.playerFrame.replaceChildren(empty);
-    return;
-  }
-
-  // LEGACY: online embed playback is kept for reference, but normal frontend
-  // rendering now passes only the local mode.
-  if (playbackMode === "online") {
-    const iframeSrc = safeHttpUrl(currentItem.embed_url);
-    const iframe = document.createElement("iframe");
-    iframe.src = iframeSrc || "about:blank";
-    iframe.allow = "autoplay; fullscreen";
-    iframe.allowFullscreen = true;
-    iframe.referrerPolicy = "origin";
-    iframe.setAttribute("sandbox", "allow-same-origin allow-scripts allow-popups allow-popups-to-escape-sandbox");
-    iframe.title = String(currentItem.display_title || "");
-    elements.playerFrame.replaceChildren(iframe);
-    return;
-  }
-
-  if (!hasSplitPlayback) {
-    const empty = document.createElement("div");
-    empty.className = "empty-state";
-    const text = document.createElement("p");
-    text.textContent = t("player.preparingTracks");
-    const hint = document.createElement("p");
-    hint.className = "empty-hint";
-    hint.textContent = hostCacheDetailTextForItem(currentItem) || t("player.cachingFallback");
-    empty.append(text, hint);
-    elements.playerFrame.replaceChildren(empty);
-    return;
-  }
-
-  const shouldAutoplay = !shouldHoldCurrentItemForTransition(currentItem);
-
-  const videoElement = document.createElement("video");
-  videoElement.dataset.playerRole = "video";
-  videoElement.controls = false;
-  videoElement.removeAttribute("controls");
-  videoElement.setAttribute("controlsList", "nofullscreen");
-  // Start the split pair together once both streams expose metadata. Waiting
-  // for canplay deadlocks WebKit when the video intentionally preloads metadata.
-  videoElement.autoplay = false;
-  videoElement.playsInline = true;
-  videoElement.tabIndex = 0;
-  videoElement.preload = "metadata";
-  videoElement.src = selectedVideoUrl;
-  const audioElement = document.createElement("audio");
-  audioElement.dataset.playerRole = "audio";
-  audioElement.preload = "auto";
-  audioElement.src = selectedAudioUrl;
-  elements.playerFrame.replaceChildren(videoElement, audioElement);
-
-  const video = elements.playerFrame.querySelector('video[data-player-role="video"]');
-  const audio = elements.playerFrame.querySelector('audio[data-player-role="audio"]');
-
-  if (!video || !audio) {
-    return;
-  }
-
-  video.dataset.playerItemId = currentItem.id;
-  state.localShouldBePlaying = shouldAutoplay;
-  setSplitPlaybackStartState("pending", video, audio);
   state.localPlayerRequestedRate = Number(video.playbackRate || 1) || 1;
   applyStoredVolumeToSplitPlayer(video, audio);
   setupAudioPitchShifter(audio);
@@ -8951,36 +15975,52 @@ function renderPlayer(currentItem, playbackMode) {
   createSplitPlaybackStartOverlay(video, audio);
   ensureTauriMediaSessionHandlers();
   syncTauriMediaSessionState(video, { forcePosition: true });
+  ["loadedmetadata", "durationchange", "timeupdate", "play", "pause", "seeked", "volumechange"].forEach((eventName) => {
+    addMountedPlayerListener(video, eventName, () => {
+      publishPresentationPlaybackState(session).catch(() => {});
+    });
+  });
 
   const reportCurrentVideoStatus = () => {
-    reportPlayerStatus(currentItem.id, video);
+    reportPlayerStatus(currentItem.id, video, session);
   };
 
   let restoreApplied = false;
   const maybeRestorePlayback = () => {
-    const pendingRestore = state.pendingPlaybackRestore;
+    const pendingRestore = session.playbackRestore;
     if (
       restoreApplied
       || !pendingRestore
       || pendingRestore.itemId !== currentItem.id
       || pendingRestore.variantId !== selectedAudioVariantForItem(currentItem)?.id
-      || video.readyState < 1
-      || audio.readyState < 1
     ) {
       return false;
     }
 
     restoreApplied = true;
-    state.pendingPlaybackRestore = null;
-    beginSplitPlayerSeek(video, audio, {
-      resumeAfterSeek: Boolean(
-        pendingRestore.wasPlaying
-        && !shouldHoldCurrentItemForTransition(currentItem),
-      ),
+    session.playbackRestore = null;
+    const started = beginSplitPlayerSeek(video, audio, {
+      resumeAfterSeek: false,
+      allowUncommitted: true,
+      updateIntent: false,
       targetTime: pendingRestore.currentTime,
       diagnosticAction: "restore-video-seek",
-      onSettled: reportCurrentVideoStatus,
+      onSettled: (applied) => {
+        if (!applied) {
+          return;
+        }
+        reportCurrentVideoStatus();
+        commitHostPlaybackSessionReadyPaused(session, video, audio);
+      },
     });
+    if (!started) {
+      failHostPlaybackCandidate(
+        session,
+        video,
+        audio,
+        "restore-seek-could-not-start",
+      );
+    }
     return true;
   };
 
@@ -8999,7 +16039,16 @@ function renderPlayer(currentItem, playbackMode) {
     synchronizeStartupPlayer();
   });
 
+  addMountedPlayerListener(video, "error", () => {
+    failHostPlaybackCandidate(session, video, audio, "video-error-before-readiness");
+  });
+
+  addMountedPlayerListener(audio, "error", () => {
+    failHostPlaybackCandidate(session, video, audio, "audio-error-before-readiness");
+  });
+
   addMountedPlayerListener(video, "play", () => {
+    if (window.BilikaraAndroidPlayback?.blockStart()) return;
     if (video.dataset.bilikaraInternalPlay === "true") {
       delete video.dataset.bilikaraInternalPlay;
       return;
@@ -9009,9 +16058,9 @@ function renderPlayer(currentItem, playbackMode) {
       return;
     }
     if (isSplitPlayerSeekSettling(video, audio)) {
-      state.localSeekResumeAfterSettle = true;
+      session.seekResumeAfterSettle = true;
       state.localShouldBePlaying = true;
-      state.localSeekResumePending = true;
+      session.seekResumePending = true;
       video.dataset.bilikaraInternalPause = "true";
       video.pause();
       return;
@@ -9028,19 +16077,38 @@ function renderPlayer(currentItem, playbackMode) {
       delete video.dataset.bilikaraInternalPause;
       return;
     }
-    if (state.localSeekResumePending) {
+    if (window.BilikaraAndroidPlayback?.blockStart()) return;
+    if (session.seekResumePending) {
+      return;
+    }
+    // Android's native timeline pauses before dispatching `seeking`. That
+    // temporary pause is not a new user intent: the existing seek lifecycle
+    // must retain whether playback should resume when the seek settles.
+    if (isAndroidNativePlaybackRuntime() && video.seeking) {
       return;
     }
     if (video.ended && !audio.ended) {
       return;
     }
     if (document.hidden && state.localShouldBePlaying) {
-      window.setTimeout(() => {
+      if (session.hiddenPauseTimer) {
+        window.clearTimeout(session.hiddenPauseTimer);
+      }
+      let hiddenPauseTimer = null;
+      hiddenPauseTimer = window.setTimeout(() => {
+        if (
+          session.hiddenPauseTimer !== hiddenPauseTimer
+          || !isCurrentHostPlaybackSession(session, video, audio)
+        ) {
+          return;
+        }
+        session.hiddenPauseTimer = null;
         if (shouldHoldCurrentItemForTransition(currentItem)) {
           return;
         }
         syncSplitPlayer(video, audio, currentAvOffsetSeconds(), true);
       }, 0);
+      session.hiddenPauseTimer = hiddenPauseTimer;
       return;
     }
     setSplitPlaybackIntent(video, audio, false, { source: "native-video-pause-intent" });
@@ -9052,7 +16120,8 @@ function renderPlayer(currentItem, playbackMode) {
       return;
     }
     beginSplitPlayerSeek(video, audio, {
-      resumeAfterSeek: !video.paused || state.localShouldBePlaying,
+      resumeAfterSeek: window.BilikaraAndroidPlayback?.seekResumeIntent?.(video, audio)
+        ?? (!video.paused || state.localShouldBePlaying),
       onSettled: reportCurrentVideoStatus,
     });
   });
@@ -9095,6 +16164,10 @@ function renderPlayer(currentItem, playbackMode) {
 
   addMountedPlayerListener(video, "playing", () => {
     state.localVideoPlaybackBlocked = false;
+    if (session.readyCommitted && !video.paused && !audio.paused) {
+      setHostPlaybackSessionPhase(session, "playing");
+      confirmPresentationPlaybackFeedback(session);
+    }
     if (!synchronizeStartupPlayer()) {
       syncSplitPlayer(
         video,
@@ -9122,26 +16195,42 @@ function renderPlayer(currentItem, playbackMode) {
   });
 
   addMountedPlayerListener(video, "timeupdate", () => {
-    reportPlayerStatusHeartbeat(currentItem.id, video);
+    reportPlayerStatusHeartbeat(currentItem.id, video, session);
   });
 
   addMountedPlayerListener(video, "ratechange", () => {
+    audio.bilikaraPitch?.reset();
     state.localPlayerRequestedRate = Number(video.playbackRate || 1) || 1;
     audio.playbackRate = state.localPlayerRequestedRate;
     syncSplitPlayer(video, audio, currentAvOffsetSeconds(), true);
   });
 
   addMountedPlayerListener(video, "volumechange", () => {
+    const previousVolume = state.localPlayerVolume;
+    const previousMuted = state.localPlayerMuted;
     syncSplitPlayerVolumeFromVideo(video, audio);
+    const nextVolume = state.localPlayerVolume;
+    const nextMuted = state.localPlayerMuted;
+    const volumeChanged = Math.abs(nextVolume - previousVolume) > 0.001;
+    if (!volumeChanged && nextMuted === previousMuted) return;
+    // Only actual native-control changes reach the authoritative manual path.
+    // Programmatic applications already match bilikaraVolume/local intent.
+    state.localPlayerVolume = previousVolume;
+    state.localPlayerMuted = previousMuted;
+    void setLocalPlayerVolumeAndMuted(nextVolume, nextMuted, { volumeIntent: volumeChanged }).catch(() => {});
   });
 
   ["pointerenter", "pointermove", "pointerdown", "touchstart", "focus"].forEach((eventName) => {
-    addMountedPlayerListener(video, eventName, () => {
-      revealMountedPlayerControlsForUserInteraction();
+    addMountedPlayerListener(video, eventName, (event) => {
+      revealMountedPlayerControlsForUserInteraction(event);
     }, { passive: true });
   });
 
-  addMountedPlayerListener(video, "pointerleave", () => {
+  addMountedPlayerListener(video, "pointerleave", (event) => {
+    // Touch pointers leave at finger-up (and when entering a UA seek control),
+    // unlike a desktop hover. Removing controls here cancels native scrubbing.
+    if (event.pointerType === "touch" && (isAndroidNativePlaybackRuntime() || isPlayerPanelFullscreen())) return;
+    if (state.playerFullscreenInteraction?.holdingPointer()) return;
     hideMountedPlayerControls();
   });
 
@@ -9151,12 +16240,20 @@ function renderPlayer(currentItem, playbackMode) {
 
   addMountedPlayerListener(audio, "waiting", () => {
     if (isWebKitPlaybackRuntime()) {
-      clearWebKitAudioStarvationTimer();
-      state.webKitAudioStarvationTimer = window.setTimeout(() => {
-        state.webKitAudioStarvationTimer = null;
+      clearWebKitAudioStarvationTimer(session);
+      let audioStarvationTimer = null;
+      audioStarvationTimer = window.setTimeout(() => {
+        if (
+          session.audioStarvationTimer !== audioStarvationTimer
+          || !isCurrentHostPlaybackSession(session, video, audio)
+        ) {
+          return;
+        }
+        session.audioStarvationTimer = null;
         state.localAudioPlaybackBlocked = true;
         syncSplitPlayer(video, audio, currentAvOffsetSeconds(), false);
       }, 200);
+      session.audioStarvationTimer = audioStarvationTimer;
     } else {
       state.localAudioPlaybackBlocked = true;
       syncSplitPlayer(video, audio, currentAvOffsetSeconds(), false);
@@ -9171,8 +16268,12 @@ function renderPlayer(currentItem, playbackMode) {
   });
 
   addMountedPlayerListener(audio, "playing", () => {
-    clearWebKitAudioStarvationTimer();
+    clearWebKitAudioStarvationTimer(session);
     state.localAudioPlaybackBlocked = false;
+    if (session.readyCommitted && !video.paused && !audio.paused) {
+      setHostPlaybackSessionPhase(session, "playing");
+      confirmPresentationPlaybackFeedback(session);
+    }
   });
 
   addMountedPlayerListener(audio, "ended", async () => {
@@ -9183,7 +16284,14 @@ function renderPlayer(currentItem, playbackMode) {
     maybeShowRatingPromptForProgress(currentItem, audio.currentTime, audio.duration);
   });
 
-  state.localPlayerSyncTimer = window.setInterval(() => {
+  let syncTimer = null;
+  syncTimer = window.setInterval(() => {
+    if (
+      session.syncTimer !== syncTimer
+      || !isCurrentHostPlaybackSession(session, video, audio)
+    ) {
+      return;
+    }
     if (isSplitPlayerSeekSettling(video, audio)) {
       settleSplitPlayerSeek(video, audio);
       reportCurrentVideoStatus();
@@ -9193,35 +16301,60 @@ function renderPlayer(currentItem, playbackMode) {
     reportCurrentVideoStatus();
     maybeShowRatingPromptForProgress(currentItem, audio.currentTime, audio.duration);
   }, localPlayerSyncIntervalMs);
+  session.syncTimer = syncTimer;
 
-  state.localPlayerStartupTimer = window.setTimeout(() => {
-    state.localPlayerStartupTimer = null;
+  let startupTimer = null;
+  startupTimer = window.setTimeout(() => {
+    if (
+      session.startupTimer !== startupTimer
+      || !isCurrentHostPlaybackSession(session, video, audio)
+    ) {
+      return;
+    }
+    session.startupTimer = null;
     synchronizeStartupPlayer();
     reportCurrentVideoStatus();
   }, 0);
+  session.startupTimer = startupTimer;
+  beginHostPlaybackSessionOwnershipClaim(session);
 }
 
 
 function applyRemotePlayerControl(command, currentItem, playbackMode) {
   const seq = Number(command?.seq || 0);
-  if (!Number.isInteger(seq) || seq <= state.lastAppliedPlayerControlSeq) {
+  if (!Number.isSafeInteger(seq) || seq < 1) {
+    return;
+  }
+  if (seq <= state.lastAppliedPlayerControlSeq) {
+    // The prior response may have been lost. Retry only its ACK, never its action.
+    ackRemotePlayerControl(seq);
     return;
   }
 
   const action = String(command?.action || "");
   const commandItemId = String(command?.item_id || "");
+  const expectedPlaybackGeneration = Number(command?.playback_generation);
+  const exactPlaybackProgram = Boolean(
+    Number.isSafeInteger(expectedPlaybackGeneration)
+    && expectedPlaybackGeneration >= 1
+    && expectedPlaybackGeneration === state.data?.playback_generation
+    && state.hostPlaybackSession?.playbackGeneration === expectedPlaybackGeneration
+    && isCurrentHostPlaybackSession(state.hostPlaybackSession)
+  );
 
   if (
-    playbackMode === "local"
+    exactPlaybackProgram
+    && playbackMode === "local"
     && currentItem
     && (!commandItemId || commandItemId === currentItem.id)
   ) {
     if (action === "next-track") {
-      requestNextTrack().catch(() => {});
+      requestNextTrack(expectedPlaybackGeneration).catch(() => {});
     } else {
       const video = elements.playerFrame.querySelector("video");
       const audio = elements.playerFrame.querySelector('audio[data-player-role="audio"]');
-      if (video) {
+      const playbackSession = state.hostPlaybackSession;
+      if (video && isCurrentHostPlaybackSession(playbackSession, video, audio)) {
         // WebKit can keep a successful active pair in "starting" until its
         // initial play promises settle. Remote controls must treat that pair
         // as an established session instead of re-entering startup policy.
@@ -9244,21 +16377,38 @@ function applyRemotePlayerControl(command, currentItem, playbackMode) {
         ) {
           setSplitPlaybackStartState("established", video, audio);
         }
-        if (action === "toggle-play") {
+        if (action === "toggle-play" || action === "play" || action === "pause") {
+          const shouldPlay = action === "play"
+            ? true
+            : action === "pause"
+              ? false
+              : !state.localShouldBePlaying;
           if (audio) {
             if (hasEstablishedTauriWebKitSession) {
-              setSplitPlaybackIntent(video, audio, !state.localShouldBePlaying, {
+              setSplitPlaybackIntent(video, audio, shouldPlay, {
                 source: "remote-toggle-intent",
               });
-            } else if (!requestSplitPlaybackStart(video, audio, { source: "remote-play-intent" })) {
-              setSplitPlaybackIntent(video, audio, !state.localShouldBePlaying, {
+            } else if (action === "toggle-play") {
+              // Preserve the existing pending-start contract: a legacy toggle
+              // arriving while startup is unresolved confirms playback instead
+              // of inverting the optimistic local intent back to pause.
+              if (!requestSplitPlaybackStart(video, audio, { source: "remote-play-intent" })) {
+                setSplitPlaybackIntent(video, audio, shouldPlay, {
+                  source: "remote-toggle-intent",
+                });
+              }
+            } else if (
+              !shouldPlay
+              || !requestSplitPlaybackStart(video, audio, { source: "remote-play-intent" })
+            ) {
+              setSplitPlaybackIntent(video, audio, shouldPlay, {
                 source: "remote-toggle-intent",
               });
             }
-          } else if (video.paused) {
+          } else if (shouldPlay && video.paused) {
             state.localShouldBePlaying = true;
             video.play().catch(() => {});
-          } else {
+          } else if (!shouldPlay && !video.paused) {
             state.localShouldBePlaying = false;
             video.pause();
           }
@@ -9272,7 +16422,7 @@ function applyRemotePlayerControl(command, currentItem, playbackMode) {
             const resumeAfterSeek = audio && isTauriWebKitRuntime()
               ? state.localShouldBePlaying
               : !video.paused || state.localShouldBePlaying;
-            const duration = Number.isFinite(video.duration) ? video.duration : Number.POSITIVE_INFINITY;
+            const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : Number.POSITIVE_INFINITY;
             const nextTime = action === "seek-absolute"
               ? Math.max(0, targetSeconds)
               : Math.max(0, Number(video.currentTime || 0) + deltaSeconds);
@@ -9280,21 +16430,42 @@ function applyRemotePlayerControl(command, currentItem, playbackMode) {
               ? Math.min(nextTime, duration)
               : nextTime;
             if (audio) {
-              beginSplitPlayerSeek(video, audio, {
+              const started = beginSplitPlayerSeek(video, audio, {
                 resumeAfterSeek,
                 targetTime: clampedNextTime,
                 diagnosticAction: "manual-video-seek",
-                onSettled: () => reportPlayerStatus(currentItem.id, video),
+                onSettled: (applied) => {
+                  if (applied) {
+                    reportPlayerStatus(currentItem.id, video, playbackSession);
+                  }
+                },
               });
+              // A replacement pair may still be binding after an audio-track
+              // change. Leave this command at the native FIFO head until the
+              // pair can seek; an ACK here would discard an unapplied action.
+              if (started === false) return;
             } else {
-              state.localSeekResumePending = resumeAfterSeek;
+              const session = state.hostPlaybackSession;
+              if (session) {
+                session.seekResumePending = resumeAfterSeek;
+              }
               setMediaCurrentTime(video, clampedNextTime);
             }
-            if (!audio && state.localSeekResumePending) {
+            if (!audio && state.hostPlaybackSession?.seekResumePending) {
               video.play().catch(() => {});
             }
           }
         }
+        // The existing ordered seek-to-zero + play pair is the shared Restart
+        // affordance. Classify only confirmed adjacent commands on this same
+        // playback owner; ordinary seeks and delayed/unrelated plays stay distinct.
+        if (globalThis.BilikaraPresentationFeedback?.isRestartPair?.(playbackSession.presentationFeedbackPreviousControl, command)) {
+          playbackSession.presentationFeedbackPlayKind = "restart";
+          playbackSession.presentationFeedbackPlayPending = true;
+          confirmPresentationPlaybackFeedback(playbackSession);
+        }
+        playbackSession.presentationFeedbackPreviousControl = { action, seq, item_id: commandItemId,
+          playback_generation: expectedPlaybackGeneration, target_seconds: command.target_seconds, at: Date.now() };
       }
     }
   }
@@ -9308,42 +16479,123 @@ function applyRemotePlayerControl(command, currentItem, playbackMode) {
 }
 
 async function ackRemotePlayerControl(seq) {
+  const pending = state.playerControlAckInFlight ?? (state.playerControlAckInFlight = new Set());
+  if (pending.has(seq)) return;
+  pending.add(seq);
   try {
     await apiPost("/api/player/control-ack", { seq });
   } catch {
-    // Ignore ack failures and let the next polling cycle recover.
+    // The repeated head in the next state update retries only the ACK.
+  } finally {
+    pending.delete(seq);
   }
 }
 
-function reportPlayerStatus(itemId, video) {
+function observedHostPlayerStatus(itemId, session, video, audio = session?.audio) {
   const normalizedItemId = String(itemId || "").trim();
-  if (!normalizedItemId || !video) {
-    return;
+  if (
+    !normalizedItemId
+    || !video
+    || !audio
+    || !isCurrentHostPlaybackSession(session, video, audio)
+    || !session.readyCommitted
+  ) {
+    return null;
   }
 
-  const currentTime = Number(video.currentTime || 0);
-  const duration = Number.isFinite(video.duration) ? Number(video.duration) : 0;
+  const rawCurrentTime = Number(video.currentTime || 0);
+  const rawDuration = Number(video.duration);
+  if (
+    !Number.isFinite(rawCurrentTime)
+    || rawCurrentTime < 0
+    || rawCurrentTime > playerStatusMaxSeconds
+    || (Number.isFinite(rawDuration) && (rawDuration < 0 || rawDuration > playerStatusMaxSeconds))
+  ) {
+    return null;
+  }
+  let observedPhase = "paused";
+  if (audio.ended) {
+    observedPhase = "ended";
+  } else if (hostPlaybackSessionObservedPlaying(session, video, audio)) {
+    observedPhase = "playing";
+  } else if (session.phase === "ready-paused") {
+    observedPhase = "ready-paused";
+  } else if (session.phase === "starting" || session.phase === "start-retry-wait") {
+    observedPhase = "starting";
+  } else if (session.phase === "needs-user-gesture") {
+    observedPhase = "needs-user-gesture";
+  } else if (session.phase === "failed") {
+    observedPhase = "failed";
+  }
+  return {
+    observed_phase: observedPhase,
+    is_paused: observedPhase !== "playing",
+    current_time: rawCurrentTime,
+    duration: Number.isFinite(rawDuration) ? rawDuration : 0,
+  };
+}
+
+function nextHostPlayerStatusSequence(session) {
+  const currentSequence = Number(session?.statusSequence);
+  if (
+    !session
+    || !Number.isSafeInteger(currentSequence)
+    || currentSequence < 0
+    || currentSequence >= Number.MAX_SAFE_INTEGER
+  ) {
+    return null;
+  }
+  const nextSequence = currentSequence + 1;
+  if (!Number.isSafeInteger(nextSequence) || nextSequence < 1) {
+    return null;
+  }
+  session.statusSequence = nextSequence;
+  return nextSequence;
+}
+
+function reportPlayerStatus(itemId, video, session) {
+  const observed = observedHostPlayerStatus(itemId, session, video, session?.audio);
+  const playbackGeneration = Number(session?.playbackGeneration);
+  if (
+    !observed
+    || !Number.isSafeInteger(playbackGeneration)
+    || playbackGeneration < 1
+  ) {
+    return false;
+  }
+
+  const normalizedItemId = String(itemId || "").trim();
   syncTauriMediaSessionState(video);
+  publishPresentationPlaybackState(session).catch(() => {});
   const currentItem = state.data?.current_item;
   if (currentItem && String(currentItem.id || "") === normalizedItemId) {
-    maybeShowRatingPromptForProgress(currentItem, currentTime, duration);
+    maybeShowRatingPromptForProgress(
+      currentItem,
+      observed.current_time,
+      observed.duration,
+    );
   }
   const signature = [
     normalizedItemId,
-    video.paused ? "paused" : "playing",
-    Math.round(currentTime),
-    Math.round(duration),
+    observed.observed_phase,
+    observed.is_paused ? "paused" : "playing",
+    Math.round(observed.current_time),
+    Math.round(observed.duration),
   ].join("|");
-  if (signature === state.lastReportedPlayerStatusSignature) {
-    return;
+  if (signature === session.lastReportedStatusSignature) {
+    return false;
   }
-  state.lastReportedPlayerStatusSignature = signature;
+  const statusSequence = nextHostPlayerStatusSequence(session);
+  if (statusSequence === null) {
+    return false;
+  }
+  session.lastReportedStatusSignature = signature;
 
   apiPost("/api/player/status", {
+    playback_generation: playbackGeneration,
+    status_sequence: statusSequence,
     item_id: normalizedItemId,
-    is_paused: video.paused,
-    current_time: currentTime,
-    duration,
+    ...observed,
     client_info: {
       user_agent: String(window.navigator?.userAgent || ""),
       platform: String(window.navigator?.platform || ""),
@@ -9351,21 +16603,28 @@ function reportPlayerStatus(itemId, video) {
       vendor: String(window.navigator?.vendor || ""),
     },
   }).catch(() => {});
+  return true;
 }
 
-function reportPlayerStatusHeartbeat(itemId, video) {
-  if (!video || video.paused) {
+function reportPlayerStatusHeartbeat(itemId, video, session) {
+  if (
+    !video
+    || video.paused
+    || !isCurrentHostPlaybackSession(session, video, session?.audio)
+    || !session.readyCommitted
+  ) {
     return;
   }
   const now = Date.now();
-  if (now - Number(state.lastPlayerStatusHeartbeatAt || 0) < 5000) {
+  if (now - Number(session.lastStatusHeartbeatAt || 0) < 5000) {
     return;
   }
-  state.lastPlayerStatusHeartbeatAt = now;
-  reportPlayerStatus(itemId, video);
+  session.lastStatusHeartbeatAt = now;
+  reportPlayerStatus(itemId, video, session);
 }
 
 function renderPlaylist(playlist, currentItem, cachePolicy) {
+  state.renderedQueue = { playlist, version: state.data?.queue_version || "" };
   if (!playlist.length) {
     const signature = `${state.data?.current_item ? "empty-with-current" : "empty"}|${state.language}`;
     if (signature === state.playlistEmptyRenderSignature) {
@@ -9380,6 +16639,7 @@ function renderPlaylist(playlist, currentItem, cachePolicy) {
     hint.textContent = state.data?.current_item ? t("list.emptyWithCurrentHint") : t("list.emptyHint");
     emptyNode.append(title, hint);
     elements.playlist.replaceChildren(emptyNode);
+    scheduleQueueScrollOwnershipSync();
     return;
   }
 
@@ -9407,6 +16667,8 @@ function renderPlaylist(playlist, currentItem, cachePolicy) {
     const sizeLabel = node.querySelector(".song-size-label");
     const readyIndicator = node.querySelector(".song-badge-check");
     const retryButton = node.querySelector(".song-retry-button");
+    const moveUpButton = node.querySelector('[data-action="move-up"]');
+    const moveDownButton = node.querySelector('[data-action="move-down"]');
     const note = node.querySelector(".song-note");
     const titleNode = node.querySelector(".song-title");
     const requesterNode = node.querySelector(".song-requester");
@@ -9470,6 +16732,14 @@ function renderPlaylist(playlist, currentItem, cachePolicy) {
       setClassToggle(note, "hidden", !noteText);
     }
     syncRetryButton(retryButton, item);
+    if (moveUpButton) {
+      moveUpButton.disabled = index === 0;
+      moveUpButton.dataset.targetIndex = String(index - 1);
+    }
+    if (moveDownButton) {
+      moveDownButton.disabled = index === playlist.length - 1;
+      moveDownButton.dataset.targetIndex = String(index + 1);
+    }
 
     const referenceNode = elements.playlist.children[index] || null;
     if (node !== referenceNode) {
@@ -9479,8 +16749,56 @@ function renderPlaylist(playlist, currentItem, cachePolicy) {
   });
 
   existingNodes.forEach((node) => {
+    if (node.contains(state.openRowMenuTrigger)) {
+      closeOpenMenus({ restoreFocus: false });
+    }
     node.remove();
   });
+  scheduleQueueScrollOwnershipSync();
+}
+
+// Measure on content/viewport changes, never on a playback timer. Native
+// overflow:auto consumes the actual scrollbar width; add only its 4px gap.
+function observeHostScrollInsets(element) {
+  if (!element || element.__bilikaraScrollInsets || typeof ResizeObserver !== "function") return;
+  element.__bilikaraScrollInsets = true;
+  let frame = 0;
+  const measure = () => {
+    frame = 0;
+    if (!element.isConnected || element.clientHeight <= 0) return;
+    element.classList.toggle("has-scroll-inset", element.scrollHeight > element.clientHeight + 1);
+  };
+  const schedule = () => { if (!frame) frame = requestAnimationFrame(measure); };
+  const resize = new ResizeObserver(schedule);
+  resize.observe(element);
+  new MutationObserver(records => {
+    if (records.some(record => record.target === element
+      || [...record.addedNodes, ...record.removedNodes].some(node => node.nodeType === 1))) schedule();
+  }).observe(element, { childList: true, subtree: true });
+  document.fonts?.ready.then(schedule);
+  schedule();
+}
+
+function syncQueueScrollOwnership() {
+  state.queueScrollMeasureFrame = null;
+  const playlist = elements.playlist;
+  if (!playlist || playlist.clientHeight <= 0) {
+    return false;
+  }
+  const scrollable = playlist.scrollHeight > playlist.clientHeight + 1;
+  playlist.classList.toggle("is-scrollable", scrollable);
+  playlist.classList.toggle("is-content-fit", !scrollable);
+  if (!scrollable && playlist.scrollTop !== 0) {
+    playlist.scrollTop = 0;
+  }
+  return scrollable;
+}
+
+function scheduleQueueScrollOwnershipSync() {
+  if (state.queueScrollMeasureFrame !== null) {
+    return;
+  }
+  state.queueScrollMeasureFrame = window.requestAnimationFrame(syncQueueScrollOwnership);
 }
 
 function badgeStateForItem(item, index, currentItem, cachePolicy) {
@@ -9555,6 +16873,9 @@ function syncRetryButton(button, item) {
     if (button.hasAttribute("data-id")) {
       button.removeAttribute("data-id");
     }
+    if (button.hasAttribute("data-item-incarnation-id")) {
+      button.removeAttribute("data-item-incarnation-id");
+    }
     if (button.hasAttribute("title")) {
       button.removeAttribute("title");
     }
@@ -9566,6 +16887,9 @@ function syncRetryButton(button, item) {
   const tooltip = t("cache.retryClick");
   if (button.dataset.id !== item.id) {
     button.dataset.id = item.id;
+  }
+  if (button.dataset.itemIncarnationId !== item.item_incarnation_id) {
+    button.dataset.itemIncarnationId = item.item_incarnation_id;
   }
   setElementTitle(button, tooltip);
   setElementAttribute(button, "aria-label", tooltip);
@@ -9596,6 +16920,9 @@ function renderHistory(history) {
     return;
   }
   state.historyRenderSignature = signature;
+  if (elements.historyList.contains(state.openRowMenuTrigger)) {
+    closeOpenMenus({ restoreFocus: false });
+  }
   elements.historyList.replaceChildren();
 
   if (!history.length) {
@@ -9688,19 +17015,6 @@ function formatBBDownHint(bbdown) {
   return labelMap[bbdown.state] || bbdown.state || t("status.unknown");
 }
 
-function formatFFmpegHint(ffmpeg) {
-  if (!ffmpeg) {
-    return t("status.unknown");
-  }
-  const labelMap = {
-    idle: t("status.idle"),
-    checking: t("status.checking"),
-    ready: t("status.ready"),
-    failed: t("status.error"),
-  };
-  return labelMap[ffmpeg.state] || ffmpeg.state || t("status.unknown");
-}
-
 function formatCacheChipMeta(cachePolicy) {
   const limit = Number(cachePolicy?.max_cache_items || 0);
   return t("service.cacheChipMeta", { usage: formatBytes(cachePolicy?.usage_bytes || 0), limit });
@@ -9767,6 +17081,11 @@ function cacheSizeLabelForItem(item) {
   const size = Number(item.cache_size_bytes || 0);
   if (size > 0) {
     return formatCompactBytes(size);
+  }
+  // Native Host can publish a ready artifact without optional byte-size data.
+  // Readiness comes from AppState, not from whether that metadata is present.
+  if (item.cache_status === "ready") {
+    return t("status.ready");
   }
   if (item.cache_status === "failed") {
     return t("status.failed");
@@ -9851,7 +17170,7 @@ function renderBackupBanner(
   if (!mode) {
     clearBackupBannerTimer();
     state.backupBannerMode = "";
-    elements.backupBanner.classList.add("hidden");
+    hideBackupBanner();
     updateBackupDismissButton();
     return;
   }
@@ -9882,7 +17201,79 @@ function renderBackupBanner(
     elements.backupActionButton.textContent = t("backup.clear");
   }
 
-  elements.backupBanner.classList.toggle("hidden", state.backupBannerDismissed);
+  if (state.backupBannerDismissed) {
+    hideBackupBanner();
+  } else {
+    showBackupBanner();
+  }
+}
+
+function clearBackupBannerMotionFrame(motion = state) {
+  if (motion.backupBannerMotionFrame !== null) {
+    window.cancelAnimationFrame(motion.backupBannerMotionFrame);
+    motion.backupBannerMotionFrame = null;
+  }
+}
+
+function clearBackupBannerMotionTimer(motion = state) {
+  if (motion.backupBannerMotionTimer !== null) {
+    window.clearTimeout(motion.backupBannerMotionTimer);
+    motion.backupBannerMotionTimer = null;
+  }
+}
+
+function showBackupBanner(banner = elements.backupBanner, motion = state) {
+  clearBackupBannerMotionTimer(motion);
+  banner.inert = false;
+  banner.setAttribute("aria-hidden", "false");
+
+  if (!banner.classList.contains("hidden")) {
+    if (motion.backupBannerMotionFrame === null) {
+      banner.classList.add("is-visible");
+    }
+    return;
+  }
+
+  clearBackupBannerMotionFrame(motion);
+  banner.classList.remove("is-visible");
+  banner.classList.remove("hidden");
+  motion.backupBannerMotionFrame = window.requestAnimationFrame(() => {
+    motion.backupBannerMotionFrame = null;
+    if (!motion.backupBannerDismissed && !banner.classList.contains("hidden")) {
+      banner.classList.add("is-visible");
+    }
+  });
+}
+
+function hideBackupBanner({ immediate = false, banner = elements.backupBanner, motion = state } = {}) {
+  clearBackupBannerMotionFrame(motion);
+  banner.classList.remove("is-visible");
+  banner.inert = true;
+  banner.setAttribute("aria-hidden", "true");
+
+  if (banner.classList.contains("hidden")) {
+    clearBackupBannerMotionTimer(motion);
+    return;
+  }
+  if (motion.backupBannerMotionTimer !== null && !immediate) {
+    return;
+  }
+
+  clearBackupBannerMotionTimer(motion);
+  const reduceMotion = Boolean(
+    window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches,
+  );
+  if (immediate || reduceMotion) {
+    banner.classList.add("hidden");
+    return;
+  }
+
+  motion.backupBannerMotionTimer = window.setTimeout(() => {
+    motion.backupBannerMotionTimer = null;
+    if (!banner.classList.contains("is-visible")) {
+      banner.classList.add("hidden");
+    }
+  }, backupBannerMotionMs);
 }
 
 function startBackupBannerTimer() {
@@ -9950,8 +17341,10 @@ function updateBackupDismissButton() {
   if (!elements.dismissBackupButton) {
     return;
   }
-  if (state.backupBannerDismissed || state.backupDismissHover) {
-    elements.dismissBackupButton.textContent = "×";
+  const showCloseGlyph = state.backupBannerDismissed || state.backupDismissHover;
+  elements.dismissBackupButton.classList.toggle("is-close-glyph", showCloseGlyph);
+  if (showCloseGlyph) {
+    elements.dismissBackupButton.innerHTML = '<svg class="close-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m6 6 12 12M18 6 6 18" /></svg>';
     return;
   }
   const remainingSeconds = Math.max(1, Math.ceil(state.backupBannerRemainingMs / 1000));
@@ -9960,23 +17353,34 @@ function updateBackupDismissButton() {
 
 function dismissBackupBanner() {
   state.backupBannerDismissed = true;
-  elements.backupBanner.classList.add("hidden");
+  hideBackupBanner();
   clearBackupBannerTimer();
   updateBackupDismissButton();
 }
 
 function openConfirm(intent) {
-  state.confirmIntent = intent;
+  state.confirmIntent = {
+    ...intent,
+    focusElement: intent?.focusElement || document.activeElement,
+  };
   renderConfirmPopover();
 }
 
-function closeConfirm() {
+function closeConfirm({ restoreFocus = true } = {}) {
+  closeCacheAdvancedInfo();
+  const focusElement = state.confirmIntent?.focusElement;
+  const sourceEditor = state.confirmIntent?.sourceEditor;
   state.confirmIntent = null;
+  if (sourceEditor) sourceEditor.confirmation = null;
   state.confirmPopoverRenderSignature = "";
   renderConfirmPopover();
+  if (restoreFocus && focusElement?.isConnected && typeof focusElement.focus === "function") {
+    focusElement.focus({ preventScroll: true });
+  }
 }
 
 function confirmPopoverAnchorElement(intent) {
+  if (intent?.anchorElement?.isConnected) return intent.anchorElement;
   const anchorElementId = String(intent?.anchorElementId || "").trim();
   return anchorElementId ? document.getElementById(anchorElementId) : null;
 }
@@ -9993,6 +17397,7 @@ function confirmPopoverRenderSignature(intent) {
   const anchorRect = confirmPopoverAnchorRect(intent);
   return JSON.stringify({
     type: intent.type || "",
+    language: state.language,
     message: intent.message || "",
     primaryLabel: intent.primaryLabel || "",
     secondaryLabel: intent.secondaryLabel || "",
@@ -10005,6 +17410,7 @@ function confirmPopoverRenderSignature(intent) {
     y: Math.round(Number(intent.y || 0)),
     anchorElementId: String(intent.anchorElementId || ""),
     anchorAlign: String(intent.anchorAlign || ""),
+    anchorSide: String(intent.anchorSide || ""),
     anchorGap: Math.round(Number(intent.anchorGap || 0)),
     anchorLeft: anchorRect ? Math.round(anchorRect.left) : 0,
     anchorTop: anchorRect ? Math.round(anchorRect.top) : 0,
@@ -10036,7 +17442,7 @@ function confirmPopoverPlacement(intent, width, popoverHeight) {
     }
 
     const aboveTop = anchorRect.top - popoverHeight - anchorGap;
-    if (rawTop + popoverHeight > window.innerHeight - margin && aboveTop >= margin) {
+    if ((intent.anchorSide === "above" || rawTop + popoverHeight > window.innerHeight - margin) && aboveTop >= margin) {
       rawTop = aboveTop;
     }
   }
@@ -10049,10 +17455,9 @@ function confirmPopoverPlacement(intent, width, popoverHeight) {
     };
   }
 
-  const anchorOutsideViewport = anchorRect.bottom < margin || anchorRect.top > window.innerHeight - margin;
   return {
     left,
-    top: anchorOutsideViewport ? rawTop : Math.min(Math.max(rawTop, margin), maxTop),
+    top: Math.min(Math.max(rawTop, margin), maxTop),
   };
 }
 
@@ -10060,9 +17465,24 @@ function renderConfirmPopover() {
   const intent = state.confirmIntent;
   if (!intent) {
     state.confirmPopoverRenderSignature = "";
-    elements.confirmPopover.classList.add("hidden");
+    const popover = elements.confirmPopover;
+    if (!popover.classList.contains("hidden") && !popover.classList.contains("closing")) {
+      const closing = popover.__bilikaraCloseSequence = (popover.__bilikaraCloseSequence || 0) + 1;
+      popover.classList.add("closing");
+      popover.inert = true;
+      Promise.allSettled((popover.getAnimations?.() || []).map(animation => animation.finished)).then(() => {
+        if (state.confirmIntent || popover.__bilikaraCloseSequence !== closing) return;
+        popover.classList.add("hidden");
+        popover.classList.remove("closing");
+        popover.inert = false;
+      });
+    }
     return;
   }
+
+  elements.confirmPopover.classList.remove("closing");
+  elements.confirmPopover.inert = false;
+  elements.confirmPopover.__bilikaraCloseSequence = (elements.confirmPopover.__bilikaraCloseSequence || 0) + 1;
 
   const renderSignature = confirmPopoverRenderSignature(intent);
   if (
@@ -10077,13 +17497,37 @@ function renderConfirmPopover() {
   const hasSourceSelect = Boolean(intent.sourceSelect);
   const hasPageSizeSelect = Boolean(intent.pageSizeSelect);
   const hideMessage = Boolean(intent.hideMessage);
-  const width = hasSourceSelect || hasPageSizeSelect ? 420 : 260;
-  const popoverHeight = (hasSecondaryAction ? 126 : 112)
-    + (hasSourceSelect || hasPageSizeSelect ? 76 : 0)
-    - (hideMessage ? 34 : 0);
-  const { left, top } = confirmPopoverPlacement(intent, width, popoverHeight);
+  const isExport = intent.type === "export-history";
+  const title = isExport ? t("history.exportTitle")
+    : intent.type === "install-app-update" ? t("service.appUpdate")
+      : intent.type === "remove-sources" ? t("sources.removeSelected") : "";
+  if (elements.confirmTitle) {
+    elements.confirmTitle.textContent = title;
+    elements.confirmTitle.classList.toggle("hidden", !title);
+  }
+  elements.confirmPopover.classList.toggle("has-title", Boolean(title));
+  elements.confirmCancel.classList.toggle("hidden", isExport);
+  elements.confirmPopover.classList.toggle("is-export", isExport);
+  elements.confirmPopover.setAttribute("aria-labelledby", title ? "confirm-title" : "confirm-text");
 
   elements.confirmText.textContent = intent.message || "";
+  const manualUpdate = document.getElementById("confirm-manual-update");
+  if (manualUpdate) {
+    manualUpdate.classList.toggle("hidden", intent.type !== "install-app-update");
+    if (intent.type === "install-app-update") {
+      const [before, after] = t("service.manualUpdateDownload").split("{releases}");
+      const link = document.createElement("a");
+      link.textContent = "GitHub Releases";
+      link.href = "https://github.com/VZRXS/bilikara/releases";
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      link.addEventListener("click", (event) => {
+        event.preventDefault();
+        openExternalUrl(link.href);
+      });
+      manualUpdate.replaceChildren(document.createTextNode(before), link, document.createTextNode(after || ""));
+    } else manualUpdate.textContent = "";
+  }
   elements.confirmText.classList.toggle("hidden", hideMessage);
   if (elements.confirmSource) {
     elements.confirmSource.classList.toggle("hidden", !hasSourceSelect);
@@ -10097,33 +17541,42 @@ function renderConfirmPopover() {
       elements.confirmPageSize.value = String(selectedConfirmHistoryExportPageSize(intent));
     }
   }
-  elements.confirmPageSizeNote?.classList.toggle("hidden", !hasPageSizeSelect);
+  const sourceField = document.getElementById("confirm-source-field");
+  const pageSizeField = document.getElementById("confirm-page-size-field");
+  sourceField?.classList.toggle("hidden", !hasSourceSelect);
+  pageSizeField?.classList.toggle("hidden", !hasPageSizeSelect);
   const shouldGroupExportControls = hasSourceSelect && hasPageSizeSelect && elements.confirmSource && elements.confirmPageSize;
   if (shouldGroupExportControls) {
     let controls = elements.confirmPopover.querySelector(".confirm-export-controls");
     if (!controls) {
       controls = document.createElement("div");
       controls.className = "confirm-export-controls";
-      elements.confirmSource.before(controls);
+      sourceField.before(controls);
     }
-    controls.append(elements.confirmSource, elements.confirmPageSize);
+    controls.append(sourceField, pageSizeField);
   } else {
     const controls = elements.confirmPopover.querySelector(".confirm-export-controls");
     if (controls) {
-      controls.before(elements.confirmSource);
-      elements.confirmSource.after(elements.confirmPageSize);
+      controls.before(sourceField, pageSizeField);
       controls.remove();
     }
   }
-  elements.confirmOk.textContent = intent.primaryLabel || t("common.confirm");
+  elements.confirmOk.textContent = isExport ? t("history.exportImage") : intent.primaryLabel || t("common.confirm");
   if (elements.confirmSecondary) {
-    elements.confirmSecondary.textContent = intent.secondaryLabel || "";
+    elements.confirmSecondary.textContent = isExport ? t("history.exportCsv") : intent.secondaryLabel || "";
     elements.confirmSecondary.classList.toggle("hidden", !hasSecondaryAction);
   }
+  elements.confirmPopover.classList.toggle("confirm-popover-wide", hasSourceSelect || hasPageSizeSelect);
+  elements.confirmPopover.style.left = "0px";
+  elements.confirmPopover.style.top = "0px";
+  elements.confirmPopover.style.visibility = "hidden";
+  elements.confirmPopover.classList.remove("hidden");
+  // Animation transforms must not shrink the dimensions used to clamp the
+  // finished card inside the viewport.
+  const { left, top } = confirmPopoverPlacement(intent, elements.confirmPopover.offsetWidth, elements.confirmPopover.offsetHeight);
   elements.confirmPopover.style.left = `${left}px`;
   elements.confirmPopover.style.top = `${top}px`;
-  elements.confirmPopover.classList.toggle("confirm-popover-wide", hasSourceSelect || hasPageSizeSelect);
-  elements.confirmPopover.classList.remove("hidden");
+  elements.confirmPopover.style.removeProperty("visibility");
 }
 
 function anchorPointForEvent(event, fallbackElement) {
@@ -10176,6 +17629,21 @@ function escapeSelector(value) {
   return String(value).replaceAll('"', '\\"');
 }
 
+function focusPlaylistItemMenuTrigger(itemId) {
+  const normalizedId = String(itemId || "");
+  if (!normalizedId) {
+    return false;
+  }
+  const trigger = elements.playlist.querySelector(
+    `.song-item[data-id="${escapeSelector(normalizedId)}"] [data-action="toggle-menu"]`,
+  );
+  if (!trigger) {
+    return false;
+  }
+  trigger.focus({ preventScroll: true });
+  return true;
+}
+
 function syncDropIndicators() {
   clearDropIndicators();
   if (!state.dragItemId) {
@@ -10221,7 +17689,7 @@ function duplicateConfirmMessage(duplicateItem, sessionEntry, activeItem) {
 }
 
 async function submitAddRequest(url, position, options = {}) {
-  return apiPost("/api/playlist/add", {
+  return apiPostStateSnapshot("/api/playlist/add", {
     url,
     position,
     requester_name: String(options.requesterName || ""),
@@ -10245,14 +17713,12 @@ function currentBindingSelection() {
   };
 }
 
-function closeBindingModal() {
+function closeBindingModal({ restoreFocus = true } = {}) {
+  const opener = state.bindingIntent?.focusElement;
   state.bindingIntent = null;
   elements.bindingModal?.classList.add("hidden");
-  if (elements.bindingVideoOptions) {
-    elements.bindingVideoOptions.innerHTML = "";
-  }
-  if (elements.bindingAudioOptions) {
-    elements.bindingAudioOptions.innerHTML = "";
+  if (restoreFocus && opener?.isConnected) {
+    opener.focus({ preventScroll: true });
   }
 }
 
@@ -10272,6 +17738,7 @@ function renderBindingOption(inputType, name, entry, checked) {
   title.textContent = `P${entry.page} · ${entry.part}`;
   const meta = document.createElement("div");
   meta.className = "selection-option-meta";
+  meta.dataset.durationSeconds = String(entry.duration || 0);
   meta.textContent = entry.duration > 0 ? t("player.durationSeconds", { seconds: entry.duration }) : t("player.durationUnknown");
   copy.append(title, meta);
 
@@ -10282,14 +17749,14 @@ function renderBindingOption(inputType, name, entry, checked) {
 function openBindingModal(intent, payload) {
   const pages = Array.isArray(payload?.pages) ? payload.pages : [];
   if (!pages.length) {
-    setMessageForSource(intent?.source || "request-form", t("binding.readFailed"), true);
+    setRequestActionMessage(t("binding.readFailed"), true);
     return;
   }
   state.bindingIntent = {
     ...intent,
     binding: payload,
+    focusElement: intent?.focusElement || document.activeElement,
   };
-  elements.bindingModalText.textContent = t("binding.videoHasParts", { title: payload.title || t("binding.thisVideo") });
   elements.bindingVideoOptions.innerHTML = "";
   elements.bindingAudioOptions.innerHTML = "";
 
@@ -10303,13 +17770,15 @@ function openBindingModal(intent, payload) {
     );
   });
   elements.bindingModal.classList.remove("hidden");
+  elements.bindingModalClose?.focus({ preventScroll: true });
 }
 
-function closeGatchaFavlistModal() {
+function closeGatchaFavlistModal({ restoreFocus = true } = {}) {
+  const opener = state.gatchaFavlistIntent?.focusElement;
   state.gatchaFavlistIntent = null;
   elements.gatchaFavlistModal?.classList.add("hidden");
-  if (elements.gatchaFavlistOptions) {
-    elements.gatchaFavlistOptions.innerHTML = "";
+  if (restoreFocus && opener?.isConnected) {
+    opener.focus({ preventScroll: true });
   }
 }
 
@@ -10351,11 +17820,15 @@ function openGatchaFavlistModal(uid, payload, { messageTarget = "gatcha" } = {})
     setGatchaUidFlowMessage(messageTarget, t("favlist.none"), true);
     return;
   }
-  state.gatchaFavlistIntent = { uid, folders, messageTarget };
-  elements.gatchaFavlistModalText.textContent = t("favlist.chooseForUid", {
-    uid: payload?.uid || uid,
-    count: payload?.public_folder_count || folders.length,
-  });
+  state.gatchaFavlistIntent = {
+    uid,
+    folders,
+    messageTarget,
+    focusElement: document.activeElement,
+  };
+  elements.gatchaFavlistModalText.textContent = "";
+  elements.gatchaFavlistModalText.classList.add("hidden");
+  document.getElementById("gatcha-favlist-count").textContent = t("favlist.folderCount", {count:folders.length});
   elements.gatchaFavlistOptions.innerHTML = "";
   folders.forEach((folder) => {
     elements.gatchaFavlistOptions.appendChild(renderGatchaFavlistOption(folder));
@@ -10374,7 +17847,7 @@ async function confirmGatchaFavlistModal() {
     setGatchaUidFlowMessage(messageTarget, t("favlist.selectAtLeastOne"), true);
     return;
   }
-  if (gatchaTaskBusy()) {
+  if (gatchaSourceBusy()) {
     setGatchaUidFlowMessage(messageTarget, gatchaTaskBusyMessage(), true);
     renderGatchaUidFace();
     return;
@@ -10382,13 +17855,18 @@ async function confirmGatchaFavlistModal() {
 
   state.gatchaFavlistSaving = true;
   renderGatchaUidFace();
-  setGatchaUidFlowMessage(messageTarget, t("favlist.pullingSelected"));
+  setGatchaUidFlowLoadingMessage(messageTarget, t("favlist.pullingSelected"));
+  (Array.isArray(intent.folders) ? intent.folders : []).forEach((folder) => {
+    const folderId = poolConfigFolderId(folder);
+    if (folderIds.includes(folderId)) window.BilikaraSourceStatus?.rememberSource({ folderId, title: folder?.title });
+  });
   closeGatchaFavlistModal();
   try {
-    const result = await pullGatchaFavlist(intent.uid, folderIds);
+    const result = await pullGatchaFavlist(intent.uid, folderIds, intent.folders || []);
     setGatchaUidFlowMessage(
       messageTarget,
-      t("favlist.pullResult", { folders: result?.matched_folder_count || 0, items: result?.item_count || 0 }),
+      result?.queued ? t(result.duplicate ? "gatcha.sourceAlreadyQueued" : "gatcha.sourceQueued")
+        : t("favlist.pullResult", { folders: result?.matched_folder_count || 0, items: result?.item_count || 0 }),
     );
     await refreshFavlistBrowseAfterPull();
   } catch (error) {
@@ -10403,17 +17881,38 @@ function poolConfigFolderId(folder) {
   return String(folder?.id || folder?.folder_id || "").trim();
 }
 
+function clonePoolConfigProjection(value) {
+  const source = value && typeof value === "object" ? value : {};
+  return {
+    ...source,
+    excluded_uids: Array.isArray(source.excluded_uids)
+      ? source.excluded_uids.map(String)
+      : [],
+    excluded_favlist_folders: Array.isArray(source.excluded_favlist_folders)
+      ? source.excluded_favlist_folders.map(String)
+      : [],
+    uid_options: Array.isArray(source.uid_options)
+      ? source.uid_options.map((entry) => ({ ...entry }))
+      : source.uid_options,
+    favlist_folder_options: Array.isArray(source.favlist_folder_options)
+      ? source.favlist_folder_options.map((entry) => ({ ...entry }))
+      : source.favlist_folder_options,
+  };
+}
+
 function poolConfigSetMessage(message, isError = false) {
-  if (!elements.poolConfigMessage) {
-    return;
+  state.poolConfigMessage = message || "";
+  state.poolConfigMessageIsError = Boolean(isError);
+  if (elements.poolConfigMessage) {
+    elements.poolConfigMessage.textContent = state.poolConfigMessage;
+    elements.poolConfigMessage.classList.toggle("is-error", state.poolConfigMessageIsError);
   }
-  elements.poolConfigMessage.textContent = message || "";
-  elements.poolConfigMessage.classList.toggle("is-error", Boolean(isError));
 }
 
 function updatePoolConfigWeightLabel() {
   const uidWeight = Math.max(0, Math.min(100, Number(elements.poolConfigWeightSlider?.value || 50)));
   const favlistWeight = 100 - uidWeight;
+  setRangeFillPercent(elements.poolConfigWeightSlider, uidWeight);
   if (elements.poolConfigWeightLabel) {
     elements.poolConfigWeightLabel.textContent = t("gatcha.poolWeightValue", {
       uid: uidWeight,
@@ -10431,6 +17930,7 @@ function renderPoolConfigOption({ type, id, title, meta, checked }) {
   input.name = type === "uid" ? "gatcha-pool-uid" : "gatcha-pool-favlist";
   input.value = String(id || "");
   input.checked = Boolean(checked);
+  input.disabled = state.poolConfigLoading || state.poolConfigSaving;
 
   const copy = document.createElement("div");
   const titleEl = document.createElement("div");
@@ -10445,14 +17945,17 @@ function renderPoolConfigOption({ type, id, title, meta, checked }) {
 }
 
 function renderPoolConfigModal() {
-  const data = state.poolConfigData || {};
+  const data = state.poolConfigDraft || {};
   const excludedUids = new Set((Array.isArray(data.excluded_uids) ? data.excluded_uids : []).map(String));
   const excludedFolders = new Set((Array.isArray(data.excluded_favlist_folders) ? data.excluded_favlist_folders : []).map(String));
   const uidWeight = Math.max(0, Math.min(100, Number(data.uid_weight ?? 50)));
+  const detailLoaded = Array.isArray(data.uid_options) || Array.isArray(data.favlist_folder_options);
 
   if (elements.poolConfigWeightSlider) {
     elements.poolConfigWeightSlider.value = String(uidWeight);
-    elements.poolConfigWeightSlider.disabled = state.poolConfigSaving;
+    elements.poolConfigWeightSlider.disabled = state.poolConfigLoading
+      || state.poolConfigSaving
+      || !detailLoaded;
   }
   updatePoolConfigWeightLabel();
 
@@ -10507,19 +18010,26 @@ function renderPoolConfigModal() {
   const hasUidOptions = Boolean(elements.poolConfigUidOptions?.querySelector('input[name="gatcha-pool-uid"]'));
   const hasFavlistOptions = Boolean(elements.poolConfigFavlistOptions?.querySelector('input[name="gatcha-pool-favlist"]'));
   [elements.poolConfigUidSelectAll, elements.poolConfigUidSelectNone].forEach((button) => {
-    if (button) button.disabled = state.poolConfigSaving || !hasUidOptions;
+    if (button) button.disabled = state.poolConfigLoading || state.poolConfigSaving || !hasUidOptions;
   });
   [elements.poolConfigFavlistSelectAll, elements.poolConfigFavlistSelectNone].forEach((button) => {
-    if (button) button.disabled = state.poolConfigSaving || !hasFavlistOptions;
+    if (button) button.disabled = state.poolConfigLoading || state.poolConfigSaving || !hasFavlistOptions;
   });
   if (elements.poolConfigModalReset) {
-    const detailLoaded = Array.isArray(data.uid_options) || Array.isArray(data.favlist_folder_options);
-    elements.poolConfigModalReset.disabled = state.poolConfigSaving || !detailLoaded;
+    elements.poolConfigModalReset.disabled = state.poolConfigLoading || state.poolConfigSaving || !detailLoaded;
   }
   if (elements.poolConfigModalSave) {
-    const detailLoaded = Array.isArray(data.uid_options) || Array.isArray(data.favlist_folder_options);
-    elements.poolConfigModalSave.disabled = state.poolConfigSaving || !detailLoaded;
+    elements.poolConfigModalSave.disabled = state.poolConfigLoading || state.poolConfigSaving || !detailLoaded;
     elements.poolConfigModalSave.textContent = state.poolConfigSaving ? t("gatcha.poolSaving") : t("gatcha.poolSave");
+    if (state.poolConfigSaving) {
+      elements.poolConfigModalSave.setAttribute("aria-busy", "true");
+    } else {
+      elements.poolConfigModalSave.removeAttribute("aria-busy");
+    }
+  }
+  if (elements.poolConfigMessage) {
+    elements.poolConfigMessage.textContent = state.poolConfigMessage || "";
+    elements.poolConfigMessage.classList.toggle("is-error", Boolean(state.poolConfigMessageIsError));
   }
 }
 
@@ -10527,86 +18037,180 @@ async function openPoolConfigModal() {
   if (!elements.poolConfigModal || !elements.poolConfigModal.classList.contains("hidden")) {
     return;
   }
+  const openGeneration = state.poolConfigOpenGeneration + 1;
+  const loadSequence = state.poolConfigLoadSequence + 1;
+  state.poolConfigOpenGeneration = openGeneration;
+  state.poolConfigLoadSequence = loadSequence;
+  state.poolConfigSaveSequence += 1;
+  state.poolConfigLoading = true;
   state.poolConfigSaving = false;
-  state.poolConfigData = state.data?.gatcha_pool_config || {};
+  state.poolConfigOpener = document.activeElement;
+  state.poolConfigRequester = selectedRequesterName();
+  state.poolConfigDraft = clonePoolConfigProjection(
+    {},
+  );
   elements.poolConfigModal.classList.remove("hidden");
-  renderPoolConfigModal();
   poolConfigSetMessage(t("gatcha.poolLoading"));
-  try {
-    state.poolConfigData = await fetchPoolConfig();
-    poolConfigSetMessage("");
-  } catch (error) {
-    poolConfigSetMessage(error.message, true);
-  }
   renderPoolConfigModal();
+  elements.poolConfigModalClose?.focus({ preventScroll: true });
+  try {
+    const loaded = await fetchPoolConfig(state.poolConfigRequester);
+    if (
+      state.poolConfigLoadSequence !== loadSequence
+      || state.poolConfigOpenGeneration !== openGeneration
+      || elements.poolConfigModal.classList.contains("hidden")
+    ) {
+      return false;
+    }
+    state.poolConfigAccepted = clonePoolConfigProjection(loaded);
+    state.poolConfigDraft = clonePoolConfigProjection(loaded);
+    poolConfigSetMessage("");
+    return true;
+  } catch (error) {
+    if (
+      state.poolConfigLoadSequence === loadSequence
+      && state.poolConfigOpenGeneration === openGeneration
+      && !elements.poolConfigModal.classList.contains("hidden")
+    ) {
+      poolConfigSetMessage(error.message, true);
+    }
+    return false;
+  } finally {
+    if (
+      state.poolConfigLoadSequence === loadSequence
+      && state.poolConfigOpenGeneration === openGeneration
+      && !elements.poolConfigModal.classList.contains("hidden")
+    ) {
+      state.poolConfigLoading = false;
+      renderPoolConfigModal();
+    }
+  }
 }
 
-function closePoolConfigModal() {
-  state.poolConfigData = null;
+function closePoolConfigModal({ restoreFocus = true } = {}) {
+  state.poolConfigOpenGeneration += 1;
+  state.poolConfigLoadSequence += 1;
+  state.poolConfigSaveSequence += 1;
+  state.poolConfigLoading = false;
   state.poolConfigSaving = false;
+  state.poolConfigDraft = null;
   elements.poolConfigModal?.classList.add("hidden");
   poolConfigSetMessage("");
+  const opener = state.poolConfigOpener;
+  state.poolConfigOpener = null;
+  if (restoreFocus) {
+    const openerIsVisible = opener?.isConnected
+      && !(typeof opener.closest === "function" && opener.closest("[hidden], [inert]"));
+    const focusTarget = openerIsVisible
+      ? opener
+      : hostWorkspaceButton(state.activeHostWorkspace);
+    focusTarget?.focus({ preventScroll: true });
+  }
+}
+
+function capturePoolConfigDraftFromControls() {
+  if (!state.poolConfigDraft) {
+    return null;
+  }
+  const uidWeight = Math.max(0, Math.min(100, Number(elements.poolConfigWeightSlider?.value || 50)));
+  state.poolConfigDraft = {
+    ...state.poolConfigDraft,
+    uid_weight: uidWeight,
+    favlist_weight: 100 - uidWeight,
+    excluded_uids: poolConfigExcludedValues("gatcha-pool-uid"),
+    excluded_favlist_folders: poolConfigExcludedValues("gatcha-pool-favlist"),
+  };
+  return state.poolConfigDraft;
 }
 
 function setPoolConfigChecked(name, checked) {
   document.querySelectorAll(`input[name="${name}"]`).forEach((input) => {
     input.checked = Boolean(checked);
   });
+  capturePoolConfigDraftFromControls();
 }
 
 function resetPoolConfigControls() {
-  if (elements.poolConfigWeightSlider) {
-    elements.poolConfigWeightSlider.value = "50";
+  if (!state.poolConfigDraft || state.poolConfigLoading || state.poolConfigSaving) {
+    return;
   }
-  updatePoolConfigWeightLabel();
-  setPoolConfigChecked("gatcha-pool-uid", true);
-  setPoolConfigChecked("gatcha-pool-favlist", true);
+  state.poolConfigDraft = {
+    ...state.poolConfigDraft,
+    uid_weight: 50,
+    favlist_weight: 50,
+    excluded_uids: [],
+    excluded_favlist_folders: [],
+  };
   poolConfigSetMessage("");
+  renderPoolConfigModal();
 }
 
 function poolConfigExcludedValues(name) {
-  return [...document.querySelectorAll(`input[name="${name}"]`)]
-    .filter((input) => !input.checked)
-    .map((input) => String(input.value || "").trim())
-    .filter(Boolean);
+  const inputs = [...document.querySelectorAll(`input[name="${name}"]`)];
+  const shown = new Set(inputs.map((input) => String(input.value || "").trim()));
+  const field = name === "gatcha-pool-uid" ? "excluded_uids" : "excluded_favlist_folders";
+  const retained = (state.poolConfigDraft?.[field] || []).filter((value) => !shown.has(String(value)));
+  return [...new Set([...retained, ...inputs.filter((input) => !input.checked)
+    .map((input) => String(input.value || "").trim()).filter(Boolean)])];
 }
 
 async function submitPoolConfigModal() {
-  if (state.poolConfigSaving) {
-    return;
+  if (state.poolConfigSaving || state.poolConfigLoading || !state.poolConfigDraft) {
+    return false;
   }
-  const uidWeight = Math.max(0, Math.min(100, Number(elements.poolConfigWeightSlider?.value || 50)));
+  const draft = capturePoolConfigDraftFromControls();
   const payload = {
-    uid_weight: uidWeight,
-    favlist_weight: 100 - uidWeight,
-    excluded_uids: poolConfigExcludedValues("gatcha-pool-uid"),
-    excluded_favlist_folders: poolConfigExcludedValues("gatcha-pool-favlist"),
+    uid_weight: draft.uid_weight,
+    favlist_weight: draft.favlist_weight,
+    excluded_uids: [...draft.excluded_uids],
+    excluded_favlist_folders: [...draft.excluded_favlist_folders],
   };
-  state.poolConfigData = {
-    ...(state.poolConfigData || {}),
-    ...payload,
-  };
+  const openGeneration = state.poolConfigOpenGeneration;
+  const saveSequence = state.poolConfigSaveSequence + 1;
+  state.poolConfigSaveSequence = saveSequence;
   state.poolConfigSaving = true;
-  renderPoolConfigModal();
   poolConfigSetMessage(t("gatcha.poolSaving"));
+  renderPoolConfigModal();
   try {
-    state.poolConfigData = await savePoolConfig(payload);
+    const saved = await savePoolConfig(payload, state.poolConfigRequester);
+    if (
+      state.poolConfigSaveSequence !== saveSequence
+      || state.poolConfigOpenGeneration !== openGeneration
+      || elements.poolConfigModal.classList.contains("hidden")
+    ) {
+      return false;
+    }
+    state.poolConfigAccepted = clonePoolConfigProjection(saved);
+    state.poolConfigDraft = clonePoolConfigProjection(saved);
     if (state.data) {
       state.data.gatcha_pool_config = {
-        uid_weight: state.poolConfigData.uid_weight,
-        favlist_weight: state.poolConfigData.favlist_weight,
-        excluded_uids: state.poolConfigData.excluded_uids || [],
-        excluded_favlist_folders: state.poolConfigData.excluded_favlist_folders || [],
-        updated_at: state.poolConfigData.updated_at || 0,
+        uid_weight: state.poolConfigAccepted.uid_weight,
+        favlist_weight: state.poolConfigAccepted.favlist_weight,
+        excluded_uids: state.poolConfigAccepted.excluded_uids || [],
+        excluded_favlist_folders: state.poolConfigAccepted.excluded_favlist_folders || [],
+        updated_at: state.poolConfigAccepted.updated_at || 0,
       };
     }
     closePoolConfigModal();
     setAppMessage(t("gatcha.poolSaved"));
+    return true;
   } catch (error) {
-    poolConfigSetMessage(error.message, true);
+    if (
+      state.poolConfigSaveSequence === saveSequence
+      && state.poolConfigOpenGeneration === openGeneration
+      && !elements.poolConfigModal.classList.contains("hidden")
+    ) {
+      poolConfigSetMessage(error.message, true);
+    }
+    return false;
   } finally {
-    state.poolConfigSaving = false;
-    if (elements.poolConfigModal && !elements.poolConfigModal.classList.contains("hidden")) {
+    if (
+      state.poolConfigSaveSequence === saveSequence
+      && state.poolConfigOpenGeneration === openGeneration
+      && elements.poolConfigModal
+      && !elements.poolConfigModal.classList.contains("hidden")
+    ) {
+      state.poolConfigSaving = false;
       renderPoolConfigModal();
     }
   }
@@ -10620,11 +18224,11 @@ async function confirmBindingModal() {
   const source = intent.source || "request-form";
   const { selectedVideoPage, selectedAudioPages } = currentBindingSelection();
   if (!selectedVideoPage) {
-    setMessageForSource(source, t("binding.selectVideoPart"), true);
+    setRequestActionMessage(t("binding.selectVideoPart"), true);
     return;
   }
   if (!selectedAudioPages.length) {
-    setMessageForSource(source, t("binding.selectAudioPart"), true);
+    setRequestActionMessage(t("binding.selectAudioPart"), true);
     return;
   }
 
@@ -10638,28 +18242,29 @@ async function confirmBindingModal() {
   }
 
   try {
-    state.data = await submitAddRequest(intent.url, intent.position || "tail", {
+    const accepted = await submitAddRequest(intent.url, intent.position || "tail", {
       requesterName: intent.requesterName || selectedRequesterName(),
       allowRepeat: Boolean(intent.allowRepeat),
       selectedVideoPage,
       selectedAudioPages,
     });
-    closeBindingModal();
-    if (intent.originatedFromDetail) {
-      searchDetailController?.close({ immediate: true });
+    if (!accepted && source === "gatcha") {
+      setRequestActionMessage(t("error.requestFailed"), true);
+      return;
     }
-    if (!intent.preserveInput) {
+    closeBindingModal({ restoreFocus: source !== "gatcha" });
+    if (intent.originatedFromDetail) {
+      if (typeof searchDetailController !== "undefined") searchDetailController?.close({ immediate: true });
+    }
+    if (source !== "gatcha" && !intent.preserveInput) {
       elements.urlInput.value = "";
     }
     if (source === "gatcha") {
-      state.gatchaCandidate = null;
-      elements.gatchaResultView.classList.add("hidden");
-      elements.gatchaInitView.classList.remove("hidden");
       setGatchaMessage(t("gatcha.nozomi"));
+      clearAcceptedGatchaCandidate();
     }
     const message = intent.position === "next" ? t("binding.addedNext") : t("binding.addedTail");
-    setMessageForSource(source, message);
-    setAppMessage(message);
+    setRequestActionMessage(message);
     render();
   } catch (error) {
     if (error.code === "manual_binding_required") {
@@ -10701,7 +18306,7 @@ async function confirmBindingModal() {
       });
       return;
     }
-    setMessageForSource(source, error.message, true);
+    setRequestActionMessage(error.message, true);
   } finally {
     if (button) {
       button.disabled = false;
@@ -10728,13 +18333,14 @@ async function handleAdd(position, anchorPoint) {
   let originalText = "";
   if (button) {
     button.disabled = true;
+    button.setAttribute("aria-busy", "true");
     originalText = button.textContent;
     button.textContent = t("search.adding") || "添加中...";
   }
 
   setFormMessage(t("request.parsing"));
   try {
-    state.data = await submitAddRequest(url, position, { requesterName });
+    await submitAddRequest(url, position, { requesterName });
     elements.urlInput.value = "";
     setFormMessage(position === "next" ? t("request.addedNext") : t("request.addedTail"));
     render();
@@ -10769,10 +18375,12 @@ async function handleAdd(position, anchorPoint) {
       setFormMessage(t("request.duplicateHint"));
       return;
     }
-    setFormMessage(error.message, true);
+    setFormMessage("");
+    setAppMessage(error.message, true);
   } finally {
     if (button) {
       button.disabled = false;
+      button.removeAttribute("aria-busy");
       button.textContent = originalText;
     }
   }
@@ -10790,16 +18398,15 @@ async function handleAddByUrl(
     return false;
   }
   const isHistory = source === "history";
-  setMessageForSource(source, isHistory ? t("history.addingFromHistory") : t("request.parsing"));
+  setRequestActionMessage(isHistory ? t("history.addingFromHistory") : t("request.parsing"));
   try {
-    state.data = await submitAddRequest(url, position, { requesterName });
+    await submitAddRequest(url, position, { requesterName });
     const message = isHistory
       ? (position === "next" ? t("history.addedNext") : t("history.addedTail"))
       : (position === "next" ? t("request.addedNext") : t("request.addedTail"));
-    setMessageForSource(source, message);
-    setAppMessage(message);
+    setRequestActionMessage(message);
     if (originatedFromDetail) {
-      searchDetailController?.close({ immediate: true });
+      if (typeof searchDetailController !== "undefined") searchDetailController?.close({ immediate: true });
     }
     render();
     return true;
@@ -10835,17 +18442,17 @@ async function handleAddByUrl(
         x: anchorPoint?.x ?? anchorPointForEvent({}, isHistory ? elements.historyList : elements.addForm).x,
         y: anchorPoint?.y ?? anchorPointForEvent({}, isHistory ? elements.historyList : elements.addForm).y,
       });
-      setMessageForSource(source, t("request.duplicateHint"));
+      setRequestActionMessage(t("request.duplicateHint"));
       return false;
     }
-    setMessageForSource(source, error.message, true);
+    setRequestActionMessage(error.message, true);
     return false;
   }
 }
 
 async function discardBackup() {
   try {
-    state.data = await apiPost("/api/backup/discard");
+    await apiPostStateSnapshot("/api/backup/discard");
     dismissBackupBanner();
     closeConfirm();
     setAppMessage(t("backup.cleared"));
@@ -10857,7 +18464,7 @@ async function discardBackup() {
 
 async function continuePreviousSession() {
   try {
-    state.data = await apiPost("/api/session/continue-previous");
+    await apiPostStateSnapshot("/api/session/continue-previous");
     state.previousSessionPromptEligible = false;
     dismissBackupBanner();
     setAppMessage(t("backup.previousSessionContinued"));
@@ -10872,7 +18479,7 @@ async function continuePreviousSession() {
 
 async function clearPlaylist() {
   try {
-    state.data = await apiPost("/api/playlist/clear");
+    await apiPostStateSnapshot("/api/playlist/clear");
     closeConfirm();
     setAppMessage(t("list.cleared"));
     render();
@@ -10883,7 +18490,7 @@ async function clearPlaylist() {
 
 async function clearHistory() {
   try {
-    state.data = await apiPost("/api/history/clear");
+    await apiPostStateSnapshot("/api/history/clear");
     closeConfirm();
     setAppMessage(t("history.cleared"));
     render();
@@ -10965,8 +18572,8 @@ function updateConfirmHistoryExportPageSize() {
   state.confirmPopoverRenderSignature = "";
 }
 
-async function loadPlayedSessions() {
-  if (!elements.confirmSource) return;
+async function fetchPlayedSessions() {
+  if (!elements.confirmSource) return false;
   try {
     const response = await fetch("/api/played-sessions", {
       headers: clientHeaders(),
@@ -10993,9 +18600,10 @@ async function loadPlayedSessions() {
       historyOpt.dataset.i18n = "history.allSource";
       elements.confirmSource.appendChild(historyOpt);
 
-      // 3. 历史场次 (限制显示最近 10 场)
+      // Native archives are bounded by AppState; keep every saved session selectable.
       const rawSessions = res.data;
-      const displaySessions = rawSessions.slice(0, 10);
+      const displaySessions = document.documentElement?.dataset?.nativeHost === "true"
+        ? rawSessions : rawSessions.slice(0, 10);
 
       // Helper to parse filename as fallback if backend returns old model
       const parseSessionId = (id) => {
@@ -11027,6 +18635,11 @@ async function loadPlayedSessions() {
       // Group displaySessions by year and month
       const groups = [];
       displaySessions.forEach(session => {
+        if (Number.isFinite(session.started_at) && session.started_at > 0) {
+          const date = new Date(session.started_at * 1000);
+          session = { ...session, year: date.getFullYear(), month: date.getMonth() + 1,
+            day: date.getDate(), hour: date.getHours(), minute: date.getMinutes() };
+        }
         const parsed = (session.year > 0 && session.month > 0)
           ? session
           : (parseSessionId(session.id) || { year: 0, month: 0, day: 0, hour: 0, minute: 0 });
@@ -11096,9 +18709,31 @@ async function loadPlayedSessions() {
       if ([...elements.confirmSource.options].some(opt => opt.value === currentVal)) {
         elements.confirmSource.value = currentVal;
       }
+      return true;
     }
   } catch (error) {
     console.error("加载场次列表失败:", error);
+  }
+  return false;
+}
+
+async function loadPlayedSessions() {
+  if (state.playedSessionsLoaded) {
+    return true;
+  }
+  if (state.playedSessionsLoadPromise) {
+    return state.playedSessionsLoadPromise;
+  }
+  const request = fetchPlayedSessions();
+  state.playedSessionsLoadPromise = request;
+  try {
+    const loaded = await request;
+    state.playedSessionsLoaded = Boolean(loaded);
+    return state.playedSessionsLoaded;
+  } finally {
+    if (state.playedSessionsLoadPromise === request) {
+      state.playedSessionsLoadPromise = null;
+    }
   }
 }
 
@@ -11108,6 +18743,10 @@ async function downloadHistoryExport(format, source = "played", pageSize = 200) 
   const normalizedPageSize = normalizedHistoryExportPageSize(pageSize);
   if (!["csv", "image"].includes(normalizedFormat)) {
     return;
+  }
+  if (document.documentElement?.dataset?.nativeHost === "true" && document.documentElement?.dataset?.hostPlatform !== "desktop") {
+    if (!window.BilikaraAndroidExport) throw new Error("Android 系统保存功能不可用，请更新系统 WebView 后重试");
+    return window.BilikaraAndroidExport.saveHistory(normalizedFormat, normalizedSource, normalizedPageSize);
   }
   const params = new URLSearchParams({
     format: normalizedFormat,
@@ -11177,6 +18816,13 @@ function diagnosticBrowserInfo() {
   };
 }
 
+function internetRemoteDiagnosticsSnapshot() {
+  const diagnostics = window.BilikaraInternetRemoteDiagnostics;
+  return diagnostics && typeof diagnostics.getSnapshot === "function"
+    ? diagnostics.getSnapshot()
+    : [];
+}
+
 function setDiagnosticsBusy(busy) {
   state.diagnosticsBusy = Boolean(busy);
   if (elements.diagnosticCopyButton) {
@@ -11184,6 +18830,8 @@ function setDiagnosticsBusy(busy) {
   }
   if (elements.diagnosticPackageButton) {
     elements.diagnosticPackageButton.disabled = state.diagnosticsBusy;
+    if (state.diagnosticsBusy) elements.diagnosticPackageButton.setAttribute("aria-busy", "true");
+    else elements.diagnosticPackageButton.removeAttribute("aria-busy");
   }
 }
 
@@ -11197,7 +18845,9 @@ async function diagnosticResponse(path) {
     headers: clientHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify({
       browser: diagnosticBrowserInfo(),
+      native_environment: await globalThis.BilikaraAndroidPlatform?.environment?.().catch(() => ({})),
       export_diagnostics: exportDiagnostics,
+      internet_remote_diagnostics: internetRemoteDiagnosticsSnapshot(),
     }),
   });
   if (!response.ok) {
@@ -11214,10 +18864,11 @@ async function diagnosticResponse(path) {
 }
 
 async function generateDiagnosticsMarkdown() {
+  await globalThis.BilikaraAndroidPresentation?.refreshDiagnostics().catch(() => {});
   const response = await diagnosticResponse("/api/diagnostics/markdown");
   const payload = await response.json();
   return typeof payload?.data?.markdown === "string"
-    ? payload.data.markdown
+    ? payload.data.markdown + (globalThis.BilikaraHostLayout?.diagnosticsMarkdown?.() || "")
     : "";
 }
 
@@ -11283,6 +18934,7 @@ async function downloadDiagnosticsPackage() {
       JSON.stringify({
         browser: diagnosticBrowserInfo(),
         export_diagnostics: exportDiagnostics,
+        internet_remote_diagnostics: internetRemoteDiagnosticsSnapshot(),
       }),
       t("service.diagnosticsFailed"),
       { format: "zip", source: "diagnostics", surface: "host" },
@@ -11326,16 +18978,16 @@ async function downloadDiagnosticsPackage() {
 
 async function resetRuntimeData() {
   try {
-    teardownMountedPlayer();
-    disposeSharedAudioContext();
-    state.playerSignature = "";
-    state.playerContext = null;
-    state.data = await apiPost("/api/data/reset");
-    closeConfirm();
-    dismissBackupBanner();
-    state.listView = "queue";
-    setAppMessage(t("service.dataCleared"));
-    render();
+    await apiPostStateSnapshot("/api/data/reset", {}, {
+      onAccepted: () => {
+        teardownMountedPlayer();
+        disposeSharedAudioContext();
+        closeConfirm();
+        dismissBackupBanner();
+        setAppMessage(t("service.dataCleared"));
+        render();
+      },
+    });
   } catch (error) {
     setAppMessage(error.message, true);
   }
@@ -11343,36 +18995,103 @@ async function resetRuntimeData() {
 
 async function resetPlayerState() {
   try {
-    teardownMountedPlayer();
-    disposeSharedAudioContext();
-    state.playerSignature = "";
-    state.playerContext = null;
-    state.localPlayerVolume = 1;
-    state.localPlayerMuted = false;
-    state.playerSettingsEchoSuppressUntil = 0;
-    state.volumeSaveSeq += 1;
-    state.avOffsetSaving = false;
-    persistLocalVolumePreferences();
-    state.data = await apiPost("/api/player/reset");
-    closeConfirm();
-    render();
-    setAppMessage(t("service.playerReset"));
+    await apiPostStateSnapshot("/api/player/reset", {}, {
+      onAccepted: () => {
+        teardownMountedPlayer();
+        disposeSharedAudioContext();
+        state.localPlayerVolume = 1;
+        state.localPlayerMuted = false;
+        state.playerSettingsEchoSuppressUntil = 0;
+        state.volumeSaveSeq += 1;
+        state.avOffsetSaving = false;
+        persistLocalVolumePreferences();
+        closeConfirm();
+        render();
+        setAppMessage(t("service.playerReset"));
+      },
+    });
   } catch (error) {
     setAppMessage(error.message, true);
   }
 }
 
-async function installAppUpdate(includePreview = false) {
-  try {
-    const updateStatus = await apiPost("/api/app/update/install", {
-      include_preview: Boolean(includePreview),
-    });
-    if (state.data) {
-      state.data = {
-        ...state.data,
-        app_update: updateStatus,
-      };
+async function requestAppUpdateCheck({ automatic = false, force = false } = {}) {
+  const includePreview = Boolean(state.updatePreviewEnabled);
+  const channel = includePreview ? "preview" : "stable";
+  if (automatic) {
+    if (
+      !state.updateAutomaticEnabled
+      || (!force && state.updateAutomaticAttemptedChannels.has(channel))
+    ) {
+      return false;
     }
+  }
+  if (state.updateCheckRequestInFlight) {
+    if (automatic) state.startupUpdateCheckScheduled = false;
+    return false;
+  }
+  const currentUpdate = appUpdateStatus();
+  if (isAppUpdateBusy(currentUpdate)) {
+    if (automatic) state.startupUpdateCheckScheduled = false;
+    return false;
+  }
+
+  if (automatic) state.updateAutomaticAttemptedChannels.add(channel);
+  state.updateCheckRequestInFlight = true;
+  if (!automatic) {
+    state.updateManualVisibleChannel = "";
+    state.manualUpdateCheck = {
+      includePreview,
+      startedAt: Number(currentUpdate?.updated_at || 0),
+    };
+  }
+  renderUpdatePreviewControl();
+  try {
+    await apiPost("/api/app/update/check", {
+      include_preview: includePreview,
+      native_environment: await globalThis.BilikaraHostUpdates?.environment(),
+    }, { timeoutMs: appUpdateCheckTimeoutMs });
+    return true;
+  } catch (error) {
+    if (automatic && error?.code === "update_busy") {
+      state.updateAutomaticAttemptedChannels.delete(channel);
+      state.startupUpdateCheckScheduled = false;
+    }
+    if (!automatic) {
+      state.manualUpdateCheck = null;
+      setAppMessage(error?.message || t("service.updateFailed"), true);
+    }
+    return false;
+  } finally {
+    state.updateCheckRequestInFlight = false;
+    renderUpdatePreviewControl();
+  }
+}
+
+function scheduleStartupAppUpdateCheck() {
+  if (state.data?.capabilities?.app_update === false) return false;
+  if (state.startupUpdateCheckScheduled || !state.hasValidStateResponse) {
+    return false;
+  }
+  if (state.updateCheckRequestInFlight || isAppUpdateBusy()) return false;
+  state.startupUpdateCheckScheduled = true;
+  if (!state.updateAutomaticEnabled) {
+    return false;
+  }
+  requestAppUpdateCheck({ automatic: true }).catch(() => {});
+  return true;
+}
+
+async function installAppUpdate(includePreview = false) {
+  if (state.updateInstallRequestInFlight || isAppUpdateBusy()) return;
+  state.updateInstallRequestInFlight = true;
+  renderUpdatePreviewControl();
+  closeConfirm();
+  try {
+    const updateStatus = globalThis.BilikaraHostUpdates
+      ? await globalThis.BilikaraHostUpdates.install(Boolean(includePreview))
+      : await apiPost("/api/app/update/install", { include_preview: Boolean(includePreview) });
+    if (state.data) state.data.app_update = updateStatus;
     closeConfirm();
     renderUpdatePreviewControl();
     const stateValue = String(updateStatus?.state || "");
@@ -11382,118 +19101,108 @@ async function installAppUpdate(includePreview = false) {
     );
   } catch (error) {
     setAppMessage(error?.message || t("service.updateFailed"), true);
-  }
-}
-
-async function checkAppUpdate(event) {
-  if (state.updateChecking || isAppUpdateBusy()) {
-    return;
-  }
-  const button = elements.updateCheckButton;
-  const point = anchorPointForEvent(event, button || elements.cacheSettings);
-  state.updateChecking = true;
-  renderUpdatePreviewControl();
-  const controller = typeof AbortController === "function" ? new AbortController() : null;
-  const timeoutId = controller
-    ? window.setTimeout(() => controller.abort(), appUpdateCheckTimeoutMs)
-    : null;
-  try {
-    const query = state.updatePreviewEnabled ? "?include_preview=1" : "";
-    const result = await apiGet(`/api/app/update${query}`, { signal: controller?.signal });
-    const updateAction = String(result?.update_action || "");
-    const installableActions = new Set([
-      "normal_upgrade",
-      "preview_to_stable",
-      "development_to_stable",
-      "development_to_preview",
-    ]);
-    const updateInstallable = updateAction
-      ? installableActions.has(updateAction)
-      : Boolean(result?.update_installable ?? (result?.update_available || result?.switch_to_release_available));
-
-    if (updateInstallable) {
-      const isChannelSwitch = updateAction === "preview_to_stable"
-        || updateAction === "development_to_stable"
-        || updateAction === "development_to_preview"
-        || (!updateAction && result?.switch_to_release_available === true);
-      const fallbackMessage = isChannelSwitch
-        ? t("service.switchReleasePrompt")
-        : t("service.updateFoundPrompt");
-      const updateMessage = result?.message || fallbackMessage;
-      const canAutoInstall = Boolean(result?.auto_update_supported);
-      openConfirm({
-        type: canAutoInstall ? "install-app-update" : "open-release",
-        includePreview: state.updatePreviewEnabled,
-        releaseUrl: result.release_url,
-        message: canAutoInstall
-          ? t("service.installUpdatePrompt", { message: updateMessage })
-          : t("service.openReleaseWithMessage", { message: updateMessage }),
-        primaryLabel: canAutoInstall ? t("service.installUpdate") : t("service.openReleases"),
-        ...point,
-        anchorElementId: button?.id || "update-check-button",
-        anchorAlign: "end",
-        anchorGap: 8,
-      });
-      return;
-    }
-    setAppMessage(t("service.upToDate"));
-  } catch (error) {
-    const message = error?.name === "AbortError"
-      ? t("service.updateTimeout")
-      : error?.message || t("service.updateFailed");
-    setAppMessage(message, true);
   } finally {
-    if (timeoutId !== null) {
-      window.clearTimeout(timeoutId);
-    }
-    state.updateChecking = false;
+    state.updateInstallRequestInFlight = false;
     renderUpdatePreviewControl();
   }
 }
 
-
-async function addSessionUser() {
-  const name = String(elements.sessionUserInput.value || "").trim();
-  if (!name) {
-    setAppMessage(t("session.nameRequired"), true);
+async function checkAppUpdate(event) {
+  if (state.updateCheckRequestInFlight || isAppUpdateBusy()) {
     return;
   }
+  const update = appUpdateStatus();
+  if (!shouldPresentCurrentChannelUpdate(update)) {
+    await requestAppUpdateCheck({ automatic: false });
+    return;
+  }
+
+  if (!update?.auto_update_supported) {
+    if (globalThis.BilikaraHostUpdates?.manualRelease === false) {
+      setAppMessage(update.message || "当前测试包暂不支持正式签名包覆盖更新。");
+      return;
+    }
+    const releaseUrl = safeHttpUrl(update?.release_url);
+    if (releaseUrl) {
+      openExternalUrl(releaseUrl);
+      setAppMessage(t("service.openedReleases"));
+    } else {
+      setAppMessage(t("service.updateReleaseUrlInvalid"), true);
+    }
+    return;
+  }
+
+  const button = elements.updateCheckButton;
+  const point = anchorPointForEvent(event, button || elements.cacheSettings);
+  openConfirm({
+    type: "install-app-update",
+    includePreview: Boolean(update.include_preview),
+    releaseUrl: update.release_url,
+    // Host status messages are not translated; the prompt uses the UI language.
+    message: t("service.installUpdatePrompt", {
+      message: t(globalThis.BilikaraHostUpdates?.manualRelease
+        ? "service.desktopUpdateFound"
+        : "service.updateFoundPrompt"),
+    }),
+    primaryLabel: t("service.update"),
+    ...point,
+    anchorElementId: button?.id || "update-check-button",
+    anchorAlign: "end",
+    anchorGap: 8,
+  });
+}
+
+
+async function addSessionUser() {
+  const button = elements.sessionUserForm.querySelector('[type="submit"]');
+  if (button.disabled) return;
+  const draft = elements.sessionUserInput.value;
+  const name = String(draft || "").trim();
+  if (!name || Array.from(name).length > 24) {
+    setAppMessage(t(name ? "session.nameLength" : "session.nameRequired"), true);
+    return;
+  }
+  button.disabled = true; button.setAttribute("aria-busy", "true");
+  const originalText = button.textContent;
+  button.textContent = t("remoteIdentity.saving");
   try {
-    state.data = await apiPost("/api/session-users/add", { name });
-    elements.sessionUserInput.value = "";
+    await apiPostStateSnapshot("/api/session-users/add", { name });
+    if (elements.sessionUserInput.value === draft) elements.sessionUserInput.value = "";
     setAppMessage(t("session.added", { name }));
     render();
   } catch (error) {
     setAppMessage(error.message, true);
+  } finally {
+    button.disabled = false; button.removeAttribute("aria-busy"); button.textContent = originalText;
   }
 }
 
-async function moveSessionUser(name, index) {
-  try {
-    state.data = await apiPost("/api/session-users/reorder", { name, index });
-    setAppMessage(t("session.orderUpdated"));
-    render();
-  } catch (error) {
-    setAppMessage(error.message, true);
-  }
-}
 
-async function removeSessionUser(name) {
-  try {
-    state.data = await apiPost("/api/session-users/remove", { name });
-    if (elements.requesterSelect.value === name) {
-      elements.requesterSelect.value = "";
-    }
-    setAppMessage(t("session.removed", { name }));
-    render();
-  } catch (error) {
-    setAppMessage(error.message, true);
+async function advanceLocalPlayerNow({
+  showTransition = true,
+  session = null,
+  expectedPlaybackGeneration: issuedPlaybackGeneration = null,
+} = {}) {
+  if (
+    session
+    && !isCurrentHostPlaybackSession(session, session.video, session.audio)
+  ) {
+    return false;
   }
-}
-
-async function advanceLocalPlayerNow({ showTransition = true } = {}) {
   if (state.localAdvanceInFlight) {
-    return;
+    return false;
+  }
+  const expectedPlaybackGeneration = issuedPlaybackGeneration
+    ?? session?.playbackGeneration
+    ?? state.data?.playback_generation;
+  if (
+    !isSafeHostSnapshotInteger(expectedPlaybackGeneration, 1)
+    || (
+      issuedPlaybackGeneration !== null
+      && state.data?.playback_generation !== expectedPlaybackGeneration
+    )
+  ) {
+    return false;
   }
   const shouldResumeOnFailure = state.localShouldBePlaying;
   const nextItemId = String(queuedNextItem()?.id || "");
@@ -11506,10 +19215,62 @@ async function advanceLocalPlayerNow({ showTransition = true } = {}) {
       ? registerManualTransitionHold(nextItemId)
       : 0
   );
+  const localAdvanceOwnershipToken = state.localAdvanceDelayToken;
+  const releaseOwnedLocalAdvance = () => {
+    const ownsLocalAdvance = Boolean(
+      state.localAdvanceDelayToken === localAdvanceOwnershipToken
+      && !state.pendingSongTransitionOverlayData
+      && state.pendingSongTransitionGeneration === 0
+      && (
+        transitionGeneration > 0
+          ? transitionGeneration === state.manualTransitionHoldGeneration
+          : state.manualTransitionHoldGeneration === 0
+      )
+    );
+    if (!ownsLocalAdvance) {
+      return false;
+    }
+    clearLocalAdvanceDelay({ resetInFlight: true });
+    if (
+      state.data?.playback_generation === expectedPlaybackGeneration
+      && (
+        !session
+        || isCurrentHostPlaybackSession(session, session.video, session.audio)
+      )
+    ) {
+      state.localShouldBePlaying = shouldResumeOnFailure;
+      syncMountedLocalPlayer(true);
+    }
+    return true;
+  };
   state.localAdvanceInFlight = true;
   try {
     const previousData = state.data;
-    state.data = await apiPost("/api/player/next");
+    const outcome = await apiPostExactStateCommand("/api/player/next", {
+      playback_generation: expectedPlaybackGeneration,
+    });
+    if (!outcome.commandApplied) {
+      releaseOwnedLocalAdvance();
+      return false;
+    }
+    if (!outcome.snapshotAccepted) {
+      if (
+        nextItemId
+        && currentItemIdFromData(state.data) === nextItemId
+        && state.data?.playback_generation > expectedPlaybackGeneration
+      ) {
+        if (showTransition && transitionGeneration) {
+          maybeShowSongTransitionOverlay(previousData, state.data, {
+            force: true,
+            generation: transitionGeneration,
+          });
+        }
+        render();
+        return true;
+      }
+      releaseOwnedLocalAdvance();
+      return false;
+    }
     if (showTransition && transitionGeneration) {
       maybeShowSongTransitionOverlay(previousData, state.data, {
         force: true,
@@ -11517,13 +19278,11 @@ async function advanceLocalPlayerNow({ showTransition = true } = {}) {
       });
     }
     render();
+    return true;
   } catch (error) {
-    if (transitionGeneration === state.manualTransitionHoldGeneration) {
-      clearLocalAdvanceDelay({ resetInFlight: true });
-      state.localShouldBePlaying = shouldResumeOnFailure;
-      syncMountedLocalPlayer(true);
-    }
+    releaseOwnedLocalAdvance();
     setAppMessage(error.message, true);
+    return false;
   } finally {
     if (!shouldHoldCurrentItemForTransition(state.data?.current_item)) {
       state.localAdvanceInFlight = false;
@@ -11531,54 +19290,144 @@ async function advanceLocalPlayerNow({ showTransition = true } = {}) {
   }
 }
 
-async function requestNextTrack() {
-  await handleLocalPlaybackEnded("manual-next");
+async function requestNextTrack(expectedPlaybackGeneration = null) {
+  if (
+    expectedPlaybackGeneration !== null
+    && (
+      !isSafeHostSnapshotInteger(expectedPlaybackGeneration, 1)
+      || state.data?.playback_generation !== expectedPlaybackGeneration
+    )
+  ) {
+    return false;
+  }
+  const session = state.hostPlaybackSession;
+  const capturedSession = isCurrentHostPlaybackSession(
+    session,
+    session?.video,
+    session?.audio,
+  ) ? session : null;
+  const advanced = await handleLocalPlaybackEnded(
+    "manual-next",
+    capturedSession,
+    expectedPlaybackGeneration,
+  );
+  if (advanced) showPresentationOperationFeedback({ kind: "next", value: "" });
+  return advanced;
 }
 
-async function handleLocalPlaybackEnded(reason = "media-ended") {
+async function handleLocalPlaybackEnded(
+  reason = "media-ended",
+  session = null,
+  expectedPlaybackGeneration = null,
+) {
+  if (
+    session
+    && !isCurrentHostPlaybackSession(session, session.video, session.audio)
+  ) {
+    return false;
+  }
   if (state.localAdvanceInFlight) {
-    return;
+    return false;
   }
   const delaySeconds = currentSongAdvanceDelaySeconds();
   if (delaySeconds <= 0 || !queuedNextItem()) {
-    await advanceLocalPlayerNow({ showTransition: false });
-    return;
+    return advanceLocalPlayerNow({
+      showTransition: false,
+      session,
+      expectedPlaybackGeneration,
+    });
   }
-  await advanceLocalPlayerNow({ showTransition: true });
+  return advanceLocalPlayerNow({
+    showTransition: true,
+    session,
+    expectedPlaybackGeneration,
+  });
 }
 
-async function reorderPlaylist(itemId, index) {
-  state.data = await apiPost("/api/playlist/reorder", { item_id: itemId, index });
+async function reorderPlaylist(itemId, index, queueVersion) {
+  const accepted = await apiPostStateSnapshot("/api/playlist/reorder", { item_id: itemId, index, expected_queue_version: queueVersion });
   render();
+  return accepted;
 }
 
 async function resortPlaylistByCycle() {
-  state.data = await apiPost("/api/playlist/resort");
+  await apiPostStateSnapshot("/api/playlist/resort");
   setAppMessage(t("list.resorted"));
   render();
 }
 
 async function setCacheLimit(maxCacheItems) {
+  state.cacheLimitDraftValue = maxCacheItems;
+  state.cacheLimitQueuedValue = maxCacheItems;
+  renderCacheSlider(state.data?.cache_policy);
   if (state.cacheLimitSaving) {
     return;
   }
 
   const currentValue = Number(state.data?.cache_policy?.max_cache_items || 0);
   if (maxCacheItems === currentValue) {
+    state.cacheLimitDraftValue = null;
+    state.cacheLimitQueuedValue = null;
+    renderCacheSlider(state.data?.cache_policy);
     return;
   }
 
   state.cacheLimitSaving = true;
   renderCacheSlider(state.data?.cache_policy);
   try {
-    state.data = await apiPost("/api/cache-policy", { max_cache_items: maxCacheItems });
-    setAppMessage(t("service.cacheLimitUpdated", { count: maxCacheItems }));
-    render();
-  } catch (error) {
-    setAppMessage(error.message, true);
-    render();
+    while (state.cacheLimitQueuedValue !== null) {
+      const submittedValue = state.cacheLimitQueuedValue;
+      state.cacheLimitQueuedValue = null;
+      if (submittedValue === Number(state.data?.cache_policy?.max_cache_items || 0)) {
+        if (state.cacheLimitDraftValue === submittedValue) {
+          state.cacheLimitDraftValue = null;
+        }
+        continue;
+      }
+
+      const requestSequence = state.cacheLimitRequestSequence + 1;
+      state.cacheLimitRequestSequence = requestSequence;
+      state.cacheLimitActiveRequestSequence = requestSequence;
+      state.cacheLimitSubmittedValue = submittedValue;
+      let acknowledged = false;
+      let requestError = null;
+      try {
+        await apiPostStateSnapshot(
+          "/api/cache-policy",
+          { max_cache_items: submittedValue },
+          {
+            onAccepted() {
+              acknowledged = Number(
+                state.data?.cache_policy?.max_cache_items || 0,
+              ) === submittedValue;
+            },
+          },
+        );
+      } catch (error) {
+        requestError = error;
+      }
+      if (state.cacheLimitActiveRequestSequence !== requestSequence) {
+        continue;
+      }
+      if (state.cacheLimitDraftValue === submittedValue) {
+        state.cacheLimitDraftValue = null;
+      }
+      if (state.cacheLimitQueuedValue === submittedValue) {
+        state.cacheLimitQueuedValue = null;
+      }
+      state.cacheLimitSubmittedValue = null;
+      state.cacheLimitActiveRequestSequence = 0;
+      if (requestError) {
+        setAppMessage(requestError.message, true);
+      } else if (acknowledged) {
+        setAppMessage(t("service.cacheLimitUpdated", { count: submittedValue }));
+      }
+      render();
+    }
   } finally {
     state.cacheLimitSaving = false;
+    state.cacheLimitSubmittedValue = null;
+    state.cacheLimitActiveRequestSequence = 0;
     if (state.data) {
       renderCacheSlider(state.data.cache_policy);
     }
@@ -11586,26 +19435,75 @@ async function setCacheLimit(maxCacheItems) {
 }
 
 async function setAdvanceDelay(delaySeconds) {
+  state.advanceDelayDraftValue = delaySeconds;
+  state.advanceDelayQueuedValue = delaySeconds;
+  renderAdvanceDelaySlider(state.data?.player_settings);
   if (state.advanceDelaySaving) {
     return;
   }
 
   const currentValue = currentSongAdvanceDelaySeconds();
   if (delaySeconds === currentValue) {
+    state.advanceDelayDraftValue = null;
+    state.advanceDelayQueuedValue = null;
+    renderAdvanceDelaySlider(state.data?.player_settings);
     return;
   }
 
   state.advanceDelaySaving = true;
   renderAdvanceDelaySlider(state.data?.player_settings);
   try {
-    state.data = await apiPost("/api/player/advance-delay", { delay_seconds: delaySeconds });
-    setAppMessage(t("service.advanceDelayUpdated", { seconds: delaySeconds }));
-    render();
-  } catch (error) {
-    setAppMessage(error.message, true);
-    render();
+    while (state.advanceDelayQueuedValue !== null) {
+      const submittedValue = state.advanceDelayQueuedValue;
+      state.advanceDelayQueuedValue = null;
+      if (submittedValue === currentSongAdvanceDelaySeconds()) {
+        if (state.advanceDelayDraftValue === submittedValue) {
+          state.advanceDelayDraftValue = null;
+        }
+        continue;
+      }
+
+      const requestSequence = state.advanceDelayRequestSequence + 1;
+      state.advanceDelayRequestSequence = requestSequence;
+      state.advanceDelayActiveRequestSequence = requestSequence;
+      state.advanceDelaySubmittedValue = submittedValue;
+      let acknowledged = false;
+      let requestError = null;
+      try {
+        await apiPostStateSnapshot(
+          "/api/player/advance-delay",
+          { delay_seconds: submittedValue },
+          {
+            onAccepted() {
+              acknowledged = currentSongAdvanceDelaySeconds() === submittedValue;
+            },
+          },
+        );
+      } catch (error) {
+        requestError = error;
+      }
+      if (state.advanceDelayActiveRequestSequence !== requestSequence) {
+        continue;
+      }
+      if (state.advanceDelayDraftValue === submittedValue) {
+        state.advanceDelayDraftValue = null;
+      }
+      if (state.advanceDelayQueuedValue === submittedValue) {
+        state.advanceDelayQueuedValue = null;
+      }
+      state.advanceDelaySubmittedValue = null;
+      state.advanceDelayActiveRequestSequence = 0;
+      if (requestError) {
+        setAppMessage(requestError.message, true);
+      } else if (acknowledged) {
+        setAppMessage(t("service.advanceDelayUpdated", { seconds: submittedValue }));
+      }
+      render();
+    }
   } finally {
     state.advanceDelaySaving = false;
+    state.advanceDelaySubmittedValue = null;
+    state.advanceDelayActiveRequestSequence = 0;
     if (state.data) {
       renderAdvanceDelaySlider(state.data.player_settings);
     }
@@ -11617,7 +19515,7 @@ function isDownkyiDownloadSource(downloadSource) {
 }
 
 function currentCacheDownloadSource() {
-  return String(state.data?.cache_policy?.download_source || "bbdown");
+  return String(state.data?.cache_policy?.download_source || "native");
 }
 
 function restoreCacheDownloadSourceSelect() {
@@ -11707,7 +19605,7 @@ async function prepareDownloadSourceAndApply(intent) {
   setAppMessage(t("service.aria2cPreparing"));
   try {
     await apiPost("/api/cache-downloader/prepare", { download_source: downloadSource });
-    state.data = await apiPost("/api/cache-policy", { download_source: downloadSource });
+    await apiPostStateSnapshot("/api/cache-policy", { download_source: downloadSource });
     closeConfirm();
     setAppMessage(t("service.downloadSourceUpdated", { source: intent.selectedLabel || downloadSource }));
     render();
@@ -11729,7 +19627,7 @@ async function setCachePolicyPreference(payload, successMessage) {
   state.cachePolicySaving = true;
   renderCachePolicyControls(state.data?.cache_policy);
   try {
-    state.data = await apiPost("/api/cache-policy", payload);
+    await apiPostStateSnapshot("/api/cache-policy", payload);
     setAppMessage(successMessage);
     render();
   } catch (error) {
@@ -11766,13 +19664,10 @@ async function dispatchAvDelayAction(action) {
       action,
       { timeoutMs: avDelayRequestTimeoutMs },
     );
-    state.data = {
-      ...state.data,
-      player_settings: {
-        ...state.data?.player_settings,
-        av_offset_ms: Number(decision?.effective_delay_ms || 0),
-        av_delay: decision,
-      },
+    state.data.player_settings = {
+      ...state.data?.player_settings,
+      av_offset_ms: Number(decision?.effective_delay_ms || 0),
+      av_delay: decision,
     };
     render();
     resyncMountedLocalPlayerIfOffsetChanged(previousOffsetMs);
@@ -11802,20 +19697,36 @@ async function handlePlaylistAction(button) {
     remove: ["/api/playlist/remove", { item_id: itemId }],
     "move-next": ["/api/playlist/move-next", { item_id: itemId }],
     "play-now": ["/api/playlist/play-now", { item_id: itemId }],
-    "retry-cache": ["/api/cache/retry", { item_id: itemId }],
+    "retry-cache": [
+      "/api/cache/retry",
+      {
+        item_id: itemId,
+        expected_item_incarnation_id: button.dataset.itemIncarnationId,
+      },
+    ],
   };
 
   const target = actionMap[action];
   if (!target) {
     return;
   }
+  if (
+    action === "play-now"
+    && manualTransitionOverlaySeconds(state.data) > 0
+    && state.localAdvanceInFlight
+  ) {
+    return;
+  }
+  if (button.getAttribute("aria-busy") === "true") {
+    return;
+  }
+  const originallyDisabled = button.disabled;
+  button.disabled = true;
+  button.setAttribute("aria-busy", "true");
 
   const shouldResumeOnFailure = state.localShouldBePlaying;
   let transitionGeneration = 0;
   if (action === "play-now" && manualTransitionOverlaySeconds(state.data) > 0) {
-    if (state.localAdvanceInFlight) {
-      return;
-    }
     clearLocalAdvanceDelay();
     state.pendingSongTransitionOverlayData = null;
     state.pendingSongTransitionGeneration = 0;
@@ -11824,7 +19735,21 @@ async function handlePlaylistAction(button) {
   }
   try {
     const previousData = state.data;
-    state.data = await apiPost(target[0], target[1]);
+    const outcome = action === "retry-cache"
+      ? await apiPostExactStateCommand(target[0], target[1])
+      : {
+        snapshotAccepted: await apiPostStateSnapshot(target[0], target[1]),
+        commandApplied: true,
+      };
+    if (!outcome.commandApplied) {
+      if (outcome.snapshotAccepted) {
+        render();
+      }
+      return;
+    }
+    if (!outcome.snapshotAccepted) {
+      return;
+    }
     if (action === "play-now") {
       maybeShowSongTransitionOverlay(previousData, state.data, {
         force: true,
@@ -11832,7 +19757,7 @@ async function handlePlaylistAction(button) {
       });
     }
     if (action === "play-now" || action === "move-next") {
-      closeOpenMenus();
+      closeOpenMenus({ restoreFocus: true });
     }
     render();
   } catch (error) {
@@ -11846,6 +19771,8 @@ async function handlePlaylistAction(button) {
     }
     setAppMessage(error.message, true);
   } finally {
+    button.disabled = originallyDisabled;
+    button.removeAttribute("aria-busy");
     if (!shouldHoldCurrentItemForTransition(state.data?.current_item)) {
       state.localAdvanceInFlight = false;
     }
@@ -11858,27 +19785,68 @@ elements.addForm.addEventListener("submit", async (event) => {
   await handleAdd("tail", point);
 });
 
-elements.searchForm.addEventListener("submit", async (event) => {
+elements.searchForm?.addEventListener("submit", async (event) => {
   event.preventDefault();
+  if (state.searchModeState.local.loading) {
+    return;
+  }
   const query = String(elements.searchQuery.value || "").trim();
+  const modeState = state.searchModeState.local;
+  modeState.draft = String(elements.searchQuery.value || "");
   if (!query) {
     hideSearchResults();
-    setSearchMessage(t("search.keywordRequired"), true);
+    modeState.items = [];
+    modeState.error = t("search.keywordRequired");
+    modeState.message = "";
+    setSearchMessage("");
+    setAppMessage(modeState.error, true);
     return;
   }
 
+  const seq = modeState.seq + 1;
+  modeState.seq = seq;
+  modeState.loading = true;
+  modeState.submitted = query;
+  modeState.error = "";
+  modeState.message = t("search.localSearching");
   elements.searchButton.disabled = true;
-  setSearchMessage(t("search.localSearching"));
+  elements.searchButton.setAttribute("aria-busy", "true");
+  setSearchMessage(modeState.message);
   try {
-    const items = await searchGatchaCache(query);
-    renderSearchResults(items);
-    setSearchMessage(items.length ? t("search.localFound", { count: items.length }) : t("search.localNotFound"));
+    const page = await searchGatchaCache(query);
+    const items = page.items;
+    if (modeState.seq !== seq) {
+      return;
+    }
+    modeState.pageData = page;
+    modeState.items = items;
+    modeState.message = items.length ? "" : t("search.localNotFound");
+    if (items.length) {
+      renderSearchResults(items);
+    } else {
+      hideSearchResults();
+    }
+    setSearchMessage(modeState.message);
   } catch (error) {
-    hideSearchResults();
-    setSearchMessage(error.message, true);
+    if (modeState.seq === seq) {
+      modeState.items = [];
+      modeState.error = error.message;
+      hideSearchResults();
+      setSearchMessage("");
+      setAppMessage(modeState.error, true);
+    }
   } finally {
-    elements.searchButton.disabled = false;
+    if (modeState.seq === seq) {
+      modeState.loading = false;
+      elements.searchButton.disabled = false;
+      elements.searchButton.removeAttribute("aria-busy");
+      syncHostSearchCounts();
+    }
   }
+});
+
+elements.searchQuery?.addEventListener("input", () => {
+  state.searchModeState.local.draft = elements.searchQuery.value;
 });
 
 function searchResultRequestTarget(event, container) {
@@ -11893,28 +19861,11 @@ function searchResultRequestTarget(event, container) {
       button,
     };
   }
-  if (!container?.closest("#search-modal")) {
-    return null;
-  }
-  const card = event.target.closest(".search-result-item[data-url]");
-  if (!card || !container.contains(card)) {
-    return null;
-  }
-  return {
-    url: String(card.dataset.url || "").trim(),
-    anchor: card,
-    button: null,
-  };
-}
-
-function setSearchCardDetailMode(active) {
-  elements.searchCardContent?.querySelectorAll(".search-result-add").forEach((button) => {
-    button.textContent = t(active ? "search.detail" : "search.add");
-  });
+  return null;
 }
 
 function openSearchResultDetail(event, container, source) {
-  if (!searchDetailController || !container?.closest("#search-modal")) {
+  if (!searchDetailController || !container || event.target.closest("button[data-url]")) {
     return false;
   }
   if (event.target.closest("button[data-dev-action]")) {
@@ -11928,15 +19879,38 @@ function openSearchResultDetail(event, container, source) {
   if (!item) {
     return false;
   }
+  const origin = requestDetailOriginForContainer(card, source);
+  if (!origin?.key) {
+    return false;
+  }
+  const selectedKey = requestResultItemKey(item);
+  const selected = state.requestDetailSelections[origin.key];
+  selected.selectedKey = selectedKey;
+  selected.origin = { ...origin };
+  selected.focusElement = card;
+  selected.closedForNavigation = false;
+  state.activeRequestDetailOriginKey = origin.key;
+  Array.from(container.querySelectorAll?.(".search-result-item") || []).forEach((row) => {
+    if (row.dataset.requestResultOrigin !== origin.key) {
+      return;
+    }
+    const isSelected = row === card;
+    row.classList.toggle("is-selected", isSelected);
+    row.setAttribute("aria-current", isSelected ? "true" : "false");
+  });
   const avatarUrl = window.BilikaraSongDetail.ownerAvatarFromCachedOwners(
     item,
     state.followBrowseData?.owners,
   );
   event.preventDefault();
+  card.tabIndex = -1;
+  card.focus({ preventScroll: true });
   searchDetailController.open({
     ...item,
     avatar_url: avatarUrl,
     detailSource: source,
+    detailOrigin: { ...origin },
+    detailSelectedKey: selectedKey,
   });
   return true;
 }
@@ -11945,13 +19919,24 @@ function initSearchDetailController() {
   if (searchDetailController || !window.BilikaraSongDetail) {
     return;
   }
-  const container = elements.searchModal?.querySelector(".search-modal-card");
+  const container = elements.requestWorkspace;
   searchDetailController = window.BilikaraSongDetail.createSongDetailController({
     container,
     t,
     requestButtonClass: "next-button",
     nextButtonClass: "toolbar-button",
     onOpenExternal: openExternalUrl,
+    resolveReturnFocus: resolveRequestDetailReturnFocus,
+    onClose: ({ item, reason }) => {
+      const originKey = String(item?.detailOrigin?.key || state.activeRequestDetailOriginKey || "");
+      const selected = originKey ? state.requestDetailSelections?.[originKey] : null;
+      if (selected && reason !== "navigation") {
+        selected.closedForNavigation = false;
+      }
+      if (state.activeRequestDetailOriginKey === originKey) {
+        state.activeRequestDetailOriginKey = "";
+      }
+    },
     onRequest: (url, position, item) => handleAddByUrl(
       url,
       position,
@@ -11977,6 +19962,7 @@ elements.searchResults.addEventListener("click", async (event) => {
   let originalText = "";
   if (target.button) {
     target.button.disabled = true;
+    target.button.setAttribute("aria-busy", "true");
     originalText = target.button.textContent;
     target.button.textContent = t("search.adding") || "添加中...";
   }
@@ -11985,6 +19971,7 @@ elements.searchResults.addEventListener("click", async (event) => {
   } finally {
     if (target.button) {
       target.button.disabled = false;
+      target.button.removeAttribute("aria-busy");
       target.button.textContent = originalText;
     }
   }
@@ -11992,22 +19979,29 @@ elements.searchResults.addEventListener("click", async (event) => {
 
 async function handleLarkSearchSubmit(event) {
   event.preventDefault();
-  const usingHitbox = event.currentTarget === elements.larkSearchHitboxForm;
-  const querySource = usingHitbox ? elements.larkSearchHitboxQuery : elements.larkSearchQuery;
-  const query = String(querySource?.value || "").trim();
-  syncLarkSearchInputs(query, usingHitbox ? "hitbox" : "main");
+  const modeState = state.searchModeState.shared;
+  if (state.larkSearchLoading || modeState.loading) {
+    return;
+  }
+  const query = String(elements.larkSearchQuery?.value || "").trim();
+  modeState.draft = String(elements.larkSearchQuery?.value || "");
   if (!query) {
-    renderSearchResultItems(elements.larkSearchResults, []);
-    setLarkSearchMessage(t("search.keywordRequired"), true);
+    hideLarkSearchResults();
+    modeState.items = [];
+    modeState.error = t("search.keywordRequired");
+    modeState.message = "";
+    setLarkSearchMessage("");
+    setAppMessage(modeState.error, true);
     return;
   }
 
   state.larkSearchLoading = true;
+  modeState.loading = true;
+  modeState.submitted = query;
+  modeState.error = "";
   if (elements.larkSearchButton) {
     elements.larkSearchButton.disabled = true;
-  }
-  if (elements.larkSearchHitboxButton) {
-    elements.larkSearchHitboxButton.disabled = true;
+    elements.larkSearchButton.setAttribute("aria-busy", "true");
   }
   const searchSeq = state.larkSearchSeq + 1;
   state.larkSearchSeq = searchSeq;
@@ -12020,7 +20014,8 @@ async function handleLarkSearchSubmit(event) {
   }
   setLarkSearchMessage(t("search.larkSearching"));
   try {
-    const poolItems = await searchLarkPool(query);
+    const page = await searchCatalog(query);
+    const poolItems = page.items;
     if (state.larkSearchSeq !== searchSeq) {
       return;
     }
@@ -12034,46 +20029,84 @@ async function handleLarkSearchSubmit(event) {
     });
     if (freshItems.length) {
       collectedItems.push(...freshItems);
-      appendSearchResultItems(elements.larkSearchResults, freshItems);
+      if (!androidBrowseEnabled()) appendSearchResultItems(elements.larkSearchResults, freshItems);
     }
     if (state.larkSearchSeq !== searchSeq) {
       return;
     }
     if (!collectedItems.length) {
-      renderSearchResultItems(elements.larkSearchResults, [], t("search.larkNoResults"));
+      hideLarkSearchResults();
     }
-    setLarkSearchMessage(
-      collectedItems.length
-        ? t(partialFailure ? "search.larkFoundPartial" : "search.larkFound", { count: collectedItems.length })
-        : partialFailure
-          ? t("search.larkPartialNoResults")
-          : t("search.larkNoResultsLong"),
-      partialFailure && !collectedItems.length,
-    );
+    modeState.pageData = page;
+    modeState.items = collectedItems;
+    if (androidBrowseEnabled() && collectedItems.length) renderSearchResultItems(elements.larkSearchResults, collectedItems);
+    modeState.message = collectedItems.length
+      ? (partialFailure ? t("search.larkFoundPartial", { count: collectedItems.length }) : "")
+      : partialFailure
+        ? t("search.larkPartialNoResults")
+        : t("search.larkNoResults");
+    if (partialFailure && collectedItems.length) {
+      setLarkSearchMessage("");
+      setAppMessage(modeState.message, false);
+    } else {
+      setLarkSearchMessage(modeState.message);
+    }
   } catch (error) {
-    renderSearchResultItems(elements.larkSearchResults, []);
-    setLarkSearchMessage(error.message, true);
+    if (state.larkSearchSeq === searchSeq) {
+      modeState.items = [];
+      modeState.error = error.message;
+      hideLarkSearchResults();
+      setLarkSearchMessage("");
+      setAppMessage(modeState.error, true);
+    }
   } finally {
     if (state.larkSearchSeq === searchSeq) {
       state.larkSearchLoading = false;
+      modeState.loading = false;
       if (elements.larkSearchButton) {
         elements.larkSearchButton.disabled = false;
+        elements.larkSearchButton.removeAttribute("aria-busy");
       }
-      if (elements.larkSearchHitboxButton) {
-        elements.larkSearchHitboxButton.disabled = false;
-      }
-      renderSearchCookieFace();
+      syncHostSearchCounts();
     }
   }
 }
 
+async function loadMoreHostSearchResults() {
+  if (androidBrowseEnabled()) return;
+  for (const [source, container] of [["local", elements.searchResults], ["shared", elements.larkSearchResults]]) {
+    const mode = state.searchModeState[source];
+    const data = mode.pageData;
+    if (!container?.getClientRects().length || container.closest("[hidden], .hidden")
+      || mode.loading || mode.pageLoading || !data?.has_more) continue;
+    const bottom = container.lastElementChild?.getBoundingClientRect().bottom;
+    if (!Number.isFinite(bottom) || bottom > Math.min(container.getBoundingClientRect().bottom, window.innerHeight) + 200) continue;
+    const query = mode.submitted;
+    const sequence = source === "shared" ? state.larkSearchSeq : mode.seq;
+    mode.pageLoading = true;
+    try {
+      const page = await (source === "shared" ? searchCatalog : searchGatchaCache)(query,
+        {offset:data.next_offset, limit:80});
+      if (sequence !== (source === "shared" ? state.larkSearchSeq : mode.seq)) continue;
+      if (page.has_more && (!Number.isSafeInteger(page.next_offset) || page.next_offset <= data.next_offset)) {
+        throw new Error(t("pagination.invalidResponse"));
+      }
+      mode.pageData = page;
+      const seen = new Set(mode.items.map(item => item.bvid));
+      const fresh = page.items.filter(item => !seen.has(item.bvid));
+      mode.items.push(...fresh);
+      appendSearchResultItems(container, fresh);
+    } catch (error) {
+      if (sequence === (source === "shared" ? state.larkSearchSeq : mode.seq)) setAppMessage(error.message, true);
+    } finally { mode.pageLoading = false; syncHostSearchCounts(); }
+  }
+}
+elements.requestWorkspace?.addEventListener("scroll", loadMoreHostSearchResults, true);
+window.addEventListener("scroll", loadMoreHostSearchResults, {passive:true});
+
 elements.larkSearchForm?.addEventListener("submit", handleLarkSearchSubmit);
-elements.larkSearchHitboxForm?.addEventListener("submit", handleLarkSearchSubmit);
 elements.larkSearchQuery?.addEventListener("input", () => {
-  syncLarkSearchInputs(elements.larkSearchQuery.value, "main");
-});
-elements.larkSearchHitboxQuery?.addEventListener("input", () => {
-  syncLarkSearchInputs(elements.larkSearchHitboxQuery.value, "hitbox");
+  state.searchModeState.shared.draft = elements.larkSearchQuery.value;
 });
 
 elements.larkSearchResults?.addEventListener("click", async (event) => {
@@ -12090,6 +20123,7 @@ elements.larkSearchResults?.addEventListener("click", async (event) => {
   let originalText = "";
   if (target.button) {
     target.button.disabled = true;
+    target.button.setAttribute("aria-busy", "true");
     originalText = target.button.textContent;
     target.button.textContent = t("search.adding") || "添加中...";
   }
@@ -12098,6 +20132,7 @@ elements.larkSearchResults?.addEventListener("click", async (event) => {
   } finally {
     if (target.button) {
       target.button.disabled = false;
+      target.button.removeAttribute("aria-busy");
       target.button.textContent = originalText;
     }
   }
@@ -12107,220 +20142,6 @@ elements.sessionUserForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   await addSessionUser();
 });
-
-let draggedSessionUser = null;
-
-function clearSessionUserDropIndicators() {
-  elements.sessionUserList
-    ?.querySelectorAll(".session-user-badge")
-    .forEach((el) => el.classList.remove("drop-before", "drop-after"));
-}
-
-async function removeDraggedSessionUser() {
-  if (!draggedSessionUser || draggedSessionUser.dataset.deleted === "true") {
-    return;
-  }
-  const name = draggedSessionUser.dataset.name;
-  draggedSessionUser.dataset.deleted = "true";
-  draggedSessionUser.style.display = "none";
-  await removeSessionUser(name);
-}
-
-function finishSessionUserDragUi() {
-  draggedSessionUser?.classList.remove("dragging");
-  elements.sessionUsersPanel?.classList.remove("is-dragging");
-  elements.sessionUserTrash?.classList.remove("drag-over");
-  clearSessionUserDropIndicators();
-}
-
-// 1. Prevent default on document dragenter to remove the forbidden icon in WebView/WebKit.
-document.addEventListener("dragenter", (e) => {
-  if (draggedSessionUser) {
-    e.preventDefault();
-  }
-});
-
-// 2. Prevent default on document dragover to permit drop anywhere.
-document.addEventListener("dragover", (e) => {
-  if (!draggedSessionUser) {
-    return;
-  }
-  e.preventDefault();
-  if (e.dataTransfer) {
-    e.dataTransfer.dropEffect = "move";
-  }
-  // If we drag outside the list and we are not natively over the trash, clear drop indicators.
-  const target = e.target instanceof Element ? e.target : null;
-  if (target && !elements.sessionUserList.contains(target) && target !== elements.sessionUserTrash && !elements.sessionUserTrash.contains(target)) {
-    state.sessionUserDragTarget = null;
-    state.sessionUserDragAfter = false;
-    clearSessionUserDropIndicators();
-  }
-});
-
-document.addEventListener("drop", (e) => {
-  if (draggedSessionUser) {
-    e.preventDefault();
-  }
-});
-
-// 3. Handle drag start for badge items.
-elements.sessionUserList.addEventListener("dragstart", (e) => {
-  const badge = e.target.closest(".session-user-badge");
-  if (!badge) return;
-  draggedSessionUser = badge;
-  e.dataTransfer.effectAllowed = "move";
-  e.dataTransfer.setData("text/plain", badge.dataset.name);
-  if (typeof e.dataTransfer.setDragImage === "function") {
-    const rect = badge.getBoundingClientRect();
-    e.dataTransfer.setDragImage(
-      badge,
-      Math.max(0, e.clientX - rect.left),
-      Math.max(0, e.clientY - rect.top),
-    );
-  }
-  setTimeout(() => {
-    badge.classList.add("dragging");
-    elements.sessionUsersPanel?.classList.add("is-dragging");
-  }, 0);
-});
-
-// 4. Handle dragover for reordering.
-elements.sessionUserList.addEventListener("dragover", (e) => {
-  e.preventDefault();
-  if (!draggedSessionUser) return;
-  e.dataTransfer.dropEffect = "move";
-
-  const allElements = [...elements.sessionUserList.querySelectorAll(".session-user-badge")];
-  const draggableElements = allElements.filter(el => el !== draggedSessionUser);
-  allElements.forEach(el => el.classList.remove("drop-before", "drop-after"));
-
-  if (allElements.length === 0) {
-    state.sessionUserDragTarget = null;
-    state.sessionUserDragAfter = false;
-    return;
-  }
-
-  let closestElement = null;
-  let minDistance = Infinity;
-
-  for (const child of allElements) {
-    const box = child.getBoundingClientRect();
-    const centerX = box.left + box.width / 2;
-    const centerY = box.top + box.height / 2;
-    const distance = (e.clientX - centerX) ** 2 + (e.clientY - centerY) ** 2;
-    if (distance < minDistance) {
-      minDistance = distance;
-      closestElement = child;
-    }
-  }
-
-  if (closestElement) {
-    const box = closestElement.getBoundingClientRect();
-    const isAfter = e.clientX >= box.left + box.width / 2;
-
-    if (closestElement === draggedSessionUser) {
-      if (isAfter) {
-        const next = draggedSessionUser.nextElementSibling;
-        if (next && next.classList.contains("session-user-badge")) {
-          state.sessionUserDragTarget = next;
-          state.sessionUserDragAfter = false;
-          next.classList.add("drop-before");
-        } else {
-          state.sessionUserDragTarget = null;
-          state.sessionUserDragAfter = true;
-          draggedSessionUser.classList.add("drop-after");
-        }
-      } else {
-        state.sessionUserDragTarget = draggedSessionUser;
-        state.sessionUserDragAfter = false;
-        const prev = draggedSessionUser.previousElementSibling;
-        if (prev && prev.classList.contains("session-user-badge")) {
-          prev.classList.add("drop-after");
-        } else {
-          draggedSessionUser.classList.add("drop-before");
-        }
-      }
-    } else {
-      if (isAfter) {
-        if (closestElement.nextElementSibling === draggedSessionUser) {
-          state.sessionUserDragTarget = draggedSessionUser;
-          state.sessionUserDragAfter = false;
-          closestElement.classList.add("drop-after");
-        } else {
-          const idx = draggableElements.indexOf(closestElement);
-          if (idx !== -1 && idx < draggableElements.length - 1) {
-            state.sessionUserDragTarget = draggableElements[idx + 1];
-            state.sessionUserDragAfter = false;
-            draggableElements[idx + 1].classList.add("drop-before");
-          } else {
-            state.sessionUserDragTarget = null;
-            state.sessionUserDragAfter = true;
-            closestElement.classList.add("drop-after");
-          }
-        }
-      } else {
-        state.sessionUserDragTarget = closestElement;
-        state.sessionUserDragAfter = false;
-        closestElement.classList.add("drop-before");
-      }
-    }
-  }
-});
-
-// 5. Handle drag end.
-document.addEventListener("dragend", async (e) => {
-  if (draggedSessionUser) {
-    finishSessionUserDragUi();
-
-    if (!draggedSessionUser.dataset.deleted) {
-      if (state.sessionUserDragTarget) {
-        elements.sessionUserList.insertBefore(draggedSessionUser, state.sessionUserDragTarget);
-      } else if (state.sessionUserDragAfter) {
-        elements.sessionUserList.appendChild(draggedSessionUser);
-      }
-
-      const name = draggedSessionUser.dataset.name;
-      const newElements = [...elements.sessionUserList.querySelectorAll(".session-user-badge")];
-      const newIndex = newElements.indexOf(draggedSessionUser);
-      const oldIndex = parseInt(draggedSessionUser.dataset.index, 10);
-
-      if (newIndex !== -1 && newIndex !== oldIndex) {
-        await moveSessionUser(name, newIndex);
-      }
-    }
-    draggedSessionUser = null;
-    state.sessionUserDragTarget = null;
-    state.sessionUserDragAfter = false;
-  }
-});
-
-// 6. Handle trash can events natively.
-if (elements.sessionUserTrash) {
-  elements.sessionUserTrash.addEventListener("dragenter", (e) => {
-    e.preventDefault();
-    e.dataTransfer.dropEffect = "move";
-    elements.sessionUserTrash.classList.add("drag-over");
-    clearSessionUserDropIndicators();
-  });
-
-  elements.sessionUserTrash.addEventListener("dragleave", (e) => {
-    elements.sessionUserTrash.classList.remove("drag-over");
-  });
-
-  elements.sessionUserTrash.addEventListener("dragover", (e) => {
-    e.preventDefault();
-    e.dataTransfer.dropEffect = "move";
-    elements.sessionUserTrash.classList.add("drag-over");
-    clearSessionUserDropIndicators();
-  });
-
-  elements.sessionUserTrash.addEventListener("drop", async (e) => {
-    e.preventDefault();
-    finishSessionUserDragUi();
-    await removeDraggedSessionUser();
-  });
-}
 
 
 elements.queueNextButton.addEventListener("click", async (event) => {
@@ -12350,7 +20171,33 @@ elements.resortPlaylistButton?.addEventListener("click", async () => {
 });
 
 elements.copyRemoteUrlButton.addEventListener("click", async () => {
-  await copyRemoteUrl();
+  await copyRemoteAction(elements.copyRemoteUrlButton, elements.remoteUrlLink);
+});
+
+async function copyRemoteAction(button, link) {
+  if (!button || button.disabled || button.getAttribute("aria-busy") === "true") return;
+  button.disabled = true;
+  button.setAttribute("aria-busy", "true");
+  try {
+    await copyRemoteUrlFromLink(link);
+  } finally {
+    button.disabled = !link?.getAttribute("href") || link.getAttribute("aria-disabled") === "true";
+    button.removeAttribute("aria-busy");
+  }
+}
+
+elements.remotePopoverCopyLink?.addEventListener("click", () => {
+  void copyRemoteAction(elements.remotePopoverCopyLink, elements.remotePopoverUrlLink);
+});
+
+elements.internetRemoteCopyLink?.addEventListener("click", () => {
+  void copyRemoteAction(elements.internetRemoteCopyLink, elements.internetRemoteUrlLink);
+});
+
+document.addEventListener("bilikara:internet-remote-feedback", (event) => {
+  const detail = event.detail && typeof event.detail === "object" ? event.detail : {};
+  const message = String(detail.message || "").trim();
+  if (message) setAppMessage(message, Boolean(detail.error));
 });
 
 elements.backupActionButton.addEventListener("click", async () => {
@@ -12378,20 +20225,24 @@ elements.dismissBackupButton.addEventListener("click", () => {
   dismissBackupBanner();
 });
 
-elements.backupBanner.addEventListener("mouseenter", () => {
+elements.backupBanner.addEventListener("pointerenter", (event) => {
+  if (!cacheAdvancedInfoSupportsHover(event)) return;
   pauseBackupBannerTimer();
 });
 
-elements.backupBanner.addEventListener("mouseleave", () => {
+elements.backupBanner.addEventListener("pointerleave", (event) => {
+  if (!cacheAdvancedInfoSupportsHover(event)) return;
   resumeBackupBannerTimer();
 });
 
-elements.dismissBackupButton.addEventListener("mouseenter", () => {
+elements.dismissBackupButton.addEventListener("pointerenter", (event) => {
+  if (!cacheAdvancedInfoSupportsHover(event)) return;
   state.backupDismissHover = true;
   updateBackupDismissButton();
 });
 
-elements.dismissBackupButton.addEventListener("mouseleave", () => {
+elements.dismissBackupButton.addEventListener("pointerleave", (event) => {
+  if (!cacheAdvancedInfoSupportsHover(event)) return;
   state.backupDismissHover = false;
   updateBackupDismissButton();
 });
@@ -12409,38 +20260,317 @@ elements.dismissBackupButton.addEventListener("blur", () => {
 elements.cacheSettingsToggle.addEventListener("click", () => {
   state.cacheSettingsOpen = !state.cacheSettingsOpen;
   if (state.cacheSettingsOpen) {
-    state.displaySettingsOpen = false;
-    syncDisplayPanelVisibility();
+    setRemoteQrPinned(false, { dismissTransient: true });
+    state.presentationSettingsOpen = false;
+    syncPresentationPanelVisibility();
   }
-  syncCachePanelVisibility({ forceLoginRefresh: state.cacheSettingsOpen });
+  syncCachePanelVisibility({ reopen: state.cacheSettingsOpen });
 });
 
-elements.cachePanelAdvancedTrigger?.addEventListener("click", () => {
-  state.cacheAdvancedOpen = !state.cacheAdvancedOpen;
-  syncCachePanelVisibility();
+function bindHostContextualInfo(region, { actionHelp = true } = {}) {
+  const info = region.matches(".cache-advanced-info") ? region : region.querySelector(".cache-advanced-info");
+  const hoverTarget = region.closest("#remote-mini-popover") ? info : region;
+  if (actionHelp) region.addEventListener("click", (event) => {
+    const button = event.target.closest(".cache-advanced-info-button");
+    if (!button) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    if (info?.classList.contains("is-pinned")) {
+      closeCacheAdvancedInfo();
+      return;
+    }
+    closeCacheAdvancedInfo();
+    setCacheAdvancedInfoVisible(info, { pinned: true });
+  });
+  hoverTarget?.addEventListener("pointerenter", (event) => {
+    if (!info || !cacheAdvancedInfoSupportsHover(event) || info.classList.contains("is-visible")) {
+      return;
+    }
+    if (cacheAdvancedInfoLeaveTimer) {
+      window.clearTimeout(cacheAdvancedInfoLeaveTimer);
+      cacheAdvancedInfoLeaveTimer = null;
+    }
+    if (cacheAdvancedInfoHoverTimer) {
+      window.clearTimeout(cacheAdvancedInfoHoverTimer);
+    }
+    cacheAdvancedInfoHoverTimer = window.setTimeout(() => {
+      cacheAdvancedInfoHoverTimer = null;
+      if (hoverTarget.matches(":hover")) {
+        showCacheAdvancedInfoTransient(info, "pointer");
+      }
+    }, cacheAdvancedInfoHoverDelayMs);
+  });
+  hoverTarget?.addEventListener("pointerleave", () => {
+    if (cacheAdvancedInfoHoverTimer) {
+      window.clearTimeout(cacheAdvancedInfoHoverTimer);
+      cacheAdvancedInfoHoverTimer = null;
+    }
+    if (cacheAdvancedInfoLeaveTimer) {
+      window.clearTimeout(cacheAdvancedInfoLeaveTimer);
+    }
+    cacheAdvancedInfoLeaveTimer = window.setTimeout(() => {
+      cacheAdvancedInfoLeaveTimer = null;
+      if (
+        !info?.classList.contains("is-pinned")
+        && !hoverTarget.matches(":hover")
+        && !info?.contains(document.activeElement)
+      ) {
+        info?.classList.remove("is-visible");
+        info?.querySelector(".cache-advanced-info-button")?.setAttribute("aria-expanded", "false");
+        resetContextualTooltipPosition(info);
+      }
+    }, cacheAdvancedInfoLeaveDelayMs);
+  });
+  region.addEventListener("focusin", (event) => {
+    if (actionHelp && !event.target.closest(".cache-advanced-info-button")) {
+      return;
+    }
+    showCacheAdvancedInfoTransient(info, "keyboard");
+  });
+  region.addEventListener("focusout", () => {
+    window.setTimeout(() => {
+      if (
+        !info?.classList.contains("is-pinned")
+        && !region.contains(document.activeElement)
+        && !region.matches(":hover")
+      ) {
+        info?.classList.remove("is-visible");
+        info?.querySelector(".cache-advanced-info-button")?.setAttribute("aria-expanded", "false");
+        resetContextualTooltipPosition(info);
+      }
+    }, 0);
+  });
+}
+document.querySelectorAll(".cache-contextual-info-region").forEach(region => bindHostContextualInfo(region));
+
+elements.hostWorkspaceButtons?.forEach((button) => {
+  button.addEventListener("click", () => {
+    activateHostWorkspace(button.dataset.hostWorkspace, { inputOrigin: "pointer" });
+  });
+  button.addEventListener("keydown", handleHostWorkspaceRailKeydown);
 });
 
-elements.displaySettingsToggle?.addEventListener("click", () => {
-  state.displaySettingsOpen = !state.displaySettingsOpen;
-  if (state.displaySettingsOpen) {
+elements.stageControlsToggle?.addEventListener("click", (event) => {
+  event.preventDefault();
+  if (stageControlsAreInline()) {
+    return;
+  }
+  setStageControlTrayOpen(!state.stageControlTrayOpen);
+});
+
+elements.stageControlsClose?.addEventListener("click", () => {
+  if (stageControlsAreInline()) {
+    return;
+  }
+  setStageControlTrayOpen(false, { restoreFocus: true });
+});
+
+elements.stageControlBackdrop?.addEventListener("click", () => {
+  setStageControlTrayOpen(false, { restoreFocus: true });
+});
+
+elements.stageControlTray?.addEventListener("keydown", (event) => {
+  if (event.key !== "Tab" || !state.stageControlTrayOpen || stageControlsAreInline()) {
+    return;
+  }
+  const focusable = [...elements.stageControlTray.querySelectorAll(
+    'button:not(:disabled):not([hidden]), input:not(:disabled):not([hidden]), select:not(:disabled):not([hidden]), [tabindex]:not([tabindex="-1"]):not([hidden])',
+  )].filter((element) => !element.closest("[hidden], [inert]"));
+  if (!focusable.length) {
+    return;
+  }
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus({ preventScroll: true });
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus({ preventScroll: true });
+  }
+});
+
+for (const eventName of ["wheel", "touchmove"]) {
+  elements.hostWorkspaceBackdrop?.addEventListener(
+    eventName,
+    (event) => event.preventDefault(),
+    { passive: false },
+  );
+}
+
+elements.remoteMiniTrigger?.addEventListener("focus", () => {
+  elements.remoteMiniControl?.classList.remove("is-qr-dismissed");
+  syncRemoteQrPreviewLayer();
+  scheduleTopControlPopoverPositionSync();
+});
+
+elements.remoteMiniControl?.addEventListener("pointerenter", (event) => {
+  if (!cacheAdvancedInfoSupportsHover(event)) return;
+  elements.remoteMiniControl?.classList.remove("is-qr-dismissed");
+  syncRemoteQrPreviewLayer();
+  scheduleTopControlPopoverPositionSync();
+});
+
+elements.remoteMiniControl?.addEventListener("pointerleave", () => {
+  syncRemoteQrPreviewLayer();
+});
+elements.remoteMiniControl?.addEventListener("focusout", () => {
+  queueMicrotask(syncRemoteQrPreviewLayer);
+});
+
+elements.remoteMiniTrigger?.addEventListener("click", () => {
+  const wasPinned = state.remoteQrPinned;
+  setRemoteQrPinned(!wasPinned, { dismissTransient: wasPinned });
+});
+
+elements.presentationSettingsToggle?.addEventListener("click", async () => {
+  state.presentationSettingsOpen = !state.presentationSettingsOpen;
+  if (state.presentationSettingsOpen) {
+    setRemoteQrPinned(false, { dismissTransient: true });
     state.cacheSettingsOpen = false;
     syncCachePanelVisibility();
   }
-  syncDisplayPanelVisibility();
+  syncPresentationPanelVisibility();
+  if (state.presentationSettingsOpen) {
+    await refreshPresentationDisplays();
+  }
+});
+
+elements.presentationDisplayList?.addEventListener("click", (event) => {
+  const option = event.target.closest("[data-presentation-display-id]");
+  if (!option || option.disabled) {
+    return;
+  }
+  selectPresentationDisplay(option.dataset.presentationDisplayId || "");
+});
+
+elements.presentationHostDisplayList?.addEventListener("click", (event) => {
+  const option = event.target.closest("[data-presentation-host-display-id]");
+  if (!option || option.disabled) {
+    return;
+  }
+  selectPresentationHostDisplay(option.dataset.presentationHostDisplayId || "");
+});
+
+function hostRestartContext(requirePresentation = true) {
+  const item = state.data?.current_item, generation = state.data?.playback_generation;
+  return { key: `${item?.id}:${item?.item_incarnation_id}:${generation}`,
+    itemId: item?.id, generation, title: item?.display_title || item?.title,
+    enabled: Boolean(item && (!requirePresentation || presentationCompositionActive()) && !state.presentationHostControlBusy && state.hostPlaybackSession?.readyCommitted
+      && isCurrentHostPlaybackSession(state.hostPlaybackSession)) };
+}
+function setHostRestartBusy(busy) {
+  state.presentationHostControlBusy = busy;
+  renderPresentationHostSurface();
+}
+async function restartHostPlayback(context) {
+  await globalThis.BilikaraPlaybackRestart.restart({ context,
+    isCurrent: () => hostRestartContext(false).key === context.key,
+    post: async (url, payload) => {
+      const outcome = await apiPostExactStateCommand(url, payload);
+      // Host-originated responses can precede their identical SSE snapshot.
+      // Consume accepted controls now; duplicate snapshots retain the FIFO guard.
+      if (outcome.snapshotAccepted) render();
+      return outcome;
+    } });
+  setFormMessage(t("player.restartSent"));
+}
+playbackRestartMenu = globalThis.BilikaraPlaybackRestart?.create({
+  hoverHints: true,
+  alwaysInline: true,
+  firstUse: globalThis.BilikaraPlaybackRestart.firstUseStore?.("host", tauriInvoke("presentation")) || null,
+  anchor: elements.presentationHostNext, iconSource: elements.presentationHostBack,
+  getContext: hostRestartContext, label: t,
+  onBusy: setHostRestartBusy, onRestart: restartHostPlayback,
+  onError: () => setFormMessage(t("player.restartFailed"), true),
+});
+
+document.querySelectorAll("[data-presentation-host-action]").forEach((button) => {
+  button.addEventListener("click", () => {
+    handlePresentationHostControl(button.dataset.presentationHostAction || "", button)
+      .catch((error) => setAppMessage(error?.message || String(error), true));
+  });
+});
+
+elements.presentationHostProgress?.addEventListener("input", () => {
+  state.presentationHostProgressScrubbing = true;
+  paintPresentationHostProgress(
+    Number(elements.presentationHostProgress?.value || 0),
+    Number(elements.presentationHostProgress?.max || 0),
+  );
+});
+
+elements.presentationHostProgress?.addEventListener("change", () => {
+  handlePresentationHostControl("seek", elements.presentationHostProgress)
+    .catch((error) => setAppMessage(error?.message || String(error), true));
+});
+
+elements.presentationRefreshButton?.addEventListener("click", () => {
+  refreshPresentationDisplays({ announceError: true }).catch(() => {});
+});
+
+elements.presentationIdentifyButton?.addEventListener("click", () => {
+  showPresentationDisplayIdentifiers({ announceError: true }).catch(() => {});
 });
 
 elements.bbdownLoginButton?.addEventListener("click", async () => {
+  if (elements.bbdownLoginButton.disabled) return;
   const loggedIn = Boolean(state.data?.bbdown?.login?.logged_in || state.data?.bbdown?.logged_in);
   if (!loggedIn) {
     await startBBDownLogin({ force: true });
     return;
   }
+  if (document.documentElement.dataset.hostPlatform === "android"
+      && elements.bbdownLoginButton.dataset.logoutArmed !== "true") {
+    elements.bbdownLoginButton.dataset.logoutArmed = "true";
+    syncAndroidLoginLabel();
+    return;
+  }
+  const button = elements.bbdownLoginButton;
+  button.disabled = true;
+  button.setAttribute("aria-busy", "true");
   try {
-    state.data = await apiPost("/api/bbdown/logout");
+    await apiPostStateSnapshot("/api/bbdown/logout");
     setAppMessage(t("service.bbdownLoggedOut"));
     render();
   } catch (error) {
     setAppMessage(error.message, true);
+  } finally {
+    button.disabled = false;
+    button.removeAttribute("aria-busy");
+    syncAndroidLoginLabel();
+  }
+});
+
+elements.bbdownLoginLink?.addEventListener("click", async event => {
+  event.preventDefault();
+  const link = elements.bbdownLoginLink;
+  if (link.hidden || !link.hasAttribute("href") || link.getAttribute("aria-busy") === "true") return;
+  const url = link.href;
+  link.setAttribute("aria-busy", "true");
+  const desktop = document.documentElement.dataset.hostPlatform === "desktop";
+  const controls = desktop ? [elements.bbdownLoginButton, elements.bbdownLoginRefresh]
+    .filter(Boolean).map(button => ({button, disabled: button.disabled})) : [];
+  if (desktop) state.bbdownWebLoginRequesting = true;
+  for (const {button} of controls) { button.disabled = true; button.setAttribute("aria-busy", "true"); }
+  try {
+    if (document.documentElement.dataset.hostPlatform === "android") {
+      if (!window.BilikaraAndroidPlatform?.openLoginLink) throw new Error(t("service.loginLinkUnavailable"));
+      await window.BilikaraAndroidPlatform.openLoginLink(url);
+    } else if (desktop) {
+      await window.BilikaraDesktopPlatform.openBilibiliLogin();
+    } else window.open(url, "_blank", "noopener,noreferrer");
+  } catch (error) { setAppMessage(desktop && typeof error === "string" ? error : t("service.loginLinkUnavailable"), true); }
+  finally {
+    if (desktop) state.bbdownWebLoginRequesting = false;
+    for (const {button, disabled} of controls) { button.disabled = disabled; button.removeAttribute("aria-busy"); }
+    link.removeAttribute("aria-busy");
+    if (desktop) {
+      try { await fetchState(); }
+      catch (error) { setAppMessage(error.message || t("error.stateFailed"), true); }
+    }
   }
 });
 
@@ -12450,6 +20580,7 @@ elements.bbdownLoginRefresh?.addEventListener("click", async () => {
 
 elements.cacheLimitSlider.addEventListener("input", (event) => {
   const currentValue = Number(event.target.value || "1");
+  state.cacheLimitDraftValue = currentValue;
   const minValue = Number(elements.cacheLimitSlider.min || "1");
   const maxValue = Number(elements.cacheLimitSlider.max || "5");
   updateCacheSliderFill(currentValue, minValue, maxValue);
@@ -12464,6 +20595,7 @@ elements.cacheLimitSlider.addEventListener("change", async (event) => {
 
 elements.advanceDelaySlider?.addEventListener("input", (event) => {
   const currentValue = Number(event.target.value || "1");
+  state.advanceDelayDraftValue = currentValue;
   updateAdvanceDelaySliderFill(currentValue);
   elements.advanceDelayScale.querySelectorAll("span").forEach((mark) => {
     mark.classList.toggle("active", Number(mark.textContent || "0") === currentValue);
@@ -12495,10 +20627,6 @@ elements.cacheDownloadSourceSelect?.addEventListener("change", async (event) => 
   await setDownloadSourcePreference(downloadSource, selectedLabel);
 });
 
-elements.playbackSelectorSelect?.addEventListener("change", async (event) => {
-  await setPlaybackSelectorMode(String(event.target.value || ""));
-});
-
 elements.cacheHiresCheckbox?.addEventListener("change", async (event) => {
   const audioHires = Boolean(event.target.checked);
   if (audioHires === Boolean(state.data?.cache_policy?.audio_hires)) {
@@ -12521,13 +20649,32 @@ elements.resetOffsetCheckbox?.addEventListener("change", async (event) => {
   );
 });
 
-elements.updatePreviewCheckbox?.addEventListener("change", (event) => {
-  state.updatePreviewEnabled = Boolean(event.target.checked);
-  writeLocalPreference(storageKeys.updatePreview, state.updatePreviewEnabled);
+elements.updatePreviewCheckbox?.addEventListener("change", async (event) => {
+  const hadVisibleUpdate = shouldPresentCurrentChannelUpdate();
+  if (!await saveUpdatePreference(event.target, "preview")) return;
+  state.manualUpdateCheck = null;
+  state.updateManualVisibleChannel = "";
   renderUpdatePreviewControl();
+  if (hadVisibleUpdate) {
+    await requestAppUpdateCheck({
+      automatic: state.updateAutomaticEnabled,
+      force: true,
+    });
+  }
+});
+
+elements.updateAutomaticCheckbox?.addEventListener("change", async (event) => {
+  if (!await saveUpdatePreference(event.target, "automatic")) return;
+  state.manualUpdateCheck = null;
+  state.updateManualVisibleChannel = "";
+  renderUpdatePreviewControl();
+  if (state.updateAutomaticEnabled) {
+    await requestAppUpdateCheck({ automatic: true, force: true });
+  }
 });
 
 elements.diagnosticCopyButton?.addEventListener("click", copyDiagnosticsMarkdown);
+window.addEventListener("bilikara:webview-diagnostics-error", event => setAppMessage(event.detail, true));
 elements.diagnosticPackageButton?.addEventListener("click", downloadDiagnosticsPackage);
 
 elements.avSyncPanel?.addEventListener("click", async (event) => {
@@ -12565,31 +20712,44 @@ elements.avOffsetInput?.addEventListener("keydown", async (event) => {
   await setAvOffset(event.target.value);
 });
 
-elements.volumeSlider?.addEventListener("input", (event) => {
-  setRangeFillPercent(event.target, event.target.value);
-  setLocalPlayerVolume(Number(event.target.value || "0") / 100);
+globalThis.BilikaraVolumeControl?.bind({
+  slider: elements.volumeSlider,
+  value: elements.volumeValue,
+  t,
+  getValue: () => Math.round(state.localPlayerVolume * 100),
+  getAutomatic: () => state.data?.automatic_volume,
+  bindInfo: (region) => bindHostContextualInfo(region),
+  closeInfo: () => closeCacheAdvancedInfo(),
+  onAutomatic: async (payload) => {
+    const next = await apiPost('/api/player/automatic-volume', payload);
+    acceptHostStateSnapshot(next);
+    syncLocalPlayerSettingsFromSnapshot(state.data?.player_settings);
+    render();
+  },
+  onInput: (percent) => setLocalPlayerVolume(percent / 100),
+  onCommit: (percent) => setLocalPlayerVolumeAndMuted(percent / 100, percent > 0 ? false : state.localPlayerMuted),
 });
 
 elements.volumeMuteButton?.addEventListener("click", () => {
   toggleLocalPlayerMute();
 });
 
-elements.keyShiftDecButton?.addEventListener("click", () => {
+elements.keyShiftDecButton?.addEventListener("click", (event) => {
   const currentKey = Number(state.data?.player_settings?.key_shift ?? 0);
-  setLocalPlayerKeyShift(currentKey - 1);
+  applyKeyShiftControl(event.currentTarget, currentKey - 1);
 });
 
-elements.keyShiftIncButton?.addEventListener("click", () => {
+elements.keyShiftIncButton?.addEventListener("click", (event) => {
   const currentKey = Number(state.data?.player_settings?.key_shift ?? 0);
-  setLocalPlayerKeyShift(currentKey + 1);
+  applyKeyShiftControl(event.currentTarget, currentKey + 1);
 });
 
-elements.keyShiftResetButton?.addEventListener("click", () => {
-  setLocalPlayerKeyShift(0);
+elements.keyShiftResetButton?.addEventListener("click", (event) => {
+  applyKeyShiftControl(event.currentTarget, 0);
 });
 
 elements.keyShiftInput?.addEventListener("change", async (event) => {
-  await setLocalPlayerKeyShift(event.target.value);
+  await applyKeyShiftControl(event.currentTarget, event.target.value);
 });
 
 elements.keyShiftInput?.addEventListener("keydown", async (event) => {
@@ -12597,7 +20757,7 @@ elements.keyShiftInput?.addEventListener("keydown", async (event) => {
     return;
   }
   event.preventDefault();
-  await setLocalPlayerKeyShift(event.target.value);
+  await applyKeyShiftControl(event.currentTarget, event.target.value);
 });
 
 document.addEventListener("click", () => {
@@ -12637,7 +20797,7 @@ elements.historyExportButton?.addEventListener("click", (event) => {
     pageSize: 200,
     sourceSelect: true,
     pageSizeSelect: true,
-    message: t("history.exportPromptWithPageSize"),
+    hideMessage: true,
     primaryLabel: t("history.exportImage"),
     secondaryLabel: t("history.exportCsv"),
     x: point.x,
@@ -12645,20 +20805,43 @@ elements.historyExportButton?.addEventListener("click", (event) => {
   });
 });
 
-elements.historyToggleButton.addEventListener("click", () => {
-  state.listView = state.listView === "history" ? "queue" : "history";
-  render();
-  if (state.listView === "history") {
-    loadPlayedSessions().catch((err) => {
-      console.warn("加载历史场次失败:", err);
-    });
-  }
+const fullscreenControlHover = window.BilikaraFullscreenControls.bind(elements.playerFullscreenControl, {
+  enabled: () => isPlayerPanelFullscreen() && !state.playerFullscreenTransitioning,
+  onEnter: syncPlayerFullscreenExpandedWidth,
 });
 
-elements.playerFullscreenButton?.addEventListener("click", async () => {
+state.playerFullscreenInteraction = window.BilikaraFullscreenControls.bindPlayer(elements.playerPanel, {
+  active: () => isPlayerPanelFullscreen() && !presentationCompositionActive(),
+  transitioning: () => state.playerFullscreenTransitioning,
+  revealControls: revealMountedPlayerControlsForUserInteraction,
+});
+
+elements.playerFullscreenButton?.addEventListener("pointerdown", (event) => {
+  state.playerFullscreenLastPointerType = String(event.pointerType || "");
+});
+
+elements.playerFullscreenButton?.addEventListener("click", async (event) => {
+  if (
+    isPlayerPanelFullscreen()
+    && !isAndroidNativePlaybackRuntime()
+    && playerFullscreenActivationUsesTouch(event)
+    && !state.playerFullscreenRemotePinned
+  ) {
+    setPlayerFullscreenRemotePinned(true);
+    return;
+  }
+  setPlayerFullscreenRemotePinned(false);
   await togglePlayerFullscreen();
   renderPlayerFullscreenButton();
 });
+
+[
+  elements.remoteUrlLink,
+  elements.remotePopoverUrlLink,
+  elements.playerFullscreenRemoteUrl,
+].forEach((link) => link?.addEventListener("click", openRemoteAccessLink));
+
+elements.presentationOutputButton?.addEventListener("click", toggleLocalPresentation);
 
 elements.playerFrame?.addEventListener("click", (event) => {
   if (event.target.closest("button, input, select, textarea, a")) {
@@ -12667,13 +20850,21 @@ elements.playerFrame?.addEventListener("click", (event) => {
   if (!event.target.closest("video")) {
     return;
   }
+  if (isAndroidNativePlaybackRuntime()) {
+    // A tap reveals the native controls; it must not enqueue the desktop
+    // playback toggle while the user is trying to grab the seekbar. Leave
+    // default actions intact so native play/seek controls still work.
+    clearPlayerFrameClickTimer();
+    revealMountedPlayerControlsForUserInteraction(event);
+    return;
+  }
   const { video, audio } = activeLocalPlayerElements();
   if (isTauriWebKitRuntime()) {
     clearPlayerFrameClickTimer();
     if (video && audio) {
       requestSplitPlaybackStartFromUserGesture(video, audio, "tauri-video-click-start-intent");
     }
-    revealMountedPlayerControlsForUserInteraction();
+    revealMountedPlayerControlsForUserInteraction(event);
     return;
   }
   if (
@@ -12682,7 +20873,7 @@ elements.playerFrame?.addEventListener("click", (event) => {
     && requestSplitPlaybackStartFromUserGesture(video, audio, "host-video-click-start-intent")
   ) {
     clearPlayerFrameClickTimer();
-    revealMountedPlayerControlsForUserInteraction();
+    revealMountedPlayerControlsForUserInteraction(event);
     return;
   }
   queuePlayerFrameSingleClick();
@@ -12690,6 +20881,14 @@ elements.playerFrame?.addEventListener("click", (event) => {
 
 elements.playerFrame?.addEventListener("dblclick", (event) => {
   if (event.target.closest("button, input, select, textarea, a")) {
+    return;
+  }
+  if (isAndroidNativePlaybackRuntime()) {
+    if (!event.target.closest("video")) return;
+    event.preventDefault();
+    clearPlayerFrameClickTimer();
+    toggleMountedLocalPlayback();
+    revealMountedPlayerControlsForUserInteraction(event);
     return;
   }
   handlePlayerFrameDoubleClick().catch(() => {});
@@ -12705,15 +20904,32 @@ elements.nextButton.addEventListener("click", async () => {
 
 elements.queueCurrentRetry.addEventListener("click", async () => {
   const itemId = elements.queueCurrentRetry.dataset.id;
-  if (!itemId) {
+  const itemIncarnationId = elements.queueCurrentRetry.dataset.itemIncarnationId;
+  if (!itemId || !itemIncarnationId) {
     return;
   }
+  const button = elements.queueCurrentRetry;
+  if (button.getAttribute("aria-busy") === "true") {
+    return;
+  }
+  const originallyDisabled = button.disabled;
+  button.disabled = true;
+  button.setAttribute("aria-busy", "true");
   try {
-    state.data = await apiPost("/api/cache/retry", { item_id: itemId, force: true });
-    setAppMessage(t("cache.retryStarted"));
+    const outcome = await apiPostExactStateCommand("/api/cache/retry", {
+      item_id: itemId,
+      expected_item_incarnation_id: itemIncarnationId,
+      force: true,
+    });
     render();
+    if (outcome.commandApplied) {
+      setAppMessage(t("cache.retryStarted"));
+    }
   } catch (error) {
     setAppMessage(error.message, true);
+  } finally {
+    button.disabled = originallyDisabled;
+    button.removeAttribute("aria-busy");
   }
 });
 
@@ -12725,27 +20941,29 @@ elements.modeSwitch?.addEventListener("click", async (event) => {
     return;
   }
   try {
-    state.data = await apiPost("/api/mode", { mode: "local" });
+    await apiPostStateSnapshot("/api/mode", { mode: "local" });
     render();
   } catch (error) {
     setAppMessage(error.message, true);
   }
 });
 
-elements.layoutModeSwitch?.addEventListener("click", (event) => {
-  const button = event.target.closest("button[data-layout-mode]");
-  if (!button) {
-    return;
-  }
-  setLayoutMode(button.dataset.layoutMode);
-});
-
-elements.languageSwitch?.addEventListener("click", (event) => {
+const languageSwitchGuard = window.BilikaraExportGuard.createExportGuard(
+  elements.languageSwitch?.querySelectorAll("button[data-language]") || [],
+);
+elements.languageSwitch?.addEventListener("click", async (event) => {
   const button = event.target.closest("button[data-language]");
   if (!button) {
     return;
   }
-  setLanguage(button.dataset.language);
+  try {
+    await languageSwitchGuard.run(async () => {
+      const language = window.BilikaraHostLanguage
+        ? await window.BilikaraHostLanguage.save(button.dataset.language)
+        : button.dataset.language;
+      setLanguage(language);
+    });
+  } catch { setAppMessage(t("settings.languageSaveFailed"), true); }
 });
 
 elements.themeSwitch?.addEventListener("click", (event) => {
@@ -12768,21 +20986,34 @@ elements.dataResetButton?.addEventListener("click", (event) => {
 
 elements.currentCacheRetryButton?.addEventListener("click", async (event) => {
   event.stopPropagation();
+  const button = elements.currentCacheRetryButton;
+  if (button.getAttribute("aria-busy") === "true") {
+    return;
+  }
   const currentItem = state.data?.current_item;
   if (!currentItem?.id) {
     setAppMessage(t("service.noCurrentSong"), true);
     return;
   }
+  const originallyDisabled = button.disabled;
+  button.disabled = true;
+  button.setAttribute("aria-busy", "true");
   try {
-    elements.currentCacheRetryButton.disabled = true;
-    state.data = await apiPost("/api/cache/retry", {
+    const outcome = await apiPostExactStateCommand("/api/cache/retry", {
       item_id: currentItem.id,
+      expected_item_incarnation_id: currentItem.item_incarnation_id,
       force: true,
     });
-    setAppMessage(t("service.retryCurrentStarted"));
     render();
+    if (outcome.commandApplied) {
+      setAppMessage(t("service.retryCurrentStarted"));
+    }
   } catch (error) {
     setAppMessage(error.message, true);
+    renderPlaybackRepairControls(state.data?.current_item);
+  } finally {
+    button.disabled = originallyDisabled;
+    button.removeAttribute("aria-busy");
     renderPlaybackRepairControls(state.data?.current_item);
   }
 });
@@ -12802,16 +21033,24 @@ elements.updateCheckButton?.addEventListener("click", async (event) => {
   await checkAppUpdate(event);
 });
 
-elements.audioVariantBar.addEventListener("click", async (event) => {
-  const toggleButton = event.target.closest('button[data-action="toggle-audio-variants"]');
-  if (toggleButton) {
-    state.audioVariantBarExpanded = !state.audioVariantBarExpanded;
-    if (state.data?.current_item) {
-      renderAudioVariantBar(state.data.current_item, frontendPlaybackMode(state.data.playback_mode));
-    }
+elements.applicationRestartButton?.addEventListener("click", (event) => {
+  event.stopPropagation();
+  if (!syncApplicationRestartAvailability() || state.applicationRestartInFlight) {
     return;
   }
+  const point = anchorPointForEvent(event, elements.applicationRestartButton);
+  openConfirm({
+    type: "restart-application",
+    message: t("service.restartApplicationConfirm"),
+    primaryLabel: t("service.restartApplication"),
+    ...point,
+    anchorElementId: "application-restart-button",
+    anchorAlign: "end",
+    anchorGap: 8,
+  });
+});
 
+async function handleAudioVariantSelection(event) {
   const button = event.target.closest("button[data-variant-id]");
   if (!button || !state.data?.current_item) {
     return;
@@ -12832,7 +21071,7 @@ elements.audioVariantBar.addEventListener("click", async (event) => {
       return;
     }
     try {
-      state.data = await submitAddRequest(currentItem.original_url || currentItem.resolved_url, "tail", {
+      await submitAddRequest(currentItem.original_url || currentItem.resolved_url, "tail", {
         requesterName,
         selectedVideoPage: page,
         selectedAudioPages: [page],
@@ -12875,40 +21114,101 @@ elements.audioVariantBar.addEventListener("click", async (event) => {
     return;
   }
 
-  const video = elements.playerFrame.querySelector("video");
+  const playbackSession = state.hostPlaybackSession;
+  const video = playbackSession?.video;
+  if (
+    !isCurrentHostPlaybackSession(
+      playbackSession,
+      video,
+      playbackSession?.audio,
+    )
+  ) {
+    return;
+  }
   state.audioVariantSwitchInFlight = true;
   state.audioVariantSwitchUnlockAt = Date.now() + audioVariantSwitchDebounceMs;
   renderAudioVariantBar(currentItem, frontendPlaybackMode(state.data?.playback_mode));
-  state.pendingPlaybackRestore = {
+  const pendingRestore = {
     itemId: currentItem.id,
+    itemIncarnationId: currentItem.item_incarnation_id,
     variantId: nextVariantId,
     currentTime: video ? Number(video.currentTime || 0) : 0,
-    wasPlaying: video ? !video.paused : true,
+    // Buffering/clock recovery can hold video without changing play intent.
+    wasPlaying: Boolean(playbackSession.logicalPlayIntent),
   };
+  state.pendingPlaybackRestore = pendingRestore;
   try {
-    state.data = await apiPost("/api/player/audio-variant", {
+    const outcome = await apiPostExactStateCommand("/api/player/audio-variant", {
       item_id: currentItem.id,
       variant_id: nextVariantId,
+      expected_item_incarnation_id: currentItem.item_incarnation_id,
     });
-    state.playerSignature = "";
+    if (!outcome.commandApplied) {
+      if (state.pendingPlaybackRestore === pendingRestore) {
+        state.pendingPlaybackRestore = null;
+      }
+      state.audioVariantSwitchUnlockAt = 0;
+    }
     render();
   } catch (error) {
-    state.pendingPlaybackRestore = null;
+    if (state.pendingPlaybackRestore === pendingRestore) {
+      state.pendingPlaybackRestore = null;
+    }
     setAppMessage(error.message, true);
   } finally {
     state.audioVariantSwitchInFlight = false;
     scheduleAudioVariantSwitchUnlock();
   }
+}
+
+elements.audioVariantBar.addEventListener("click", handleAudioVariantSelection);
+elements.audioVariantPopover.addEventListener("click", handleAudioVariantSelection);
+
+elements.audioVariantToggle?.addEventListener("click", () => {
+  setAudioVariantPopoverOpen(!state.audioVariantBarExpanded);
+});
+
+elements.audioVariantBackdrop?.addEventListener("click", () => {
+  setAudioVariantPopoverOpen(false, { restoreFocus: true });
 });
 
 elements.playlist.addEventListener("click", async (event) => {
   const button = event.target.closest("button[data-action]");
-  if (!button) {
+  if (!button || button.disabled) {
+    return;
+  }
+  if (button.dataset.action === "move-up" || button.dataset.action === "move-down") {
+    event.stopPropagation();
+    const itemId = button.dataset.id || "";
+    const targetIndex = Number.parseInt(button.dataset.targetIndex || "", 10);
+    const item = state.data?.playlist?.find((candidate) => candidate.id === itemId);
+    if (!itemId || !Number.isInteger(targetIndex) || !item) {
+      return;
+    }
+    const point = anchorPointForEvent(event, button);
+    closeOpenMenus({ restoreFocus: false });
+    openConfirm({
+      type: "reorder-item",
+      queueVersion: state.renderedQueue?.version,
+      itemId,
+      targetIndex,
+      focusItemId: itemId,
+      announcePosition: targetIndex + 1,
+      x: point.x,
+      y: point.y,
+      message: t("remote.queueOrderMessage", {
+        title: item.display_title || t("request.thisSong"),
+        index: targetIndex + 1,
+      }),
+      primaryLabel: t("remote.queueOrderConfirm"),
+    });
+    elements.confirmCancel.focus({ preventScroll: true });
     return;
   }
   if (button.dataset.action === "remove") {
     event.stopPropagation();
     const point = anchorPointForEvent(event, button);
+    closeOpenMenus({ restoreFocus: false });
     openConfirm({
       type: "remove-item",
       itemId: button.dataset.id,
@@ -12959,13 +21259,19 @@ elements.historyList.addEventListener("click", async (event) => {
     button.disabled = false;
     button.removeAttribute("aria-busy");
     button.textContent = prevText;
-    closeOpenMenus();
+    closeOpenMenus({ restoreFocus: true });
   }
 });
 
-elements.confirmCancel.addEventListener("click", () => {
+function cancelConfirm() {
+  const intent = state.confirmIntent;
   closeConfirm();
-});
+  if (intent?.type === "reorder-item" && intent.focusItemId) {
+    focusPlaylistItemMenuTrigger(intent.focusItemId);
+  }
+}
+elements.confirmCancel.addEventListener("click", cancelConfirm);
+elements.confirmClose?.addEventListener("click", cancelConfirm);
 
 elements.confirmSource?.addEventListener("change", () => {
   updateConfirmHistoryExportSource();
@@ -12983,6 +21289,22 @@ elements.confirmSecondary?.addEventListener("click", async () => {
   if (intent.type === "export-history") {
     await exportHistory("csv", selectedConfirmHistoryExportSource(intent), selectedConfirmHistoryExportPageSize(intent));
     return;
+  }
+});
+
+elements.bindingModal?.addEventListener("keydown", (event) => {
+  if (event.key !== "Tab") return;
+  const focusable = [...elements.bindingModal.querySelectorAll(
+    'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])',
+  )].filter((element) => element.getClientRects().length && getComputedStyle(element).visibility !== "hidden");
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last?.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first?.focus();
   }
 });
 
@@ -13031,7 +21353,42 @@ elements.poolConfigModalBackdrop?.addEventListener("click", () => {
 });
 
 elements.poolConfigWeightSlider?.addEventListener("input", () => {
+  capturePoolConfigDraftFromControls();
   updatePoolConfigWeightLabel();
+});
+
+[elements.poolConfigUidOptions, elements.poolConfigFavlistOptions].forEach((list) => {
+  list?.addEventListener("change", (event) => {
+    if (event.target?.matches?.('input[type="checkbox"]')) {
+      capturePoolConfigDraftFromControls();
+      poolConfigSetMessage("");
+    }
+  });
+});
+
+elements.poolConfigModal?.addEventListener("keydown", (event) => {
+  if (
+    event.key !== "Tab"
+    || state.confirmIntent
+    || elements.poolConfigModal.classList.contains("hidden")
+  ) {
+    return;
+  }
+  const focusable = [...elements.poolConfigModal.querySelectorAll(
+    'button:not(:disabled):not([hidden]), input:not(:disabled):not([hidden]), [tabindex]:not([tabindex="-1"]):not([hidden])',
+  )].filter((element) => !element.closest("[hidden], [inert]"));
+  if (!focusable.length) {
+    return;
+  }
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus({ preventScroll: true });
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus({ preventScroll: true });
+  }
 });
 
 elements.poolConfigModalReset?.addEventListener("click", () => {
@@ -13089,6 +21446,28 @@ elements.bilikaraSecretBackdrop?.addEventListener("click", () => {
 
 document.addEventListener("click", handleDeveloperTagResetButtonClick);
 
+elements.requestWorkspaceExpand?.addEventListener("click", openExpandedRequestWorkspace);
+elements.requestWorkspaceCollapse?.addEventListener("click", () => closeExpandedRequestWorkspace());
+elements.requestWorkspaceModalBackdrop?.addEventListener("click", () => closeExpandedRequestWorkspace());
+elements.requestWorkspaceModal?.addEventListener("keydown", event => {
+  trapDeveloperDialogFocus(event, elements.requestWorkspaceModal);
+});
+elements.developerTagResetModal?.addEventListener("keydown", event => {
+  if (elements.developerTagResetModal.classList.contains("hidden")) return;
+  trapDeveloperDialogFocus(event, elements.developerTagResetModal);
+  if (event.key !== "Enter" || event.isComposing || event.keyCode === 229 || event.repeat
+    || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey
+    || !["reject-entry", "reject-page"].includes(state.developerTagResetAction)) return;
+  const button = event.target.closest?.("button");
+  if (button && button !== elements.developerTagResetConfirm) return;
+  event.preventDefault();
+  event.stopPropagation();
+  if (!elements.developerTagResetConfirm.disabled) void confirmDeveloperAction();
+});
+document.addEventListener("bilikara:i18n", () => {
+  if (state.developerTagResetItem && !state.developerTagResetSaving) renderDeveloperTagResetModal();
+});
+
 elements.developerTagResetClose?.addEventListener("click", () => {
   closeDeveloperTagResetModal();
 });
@@ -13125,7 +21504,14 @@ elements.confirmOk.addEventListener("click", async () => {
     elements.confirmSecondary.setAttribute("aria-busy", "true");
   }
 
+  let keepBusyUntilApplicationExit = false;
   try {
+    if (intent.type === "remove-sources") {
+      const pending = intent.sourceEditor.confirmRemoval(intent.captured);
+      closeConfirm();
+      await pending;
+      return;
+    }
     if (intent.type === "clear-playlist") {
       await clearPlaylist();
       return;
@@ -13150,34 +21536,49 @@ elements.confirmOk.addEventListener("click", async () => {
       await installAppUpdate(Boolean(intent.includePreview));
       return;
     }
+    if (intent.type === "restart-application") {
+      keepBusyUntilApplicationExit = await restartApplication();
+      return;
+    }
     if (intent.type === "prepare-download-source") {
       await prepareDownloadSourceAndApply(intent);
       return;
     }
     if (intent.type === "open-release" && intent.releaseUrl) {
-      window.open(intent.releaseUrl, "_blank", "noopener");
+      const releaseUrl = safeHttpUrl(intent.releaseUrl);
+      if (!releaseUrl) {
+        throw new Error(t("service.updateReleaseUrlInvalid"));
+      }
+      openExternalUrl(releaseUrl);
       closeConfirm();
       setAppMessage(t("service.openedReleases"));
       return;
     }
     if (intent.type === "remove-item" && intent.itemId) {
-      state.data = await apiPost("/api/playlist/remove", { item_id: intent.itemId });
+      await apiPostStateSnapshot("/api/playlist/remove", { item_id: intent.itemId });
       closeConfirm();
       setAppMessage(t("list.removedSong"));
       render();
       return;
     }
     if (intent.type === "remove-history" && intent.key) {
-      state.data = await apiPost("/api/history/remove", { key: intent.key });
+      await apiPostStateSnapshot("/api/history/remove", { key: intent.key });
       closeConfirm();
       setAppMessage(t("history.removed"));
       render();
       return;
     }
     if (intent.type === "reorder-item" && intent.itemId && Number.isInteger(intent.targetIndex)) {
-      await reorderPlaylist(intent.itemId, intent.targetIndex);
+      const accepted = await reorderPlaylist(intent.itemId, intent.targetIndex, intent.queueVersion);
       closeConfirm();
-      setAppMessage(t("remote.queueOrderUpdated"));
+      if (intent.focusItemId) {
+        focusPlaylistItemMenuTrigger(intent.focusItemId);
+      }
+      if (accepted) {
+        setAppMessage(intent.announcePosition
+          ? t("list.movedPosition", { index: intent.announcePosition })
+          : t("remote.queueOrderUpdated"));
+      }
       return;
     }
     if (intent.type === "gatcha-uid-add" && intent.uid) {
@@ -13186,76 +21587,95 @@ elements.confirmOk.addEventListener("click", async () => {
     }
     if (intent.type === "duplicate-add" && intent.url) {
       const source = intent.source || "request-form";
-      state.data = await submitAddRequest(intent.url, intent.position || "tail", {
+      const accepted = await submitAddRequest(intent.url, intent.position || "tail", {
         requesterName: intent.requesterName || selectedRequesterName(),
         allowRepeat: true,
         selectedVideoPage: Number.isInteger(intent.selectedVideoPage) ? intent.selectedVideoPage : undefined,
         selectedAudioPages: Array.isArray(intent.selectedAudioPages) ? intent.selectedAudioPages : undefined,
       });
-      closeConfirm();
-      if (intent.originatedFromDetail) {
-        searchDetailController?.close({ immediate: true });
+      if (!accepted && source === "gatcha") {
+        setRequestActionMessage(t("error.requestFailed"), true);
+        return;
       }
-      if (!intent.preserveInput) {
-        elements.urlInput.value = "";
-      } else {
-        elements.urlInput.value = "";
+      closeConfirm({ restoreFocus: source !== "gatcha" });
+      if (intent.originatedFromDetail) {
+        if (typeof searchDetailController !== "undefined") searchDetailController?.close({ immediate: true });
+      }
+      if (source !== "gatcha") {
+        if (!intent.preserveInput) {
+          elements.urlInput.value = "";
+        } else {
+          elements.urlInput.value = "";
+        }
       }
       const message = intent.position === "next" ? t("request.confirmedNext") : t("request.confirmedTail");
-      setMessageForSource(source, message);
-      setAppMessage(message);
+      setRequestActionMessage(message);
+      if (source === "gatcha") {
+        clearAcceptedGatchaCandidate();
+      }
       render();
     }
   } catch (error) {
     if (intent?.type === "duplicate-add") {
-      setMessageForSource(intent.source || "request-form", error.message, true);
+      setRequestActionMessage(error.message, true);
     } else {
       setAppMessage(error.message, true);
     }
   } finally {
-    elements.confirmOk.disabled = false;
-    elements.confirmOk.removeAttribute("aria-busy");
-    elements.confirmOk.textContent = prevOkText;
-    if (elements.confirmSecondary) {
-      elements.confirmSecondary.disabled = false;
-      elements.confirmSecondary.removeAttribute("aria-busy");
+    if (!keepBusyUntilApplicationExit) {
+      elements.confirmOk.disabled = false;
+      elements.confirmOk.removeAttribute("aria-busy");
+      elements.confirmOk.textContent = prevOkText;
+      if (elements.confirmSecondary) {
+        elements.confirmSecondary.disabled = false;
+        elements.confirmSecondary.removeAttribute("aria-busy");
+      }
     }
   }
 });
 
+// Dismiss before the next action's click, so opening clicks need no permanent
+// exceptions for entire forms or lists. Do not steal focus from the new target.
+document.addEventListener("pointerdown", (event) => {
+  if (state.confirmIntent && !event.target.closest("#confirm-popover")) {
+    closeConfirm({ restoreFocus: false });
+  }
+});
+
 document.addEventListener("click", (event) => {
-  if (state.confirmIntent) {
-    if (
-      event.target.closest("#confirm-popover") ||
-      event.target.closest("#clear-playlist-button") ||
-      event.target.closest("#history-export-button") ||
-      event.target.closest("#clear-history-button") ||
-      event.target.closest('button[data-action="remove"]') ||
-      event.target.closest("#queue-next-button") ||
-      event.target.closest("#data-reset-button") ||
-      event.target.closest("#current-cache-retry-button") ||
-      event.target.closest("#player-reset-button") ||
-      event.target.closest("#update-check-button") ||
-      event.target.closest("#cache-download-source-select") ||
-      event.target.closest("#add-form") ||
-      event.target.closest("#gatcha-uid-form") ||
-      event.target.closest("#modal-follow-uid-form") ||
-      event.target.closest("#refresh-gatcha-cache-button") ||
-      event.target.closest("#history-list")
-    ) {
-      return;
-    }
-    closeConfirm();
+  if (event.target.closest("#confirm-popover")) return;
+
+  if (!event.target.closest(".cache-contextual-info-region")) {
+    closeCacheAdvancedInfo();
   }
 
-  if (state.cacheSettingsOpen && !event.target.closest("#cache-settings")) {
+  const clickedInsideRemoteQr = Boolean(event.target.closest("#remote-mini-control"));
+  if (state.remoteQrPinned && !clickedInsideRemoteQr) {
+    setRemoteQrPinned(false);
+  }
+
+  const clickedInsideFullscreenRemote = Boolean(
+    event.target.closest("#player-fullscreen-control"),
+  );
+  if (state.playerFullscreenRemotePinned && !clickedInsideFullscreenRemote) {
+    setPlayerFullscreenRemotePinned(false);
+  }
+
+  if (
+    state.cacheSettingsOpen
+    && !event.target.closest("#cache-settings")
+  ) {
     state.cacheSettingsOpen = false;
     syncCachePanelVisibility();
   }
 
-  if (state.displaySettingsOpen && !event.target.closest("#display-settings")) {
-    state.displaySettingsOpen = false;
-    syncDisplayPanelVisibility();
+  const presentationClickPath = typeof event.composedPath === "function" ? event.composedPath() : [];
+  const clickedInsidePresentationSettings = presentationClickPath.includes(
+    elements.presentationSettings,
+  ) || Boolean(event.target.closest("#presentation-settings"));
+  if (state.presentationSettingsOpen && !clickedInsidePresentationSettings) {
+    state.presentationSettingsOpen = false;
+    syncPresentationPanelVisibility();
   }
 });
 
@@ -13266,10 +21686,14 @@ document.addEventListener("click", (event) => {
     const menu = wrap?.querySelector(".menu-content");
     if (menu) {
       const isHidden = menu.classList.contains("hidden");
-      // Close all other menus first
-      closeOpenMenus();
+      closeOpenMenus({ restoreFocus: false });
       if (isHidden) {
         menu.classList.remove("hidden");
+        toggle.setAttribute("aria-expanded", "true");
+        state.openRowMenuTrigger = toggle;
+        menu.querySelector("button:not(:disabled)")?.focus({ preventScroll: true });
+      } else {
+        toggle.focus({ preventScroll: true });
       }
       event.stopPropagation();
       return;
@@ -13278,37 +21702,63 @@ document.addEventListener("click", (event) => {
 
   // Close menus if clicking outside
   if (!event.target.closest(".menu-content")) {
-    closeOpenMenus();
+    closeOpenMenus({ restoreFocus: true });
   }
 });
 
 document.addEventListener("keydown", (event) => {
+  if (!event.altKey && !event.ctrlKey && !event.metaKey) {
+    document.documentElement.dataset.hostInputModality = "keyboard";
+  }
   if (event.key !== "Escape") {
     return;
   }
-  if (state.bindingIntent) {
-    closeBindingModal();
-  }
-  if (state.gatchaFavlistIntent) {
-    closeGatchaFavlistModal();
-  }
-  if (elements.poolConfigModal && !elements.poolConfigModal.classList.contains("hidden")) {
-    closePoolConfigModal();
-  }
   if (state.confirmIntent) {
     closeConfirm();
+    event.preventDefault();
+    return;
   }
-  if (state.cacheSettingsOpen) {
-    state.cacheSettingsOpen = false;
-    syncCachePanelVisibility();
+  if (closeHighestRequestTaskLayerForEscape()) {
+    event.preventDefault();
+    return;
   }
-  if (state.displaySettingsOpen) {
-    state.displaySettingsOpen = false;
-    syncDisplayPanelVisibility();
+  if (searchDetailController?.isOpen?.()) {
+    searchDetailController.close({ reason: "escape" });
+    event.preventDefault();
+    return;
   }
+  if (state.audioVariantBarExpanded) {
+    setAudioVariantPopoverOpen(false, { restoreFocus: true });
+    event.preventDefault();
+    return;
+  }
+  if (closeOrdinaryPopoverForEscape()) {
+    event.preventDefault();
+    return;
+  }
+  if (state.stageControlTrayOpen && !stageControlsAreInline()) {
+    setStageControlTrayOpen(false, { restoreFocus: true });
+    event.preventDefault();
+    return;
+  }
+  if (!isPlayerPanelFullscreen() && [...sourceRemovalEditors.values()].some(editor => editor?.handleEscape())) {
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    return;
+  }
+  if (!isPlayerPanelFullscreen() && closeHostWorkspaceOverlay()) {
+    event.preventDefault();
+    return;
+  }
+  if (closeOpenMenus({ restoreFocus: true })) {
+    event.preventDefault();
+    return;
+  }
+  handleNativePlayerFullscreenEscape(event);
 });
 
 document.addEventListener("visibilitychange", () => {
+  if (window.BilikaraAndroidPlayback?.visibilityChanged()) return;
   if (
     !state.localShouldBePlaying
     || shouldHoldCurrentItemForTransition(state.data?.current_item)
@@ -13326,20 +21776,49 @@ document.addEventListener("visibilitychange", () => {
 
 function handleFullscreenChange() {
   const isFullscreen = isPlayerPanelFullscreen();
+  fullscreenControlHover.reset();
+  hideMountedPlayerControls();
+  state.playerFullscreenInteraction?.sync();
   if (!isFullscreen) {
+    setPlayerFullscreenRemotePinned(false);
     hideFullscreenRequestToast();
+    state.presentationFeedbackView?.hide();
+    state.presentationActionFeedback = null;
     if (hasLocalAdvanceDelayOverlay()) {
       updateLocalAdvanceDelayOverlay();
     } else {
       hidePlayerDelayOverlay();
     }
   }
-  setTauriWindowFullscreen(isFullscreen).catch(() => {});
   renderPlayerFullscreenButton();
+  renderCurrentPresentationScene();
 }
 
 document.addEventListener("fullscreenchange", handleFullscreenChange);
 document.addEventListener("webkitfullscreenchange", handleFullscreenChange);
+
+async function deferCurrentSong(payload) {
+  state.immediateDeferTransition = payload;
+  try {
+    return await apiPostStateSnapshot("/api/playlist/defer-current", payload);
+  } finally {
+    if (state.immediateDeferTransition === payload) state.immediateDeferTransition = null;
+  }
+}
+
+currentQueueDefer = window.BilikaraQueueDefer?.mount({
+  handle: elements.queueCurrentProgressBadge,
+  card: elements.queueCurrent,
+  list: elements.playlist,
+  getSnapshot: () => state.data,
+  submit: deferCurrentSong,
+  started: () => closeCacheAdvancedInfo(),
+  changed: () => { render(); setFormMessage(t("queue.deferred")); },
+  failed: error => {
+    render();
+    setFormMessage(error.code === "defer_current_conflict" ? t("queue.deferConflict") : error.message, true);
+  },
+});
 
 elements.playlist.addEventListener("dragstart", (event) => {
   const item = event.target.closest(".song-item");
@@ -13353,6 +21832,7 @@ elements.playlist.addEventListener("dragstart", (event) => {
   }
 
   state.dragItemId = item.dataset.id || "";
+  state.dragQueue = state.renderedQueue;
   state.dragTargetId = "";
   state.dragTargetAfter = false;
 
@@ -13415,7 +21895,8 @@ elements.playlist.addEventListener("drop", async (event) => {
   event.preventDefault();
 
   const draggedId = state.dragItemId;
-  const playlist = state.data.playlist;
+  const playlist = state.dragQueue?.playlist || [];
+  const queueVersion = state.dragQueue?.version || "";
   const sourceIndex = playlist.findIndex((item) => item.id === draggedId);
   if (sourceIndex === -1 || !state.dragTargetId) {
     clearDragState();
@@ -13444,6 +21925,7 @@ elements.playlist.addEventListener("drop", async (event) => {
   const point = anchorPointForEvent(event, elements.playlist);
   openConfirm({
     type: "reorder-item",
+    queueVersion,
     itemId: draggedId,
     targetIndex,
     x: point.x,
@@ -13456,29 +21938,6 @@ elements.playlist.addEventListener("drop", async (event) => {
   });
   render();
 });
-
-elements.listStage.addEventListener("wheel", (event) => {
-  const list = activeScrollableList();
-  if (!list) {
-    return;
-  }
-
-  const deltaY = normalizeWheelDelta(event, list);
-  if (!deltaY || list.scrollHeight <= list.clientHeight) {
-    return;
-  }
-
-  const nextScrollTop = list.scrollTop + deltaY;
-  const maxScrollTop = list.scrollHeight - list.clientHeight;
-  const clampedScrollTop = Math.max(0, Math.min(nextScrollTop, maxScrollTop));
-
-  if (clampedScrollTop === list.scrollTop) {
-    return;
-  }
-
-  event.preventDefault();
-  list.scrollTop = clampedScrollTop;
-}, { passive: false });
 
 elements.gatchaButton.addEventListener("click", handleGatchaDraw);
 elements.gatchaRetryButton.addEventListener("click", handleGatchaDraw);
@@ -13495,42 +21954,48 @@ document.addEventListener("click", async (event) => {
   }
   const scoreButton = event.target.closest("[data-rating-score]");
   if (scoreButton) {
+    if (scoreButton.disabled || !isItemRateable(activeRatingPromptItem())) return;
     state.ratingPromptScore = Math.max(1, Math.min(5, Number(scoreButton.dataset.ratingScore || "5")));
+    state.ratingPromptScoreDirty = true;
     renderRatingStars();
-    return;
-  }
-  const optOutInput = event.target.closest("[data-rating-opt-out]");
-  if (optOutInput) {
-    setRatingOptOut(optOutInput.checked);
-    if (optOutInput.checked) {
-      closeRatingPrompt({ submit: false });
-    }
     return;
   }
   const addUpButton = event.target.closest("[data-rating-add-up]");
   if (addUpButton) {
     const promptItem = activeRatingPromptItem();
     const uid = ratingOwnerUid(promptItem);
-    const message = root.querySelector("[data-rating-message]");
+    if (addUpButton.disabled) return;
     if (!uid) {
-      if (message) message.textContent = t("rating.missingUidMessage");
+      setAppMessage(t("rating.missingUidMessage"), true);
       return;
     }
     addUpButton.disabled = true;
-    if (message) message.textContent = t("rating.addingUp");
+    addUpButton.setAttribute("aria-busy", "true");
+    addUpButton.textContent = t("rating.addingUp");
     try {
       await addGatchaUid(uid);
-      if (message) message.textContent = t("rating.addedUp");
+      setAppMessage(t("rating.addedUp"));
     } catch (error) {
-      if (message) message.textContent = error.message || t("rating.addFailed");
+      setAppMessage(error.message || t("rating.addFailed"), true);
     } finally {
-      addUpButton.disabled = false;
+      addUpButton.removeAttribute("aria-busy");
+      if (state.ratingPromptElement === root) renderRatingPromptContent();
     }
     return;
   }
-  if (event.target.closest("[data-rating-close]")) {
-    closeRatingPrompt({ submit: true });
+  const submitButton = event.target.closest("[data-rating-submit]");
+  if (submitButton) {
+    if (submitButton.disabled || !isItemRateable(activeRatingPromptItem())) return;
+    closeRatingPrompt({ submit: true, trigger: submitButton });
+    return;
   }
+  if (event.target.closest("[data-rating-close]")) {
+    closeRatingPrompt({ submit: false, trigger: event.target.closest("[data-rating-close]") });
+  }
+});
+
+elements.openRatingButton?.addEventListener("click", () => {
+  openRatingPrompt(state.data?.current_item, { manual: true });
 });
 
 function handleRatingFullscreenChange() {
@@ -13549,132 +22014,109 @@ document.addEventListener("webkitfullscreenchange", handleRatingFullscreenChange
 
 elements.requesterSelect?.addEventListener("change", handleRequesterSelectionChange);
 
-function openExpandedSearchModal() {
-  if (elements.searchModalPlaceholder && elements.searchCardContent && elements.searchModal) {
-    window.clearTimeout(searchModalCloseTimer);
-    searchModalCloseTimer = 0;
-    elements.searchModalPlaceholder.appendChild(elements.searchCardContent);
-    elements.searchModal.classList.remove("hidden", "closing");
-    elements.searchModalPlaceholder.classList.remove("hidden");
-    elements.favlistBrowserView?.classList.add("hidden");
-    elements.searchModalOtherView?.classList.add("hidden");
-    elements.searchSidebarItems?.forEach((btn) => {
-      btn.classList.toggle("active", btn.dataset.target === "search");
-    });
-    if (elements.searchExpandButton) {
-      elements.searchExpandButton.style.display = "none";
+elements.requesterEmptyButton?.addEventListener("click", () => {
+  activateHostWorkspace("users", { inputOrigin: "pointer" });
+  window.requestAnimationFrame(() => {
+    elements.sessionUserInput?.focus({ preventScroll: true });
+  });
+});
+
+elements.requestSubviewButtons?.forEach((button) => {
+  button.addEventListener("click", () => activateRequestSubview(button.dataset.requestView));
+  button.addEventListener("keydown", (event) => {
+    handleHorizontalTabKeydown(event, ["quick", "search", "discover", "sources"], activateRequestSubview);
+  });
+});
+
+elements.searchModeButtons?.forEach((button) => {
+  button.addEventListener("click", () => activateSearchMode(button.dataset.searchMode));
+  button.addEventListener("keydown", (event) => {
+    handleHorizontalTabKeydown(event, ["shared", "local"], activateSearchMode);
+  });
+});
+
+elements.discoverModeButtons?.forEach((button) => {
+  button.addEventListener("click", () => activateDiscoverMode(button.dataset.discoverMode));
+  button.addEventListener("keydown", (event) => {
+    handleHorizontalTabKeydown(event, ["categories", "name", "artist"], activateDiscoverMode);
+  });
+});
+
+elements.sourcesModeButtons?.forEach((button) => {
+  button.addEventListener("click", () => activateSourcesMode(button.dataset.sourcesMode));
+  button.addEventListener("keydown", (event) => {
+    handleHorizontalTabKeydown(event, ["uids", "favorites"], activateSourcesMode);
+  });
+});
+
+elements.catalogToolButtons?.forEach((button) => {
+  button.addEventListener("click", () => {
+    if (!state.developerMode) {
+      return;
     }
-    setSearchCardDetailMode(true);
-  }
-}
-
-function closeExpandedSearchModal() {
-  if (
-    !elements.searchOriginalContainer
-    || !elements.searchCardContent
-    || !elements.searchModal
-    || elements.searchModal.classList.contains("hidden")
-    || elements.searchModal.classList.contains("closing")
-  ) {
-    return;
-  }
-  searchDetailController?.close({ immediate: true });
-  elements.searchModal.classList.add("closing");
-  window.clearTimeout(searchModalCloseTimer);
-  searchModalCloseTimer = window.setTimeout(() => {
-    elements.searchOriginalContainer.appendChild(elements.searchCardContent);
-    elements.searchModal.classList.add("hidden");
-    elements.searchModal.classList.remove("closing");
-    setSearchCardDetailMode(false);
-    if (elements.searchExpandButton) {
-      elements.searchExpandButton.style.display = "";
+    const tool = String(button.dataset.catalogTool || "");
+    if (!["review", "blacklist", "maintenance"].includes(tool)) {
+      return;
     }
-    searchModalCloseTimer = 0;
-  }, 220);
-}
-
-elements.searchExpandButton?.addEventListener("click", openExpandedSearchModal);
-
-elements.searchModalClose?.addEventListener("click", closeExpandedSearchModal);
-
-elements.searchModalBackdrop?.addEventListener("click", closeExpandedSearchModal);
-
-elements.searchSidebarItems?.forEach((btn) => {
-  btn.addEventListener("click", () => {
-    elements.searchSidebarItems.forEach((b) => {
-      b.classList.remove("active");
-    });
-    btn.classList.add("active");
-
-    const target = btn.dataset.target;
-    if (target === "search") {
-      elements.searchModalPlaceholder?.classList.remove("hidden");
-      elements.favlistBrowserView?.classList.add("hidden");
-      elements.searchModalOtherView?.classList.add("hidden");
-    } else if (target === "favlist") {
-      elements.searchModalPlaceholder?.classList.add("hidden");
-      elements.favlistBrowserView?.classList.remove("hidden");
-      elements.searchModalOtherView?.classList.add("hidden");
-      if (!state.favlistBrowseData && !state.favlistBrowseLoading) {
-        state.favlistBrowseSelectedFolderId = "";
-        if (elements.favlistSearchQuery) {
-          elements.favlistSearchQuery.value = "";
-        }
-        loadFavlistBrowse({ folderId: "", query: "" });
-      } else {
-        renderFavlistBrowse();
-      }
-    } else if (target === "name" || target === "artist") {
-      elements.searchModalPlaceholder?.classList.add("hidden");
-      elements.favlistBrowserView?.classList.add("hidden");
-      elements.searchModalOtherView?.classList.remove("hidden");
-      if (state.d1BrowseKind !== target) {
-        state.d1BrowseData = null;
-        state.d1BrowseLetter = "";
-        state.d1BrowseTag = "";
-        state.d1BrowseLocale = "";
-        state.d1BrowseQuery = "";
-      }
-      state.d1BrowseKind = target;
-      renderD1BrowseView();
-    } else if (target === "category") {
-      elements.searchModalPlaceholder?.classList.add("hidden");
-      elements.favlistBrowserView?.classList.add("hidden");
-      elements.searchModalOtherView?.classList.remove("hidden");
-      renderCategoryBrowseView();
-    } else if (target === "review") {
-      if (!state.developerMode) {
-        btn.classList.remove("active");
-        const searchButton = Array.from(elements.searchSidebarItems || []).find((item) => item.dataset.target === "search");
-        searchButton?.classList.add("active");
-        elements.searchModalPlaceholder?.classList.remove("hidden");
-        elements.favlistBrowserView?.classList.add("hidden");
-        elements.searchModalOtherView?.classList.add("hidden");
-        return;
-      }
-      elements.searchModalPlaceholder?.classList.add("hidden");
-      elements.favlistBrowserView?.classList.add("hidden");
-      elements.searchModalOtherView?.classList.remove("hidden");
-      if (state.pendingReviewLoaded || state.pendingReviewLoading) {
-        renderPendingReviewView();
-      } else {
-        loadPendingReviewItems();
-      }
+    closeRequestDetailForNavigation();
+    rememberRequestScrollPosition();
+    state.catalogAdvancedTool = tool;
+    elements.catalogAdvancedMenu?.removeAttribute("open");
+    syncDiscoverModeSelection();
+    if (tool === "maintenance") {
+      renderMaintenanceView();
+    } else if (tool === "blacklist") {
+      state.blacklistLoaded || state.blacklistLoading
+        ? renderBlacklistView()
+        : loadBlacklistItems({ force: true, offset: 0 });
     } else {
-      elements.searchModalPlaceholder?.classList.add("hidden");
-      elements.favlistBrowserView?.classList.add("hidden");
-      elements.searchModalOtherView?.classList.remove("search-modal-browser-view");
-      elements.searchModalOtherView?.classList.remove("hidden");
-      if (elements.searchModalOtherView) {
-        elements.searchModalOtherView.textContent = t("search.browseComingSoon");
-      }
+      state.pendingReviewLoaded || state.pendingReviewLoading
+        ? renderPendingReviewView()
+        : loadPendingReviewItems();
     }
   });
 });
 
-elements.searchModalOtherView?.addEventListener("submit", (event) => {
+elements.catalogAdvancedBack?.addEventListener("click", () => {
+  state.catalogAdvancedTool = "";
+  syncDiscoverModeSelection();
+  restoreRequestScrollPosition();
+  elements.catalogAdvancedMenu?.querySelector("summary")?.focus({ preventScroll: true });
+});
+
+async function runRequestBusyAction(button, loadingLabel, action) {
+  if (!button || button.disabled) {
+    return;
+  }
+  const wasDisabled = button.disabled;
+  const originalLabel = button.getAttribute("aria-label");
+  button.disabled = true;
+  button.setAttribute("aria-busy", "true");
+  button.setAttribute("aria-label", loadingLabel);
+  try {
+    await action();
+  } finally {
+    button.disabled = wasDisabled;
+    button.removeAttribute("aria-busy");
+    // Navigation already displays loading in the detail view. Retain the
+    // card's name/count/avatar nodes and any newer accessible label.
+    if (button.getAttribute("aria-label") === loadingLabel) {
+      if (originalLabel === null) button.removeAttribute("aria-label");
+      else button.setAttribute("aria-label", originalLabel);
+    }
+  }
+}
+
+elements.requestWorkspace?.addEventListener("submit", (event) => {
+  const blacklistForm = event.target.closest("[data-blacklist-search]");
+  if (blacklistForm && elements.requestWorkspace.contains(blacklistForm)) {
+    event.preventDefault();
+    const input = blacklistForm.querySelector("[data-blacklist-query]");
+    loadBlacklistItems({ force: true, query: input?.value || "", offset: 0 });
+    return;
+  }
   const categoryForm = event.target.closest("[data-category-browse-search]");
-  if (categoryForm && elements.searchModalOtherView.contains(categoryForm)) {
+  if (categoryForm && elements.requestWorkspace.contains(categoryForm)) {
     event.preventDefault();
     const input = categoryForm.querySelector("[data-category-browse-query]");
     loadCategoryBrowse({
@@ -13684,12 +22126,15 @@ elements.searchModalOtherView?.addEventListener("submit", (event) => {
     return;
   }
   const form = event.target.closest("[data-d1-browse-search]");
-  if (!form || !elements.searchModalOtherView.contains(form)) {
+  if (!form || !elements.requestWorkspace.contains(form)) {
     return;
   }
   event.preventDefault();
+  if (state.d1BrowseLoading) {
+    return;
+  }
   const input = form.querySelector("[data-d1-browse-query]");
-  if (!state.d1BrowseLetter) {
+  if (state.d1BrowseLevel === "alphabet") {
     if (input) {
       input.value = "";
     }
@@ -13700,7 +22145,7 @@ elements.searchModalOtherView?.addEventListener("submit", (event) => {
     renderD1BrowseView();
     return;
   }
-  if (state.d1BrowseTag) {
+  if (state.d1BrowseLevel === "items") {
     loadD1Browse({
       kind: state.d1BrowseKind || "name",
       letter: state.d1BrowseLetter,
@@ -13719,62 +22164,112 @@ elements.searchModalOtherView?.addEventListener("submit", (event) => {
   });
 });
 
-elements.searchModalOtherView?.addEventListener("click", (event) => {
+elements.requestWorkspace?.addEventListener("click", (event) => {
+  const maintenanceButton = event.target.closest("[data-maintenance-job]");
+  if (maintenanceButton && elements.requestWorkspace.contains(maintenanceButton)) {
+    void triggerMaintenanceJob(maintenanceButton.dataset.maintenanceJob || "");
+    return;
+  }
+  const blacklistRefreshButton = event.target.closest("[data-blacklist-refresh]");
+  if (blacklistRefreshButton && elements.requestWorkspace.contains(blacklistRefreshButton)) {
+    loadBlacklistItems({ force: true });
+    return;
+  }
+  const blacklistPreviousButton = event.target.closest("[data-blacklist-previous]");
+  if (blacklistPreviousButton && elements.requestWorkspace.contains(blacklistPreviousButton)) {
+    loadBlacklistItems({
+      force: true,
+      offset: Math.max(0, state.blacklistOffset - state.blacklistLimit),
+    });
+    return;
+  }
+  const blacklistNextButton = event.target.closest("[data-blacklist-next]");
+  if (blacklistNextButton && elements.requestWorkspace.contains(blacklistNextButton)) {
+    loadBlacklistItems({
+      force: true,
+      offset: state.blacklistOffset + state.blacklistLimit,
+    });
+    return;
+  }
   const reviewRefreshButton = event.target.closest("[data-pending-review-refresh]");
-  if (reviewRefreshButton && elements.searchModalOtherView.contains(reviewRefreshButton)) {
+  if (reviewRefreshButton && elements.requestWorkspace.contains(reviewRefreshButton)) {
+    if (state.developerTagResetSaving || state.pendingReviewApproving) return;
     loadPendingReviewItems({ force: true });
     return;
   }
   const reviewApproveButton = event.target.closest("[data-pending-review-approve]");
-  if (reviewApproveButton && elements.searchModalOtherView.contains(reviewApproveButton)) {
+  if (reviewApproveButton && elements.requestWorkspace.contains(reviewApproveButton)) {
     approvePendingReviewVisibleItems();
     return;
   }
+  const reviewRejectButton = event.target.closest("[data-pending-review-reject]");
+  if (reviewRejectButton && elements.requestWorkspace.contains(reviewRejectButton)) {
+    openPendingReviewRejectModal();
+    return;
+  }
   const categoryBackButton = event.target.closest("[data-category-browse-back]");
-  if (categoryBackButton && elements.searchModalOtherView.contains(categoryBackButton)) {
-    state.categoryBrowseSelectedId = "";
-    state.categoryBrowseQuery = "";
-    state.categoryBrowseItems = [];
-    state.categoryBrowseOffset = 0;
-    state.categoryBrowseHasMore = false;
-    state.categoryBrowseError = "";
+  if (categoryBackButton && elements.requestWorkspace.contains(categoryBackButton)) {
+    rememberDiscoverHierarchyScrollPosition(activeRequestScrollOwner(), "categories");
+    state.categoryBrowseSeq += 1;
+    state.categoryBrowseLoading = false;
+    state.categoryBrowseLevel = "home";
     renderCategoryBrowseView();
+    restoreRequestScrollPosition();
     return;
   }
   const categoryButton = event.target.closest("[data-category-id]");
-  if (categoryButton && elements.searchModalOtherView.contains(categoryButton)) {
+  if (categoryButton && elements.requestWorkspace.contains(categoryButton)) {
+    const categoryId = String(categoryButton.dataset.categoryId || "");
+    rememberDiscoverHierarchyScrollPosition(activeRequestScrollOwner(), "categories");
+    if (categoryId === state.categoryBrowseSelectedId && state.categoryBrowseLoaded) {
+      state.categoryBrowseLevel = "detail";
+      renderCategoryBrowseView();
+      restoreRequestScrollPosition();
+      return;
+    }
     loadCategoryBrowse({
-      categoryId: categoryButton.dataset.categoryId || "",
+      categoryId,
       query: "",
       append: false,
     });
     return;
   }
   const backButton = event.target.closest("[data-d1-browse-back]");
-  if (backButton && elements.searchModalOtherView.contains(backButton)) {
-    if (state.d1BrowseTag) {
-      loadD1Browse({
-        kind: state.d1BrowseKind || "name",
-        letter: state.d1BrowseLetter,
-        query: "",
-        tag: "",
-        locale: "",
-      });
-    } else if (state.d1BrowseLetter) {
-      state.d1BrowseLetter = "";
-      state.d1BrowseTag = "";
-      state.d1BrowseLocale = "";
-      state.d1BrowseQuery = "";
-      state.d1BrowseData = null;
-      renderD1BrowseView();
-    }
+  if (backButton && elements.requestWorkspace.contains(backButton)) {
+    const kind = state.d1BrowseKind || "name";
+    const mode = d1BrowseModeState(kind);
+    rememberDiscoverHierarchyScrollPosition(activeRequestScrollOwner(), kind);
+    mode.seq += 1;
+    mode.loading = false;
+    mode.level = state.d1BrowseLevel === "items" ? "tags" : "alphabet";
+    restoreD1BrowseMode(kind);
+    state.d1BrowseData = mode.level === "items" ? mode.itemData : mode.tagData;
+    renderD1BrowseView();
+    restoreRequestScrollPosition();
     return;
   }
   const letterButton = event.target.closest("[data-letter]");
-  if (letterButton && elements.searchModalOtherView.contains(letterButton)) {
+  if (letterButton && elements.requestWorkspace.contains(letterButton)) {
+    if (document.documentElement.dataset.hostPlatform === "android") {
+      if (document.activeElement?.matches("input, textarea, [contenteditable='true']")) document.activeElement.blur();
+    }
+    const kind = state.d1BrowseKind || "name";
+    const mode = d1BrowseModeState(kind);
+    const letter = String(letterButton.dataset.letter || "");
+    rememberDiscoverHierarchyScrollPosition(activeRequestScrollOwner(), kind);
+    if (mode.letter === letter && mode.tagData) {
+      mode.level = "tags";
+      restoreD1BrowseMode(kind);
+      state.d1BrowseData = mode.tagData;
+      renderD1BrowseView();
+      restoreRequestScrollPosition();
+      return;
+    }
+    mode.scrollPositions.tags = 0;
+    mode.scrollPositions.items = 0;
     loadD1Browse({
-      kind: state.d1BrowseKind || "name",
-      letter: letterButton.dataset.letter || "",
+      kind,
+      letter,
       query: "",
       tag: "",
       locale: "",
@@ -13782,94 +22277,123 @@ elements.searchModalOtherView?.addEventListener("click", (event) => {
     return;
   }
   const tagButton = event.target.closest("[data-tag]");
-  if (tagButton && elements.searchModalOtherView.contains(tagButton)) {
+  if (tagButton && elements.requestWorkspace.contains(tagButton)) {
+    const kind = state.d1BrowseKind || "name";
+    const mode = d1BrowseModeState(kind);
+    const tag = String(tagButton.dataset.tag || "");
+    const locale = String(tagButton.dataset.locale || "");
+    rememberDiscoverHierarchyScrollPosition(activeRequestScrollOwner(), kind);
+    if (mode.tag === tag && mode.locale === locale && mode.itemData) {
+      mode.level = "items";
+      restoreD1BrowseMode(kind);
+      state.d1BrowseData = mode.itemData;
+      renderD1BrowseView();
+      restoreRequestScrollPosition();
+      return;
+    }
+    mode.scrollPositions.items = 0;
     loadD1Browse({
-      kind: state.d1BrowseKind || "name",
+      kind,
       letter: state.d1BrowseLetter,
       query: "",
-      tag: tagButton.dataset.tag || "",
-      locale: tagButton.dataset.locale || "",
+      tag,
+      locale,
     });
   }
 });
 
-elements.searchModalOtherView?.addEventListener("click", async (event) => {
-  if (openSearchResultDetail(event, elements.searchModalOtherView, "modalBrowse")) {
+elements.requestWorkspace?.addEventListener("click", async (event) => {
+  const browseContainer = event.target.closest(
+    "#request-discover-panel, #catalog-advanced-view",
+  );
+  if (!browseContainer || !elements.requestWorkspace.contains(browseContainer)) {
     return;
   }
-  const target = searchResultRequestTarget(event, elements.searchModalOtherView);
+  if (openSearchResultDetail(event, browseContainer, "discover")) {
+    return;
+  }
+  const target = searchResultRequestTarget(event, browseContainer);
   if (!target?.url || (target.button && target.button.disabled)) {
     return;
   }
   let originalText = "";
   if (target.button) {
     target.button.disabled = true;
+    target.button.setAttribute("aria-busy", "true");
     originalText = target.button.textContent;
     target.button.textContent = t("search.adding") || "添加中...";
   }
   try {
-    await handleAddByUrl(target.url, "tail", anchorPointForEvent(event, target.anchor), "modalBrowse");
+    await handleAddByUrl(target.url, "tail", anchorPointForEvent(event, target.anchor), "discover");
   } finally {
     if (target.button) {
       target.button.disabled = false;
+      target.button.removeAttribute("aria-busy");
       target.button.textContent = originalText;
     }
   }
 });
 
-elements.searchModalOtherView?.addEventListener("scroll", (event) => {
+elements.requestWorkspace?.addEventListener("scroll", (event) => {
   const target = event.target;
-  if (target instanceof Element && target.matches("[data-category-browse-results]")) {
-    maybeLoadMoreCategoryBrowse(target);
+  const owner = activeRequestScrollOwner();
+  if (state.requestScrollRestoring || target !== owner) {
+    return;
+  }
+  const mode = normalizeDiscoverMode(state.discoverMode);
+  if (mode === "categories") {
+    rememberDiscoverHierarchyScrollPosition(target, "categories");
+    if (state.categoryBrowseLevel === "detail") {
+      maybeLoadMoreCategoryBrowse(target);
+    }
+  } else if (mode === "name") {
+    rememberDiscoverHierarchyScrollPosition(target, "name");
+  } else if (mode === "artist") {
+    rememberDiscoverHierarchyScrollPosition(target, "artist");
   }
 }, true);
 
-elements.searchCookieToggle?.addEventListener("click", () => {
-  state.searchLarkVisible = false;
-  state.searchCookieVisible = !state.searchCookieVisible;
-  renderSearchCookieFace();
-  if (state.searchCookieVisible && !state.followBrowseLoading) {
-    state.followBrowseSelectedUid = "";
-    if (elements.followSearchQuery) {
-      elements.followSearchQuery.value = "";
-    }
-    loadFollowBrowse({ uid: "", query: "" });
-  }
-});
-
-elements.searchLarkToggle?.addEventListener("click", () => {
-  state.searchCookieVisible = false;
-  state.searchLarkVisible = !state.searchLarkVisible;
-  renderSearchCookieFace();
-});
-
 elements.followUpGrid?.addEventListener("click", async (event) => {
   const button = event.target.closest("button[data-uid]");
-  if (!button) {
+  if (!button || button.disabled) {
     return;
   }
   const uid = String(button.dataset.uid || "").trim();
   if (!uid) {
     return;
   }
+  state.sourceParentScrollPositions.followed = Number(elements.sourcesFollowedScroll?.scrollTop || 0);
   state.followBrowseSelectedUid = uid;
   if (elements.followSearchQuery) {
     elements.followSearchQuery.value = "";
   }
-  await loadFollowBrowse({ uid, query: "" });
+  await runRequestBusyAction(
+    button,
+    t("follow.loadingItems"),
+    () => loadFollowBrowse({ uid, query: "" }),
+  );
+  if (elements.followSongResults) {
+    elements.followSongResults.scrollTop = state.sourceItemScrollPositions.followed;
+  }
 });
 
 elements.followBrowseBack?.addEventListener("click", () => {
+  state.sourceItemScrollPositions.followed = Number(elements.followSongResults?.scrollTop || 0);
   state.followBrowseSelectedUid = "";
   if (elements.followSearchQuery) {
     elements.followSearchQuery.value = "";
   }
   renderFollowBrowse();
-  renderSearchCookieFace();
+  if (elements.sourcesFollowedScroll) {
+    elements.sourcesFollowedScroll.scrollTop = state.sourceParentScrollPositions.followed;
+  }
 });
 
 elements.followSearchForm?.addEventListener("submit", async (event) => {
   event.preventDefault();
+  if (state.followBrowseLoading) {
+    return;
+  }
   const query = String(elements.followSearchQuery?.value || "").trim();
   await loadFollowBrowse({
     uid: state.followBrowseSelectedUid,
@@ -13893,6 +22417,7 @@ elements.followSongResults?.addEventListener("click", async (event) => {
   let originalText = "";
   if (target.button) {
     target.button.disabled = true;
+    target.button.setAttribute("aria-busy", "true");
     originalText = target.button.textContent;
     target.button.textContent = t("search.adding") || "添加中...";
   }
@@ -13901,6 +22426,7 @@ elements.followSongResults?.addEventListener("click", async (event) => {
   } finally {
     if (target.button) {
       target.button.disabled = false;
+      target.button.removeAttribute("aria-busy");
       target.button.textContent = originalText;
     }
   }
@@ -13908,30 +22434,45 @@ elements.followSongResults?.addEventListener("click", async (event) => {
 
 elements.favlistGrid?.addEventListener("click", async (event) => {
   const button = event.target.closest("button[data-folder-id]");
-  if (!button) {
+  if (!button || button.disabled) {
     return;
   }
   const folderId = String(button.dataset.folderId || "").trim();
   if (!folderId) {
     return;
   }
+  state.sourceParentScrollPositions.favorites = Number(elements.sourcesFavoritesScroll?.scrollTop || 0);
   state.favlistBrowseSelectedFolderId = folderId;
   if (elements.favlistSearchQuery) {
     elements.favlistSearchQuery.value = "";
   }
-  await loadFavlistBrowse({ folderId, query: "" });
+  await runRequestBusyAction(
+    button,
+    t("favlist.loadingItems"),
+    () => loadFavlistBrowse({ folderId, query: "" }),
+  );
+  if (elements.favlistSongResults) {
+    elements.favlistSongResults.scrollTop = state.sourceItemScrollPositions.favorites;
+  }
 });
 
 elements.favlistBrowseBack?.addEventListener("click", () => {
+  state.sourceItemScrollPositions.favorites = Number(elements.favlistSongResults?.scrollTop || 0);
   state.favlistBrowseSelectedFolderId = "";
   if (elements.favlistSearchQuery) {
     elements.favlistSearchQuery.value = "";
   }
   renderFavlistBrowse();
+  if (elements.sourcesFavoritesScroll) {
+    elements.sourcesFavoritesScroll.scrollTop = state.sourceParentScrollPositions.favorites;
+  }
 });
 
 elements.favlistSearchForm?.addEventListener("submit", async (event) => {
   event.preventDefault();
+  if (state.favlistBrowseLoading) {
+    return;
+  }
   const query = String(elements.favlistSearchQuery?.value || "").trim();
   await loadFavlistBrowse({
     folderId: state.favlistBrowseSelectedFolderId,
@@ -13955,6 +22496,7 @@ elements.favlistSongResults?.addEventListener("click", async (event) => {
   let originalText = "";
   if (target.button) {
     target.button.disabled = true;
+    target.button.setAttribute("aria-busy", "true");
     originalText = target.button.textContent;
     target.button.textContent = t("search.adding") || "添加中...";
   }
@@ -13963,44 +22505,76 @@ elements.favlistSongResults?.addEventListener("click", async (event) => {
   } finally {
     if (target.button) {
       target.button.disabled = false;
+      target.button.removeAttribute("aria-busy");
       target.button.textContent = originalText;
     }
   }
 });
 
-elements.gatchaUidToggle?.addEventListener("click", () => {
-  state.gatchaUidVisible = !state.gatchaUidVisible;
-  renderGatchaUidFace();
+elements.sourcesFollowedScroll?.addEventListener("scroll", () => {
+  if (state.followBrowseSelectedUid) {
+    return;
+  }
+  state.sourceParentScrollPositions.followed = Number(elements.sourcesFollowedScroll.scrollTop || 0);
+  state.requestScrollPositions.sources.uids = state.sourceParentScrollPositions.followed;
+});
+
+elements.followSongResults?.addEventListener("scroll", () => {
+  if (!state.followBrowseSelectedUid) {
+    return;
+  }
+  state.sourceItemScrollPositions.followed = Number(elements.followSongResults.scrollTop || 0);
+  state.requestScrollPositions.sources.uids = state.sourceItemScrollPositions.followed;
+});
+
+elements.sourcesFavoritesScroll?.addEventListener("scroll", () => {
+  if (state.favlistBrowseSelectedFolderId) return;
+  state.sourceParentScrollPositions.favorites = Number(elements.sourcesFavoritesScroll.scrollTop || 0);
+  state.requestScrollPositions.sources.favorites = state.sourceParentScrollPositions.favorites;
+});
+elements.favlistSongResults?.addEventListener("scroll", () => {
+  if (!state.favlistBrowseSelectedFolderId) return;
+  state.sourceItemScrollPositions.favorites = Number(elements.favlistSongResults.scrollTop || 0);
+  state.requestScrollPositions.sources.favorites = state.sourceItemScrollPositions.favorites;
+});
+
+elements.gatchaStage?.addEventListener("scroll", () => {
+  state.gatchaScrollTop = Math.max(0, Number(elements.gatchaStage.scrollTop || 0));
 });
 
 elements.gatchaPoolConfigToggle?.addEventListener("click", async () => {
   await openPoolConfigModal();
 });
 
-elements.gatchaConfirmButton.addEventListener("click", async () => {
-  if (!state.gatchaCandidate || elements.gatchaConfirmButton.disabled) return;
-
-  const url = state.gatchaCandidate.url;
-  const requesterName = validatedRequesterNameForAdd(setGatchaMessage);
-  if (!requesterName) {
-    return;
+async function confirmGatchaCandidate(event = null) {
+  event?.stopPropagation?.();
+  if (!state.gatchaCandidate || state.gatchaRequestBusy) {
+    return false;
   }
 
-  const prevText = elements.gatchaConfirmButton.textContent;
-  elements.gatchaConfirmButton.disabled = true;
-  elements.gatchaConfirmButton.setAttribute("aria-busy", "true");
-  elements.gatchaConfirmButton.textContent = t("search.adding");
+  const url = state.gatchaCandidate.url;
+  const title = state.gatchaCandidate.title;
+  const idleLabel = elements.gatchaConfirmButton.textContent;
+  const requesterName = validatedRequesterNameForAdd(setGatchaMessage);
+  if (!requesterName) {
+    renderGatchaWorkspace();
+    return false;
+  }
 
+  state.gatchaRequestBusy = true;
   setGatchaMessage(t("gatcha.nozomi"));
+  renderGatchaWorkspace();
   try {
-    state.data = await submitAddRequest(url, "tail", { requesterName });
-    setFormMessage(t("gatcha.requestSuccess", { title: state.gatchaCandidate.title }));
-
-
-    state.gatchaCandidate = null;
-    elements.gatchaResultView.classList.add("hidden");
-    elements.gatchaInitView.classList.remove("hidden");
+    const accepted = await submitAddRequest(url, "tail", { requesterName });
+    if (!accepted) {
+      setGatchaMessage("");
+      setAppMessage(t("error.requestFailed"), true);
+      return false;
+    }
+    setFormMessage(t("gatcha.requestSuccess", { title }));
+    clearAcceptedGatchaCandidate();
     render();
+    return true;
   } catch (error) {
     if (error.code === "manual_binding_required") {
       openBindingModal(
@@ -14010,11 +22584,12 @@ elements.gatchaConfirmButton.addEventListener("click", async () => {
           requesterName,
           preserveInput: false,
           source: "gatcha",
-          title: state.gatchaCandidate.title,
+          title,
+          focusElement: elements.gatchaConfirmButton,
         },
         error.payload?.binding,
       );
-      return;
+      return false;
     }
     if (error.code === "duplicate_session_request") {
       const point = anchorPointForEvent({}, elements.gatchaConfirmButton);
@@ -14022,7 +22597,11 @@ elements.gatchaConfirmButton.addEventListener("click", async () => {
         type: "duplicate-add",
         url,
         position: "tail",
+        requesterName,
         preserveInput: false,
+        source: "gatcha",
+        title,
+        focusElement: elements.gatchaConfirmButton,
         message: duplicateConfirmMessage(
           error.payload?.duplicate_item,
           error.payload?.session_entry,
@@ -14031,24 +22610,19 @@ elements.gatchaConfirmButton.addEventListener("click", async () => {
         x: point.x,
         y: point.y,
       });
-      return;
+      return false;
     }
-    setGatchaMessage(error.message, true);
+    setGatchaMessage("");
+    setAppMessage(error.message, true);
+    return false;
   } finally {
-    elements.gatchaConfirmButton.disabled = false;
-    elements.gatchaConfirmButton.removeAttribute("aria-busy");
-    elements.gatchaConfirmButton.textContent = prevText;
+    state.gatchaRequestBusy = false;
+    renderGatchaWorkspace();
+    elements.gatchaConfirmButton.textContent = idleLabel;
   }
-});
+}
 
-elements.gatchaUidForm?.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  await previewGatchaUidAddFromInput(elements.gatchaUidInput, {
-    messageTarget: "gatcha",
-    anchor: elements.addGatchaUidButton,
-    event,
-  });
-});
+elements.gatchaConfirmButton.addEventListener("click", confirmGatchaCandidate);
 
 elements.modalFollowUidForm?.addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -14060,6 +22634,7 @@ elements.modalFollowUidForm?.addEventListener("submit", async (event) => {
 });
 
 elements.refreshGatchaCacheButton?.addEventListener("click", async () => {
+  if (state.gatchaRefreshSaving) return;
   if (gatchaTaskBusy()) {
     setGatchaUidMessage(gatchaTaskBusyMessage(), true);
     renderGatchaUidFace();
@@ -14067,17 +22642,10 @@ elements.refreshGatchaCacheButton?.addEventListener("click", async () => {
   }
   state.gatchaRefreshSaving = true;
   renderGatchaUidFace();
-  setGatchaUidMessage(t("gatcha.refreshingBackground"));
+  setGatchaUidInlineMessage(t("gatcha.refreshingBackground"));
   try {
     const result = await refreshGatchaCache();
-    if (result?.started !== false && state.data) {
-      state.data.gatcha = {
-        ...(state.data.gatcha || {}),
-        busy: true,
-        message: gatchaTaskBusyMessage(),
-        last_status: "running",
-      };
-    }
+    await fetchState();
     setGatchaUidMessage(result?.started === false ? t("gatcha.refreshAlreadyRunning") : t("gatcha.refreshStarted"));
   } catch (error) {
     setGatchaUidMessage(error.message, true);
@@ -14085,13 +22653,6 @@ elements.refreshGatchaCacheButton?.addEventListener("click", async () => {
     state.gatchaRefreshSaving = false;
     renderGatchaUidFace();
   }
-});
-
-elements.pullGatchaFavlistButton?.addEventListener("click", async () => {
-  await previewGatchaFavlistFromInput(elements.gatchaUidInput, {
-    messageTarget: "gatcha",
-    modalSource: "gatcha",
-  });
 });
 
 elements.modalFavlistPullForm?.addEventListener("submit", async (event) => {
@@ -14105,40 +22666,180 @@ elements.modalFavlistPullForm?.addEventListener("submit", async (event) => {
 
 async function startPolling() {
   hydrateLocalPreferences();
+  let preferencesFailed = false;
+  state.updatePreferencesHydration = hydrateNativeUpdatePreferences().catch(() => {
+    // An unreadable native choice must not turn a previously disabled check on.
+    state.updateAutomaticEnabled = false;
+    preferencesFailed = true;
+  });
   await loadTranslations();
+  await state.updatePreferencesHydration;
+  if (preferencesFailed) setAppMessage(t("service.updatePreferencesFailed"), true);
+  initializeHostShell();
+  syncApplicationRestartAvailability();
   initSearchDetailController();
-  renderLayoutMode();
-  try {
-    await reportMediaCapabilities();
-  } catch {
-    // Playback capability reporting should not block the host UI from loading.
-  }
+  await initializeLocalPresentation();
   try {
     await fetchState();
   } catch (error) {
-    setAppMessage(error.message, true);
+    if (shouldReportStateFetchError(error)) {
+      setAppMessage(error.message, true);
+    }
   }
-  await loadPlaybackSelectorCapability();
+  if (!state.data?.session_flags?.startup_choice_pending) {
+    try { await reportMediaCapabilities(); } catch {
+      // Capability reporting must not block the Host UI; the Rust limits remain.
+    }
+  }
+  await restartHostPlaybackAfterBootstrap();
+  // The native backend/origin and initial page theme are both settled now.
+  // Do this once at bootstrap, not on polling or progress snapshots.
+  syncNativeWindowTheme();
   window.setInterval(async () => {
+    if (state.statePollInFlight) return;
+    state.statePollInFlight = true;
     try {
       await fetchState();
-    } catch {
-      // Ignore transient polling errors and keep the last state on screen.
+      await restartHostPlaybackAfterBootstrap();
+    } catch (error) {
+      if (shouldReportStateFetchError(error)) {
+        setAppMessage(error.message, true);
+      }
+    } finally {
+      state.statePollInFlight = false;
     }
   }, pollIntervalMs);
 }
 
-window.addEventListener("resize", scheduleConfirmPopoverPositionSync);
-window.addEventListener("scroll", scheduleConfirmPopoverPositionSync, true);
+async function restartHostPlaybackAfterBootstrap() {
+  if (!state.hostPlaybackBootstrapRestartPending || !state.hasValidStateResponse || state.data?.session_flags?.startup_choice_pending) {
+    return false;
+  }
+  state.hostPlaybackBootstrapRestartPending = false;
+  if (!state.data?.playback_program) {
+    return false;
+  }
+  try {
+    const accepted = await apiPostStateSnapshot("/api/player/restart-program");
+    if (accepted) {
+      render();
+    }
+    return accepted;
+  } catch (error) {
+    setAppMessage(error.message, true);
+    return false;
+  }
+}
+
+async function restartHostPlaybackAfterPageRestore() {
+  if (
+    !state.pageHidePlaybackRestartRequired
+    || state.pageRestoreRestartInFlight
+  ) {
+    return false;
+  }
+  if (!state.data?.playback_program) {
+    state.pageHidePlaybackRestartRequired = false;
+    state.pageHiddenPlaybackGeneration = null;
+    return false;
+  }
+  const pageHiddenPlaybackGeneration = state.pageHiddenPlaybackGeneration;
+  state.pageRestoreRestartInFlight = true;
+  let accepted = false;
+  try {
+    accepted = await apiPostStateSnapshot("/api/player/restart-program");
+  } catch (error) {
+    setAppMessage(error.message, true);
+  } finally {
+    state.pageHidePlaybackRestartRequired = false;
+    state.pageHiddenPlaybackGeneration = null;
+    state.pageRestoreRestartInFlight = false;
+  }
+  const acceptedNewerProgramWhileRestartWasPending = Boolean(
+    !accepted
+    && Number.isSafeInteger(pageHiddenPlaybackGeneration)
+    && Number.isSafeInteger(state.data?.playback_generation)
+    && state.data.playback_generation > pageHiddenPlaybackGeneration
+    && state.data?.playback_program
+  );
+  if (accepted || acceptedNewerProgramWhileRestartWasPending) {
+    const session = state.hostPlaybackSession;
+    if (
+      session?.phase === "retired"
+      && session.playbackGeneration === state.data.playback_generation
+      && playbackProgramDescriptorsEqual(
+        session.playbackProgram,
+        state.data.playback_program,
+      )
+      && !session.video
+      && !session.audio
+    ) {
+      state.hostPlaybackSession = null;
+    }
+    render();
+  }
+  return accepted;
+}
+
+window.addEventListener("resize", () => {
+  scheduleConfirmPopoverPositionSync();
+  renderHostWorkspaceSelection();
+  schedulePersistentStageMeasurement();
+  scheduleTopControlPopoverPositionSync();
+  schedulePlaybackContextualTooltipPositionSync();
+  syncAudioVariantOverflow();
+});
+window.addEventListener("scroll", () => {
+  scheduleConfirmPopoverPositionSync();
+  schedulePlaybackContextualTooltipPositionSync();
+}, true);
 
 window.addEventListener("pagehide", () => {
+  const session = state.hostPlaybackSession;
+  const restartRequired = Boolean(
+    state.data?.playback_program
+    && session?.video
+    && session?.audio
+    && isCurrentHostPlaybackSession(session, session.video, session.audio),
+  );
+  state.pageHidePlaybackRestartRequired = restartRequired;
+  state.pageHiddenPlaybackGeneration = restartRequired
+    ? session.playbackGeneration
+    : null;
+  teardownMountedPlayer();
+  disposeSharedAudioContext();
+  teardownLocalPresentationListeners();
+  disconnectClient();
+});
+window.addEventListener("beforeunload", disconnectClient);
+// The shell requests this before waiting for backend cleanup. Keep the UI
+// thread free to unload the WebView media and stop Web Audio immediately.
+window.addEventListener("bilikara-before-close", () => {
+  state.desktopClosing = true;
   teardownMountedPlayer();
   disposeSharedAudioContext();
   disconnectClient();
 });
-window.addEventListener("beforeunload", disconnectClient);
 window.addEventListener("pageshow", () => {
+  initializeLocalPresentation().catch(() => {});
   renderVolumeControls(frontendPlaybackMode(state.data?.playback_mode));
+  restartHostPlaybackAfterPageRestore().catch(() => {});
 });
 
 startPolling();
+
+// Cancels the operation owned by the native desktop Host. A committed helper
+// explicitly rejects cancellation; closing the UI never claims rollback.
+document.getElementById("update-cancel-button")?.addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  if (button.disabled) return;
+  button.disabled = true;
+  button.setAttribute("aria-busy", "true");
+  try {
+    const result = await globalThis.BilikaraHostUpdates.cancel();
+    if (state.data) state.data.app_update = result;
+    renderUpdatePreviewControl();
+    setAppMessage(result.message);
+  } catch (error) { setAppMessage(error.message, true); }
+  finally { button.disabled = false; button.removeAttribute("aria-busy"); }
+});

@@ -8,14 +8,16 @@ import zipfile
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import bilikara.server as server_module
+from bilikara import rust_backend, rust_runtime
 import bilikara.diagnostics as diagnostics
 from bilikara.diagnostics import DiagnosticArtifact
+from bilikara.models import PlaylistItem
 from bilikara.remote_identity import RemoteIdentityStore
 from bilikara.server import AppContext, BilikaraHandler, run
-from bilikara.store import PlaylistStore
+from bilikara.store import PlaylistStore, PlaylistStoreCommandError
 
 
 class FileServingPathSecurityTest(unittest.TestCase):
@@ -145,6 +147,56 @@ class FileServingPathSecurityTest(unittest.TestCase):
 
         self.assertEqual(streams, [])
         self.assertEqual(writes[0]["status"], server_module.HTTPStatus.NOT_FOUND)
+
+    def test_media_route_never_serves_attempt_staging_or_directories(self):
+        with TemporaryDirectory() as tmpdir:
+            cache_dir = Path(tmpdir) / "cache"
+            staging = cache_dir / ".staging" / "attempt-1"
+            staging.mkdir(parents=True)
+            (staging / "partial.mp4").write_bytes(b"partial")
+            handler, writes, streams = self.make_handler()
+
+            with patch("bilikara.server.CACHE_DIR", cache_dir):
+                handler._serve_media("/media/.staging/attempt-1/partial.mp4")
+                handler._serve_media("/media/.staging/attempt-1")
+
+        self.assertEqual(streams, [])
+        self.assertEqual(
+            [entry["status"] for entry in writes],
+            [server_module.HTTPStatus.NOT_FOUND, server_module.HTTPStatus.NOT_FOUND],
+        )
+
+    def test_old_and_new_immutable_artifact_urls_remain_distinct_and_servable(self):
+        with TemporaryDirectory() as tmpdir:
+            cache_dir = Path(tmpdir) / "cache"
+            incarnation = "i-0123456789abcdef0123456789abcdef-0000000000000001"
+            old_set = "a-0123456789abcdef0123456789abcdef-0000000000000001"
+            new_set = "a-0123456789abcdef0123456789abcdef-0000000000000002"
+            old_relative = f"artifacts/{incarnation}/{old_set}/video-p1.mp4"
+            new_relative = f"artifacts/{incarnation}/{new_set}/video-p1.mp4"
+            old_file = cache_dir / old_relative
+            new_file = cache_dir / new_relative
+            old_file.parent.mkdir(parents=True)
+            new_file.parent.mkdir(parents=True)
+            old_file.write_bytes(b"old-version")
+            new_file.write_bytes(b"new-version")
+            handler, writes, streams = self.make_handler()
+            leases = []
+            manager = SimpleNamespace(
+                acquire_media_reader=lambda relative: leases.append(relative) or object(),
+                release_media_reader=lambda _lease: True,
+            )
+
+            with (
+                patch("bilikara.server.CACHE_DIR", cache_dir),
+                patch.object(server_module.CONTEXT, "cache_manager", manager),
+            ):
+                handler._serve_media(f"/media/{old_relative}")
+                handler._serve_media(f"/media/{new_relative}")
+
+        self.assertEqual(writes, [])
+        self.assertEqual(streams, [old_file.resolve(), new_file.resolve()])
+        self.assertEqual(leases, [old_relative, new_relative])
 
 
 class AppContextRemoteAccessTest(unittest.TestCase):
@@ -208,10 +260,6 @@ class AppContextRemoteIdentityTest(unittest.TestCase):
     def prepare_reset_state(context: AppContext) -> None:
         context.cache_manager = SimpleNamespace(clear_runtime_cache=lambda: None)
         context.auto_restored_backup = False
-        context._player_control_lock = threading.RLock()
-        context._player_control_seq = 0
-        context._player_control_ack_seq = 0
-        context._player_control_command = None
         context._player_status_lock = threading.RLock()
         context._player_status = None
 
@@ -276,6 +324,21 @@ class AppContextRemoteIdentityTest(unittest.TestCase):
 
 
 class AppContextStateRevisionTest(unittest.TestCase):
+    def test_shutdown_stops_cache_before_uninitializing_appstate(self):
+        context = AppContext.__new__(AppContext)
+        context._closed = False
+        calls: list[str] = []
+        context.cache_manager = SimpleNamespace(
+            shutdown=lambda: calls.append("cache")
+        )
+        context.store = SimpleNamespace(shutdown=lambda: calls.append("appstate"))
+
+        context.shutdown()
+        context.shutdown()
+
+        self.assertTrue(context._closed)
+        self.assertEqual(calls, ["cache", "appstate"])
+
     def test_background_tasks_include_one_time_prewarm_targets(self):
         context = AppContext.__new__(AppContext)
         context._startup_lock = threading.RLock()
@@ -330,6 +393,7 @@ class AppContextStateRevisionTest(unittest.TestCase):
 
     def test_startup_gatcha_refresh_bypasses_global_lock_only_once(self):
         context = AppContext.__new__(AppContext)
+        context._gatcha_refresh_owner = 42
         context._startup_lock = threading.RLock()
         context._startup_gatcha_refresh_bypass_available = True
         context._state_change_condition = threading.Condition()
@@ -346,8 +410,10 @@ class AppContextStateRevisionTest(unittest.TestCase):
                 "use_global_lock": False,
                 "upload_default_uids_to_lark": False,
                 "startup_schema_rebuild": True,
+                "_owner": 42,
             },
         )
+        self.assertEqual(refresh.call_args_list[1].kwargs["_owner"], 42)
         self.assertIn("on_start", refresh.call_args_list[1].kwargs)
         self.assertIn("on_done", refresh.call_args_list[1].kwargs)
         self.assertNotIn("use_global_lock", refresh.call_args_list[1].kwargs)
@@ -375,20 +441,313 @@ class AppContextStateRevisionTest(unittest.TestCase):
         context = AppContext.__new__(AppContext)
         context._state_change_condition = threading.Condition()
         context._state_revision = 0
-        context._player_control_lock = threading.RLock()
-        context._player_control_seq = 7
-        context._player_control_ack_seq = 0
-        context._player_control_command = {"type": "play"}
         context._player_status_lock = threading.RLock()
         context._player_status = {"item_id": "song-a", "current_time": 12.0}
-        context.store = SimpleNamespace(reset_player_state=lambda: None)
+        context.store = SimpleNamespace(reset_player_state=Mock())
 
         context.reset_player_state()
 
         self.assertEqual(context._state_revision, 1)
-        self.assertEqual(context._player_control_ack_seq, 7)
-        self.assertIsNone(context._player_control_command)
+        # Queue reset is covered at the real AppState/HTTP boundary.
+        context.store.reset_player_state.assert_called_once_with()
         self.assertIsNone(context._player_status)
+
+
+class AppContextArtifactOwnershipBoundaryTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = TemporaryDirectory()
+        root = Path(self.temp_dir.name)
+        self.cache_dir = root / "cache"
+        self.cache_dir.mkdir()
+        self.store = PlaylistStore(root / "state.json", root / "backup.json")
+        self.store.add_session_user("ownership-user")
+        self.cache_patch = patch("bilikara.cache.CACHE_DIR", self.cache_dir)
+        self.worker_patch = patch.object(
+            server_module.CacheManager, "_worker_loop", lambda _self: None
+        )
+        self.cache_patch.start()
+        self.worker_patch.start()
+        self.manager = server_module.CacheManager(self.store, max_cache_items=2)
+
+    def tearDown(self) -> None:
+        self.manager.shutdown()
+        self.worker_patch.stop()
+        self.cache_patch.stop()
+        self.temp_dir.cleanup()
+
+    @staticmethod
+    def _item() -> PlaylistItem:
+        return PlaylistItem(
+            id="song-a",
+            original_url="https://example.test/song-a",
+            resolved_url="https://example.test/song-a?p=1",
+            bvid="BV1xx411c7mD",
+            aid=1,
+            cid=2,
+            page=1,
+            title="song-a",
+            part_title="P1",
+            display_title="song-a - P1",
+            cover_url="",
+            embed_url="",
+        )
+
+    def _publish(self) -> dict[str, object]:
+        self.store.add_item(self._item(), requester_name="ownership-user")
+        item = self.store.get_item("song-a")
+        self.assertIsNotNone(item)
+        token = self.manager._begin_cache_attempt_for_item(item)
+        reservation = self.store.cache_attempt_reservation(token)
+        relative_directory = str(reservation["artifact_relative_directory"])
+        committed = self.cache_dir / relative_directory
+        committed.mkdir(parents=True)
+        video_relative_path = f"{relative_directory}/video.mp4"
+        audio_relative_path = f"{relative_directory}/audio.m4a"
+        (self.cache_dir / video_relative_path).write_bytes(b"video")
+        (self.cache_dir / audio_relative_path).write_bytes(b"audio")
+        self.assertTrue(
+            self.manager._project_cache_event(
+                "song-a",
+                "ready",
+                cache_attempt_token=token,
+                progress=100.0,
+                message="ready",
+                video_relative_path=video_relative_path,
+                video_media_url=f"/media/{video_relative_path}",
+                audio_variants=[
+                    {
+                        "id": "p1",
+                        "label": "P1",
+                        "page": 1,
+                        "audio_url": f"/media/{audio_relative_path}",
+                    }
+                ],
+                selected_audio_variant_id="p1",
+                item_incarnation_id=reservation["item_incarnation_id"],
+                artifact_set_id=reservation["artifact_set_id"],
+                artifact_relative_directory=relative_directory,
+            )
+        )
+        return {**reservation, "directory": committed}
+
+    def _context(self) -> AppContext:
+        context = AppContext.__new__(AppContext)
+        context.store = self.store
+        context.cache_manager = self.manager
+        context._state_change_condition = threading.Condition()
+        context._state_revision = 1
+        context._state_epoch = "fixture-host-epoch"
+        context._client_lock = threading.RLock()
+        context._host_client_last_seen = {"host-client": 1.0}
+        context.auto_restored_backup = False
+        context.remote_identities = SimpleNamespace(
+            snapshot_session_id=lambda: "remote-session"
+        )
+        context.remote_access_snapshot = lambda: {}
+        context.player_control_command_snapshot = lambda: None
+        context.player_status_snapshot = lambda _snapshot: None
+        context.app_update_snapshot = lambda: {}
+        return context
+
+    def test_unmounted_intermediate_snapshot_does_not_pin_after_real_sessions_retire(self):
+        artifact = self._publish()
+        context = self._context()
+        with (
+            patch.object(self.manager, "reconcile_cache_state"),
+            patch.object(server_module, "gatcha_task_snapshot", return_value={}),
+            patch.object(server_module, "gatcha_pool_config_snapshot", return_value={}),
+            patch.object(server_module, "gatcha_favlist_updated_at", return_value=None),
+        ):
+            mounted_g1 = context.snapshot()
+            self.assertTrue(
+                context.claim_host_playback_program(
+                    host_client_id="host-client",
+                    playback_generation=mounted_g1["playback_generation"],
+                    item_incarnation_id=artifact["item_incarnation_id"],
+                    artifact_set_id=artifact["artifact_set_id"],
+                )
+            )
+            self.assertTrue(context.restart_playback_program())
+            unmounted_g2 = context.snapshot()
+            self.assertTrue(context.restart_playback_program())
+            mounted_g3 = context.snapshot()
+            self.assertTrue(
+                context.claim_host_playback_program(
+                    host_client_id="host-client",
+                    playback_generation=mounted_g3["playback_generation"],
+                    item_incarnation_id=artifact["item_incarnation_id"],
+                    artifact_set_id=artifact["artifact_set_id"],
+                )
+            )
+
+        generations = {
+            mounted_g1["playback_generation"],
+            unmounted_g2["playback_generation"],
+            mounted_g3["playback_generation"],
+        }
+        self.assertEqual(len(generations), 3)
+
+        item = self.store.get_item("song-a")
+        self.assertIsNotNone(item)
+        token = self.manager._begin_cache_attempt_for_item(item)
+        self.assertTrue(
+            self.manager._project_cache_event(
+                "song-a",
+                "evicted",
+                cache_attempt_token=token,
+                message="test eviction",
+            )
+        )
+        for snapshot in (mounted_g1, mounted_g3):
+            self.assertTrue(
+                context.retire_host_playback_program(
+                    host_client_id="host-client",
+                    playback_generation=snapshot["playback_generation"],
+                    item_incarnation_id=artifact["item_incarnation_id"],
+                    artifact_set_id=artifact["artifact_set_id"],
+                )
+            )
+
+        self.assertFalse(artifact["directory"].exists())
+
+    def test_one_host_retirement_does_not_release_another_host_owner(self):
+        artifact = self._publish()
+        context = self._context()
+        context._host_client_last_seen = {
+            "host-client-1": 1.0,
+            "host-client-2": 1.0,
+        }
+        with (
+            patch.object(self.manager, "reconcile_cache_state"),
+            patch.object(server_module, "gatcha_task_snapshot", return_value={}),
+            patch.object(server_module, "gatcha_pool_config_snapshot", return_value={}),
+            patch.object(server_module, "gatcha_favlist_updated_at", return_value=None),
+        ):
+            host_1_snapshot = context.snapshot()
+            host_2_snapshot = context.snapshot()
+
+        for host_client_id, snapshot in (
+            ("host-client-1", host_1_snapshot),
+            ("host-client-2", host_2_snapshot),
+        ):
+            self.assertTrue(
+                context.claim_host_playback_program(
+                    host_client_id=host_client_id,
+                    playback_generation=snapshot["playback_generation"],
+                    item_incarnation_id=artifact["item_incarnation_id"],
+                    artifact_set_id=artifact["artifact_set_id"],
+                )
+            )
+
+        self.assertEqual(
+            host_1_snapshot["playback_generation"],
+            host_2_snapshot["playback_generation"],
+        )
+        reader = self.manager.acquire_media_reader(
+            f"{artifact['artifact_relative_directory']}/video.mp4"
+        )
+        self.assertIsNotNone(reader)
+        item = self.store.get_item("song-a")
+        self.assertIsNotNone(item)
+        token = self.manager._begin_cache_attempt_for_item(item)
+        self.assertTrue(
+            self.manager._project_cache_event(
+                "song-a",
+                "evicted",
+                cache_attempt_token=token,
+                message="test eviction",
+            )
+        )
+        self.assertTrue(
+            context.retire_host_playback_program(
+                host_client_id="host-client-1",
+                playback_generation=host_1_snapshot["playback_generation"],
+                item_incarnation_id=artifact["item_incarnation_id"],
+                artifact_set_id=artifact["artifact_set_id"],
+            )
+        )
+
+        self.assertTrue(artifact["directory"].is_dir())
+        self.assertFalse(
+            context.retire_host_playback_program(
+                host_client_id="host-client-1",
+                playback_generation=host_1_snapshot["playback_generation"],
+                item_incarnation_id=artifact["item_incarnation_id"],
+                artifact_set_id=artifact["artifact_set_id"],
+            )
+        )
+        self.assertTrue(
+            context.retire_host_playback_program(
+                host_client_id="host-client-2",
+                playback_generation=host_2_snapshot["playback_generation"],
+                item_incarnation_id=artifact["item_incarnation_id"],
+                artifact_set_id=artifact["artifact_set_id"],
+            )
+        )
+        self.assertTrue(artifact["directory"].is_dir())
+        self.assertTrue(self.manager.release_media_reader(reader))
+        self.assertFalse(artifact["directory"].exists())
+
+    def test_stale_host_release_cannot_affect_another_hosts_newer_owner(self):
+        artifact = self._publish()
+        context = self._context()
+        first = self.store.snapshot()
+        self.assertTrue(
+            context.claim_host_playback_program(
+                host_client_id="host-client-1",
+                playback_generation=first["playback_generation"],
+                item_incarnation_id=artifact["item_incarnation_id"],
+                artifact_set_id=artifact["artifact_set_id"],
+            )
+        )
+        self.assertTrue(context.restart_playback_program())
+        second = self.store.snapshot()
+        self.assertTrue(
+            context.claim_host_playback_program(
+                host_client_id="host-client-2",
+                playback_generation=second["playback_generation"],
+                item_incarnation_id=artifact["item_incarnation_id"],
+                artifact_set_id=artifact["artifact_set_id"],
+            )
+        )
+
+        item = self.store.get_item("song-a")
+        self.assertIsNotNone(item)
+        token = self.manager._begin_cache_attempt_for_item(item)
+        self.assertTrue(
+            self.manager._project_cache_event(
+                "song-a",
+                "evicted",
+                cache_attempt_token=token,
+                message="test eviction",
+            )
+        )
+        self.assertTrue(
+            context.retire_host_playback_program(
+                host_client_id="host-client-1",
+                playback_generation=first["playback_generation"],
+                item_incarnation_id=artifact["item_incarnation_id"],
+                artifact_set_id=artifact["artifact_set_id"],
+            )
+        )
+        self.assertFalse(
+            context.retire_host_playback_program(
+                host_client_id="host-client-1",
+                playback_generation=second["playback_generation"],
+                item_incarnation_id=artifact["item_incarnation_id"],
+                artifact_set_id=artifact["artifact_set_id"],
+            )
+        )
+        self.assertTrue(artifact["directory"].is_dir())
+        self.assertTrue(
+            context.retire_host_playback_program(
+                host_client_id="host-client-2",
+                playback_generation=second["playback_generation"],
+                item_incarnation_id=artifact["item_incarnation_id"],
+                artifact_set_id=artifact["artifact_set_id"],
+            )
+        )
+        self.assertFalse(artifact["directory"].exists())
 
 
 class AppContextSsePayloadCacheTest(unittest.TestCase):
@@ -430,6 +789,28 @@ class AppContextSsePayloadCacheTest(unittest.TestCase):
         self.assertEqual(
             self.decode_state_event(first_payload),
             {"state_revision": 7, "value": "same"},
+        )
+
+    def test_state_event_carries_authoritative_rust_revision(self):
+        context = self.make_context(revision=7)
+        context.snapshot = lambda: {
+            "revision": 41,
+            "session_generation": 3,
+            "playback_generation": 9,
+            "state_revision": context._state_revision,
+        }
+
+        transport_revision, payload = context.serialized_sse_state_event()
+
+        self.assertEqual(transport_revision, 7)
+        self.assertEqual(
+            self.decode_state_event(payload),
+            {
+                "revision": 41,
+                "session_generation": 3,
+                "playback_generation": 9,
+                "state_revision": 7,
+            },
         )
 
     def test_revision_change_builds_and_publishes_new_payload(self):
@@ -557,6 +938,48 @@ class AppContextSsePayloadCacheTest(unittest.TestCase):
         )
 
 
+class StateApiCompatibilityTest(unittest.TestCase):
+    def test_host_and_remote_receive_the_same_revisioned_snapshot(self):
+        snapshot = {
+            "revision": 19,
+            "session_generation": 4,
+            "playback_generation": 8,
+            "playback_program": {
+                "item_id": "song-a",
+                "item_incarnation_id": "i-exact",
+                "selected_audio_variant_id": "instrumental",
+                "artifact_set_id": "a-exact",
+            },
+            "current_item": {"id": "song-a"},
+            "playlist": [],
+        }
+        context = SimpleNamespace(
+            touch_client=lambda *_args, **_kwargs: None,
+            snapshot=lambda: dict(snapshot),
+        )
+
+        def request(referer: str) -> dict[str, object]:
+            handler = BilikaraHandler.__new__(BilikaraHandler)
+            handler.path = "/api/state"
+            handler.headers = {
+                "X-Bilikara-Client": "test-client",
+                "Referer": referer,
+            }
+            writes: list[dict[str, object]] = []
+            handler._write_json = lambda payload, status=None: writes.append(payload)
+            with patch("bilikara.server.CONTEXT", context):
+                handler.do_GET()
+            return writes[0]
+
+        host = request("http://127.0.0.1:8080/")
+        remote = request("http://127.0.0.1:8080/remote")
+
+        self.assertEqual(host, remote)
+        self.assertEqual(host["data"]["revision"], 19)
+        self.assertEqual(host["data"]["playback_generation"], 8)
+        self.assertEqual(host["data"]["playback_program"], snapshot["playback_program"])
+
+
 class AppContextRatingSubmissionTest(unittest.TestCase):
     def make_context(self) -> AppContext:
         context = AppContext.__new__(AppContext)
@@ -639,9 +1062,49 @@ class BilikaraHandlerLocalClientTest(unittest.TestCase):
 
 
 class AddressArchitectureTest(unittest.TestCase):
+    def test_context_is_lazy_and_forwards_reads_writes_and_shutdown_to_one_adapter(self):
+        adapter = SimpleNamespace(value=1, shutdown=Mock())
+        with patch.object(server_module, "AppContext", return_value=adapter) as create:
+            context = server_module._LazyAppContext()
+            context.shutdown()
+            create.assert_not_called()
+            self.assertEqual(context.value, 1)
+            context.value = 2
+            self.assertEqual(adapter.value, 2)
+            self.assertEqual(context.value, 2)
+            with patch.object(context, "value", 3):
+                self.assertEqual(adapter.value, 3)
+            self.assertEqual(context.value, 2)
+            del context.value
+            self.assertFalse(hasattr(adapter, "value"))
+            create.assert_called_once_with()
+            context.shutdown()
+            adapter.shutdown.assert_called_once_with()
+
     def test_wildcard_bind_uses_loopback_for_local_ui(self):
         self.assertEqual(server_module._local_ui_host("0.0.0.0"), "127.0.0.1")
         self.assertEqual(server_module._local_ui_url("0.0.0.0", 8080), "http://127.0.0.1:8080")
+
+    def test_windows_bundle_keeps_lan_bind_and_adds_loopback_host_ui(self):
+        with (
+            patch.object(server_module.sys, "frozen", True, create=True),
+            patch.object(server_module.os, "name", "nt"),
+        ):
+            self.assertEqual(
+                server_module._port_probe_hosts("192.168.1.20"),
+                ("192.168.1.20", "127.0.0.1"),
+            )
+            self.assertEqual(
+                server_module._local_ui_url("192.168.1.20", 8080),
+                "http://127.0.0.1:8080",
+            )
+
+    def test_source_explicit_lan_bind_does_not_add_companion_listener(self):
+        with patch.object(server_module.sys, "frozen", False, create=True):
+            self.assertEqual(
+                server_module._port_probe_hosts("192.168.1.20"),
+                ("192.168.1.20",),
+            )
 
     def test_windows_remote_url_uses_ranked_system_addresses(self):
         with (
@@ -702,28 +1165,325 @@ class AppContextPlayerStatusTest(unittest.TestCase):
         context._player_status = None
         context._state_change_condition = threading.Condition()
         context._state_revision = 0
-        context.store = SimpleNamespace(mark_item_playback_started=lambda item_id: None)
+        temp_dir = TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        root = Path(temp_dir.name)
+        context.store = PlaylistStore(
+            root / "state.json",
+            root / "backup.json",
+            root / "played",
+            on_change=context._notify_state_changed,
+        )
+        context.store.add_session_user("Alice")
+        context.store.add_item(
+            PlaylistItem(
+                id="song-1",
+                original_url="https://example.test/song-1",
+                resolved_url="https://example.test/song-1?p=1",
+                bvid="BV0000000001",
+                aid=1,
+                cid=2,
+                page=1,
+                title="Song 1",
+                part_title="P1",
+                display_title="Song 1 - P1",
+                cover_url="",
+                embed_url="",
+            ),
+            requester_name="Alice",
+        )
+        context._state_revision = 0
         return context
 
-    def test_player_status_preserves_reported_duration(self):
+    @staticmethod
+    def report(
+        context: AppContext,
+        *,
+        generation: int,
+        sequence: int,
+        current_time: float,
+        duration: float = 100.0,
+        phase: str = "playing",
+        is_paused: bool = False,
+    ) -> dict[str, object]:
+        return context.update_player_status(
+            playback_generation=generation,
+            status_sequence=sequence,
+            item_id="song-1",
+            observed_phase=phase,
+            is_paused=is_paused,
+            current_time=current_time,
+            duration=duration,
+            client_info={"platform": "test"},
+        )
+
+    def test_ordering_duplicate_and_inverse_arrival_change_revision_only_when_visible(self):
         context = self.make_context()
+        generation = context.store.playback_generation
 
-        context.update_player_status(
-            item_id="song-1",
-            is_paused=False,
-            current_time=12.0,
-            duration=123.4,
+        first = self.report(
+            context,
+            generation=generation,
+            sequence=1,
+            current_time=50.0,
         )
-        context.update_player_status(
-            item_id="song-1",
-            is_paused=True,
-            current_time=13.0,
-        )
+        self.assertTrue(first["accepted"])
+        self.assertTrue(first["changed"])
+        self.assertTrue(context.store.current_item_started)
+        self.assertTrue(context.store.session_played[0].threshold_reached)
+        self.assertEqual(context._state_revision, 1)
 
-        snapshot = context.player_status_snapshot({"id": "song-1"})
+        higher = self.report(
+            context,
+            generation=generation,
+            sequence=2,
+            current_time=51.0,
+        )
+        self.assertTrue(higher["accepted"])
+        self.assertTrue(higher["changed"])
+        self.assertEqual(context._state_revision, 2)
+
+        duplicate = self.report(
+            context,
+            generation=generation,
+            sequence=2,
+            current_time=51.0,
+        )
+        self.assertTrue(duplicate["accepted"])
+        self.assertTrue(duplicate["duplicate"])
+        self.assertFalse(duplicate["changed"])
+        self.assertEqual(context._state_revision, 2)
+
+        with self.assertRaises(server_module.PlayerStatusAdmissionError) as conflict:
+            self.report(
+                context,
+                generation=generation,
+                sequence=2,
+                current_time=52.0,
+            )
+        self.assertEqual(conflict.exception.kind, "player_status_sequence_conflict")
+        self.assertEqual(context._state_revision, 2)
+
+        newest = self.report(
+            context,
+            generation=generation,
+            sequence=4,
+            current_time=54.0,
+        )
+        self.assertTrue(newest["changed"])
+        self.assertEqual(context._state_revision, 3)
+        with self.assertRaises(server_module.PlayerStatusAdmissionError) as stale:
+            self.report(
+                context,
+                generation=generation,
+                sequence=3,
+                current_time=53.0,
+            )
+        self.assertEqual(stale.exception.kind, "player_status_sequence_stale")
+        self.assertEqual(context._state_revision, 3)
+
+        ordering_only = self.report(
+            context,
+            generation=generation,
+            sequence=5,
+            current_time=54.0,
+        )
+        self.assertTrue(ordering_only["accepted"])
+        self.assertFalse(ordering_only["changed"])
+        self.assertEqual(context._state_revision, 3)
+
+        snapshot = context.player_status_snapshot(context.store.snapshot())
         self.assertIsNotNone(snapshot)
-        self.assertEqual(snapshot["duration"], 123.4)
-        self.assertEqual(snapshot["current_time"], 13.0)
+        self.assertEqual(snapshot["playback_generation"], generation)
+        self.assertEqual(snapshot["current_time"], 54.0)
+        self.assertNotIn("status_sequence", snapshot)
+
+    def test_program_change_hides_status_and_stale_generation_has_no_side_effect(self):
+        context = self.make_context()
+        generation = context.store.playback_generation
+        self.report(
+            context,
+            generation=generation,
+            sequence=1,
+            current_time=0.0,
+            phase="ready-paused",
+            is_paused=True,
+        )
+        self.assertFalse(context.store.current_item_started)
+        self.assertIsNotNone(
+            context.player_status_snapshot(context.store.snapshot())
+        )
+
+        context._notify_state_changed()
+        same_program = context.store.snapshot()
+        self.assertEqual(same_program["playback_generation"], generation)
+        self.assertIsNotNone(context.player_status_snapshot(same_program))
+
+        context.store.restart_playback_program()
+        replacement = context.store.snapshot()
+        self.assertGreater(replacement["playback_generation"], generation)
+        self.assertIsNone(context.player_status_snapshot(replacement))
+        revision_after_replacement = context._state_revision
+        before_rust = context.store.authoritative_snapshot()
+        with self.assertRaises(server_module.PlayerStatusAdmissionError) as stale:
+            self.report(
+                context,
+                generation=generation,
+                sequence=2,
+                current_time=75.0,
+            )
+        self.assertEqual(stale.exception.kind, "playback_generation_mismatch")
+        self.assertEqual(context.store.authoritative_snapshot(), before_rust)
+        self.assertEqual(context._state_revision, revision_after_replacement)
+        self.assertFalse(context.store.current_item_started)
+        self.assertFalse(context.store.session_played[0].threshold_reached)
+
+        current = self.report(
+            context,
+            generation=replacement["playback_generation"],
+            sequence=1,
+            current_time=0.0,
+            phase="ready-paused",
+            is_paused=True,
+        )
+        self.assertTrue(current["accepted"])
+        projected = context.player_status_snapshot(context.store.snapshot())
+        self.assertEqual(
+            projected["playback_generation"],
+            replacement["playback_generation"],
+        )
+
+
+class PlayerStatusRouteTest(unittest.TestCase):
+    @staticmethod
+    def run_request(
+        body: dict[str, object],
+        *,
+        rejection: server_module.PlayerStatusAdmissionError | None = None,
+    ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+        handler = BilikaraHandler.__new__(BilikaraHandler)
+        handler.path = "/api/player/status"
+        handler.headers = {}
+        handler._read_json_body = lambda: body
+        writes: list[dict[str, object]] = []
+        calls: list[dict[str, object]] = []
+        handler._write_json = lambda payload, status=None: writes.append(
+            {"payload": payload, "status": status}
+        )
+        def update_player_status(**kwargs):
+            calls.append(kwargs)
+            if rejection is not None:
+                raise rejection
+            return {"accepted": True, "duplicate": False, "changed": True}
+
+        context = SimpleNamespace(
+            touch_client=lambda _client_id, is_host=True: None,
+            update_player_status=update_player_status,
+        )
+        with patch("bilikara.server.CONTEXT", context):
+            handler.do_POST()
+        return calls, writes
+
+    @staticmethod
+    def valid_body() -> dict[str, object]:
+        return {
+            "playback_generation": 7,
+            "status_sequence": 3,
+            "item_id": "song-1",
+            "observed_phase": "playing",
+            "is_paused": False,
+            "current_time": 12.5,
+            "duration": 100.0,
+            "client_info": {"platform": "test"},
+        }
+
+    def test_route_forwards_one_normalized_bounded_observation(self):
+        calls, writes = self.run_request(self.valid_body())
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["playback_generation"], 7)
+        self.assertEqual(calls[0]["status_sequence"], 3)
+        self.assertEqual(calls[0]["observed_phase"], "playing")
+        self.assertEqual(calls[0]["current_time"], 12.5)
+        self.assertEqual(
+            writes,
+            [
+                {
+                    "payload": {
+                        "ok": True,
+                        "data": {
+                            "accepted": True,
+                            "duplicate": False,
+                            "changed": True,
+                        },
+                    },
+                    "status": None,
+                }
+            ],
+        )
+
+    def test_route_rejects_invalid_identity_phase_and_numeric_bounds(self):
+        invalid_cases = [
+            ("playback_generation", None),
+            ("playback_generation", True),
+            ("playback_generation", 0),
+            ("playback_generation", 9_007_199_254_740_992),
+            ("status_sequence", None),
+            ("status_sequence", 0),
+            ("status_sequence", 9_007_199_254_740_992),
+            ("item_id", 1),
+            ("item_id", ""),
+            ("item_id", "x" * (server_module.PLAYER_STATUS_ITEM_ID_MAX_BYTES + 1)),
+            ("observed_phase", "binding"),
+            ("observed_phase", 1),
+            ("current_time", -1.0),
+            ("current_time", float("nan")),
+            ("current_time", float("inf")),
+            ("duration", -1.0),
+            ("duration", server_module.PLAYER_STATUS_MAX_SECONDS + 1),
+        ]
+        for field, value in invalid_cases:
+            with self.subTest(field=field, value=value):
+                body = self.valid_body()
+                body[field] = value
+                calls, writes = self.run_request(body)
+                self.assertEqual(calls, [])
+                self.assertEqual(writes[0]["status"], server_module.HTTPStatus.BAD_REQUEST)
+                self.assertFalse(writes[0]["payload"]["ok"])
+
+        conflicting = self.valid_body()
+        conflicting["is_paused"] = True
+        calls, writes = self.run_request(conflicting)
+        self.assertEqual(calls, [])
+        self.assertEqual(writes[0]["status"], server_module.HTTPStatus.BAD_REQUEST)
+
+    def test_route_maps_typed_stale_status_rejection_to_noop_envelope(self):
+        calls, writes = self.run_request(
+            self.valid_body(),
+            rejection=server_module.PlayerStatusAdmissionError(
+                "playback_generation_mismatch",
+                "playback program changed",
+            ),
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            writes,
+            [
+                {
+                    "payload": {
+                        "ok": True,
+                        "data": {
+                            "accepted": False,
+                            "duplicate": False,
+                            "changed": False,
+                            "reason": "playback_generation_mismatch",
+                        },
+                    },
+                    "status": None,
+                }
+            ],
+        )
 
 
 class AppContextPlayerDiagnosticTest(unittest.TestCase):
@@ -811,7 +1571,6 @@ class AppContextPlayerDiagnosticTest(unittest.TestCase):
                 snapshot=lambda: {
                     "current_item": None,
                     "playlist": [],
-                    "playback_selector": "auto",
                     "session_users": ["AliceSecretUser"],
                 }
             )
@@ -931,6 +1690,92 @@ class PortSelectionTest(unittest.TestCase):
         self.assertEqual(port, 8081)
 
 
+class PlaybackCapabilityHttpBoundaryTest(unittest.TestCase):
+    @staticmethod
+    def context():
+        return SimpleNamespace(touch_client=lambda _client_id, is_host=True: None)
+
+    def test_removed_processing_backend_routes_are_not_dispatched(self):
+        route = "/api/player/" + "playback-" + "selector"
+        handler = BilikaraHandler.__new__(BilikaraHandler)
+        handler.path = route
+        handler.headers = {}
+        served = []
+        handler._serve_static = lambda value: served.append(value)
+        handler._write_json = lambda *_args, **_kwargs: None
+        with patch("bilikara.server.CONTEXT", self.context()):
+            handler.do_GET()
+        self.assertEqual(served, [route])
+
+        writes = []
+        handler = BilikaraHandler.__new__(BilikaraHandler)
+        handler.path = route
+        handler.headers = {}
+        handler._read_json_body = lambda: {"mode": "rust"}
+        handler._write_json = lambda payload, status=None: writes.append(
+            (payload, status)
+        )
+        with patch("bilikara.server.CONTEXT", self.context()):
+            handler.do_POST()
+        self.assertEqual(writes[0][1], server_module.HTTPStatus.NOT_FOUND)
+        self.assertIn("未知接口", writes[0][0]["error"])
+
+    def test_direct_capability_failure_preserves_stable_503_shape(self):
+        handler = BilikaraHandler.__new__(BilikaraHandler)
+        handler.path = "/api/playlist/add"
+        handler.headers = {}
+        handler._read_json_body = lambda: {"url": "https://example.test/video"}
+        handler._handle_add = lambda _body: (_ for _ in ()).throw(
+            rust_backend.PlaybackCapabilityError("decide_audio_binding")
+        )
+        writes = []
+        handler._write_json = lambda payload, status=None: writes.append(
+            (payload, status)
+        )
+
+        with patch("bilikara.server.CONTEXT", self.context()):
+            handler.do_POST()
+
+        self.assertEqual(writes[0][1], server_module.HTTPStatus.SERVICE_UNAVAILABLE)
+        self.assertEqual(
+            writes[0][0],
+            {
+                "ok": False,
+                "error": "Rust playback capability failed: decide_audio_binding",
+                "code": "playback_capability_failed",
+                "capability": "decide_audio_binding",
+            },
+        )
+
+
+class RatingConsoleFailureTest(unittest.TestCase):
+    def test_invalid_console_does_not_fail_logging_or_lose_rating_submission(self):
+        context = Mock()
+        context.register_rating_submission.side_effect = [True, False]
+        body = {"session_user_name": "Test", "play_id": "play-1",
+                "bvid": "BV1tPC2BEEjq", "score": 4, "message": "open rating"}
+        submitted = Mock()
+        for route in ["/api/rating/log", "/api/rating/submit", "/api/rating/submit"]:
+            handler = BilikaraHandler.__new__(BilikaraHandler)
+            handler.path = route
+            handler.headers = {}
+            handler._read_json_body = lambda: body
+            handler._submit_rating_in_background = submitted
+            writes = []
+            handler._write_json = lambda payload, status=None: writes.append((payload, status))
+            console = Mock()
+            console.write.side_effect = OSError(22, "Invalid argument")
+            console.buffer.write.side_effect = OSError(22, "Invalid argument")
+            console.encoding = "utf-8"
+            with patch("bilikara.server.CONTEXT", context), patch("sys.stdout", console):
+                handler.do_POST()
+            self.assertEqual(len(writes), 1)
+            self.assertTrue(writes[0][0]["ok"], writes)
+            self.assertIsNone(writes[0][1])
+        submitted.assert_called_once_with("Test", "play-1", "BV1tPC2BEEjq", 4)
+        self.assertTrue(writes[0][0]["data"]["duplicate"])
+
+
 class PlaylistAddRequestTest(unittest.TestCase):
     def test_add_requires_session_user_before_parsing_video(self):
         handler = BilikaraHandler.__new__(BilikaraHandler)
@@ -969,19 +1814,18 @@ class PlaylistAddRequestTest(unittest.TestCase):
         added = []
         context = SimpleNamespace(
             has_session_users=lambda: True,
-            capture_playback_selector=lambda: "rust",
             store=SimpleNamespace(
                 session_request_for_item=lambda _item: None,
                 active_duplicate_for_item=lambda _item: None,
             ),
             add_item=lambda added_item, **kwargs: added.append((added_item, kwargs)),
-            snapshot=lambda: {"playlist": []},
+            snapshot=lambda: {"playlist": [], "session_generation": 1, "session_user_entries": [{"name": "VZRXS", "id": "a" * 64}]},
         )
 
         with patch("bilikara.server.CONTEXT", context), patch(
             "bilikara.server.fetch_video_item",
             return_value=item,
-        ), patch("bilikara.server.append_lark_pool_entries_in_background") as append_entries:
+        ), patch("bilikara.server.append_catalog_entries_in_background") as append_entries:
             handler._handle_add(
                 {
                     "url": item.original_url,
@@ -991,6 +1835,15 @@ class PlaylistAddRequestTest(unittest.TestCase):
             )
 
         self.assertEqual(len(added), 1)
+        self.assertEqual(
+            added[0][1],
+            {
+                "position": "tail",
+                "requester_name": "VZRXS",
+                "requester_user_id": "a" * 64,
+                "allow_repeat": False,
+            },
+        )
         append_entries.assert_called_once_with(
             [
                 {
@@ -1004,7 +1857,130 @@ class PlaylistAddRequestTest(unittest.TestCase):
                 }
             ]
         )
-        self.assertEqual(writes, [({"ok": True, "data": {"playlist": []}}, None)])
+        self.assertEqual(writes, [({"ok": True, "data": context.snapshot()}, None)])
+
+    def test_duplicate_add_is_decided_atomically_by_rust_appstate(self):
+        handler = BilikaraHandler.__new__(BilikaraHandler)
+        item = PlaylistItem(
+            id="incoming",
+            original_url="https://www.bilibili.com/video/BV1xx411c7mD",
+            resolved_url="https://www.bilibili.com/video/BV1xx411c7mD?p=1",
+            bvid="BV1xx411c7mD",
+            aid=123,
+            cid=456,
+            page=1,
+            title="Song title",
+            part_title="P1",
+            display_title="Song title - P1",
+            cover_url="",
+            embed_url="https://player.bilibili.com/player.html?aid=123",
+        )
+        active = PlaylistItem.from_dict({**item.serialize(), "id": "active"})
+        response = {
+            "schema_version": 1,
+            "status": "rejected",
+            "error": {
+                "kind": "duplicate_session_request",
+                "message": "duplicate",
+                "details": {
+                    "identity_key": "BV1xx411c7mD:p1:a1",
+                    "session_entry": None,
+                    "active_item": active.serialize(),
+                },
+            },
+        }
+        rust_error = rust_runtime.RustAppStateRejectedError(
+            "rejected",
+            "duplicate_session_request",
+            "duplicate",
+            response=response,
+        )
+        rejection = PlaylistStoreCommandError(rust_error)
+        add_calls = []
+
+        def reject_add(added_item, **kwargs):
+            add_calls.append((added_item, kwargs))
+            raise rejection
+
+        context = SimpleNamespace(
+            has_session_users=lambda: True,
+            add_item=reject_add,
+            snapshot=lambda: {"session_generation": 1, "session_user_entries": [{"name": "VZRXS", "id": "a" * 64}]},
+        )
+
+        with patch("bilikara.server.CONTEXT", context), patch(
+            "bilikara.server.fetch_video_item",
+            return_value=item,
+        ), patch(
+            "bilikara.server.append_catalog_entries_in_background",
+            side_effect=AssertionError("rejected add must not be indexed"),
+        ):
+            with self.assertRaises(server_module.DuplicateSessionRequestError) as raised:
+                handler._handle_add(
+                    {
+                        "url": item.original_url,
+                        "requester_name": "VZRXS",
+                        "allow_repeat": False,
+                    }
+                )
+
+        self.assertEqual(len(add_calls), 1)
+        self.assertFalse(add_calls[0][1]["allow_repeat"])
+        self.assertIs(raised.exception.item, item)
+        self.assertIsNone(raised.exception.session_entry)
+        self.assertEqual(raised.exception.active_item.id, "active")
+
+    def test_successful_add_survives_indexing_error_and_unwritable_stderr(self):
+        item = SimpleNamespace(
+            owner_mid=33091201,
+            bvid="BV1JgojY8EMV",
+            title="Song title",
+            display_title="Song title",
+            resolved_url="https://www.bilibili.com/video/BV1JgojY8EMV",
+            original_url="https://www.bilibili.com/video/BV1JgojY8EMV",
+            owner_name="Singer",
+            owner_url="https://space.bilibili.com/33091201",
+            cover_url="",
+        )
+        failures = [
+            OSError(22, "Invalid argument"),
+            UnicodeEncodeError("ascii", "凛夜", 0, 2, "ordinal not in range"),
+            ValueError("I/O operation on closed file"),
+        ]
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__):
+                added = []
+                context = Mock()
+                context.has_session_users.return_value = True
+                context.add_item.side_effect = lambda value, **_kwargs: added.append(value.bvid)
+                context.snapshot.side_effect = lambda: {"playlist": list(added)}
+                handler = BilikaraHandler.__new__(BilikaraHandler)
+                handler.path = "/api/playlist/add"
+                handler.headers = {}
+                handler._read_json_body = lambda: {
+                    "url": item.original_url,
+                    "position": "tail",
+                    "requester_name": "Test",
+                }
+                writes = []
+                handler._write_json = lambda payload, status=None: writes.append((payload, status))
+                console = Mock()
+                console.write.side_effect = failure
+                with (
+                    patch("bilikara.server.CONTEXT", context),
+                    patch("bilikara.server.fetch_video_item", return_value=item),
+                    patch(
+                        "bilikara.server.append_catalog_entries_in_background",
+                        side_effect=RuntimeError("append scheduling unavailable"),
+                    ),
+                    patch("sys.stderr", console),
+                ):
+                    handler.do_POST()
+
+                self.assertEqual(added, [item.bvid])
+                context.add_item.assert_called_once()
+                console.write.assert_called_once()
+                self.assertEqual(writes, [({"ok": True, "data": {"playlist": added}}, None)])
 
     def test_add_indexing_payload_falls_back_to_display_title_and_original_url(self):
         handler = BilikaraHandler.__new__(BilikaraHandler)
@@ -1022,7 +1998,6 @@ class PlaylistAddRequestTest(unittest.TestCase):
         )
         context = SimpleNamespace(
             has_session_users=lambda: True,
-            capture_playback_selector=lambda: "rust",
             store=SimpleNamespace(
                 session_request_for_item=lambda _item: None,
                 active_duplicate_for_item=lambda _item: None,
@@ -1034,14 +2009,14 @@ class PlaylistAddRequestTest(unittest.TestCase):
         with patch("bilikara.server.CONTEXT", context), patch(
             "bilikara.server.fetch_video_item",
             return_value=item,
-        ), patch("bilikara.server.append_lark_pool_entries_in_background") as append_entries:
+        ), patch("bilikara.server.append_catalog_entries_in_background") as append_entries:
             handler._handle_add({"url": item.original_url})
 
         entry = append_entries.call_args.args[0][0]
         self.assertEqual(entry["title"], item.display_title)
         self.assertEqual(entry["url"], item.original_url)
 
-    def test_successful_add_is_not_failed_by_indexing_scheduler_error(self):
+    def test_successful_add_is_not_failed_by_indexing_rejection_or_error(self):
         handler = BilikaraHandler.__new__(BilikaraHandler)
         writes = []
         handler._write_json = lambda payload, status=None: writes.append((payload, status))
@@ -1059,7 +2034,6 @@ class PlaylistAddRequestTest(unittest.TestCase):
         added = []
         context = SimpleNamespace(
             has_session_users=lambda: True,
-            capture_playback_selector=lambda: "rust",
             store=SimpleNamespace(
                 session_request_for_item=lambda _item: None,
                 active_duplicate_for_item=lambda _item: None,
@@ -1068,21 +2042,54 @@ class PlaylistAddRequestTest(unittest.TestCase):
             snapshot=lambda: {"playlist": [item.bvid]},
         )
 
+        service_error = rust_runtime.RustRuntimeServiceError(
+            "queue_unavailable", "worker unavailable", response={},
+        )
+        for result, error in (
+            ({"accepted": False, "reason": "queue_full"}, None),
+            (None, rust_runtime.RustRuntimeUnavailableError("missing")),
+            (None, service_error),
+            (None, RuntimeError("scheduler failed")),
+        ):
+            with self.subTest(result=result, error=type(error).__name__):
+                added.clear()
+                writes.clear()
+                with (
+                    patch("bilikara.server.CONTEXT", context),
+                    patch("bilikara.server.fetch_video_item", return_value=item) as fetch,
+                    patch.object(
+                        rust_runtime, "cloudflare_service_request",
+                        return_value=result, side_effect=error,
+                    ) as enqueue,
+                    patch("builtins.print") as mock_print,
+                ):
+                    handler._handle_add({"url": item.original_url})
+
+                fetch.assert_called_once()
+                enqueue.assert_called_once()
+                self.assertEqual(enqueue.call_args.args, ("enqueue_append",))
+                self.assertEqual(len(added), 1)
+                self.assertIs(added[0][0], item)
+                self.assertEqual(writes, [({"ok": True, "data": {"playlist": [item.bvid]}}, None)])
+                self.assertEqual(mock_print.call_count, int(error is not None))
+
+        # Keep coverage of the caller's outer containment if the entry itself raises.
+        added.clear()
+        writes.clear()
         with (
             patch("bilikara.server.CONTEXT", context),
             patch("bilikara.server.fetch_video_item", return_value=item),
             patch(
-                "bilikara.server.append_lark_pool_entries_in_background",
+                "bilikara.server.append_catalog_entries_in_background",
                 side_effect=RuntimeError("scheduler failed"),
             ),
             patch("builtins.print") as mock_print,
         ):
             handler._handle_add({"url": item.original_url})
-
         self.assertEqual(len(added), 1)
         self.assertEqual(writes, [({"ok": True, "data": {"playlist": [item.bvid]}}, None)])
         mock_print.assert_called_once_with(
-            "[bilikara:lark] background append scheduling failed: scheduler failed",
+            "[bilikara:catalog] background append scheduling failed: scheduler failed",
             file=server_module.sys.stderr,
             flush=True,
         )
@@ -1547,7 +2554,239 @@ class MediaRangeEvidenceTest(unittest.TestCase):
         self.assertEqual(headers["Content-Range"], "bytes */10")
         self.assertEqual(body, b"")
 
+    def test_artifact_reader_lease_wraps_full_range_head_and_disconnect(self):
+        incarnation = "i-0123456789abcdef0123456789abcdef-0000000000000001"
+        artifact = "a-0123456789abcdef0123456789abcdef-0000000000000001"
+        relative = f"artifacts/{incarnation}/{artifact}/video-p1.mp4"
+
+        class DisconnectingWriter:
+            def write(self, _payload):
+                raise BrokenPipeError
+
+        cases = (
+            ("full", {}, False, io.BytesIO()),
+            ("range", {"Range": "bytes=1-3"}, False, io.BytesIO()),
+            ("head", {"Range": "bytes=1-3"}, True, io.BytesIO()),
+            ("disconnect", {"Range": "bytes=1-3"}, False, DisconnectingWriter()),
+        )
+        for name, headers, head_only, writer in cases:
+            with self.subTest(name=name), TemporaryDirectory() as tmpdir:
+                cache_dir = Path(tmpdir) / "cache"
+                media = cache_dir / relative
+                media.parent.mkdir(parents=True)
+                media.write_bytes(b"0123456789")
+                lifecycle = []
+                lease = object()
+                manager = SimpleNamespace(
+                    acquire_media_reader=lambda observed: lifecycle.append(
+                        ("acquire", observed)
+                    )
+                    or lease,
+                    release_media_reader=lambda observed: lifecycle.append(
+                        ("release", observed)
+                    )
+                    or True,
+                )
+                handler = BilikaraHandler.__new__(BilikaraHandler)
+                handler.headers = headers
+                handler.wfile = writer
+                handler.send_response = lambda _status: None
+                handler.send_header = lambda _name, _value: None
+                handler.end_headers = lambda: None
+
+                with (
+                    patch("bilikara.server.CACHE_DIR", cache_dir),
+                    patch(
+                        "bilikara.server.CONTEXT",
+                        SimpleNamespace(cache_manager=manager),
+                    ),
+                ):
+                    handler._serve_media(f"/media/{relative}", head_only=head_only)
+
+                self.assertEqual(
+                    lifecycle,
+                    [("acquire", relative), ("release", lease)],
+                )
+
+    def test_artifact_reader_lease_releases_after_stream_exception(self):
+        incarnation = "i-0123456789abcdef0123456789abcdef-0000000000000001"
+        artifact = "a-0123456789abcdef0123456789abcdef-0000000000000001"
+        relative = f"artifacts/{incarnation}/{artifact}/video-p1.mp4"
+        with TemporaryDirectory() as tmpdir:
+            cache_dir = Path(tmpdir) / "cache"
+            media = cache_dir / relative
+            media.parent.mkdir(parents=True)
+            media.write_bytes(b"content")
+            lease = object()
+            released = []
+            manager = SimpleNamespace(
+                acquire_media_reader=lambda _relative: lease,
+                release_media_reader=lambda observed: released.append(observed),
+            )
+            handler = BilikaraHandler.__new__(BilikaraHandler)
+
+            def fail_stream(*_args, **_kwargs):
+                raise OSError("stream failed")
+
+            handler._stream_file = fail_stream
+
+            with (
+                patch("bilikara.server.CACHE_DIR", cache_dir),
+                patch(
+                    "bilikara.server.CONTEXT",
+                    SimpleNamespace(cache_manager=manager),
+                ),
+                self.assertRaisesRegex(OSError, "stream failed"),
+            ):
+                handler._serve_media(f"/media/{relative}")
+
+        self.assertEqual(released, [lease])
+
 class UpdateRouteTest(unittest.TestCase):
+    def test_monthly_maintenance_trigger_starts_local_script(self):
+        handler = BilikaraHandler.__new__(BilikaraHandler)
+        writes: list[dict] = []
+        context = SimpleNamespace(touch_client=lambda client_id, is_host=True: None)
+
+        handler.path = "/api/admin-maintenance/trigger"
+        handler.headers = {}
+        handler._read_json_body = lambda: {
+            "job": "monthly-d1-refresh",
+            "BILIKARA_ADMIN_SECRET": "local-secret",
+            "requested_by": "VZRXS",
+        }
+        handler._write_json = lambda payload, status=None: writes.append({"payload": payload, "status": status})
+
+        with patch("bilikara.server.CONTEXT", context), patch.dict(
+            "bilikara.server.os.environ",
+            {"BILIKARA_ADMIN_SECRET": "local-secret"},
+            clear=False,
+        ), patch(
+            "bilikara.server.start_monthly_refresh_in_background",
+            return_value={
+                "success": True,
+                "job": "monthly-d1-refresh",
+                "instance_id": "local-monthly-123",
+            },
+        ) as trigger:
+            handler.do_POST()
+
+        trigger.assert_called_once_with("local-secret", requested_by="VZRXS")
+        self.assertEqual(writes[0]["status"], server_module.HTTPStatus.ACCEPTED)
+        self.assertEqual(writes[0]["payload"]["data"]["instance_id"], "local-monthly-123")
+
+    def test_maintenance_trigger_starts_cloudflare_workflow(self):
+        handler = BilikaraHandler.__new__(BilikaraHandler)
+        writes: list[dict] = []
+        context = SimpleNamespace(touch_client=lambda client_id, is_host=True: None)
+
+        handler.path = "/api/admin-maintenance/trigger"
+        handler.headers = {}
+        handler._read_json_body = lambda: {
+            "job": "tagger-yomi",
+            "BILIKARA_ADMIN_SECRET": "local-secret",
+            "requested_by": "VZRXS",
+        }
+        handler._write_json = lambda payload, status=None: writes.append({"payload": payload, "status": status})
+
+        with patch("bilikara.server.CONTEXT", context), patch.dict(
+            "bilikara.server.os.environ",
+            {"BILIKARA_ADMIN_SECRET": "local-secret"},
+            clear=False,
+        ), patch(
+            "bilikara.server.trigger_cloudflare_maintenance_job",
+            return_value={"success": True, "job": "tagger-yomi", "instance_id": "workflow-123"},
+        ) as trigger:
+            handler.do_POST()
+
+        trigger.assert_called_once_with("tagger-yomi", "local-secret", requested_by="VZRXS")
+        self.assertEqual(writes[0]["status"], server_module.HTTPStatus.ACCEPTED)
+        self.assertEqual(writes[0]["payload"]["data"]["instance_id"], "workflow-123")
+
+    def test_maintenance_trigger_rejects_invalid_job_without_starting_backend(self):
+        handler = BilikaraHandler.__new__(BilikaraHandler)
+        writes: list[dict] = []
+        handler.path = "/api/admin-maintenance/trigger"
+        handler.headers = {}
+        handler._read_json_body = lambda: {
+            "job": "unknown",
+            "BILIKARA_ADMIN_SECRET": "local-secret",
+        }
+        handler._write_json = lambda payload, status=None: writes.append({"payload": payload, "status": status})
+
+        with patch(
+            "bilikara.server.CONTEXT",
+            SimpleNamespace(touch_client=lambda client_id, is_host=True: None),
+        ), patch.dict(
+            "bilikara.server.os.environ",
+            {"BILIKARA_ADMIN_SECRET": "local-secret"},
+            clear=False,
+        ), patch("bilikara.server.start_monthly_refresh_in_background") as monthly, patch(
+            "bilikara.server.trigger_cloudflare_maintenance_job"
+        ) as cloudflare:
+            handler.do_POST()
+
+        monthly.assert_not_called()
+        cloudflare.assert_not_called()
+        self.assertEqual(writes[0]["status"], server_module.HTTPStatus.BAD_REQUEST)
+
+    def test_monthly_maintenance_duplicate_returns_conflict(self):
+        handler = BilikaraHandler.__new__(BilikaraHandler)
+        writes: list[dict] = []
+        handler.path = "/api/admin-maintenance/trigger"
+        handler.headers = {}
+        handler._read_json_body = lambda: {
+            "job": "monthly-d1-refresh",
+            "BILIKARA_ADMIN_SECRET": "local-secret",
+        }
+        handler._write_json = lambda payload, status=None: writes.append({"payload": payload, "status": status})
+
+        with patch(
+            "bilikara.server.CONTEXT",
+            SimpleNamespace(touch_client=lambda client_id, is_host=True: None),
+        ), patch.dict(
+            "bilikara.server.os.environ",
+            {"BILIKARA_ADMIN_SECRET": "local-secret"},
+            clear=False,
+        ), patch(
+            "bilikara.server.start_monthly_refresh_in_background",
+            return_value={
+                "success": False,
+                "job": "monthly-d1-refresh",
+                "error": "monthly D1 refresh is already running locally",
+            },
+        ):
+            handler.do_POST()
+
+        self.assertEqual(writes[0]["status"], server_module.HTTPStatus.CONFLICT)
+
+    def test_maintenance_backend_start_failure_returns_bad_gateway(self):
+        handler = BilikaraHandler.__new__(BilikaraHandler)
+        writes: list[dict] = []
+        handler.path = "/api/admin-maintenance/trigger"
+        handler.headers = {}
+        handler._read_json_body = lambda: {
+            "job": "tagger-yomi",
+            "BILIKARA_ADMIN_SECRET": "local-secret",
+        }
+        handler._write_json = lambda payload, status=None: writes.append({"payload": payload, "status": status})
+
+        with patch(
+            "bilikara.server.CONTEXT",
+            SimpleNamespace(touch_client=lambda client_id, is_host=True: None),
+        ), patch.dict(
+            "bilikara.server.os.environ",
+            {"BILIKARA_ADMIN_SECRET": "local-secret"},
+            clear=False,
+        ), patch(
+            "bilikara.server.trigger_cloudflare_maintenance_job",
+            side_effect=RuntimeError("workflow unavailable"),
+        ):
+            handler.do_POST()
+
+        self.assertEqual(writes[0]["status"], server_module.HTTPStatus.BAD_GATEWAY)
+        self.assertEqual(writes[0]["payload"]["error"], "workflow unavailable")
+
     def test_bilikara_secret_verify_uses_local_bilikara_secret_when_set(self):
         handler = BilikaraHandler.__new__(BilikaraHandler)
         writes: list[dict] = []
@@ -1591,51 +2830,72 @@ class UpdateRouteTest(unittest.TestCase):
     def test_update_check_route_returns_update_payload(self):
         handler = BilikaraHandler.__new__(BilikaraHandler)
         writes: list[dict] = []
-        context = SimpleNamespace(touch_client=lambda client_id, is_host=True: None)
+        calls: list[bool] = []
+        context = SimpleNamespace(
+            touch_client=lambda client_id, is_host=True: None,
+            check_app_update=lambda include_preview=False: calls.append(include_preview) or {
+                "state": "checking",
+                "include_preview": include_preview,
+            },
+        )
 
         handler.path = "/api/app/update"
         handler.headers = {}
         handler._write_json = lambda payload, status=None: writes.append(payload)
 
-        with patch("bilikara.server.CONTEXT", context), patch(
-            "bilikara.server.check_for_update",
-            return_value={
-                "current_version": "v0.4.0",
-                "latest_version": "v0.4.1",
-                "release_url": "https://github.com/VZRXS/bilikara/releases/tag/v0.4.1",
-                "update_available": True,
-            },
-        ) as update_check:
+        with patch("bilikara.server.CONTEXT", context):
             handler.do_GET()
 
         self.assertEqual(writes[0]["ok"], True)
-        self.assertTrue(writes[0]["data"]["update_available"])
-        update_check.assert_called_once_with(include_preview=False)
+        self.assertEqual(writes[0]["data"]["state"], "checking")
+        self.assertEqual(calls, [False])
 
     def test_update_check_route_can_include_preview_releases(self):
         handler = BilikaraHandler.__new__(BilikaraHandler)
         writes: list[dict] = []
-        context = SimpleNamespace(touch_client=lambda client_id, is_host=True: None)
+        calls: list[bool] = []
+        context = SimpleNamespace(
+            touch_client=lambda client_id, is_host=True: None,
+            check_app_update=lambda include_preview=False: calls.append(include_preview) or {
+                "state": "checking",
+                "include_preview": include_preview,
+            },
+        )
 
         handler.path = "/api/app/update?include_preview=1"
         handler.headers = {}
         handler._write_json = lambda payload, status=None: writes.append(payload)
 
-        with patch("bilikara.server.CONTEXT", context), patch(
-            "bilikara.server.check_for_update",
-            return_value={
-                "current_version": "v0.4.0",
-                "latest_version": "v0.5.0-preview.1",
-                "release_url": "https://github.com/VZRXS/bilikara/releases/tag/v0.5.0-preview.1",
-                "update_available": True,
-                "include_preview": True,
-            },
-        ) as update_check:
+        with patch("bilikara.server.CONTEXT", context):
             handler.do_GET()
 
         self.assertEqual(writes[0]["ok"], True)
         self.assertTrue(writes[0]["data"]["include_preview"])
-        update_check.assert_called_once_with(include_preview=True)
+        self.assertEqual(calls, [True])
+
+    def test_check_only_post_route_never_starts_install(self):
+        handler = BilikaraHandler.__new__(BilikaraHandler)
+        writes: list[dict] = []
+        calls: list[bool] = []
+        context = SimpleNamespace(
+            touch_client=lambda client_id, is_host=True: None,
+            check_app_update=lambda include_preview=False: calls.append(include_preview) or {
+                "state": "checking",
+                "include_preview": include_preview,
+            },
+            start_app_update=lambda **kwargs: self.fail("check-only route started install"),
+        )
+
+        handler.path = "/api/app/update/check"
+        handler.headers = {}
+        handler._read_json_body = lambda: {"include_preview": False}
+        handler._write_json = lambda payload, status=None: writes.append(payload)
+
+        with patch("bilikara.server.CONTEXT", context):
+            handler.do_POST()
+
+        self.assertEqual(calls, [False])
+        self.assertEqual(writes[0]["data"]["state"], "checking")
 
     def test_update_status_route_returns_update_snapshot(self):
         handler = BilikaraHandler.__new__(BilikaraHandler)
@@ -1793,15 +3053,20 @@ class DiagnosticRouteTest(unittest.TestCase):
                     "user_agent": "Browser/1.0",
                     "platform": "Windows",
                     "brands": [{"brand": "Browser", "version": "1"}],
-                }
+                },
+                "internet_remote_diagnostics": [
+                    {"stage": "room.create", "status": "failed"}
+                ],
             },
         )
         writes = []
         browser_infos = []
+        diagnostic_options = []
         context = SimpleNamespace(
             touch_client=lambda client_id, is_host=True: None,
-            build_diagnostics=lambda browser_info: (
+            build_diagnostics=lambda browser_info, **kwargs: (
                 browser_infos.append(browser_info)
+                or diagnostic_options.append(kwargs)
                 or DiagnosticArtifact(markdown="# report", files={})
             ),
         )
@@ -1813,6 +3078,10 @@ class DiagnosticRouteTest(unittest.TestCase):
         self.assertEqual(writes, [{"ok": True, "data": {"markdown": "# report"}}])
         self.assertEqual(browser_infos[0]["user_agent"], "Browser/1.0")
         self.assertEqual(browser_infos[0]["brands"], [{"brand": "Browser", "version": "1"}])
+        self.assertEqual(
+            diagnostic_options[0]["internet_remote_diagnostics"],
+            [{"stage": "room.create", "status": "failed"}],
+        )
 
     def test_player_diagnostic_route_retains_only_sanitized_bounded_fields(self):
         media_url = "https://media.example/video/track.m4a?token=secret"
@@ -2004,25 +3273,394 @@ class CacheDownloaderRouteTest(unittest.TestCase):
 
 
 class PlayerResetRouteTest(unittest.TestCase):
-    def test_player_reset_route_returns_fresh_snapshot(self):
-        handler = BilikaraHandler.__new__(BilikaraHandler)
-        writes: list[dict] = []
-        context = SimpleNamespace(
-            touch_client=lambda client_id, is_host=True: None,
-            reset_player_state=lambda: writes.append({"reset_player": True}),
-            snapshot=lambda: {"playback_mode": "local"},
-        )
+    def test_player_reset_route_returns_rust_forced_program_lifetime(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            store = PlaylistStore(
+                root / "state.json",
+                root / "backup.json",
+                root / "played",
+            )
+            store.add_session_user("Alice")
+            store.add_item(
+                PlaylistItem(
+                    id="song-a",
+                    original_url="https://example.test/song-a",
+                    resolved_url="https://example.test/song-a?p=1",
+                    bvid="BV0000000001",
+                    aid=1,
+                    cid=2,
+                    page=1,
+                    title="Song A",
+                    part_title="P1",
+                    display_title="Song A - P1",
+                    cover_url="",
+                    embed_url="",
+                ),
+                requester_name="Alice",
+            )
+            before = store.authoritative_snapshot()
+            handler = BilikaraHandler.__new__(BilikaraHandler)
+            writes: list[dict] = []
+            context = SimpleNamespace(
+                touch_client=lambda client_id, is_host=True: None,
+                reset_player_state=store.reset_player_state,
+                snapshot=store.snapshot,
+            )
 
-        handler.path = "/api/player/reset"
+            handler.path = "/api/player/reset"
+            handler.headers = {}
+            handler._read_json_body = lambda: {}
+            handler._write_json = lambda payload, status=None: writes.append(payload)
+
+            with patch("bilikara.server.CONTEXT", context):
+                handler.do_POST()
+
+            self.assertEqual(len(writes), 1)
+            returned = writes[0]["data"]
+            self.assertEqual(returned["playback_program"], before["playback_program"])
+            self.assertEqual(
+                returned["playback_generation"],
+                before["playback_generation"] + 1,
+            )
+            authoritative = store.authoritative_snapshot()
+            self.assertEqual(
+                returned["playback_program"], authoritative["playback_program"]
+            )
+            self.assertEqual(
+                returned["playback_generation"],
+                authoritative["playback_generation"],
+            )
+
+
+class PlayerNextRouteTest(unittest.TestCase):
+    @staticmethod
+    def run_request(expected_generation: int, authoritative_generation: int) -> tuple[list, dict]:
+        program = {"current": "song-b", "queue": ["song-c"]}
+        calls: list[int | None] = []
+        current_generation = authoritative_generation
+
+        def advance_to_next(playback_generation=None):
+            nonlocal current_generation
+            calls.append(playback_generation)
+            if playback_generation is not None and playback_generation != authoritative_generation:
+                response = {
+                    "schema_version": 1,
+                    "status": "rejected",
+                    "error": {
+                        "kind": "playback_generation_mismatch",
+                        "message": "playback generation changed before Next was applied",
+                    },
+                }
+                raise PlaylistStoreCommandError(
+                    rust_runtime.RustAppStateRejectedError(
+                        "rejected",
+                        "playback_generation_mismatch",
+                        "playback generation changed before Next was applied",
+                        response=response,
+                    )
+                )
+            program["current"] = program["queue"].pop(0)
+            current_generation += 1
+
+        context = SimpleNamespace(
+            touch_client=lambda _client_id, is_host=True: None,
+            advance_to_next=advance_to_next,
+            snapshot=lambda: {
+                "state_revision": 99,
+                "playback_generation": current_generation,
+                "current_item": {"id": program["current"]},
+            },
+        )
+        handler = BilikaraHandler.__new__(BilikaraHandler)
+        handler.path = "/api/player/next"
         handler.headers = {}
-        handler._read_json_body = lambda: {}
-        handler._write_json = lambda payload, status=None: writes.append(payload)
+        handler._read_json_body = lambda: {
+            "playback_generation": expected_generation,
+            "state_revision": 1,
+        }
+        writes = []
+        handler._write_json = lambda payload, status=None: writes.append((payload, status))
 
         with patch("bilikara.server.CONTEXT", context):
             handler.do_POST()
 
-        self.assertEqual(writes[0], {"reset_player": True})
-        self.assertEqual(writes[1], {"ok": True, "data": {"playback_mode": "local"}})
+        return calls, {"program": program, "writes": writes}
+
+    def test_stale_generation_next_rejects_without_skipping_authoritative_current(self):
+        calls, result = self.run_request(7, 8)
+
+        self.assertEqual(calls, [7])
+        self.assertEqual(result["program"], {"current": "song-b", "queue": ["song-c"]})
+        self.assertIsNone(result["writes"][0][1])
+        self.assertTrue(result["writes"][0][0]["ok"])
+        self.assertTrue(result["writes"][0][0]["stale"])
+
+    def test_exact_generation_ignores_python_state_revision_and_advances_once(self):
+        calls, result = self.run_request(8, 8)
+
+        self.assertEqual(calls, [8])
+        self.assertEqual(result["program"], {"current": "song-c", "queue": []})
+        self.assertIsNone(result["writes"][0][1])
+        self.assertEqual(result["writes"][0][0]["data"]["state_revision"], 99)
+
+
+class PlayerRestartProgramRouteTest(unittest.TestCase):
+    def test_local_host_restart_returns_one_settings_preserving_lifetime(self):
+        before = {
+            "state_revision": 4,
+            "revision": 8,
+            "playback_generation": 5,
+            "playback_program": {"item_id": "song-a"},
+            "player_settings": {"volume_percent": 37, "is_muted": True},
+        }
+        after = {
+            **before,
+            "state_revision": 5,
+            "revision": 9,
+            "playback_generation": 6,
+        }
+        restarts: list[bool] = []
+        writes: list[tuple[dict, object]] = []
+        context = SimpleNamespace(
+            touch_client=lambda client_id, is_host=True: None,
+            restart_playback_program=lambda: restarts.append(True),
+            snapshot=lambda: after,
+        )
+        handler = BilikaraHandler.__new__(BilikaraHandler)
+        handler.path = "/api/player/restart-program"
+        handler.headers = {"X-Bilikara-Client": "host-client"}
+        handler._is_local_client = lambda: True
+        handler._read_json_body = lambda: {}
+        handler._write_json = lambda payload, status=None: writes.append((payload, status))
+
+        with patch("bilikara.server.CONTEXT", context):
+            handler.do_POST()
+
+        self.assertEqual(restarts, [True])
+        self.assertEqual(writes, [({"ok": True, "data": after}, None)])
+        self.assertEqual(after["playback_program"], before["playback_program"])
+        self.assertEqual(after["player_settings"], before["player_settings"])
+        self.assertEqual(after["revision"], before["revision"] + 1)
+        self.assertEqual(
+            after["playback_generation"], before["playback_generation"] + 1
+        )
+
+    def test_nonlocal_remote_cannot_restart_program(self):
+        writes: list[tuple[dict, object]] = []
+        context = SimpleNamespace(
+            touch_client=lambda client_id, is_host=True: None,
+            restart_playback_program=lambda: self.fail("remote restart must be rejected"),
+            snapshot=lambda: self.fail("remote restart must not return a snapshot"),
+        )
+        handler = BilikaraHandler.__new__(BilikaraHandler)
+        handler.path = "/api/player/restart-program"
+        handler.headers = {"Referer": "http://192.168.1.20:8080/remote"}
+        handler._is_local_client = lambda: False
+        handler._read_json_body = lambda: {}
+        handler._write_json = lambda payload, status=None: writes.append((payload, status))
+
+        with patch("bilikara.server.CONTEXT", context):
+            handler.do_POST()
+
+        self.assertEqual(
+            writes,
+            [({"ok": False, "error": "forbidden"}, server_module.HTTPStatus.FORBIDDEN)],
+        )
+        controller = (Path(__file__).resolve().parents[1] / "static" / "controller.js").read_text(
+            encoding="utf-8"
+        )
+        remote = (Path(__file__).resolve().parents[1] / "static" / "remote.js").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("/api/player/restart-program", controller)
+        self.assertNotIn("/api/player/restart-program", remote)
+
+
+class PlayerRetireProgramRouteTest(unittest.TestCase):
+    INCARNATION = "i-0123456789abcdef0123456789abcdef-0000000000000001"
+    ARTIFACT = "a-0123456789abcdef0123456789abcdef-0000000000000001"
+
+    @classmethod
+    def body(cls) -> dict[str, object]:
+        return {
+            "playback_generation": 7,
+            "item_incarnation_id": cls.INCARNATION,
+            "artifact_set_id": cls.ARTIFACT,
+        }
+
+    @staticmethod
+    def run_request(
+        context: object,
+        body: dict[str, object],
+        *,
+        local: bool,
+        route: str = "/api/player/retire-program",
+    ) -> list[tuple[dict, object]]:
+        writes: list[tuple[dict, object]] = []
+        handler = BilikaraHandler.__new__(BilikaraHandler)
+        handler.path = route
+        handler.headers = {"X-Bilikara-Client": "host-client"}
+        handler._is_local_client = lambda: local
+        handler._read_json_body = lambda: body
+        handler._write_json = lambda payload, status=None: writes.append(
+            (payload, status)
+        )
+        with patch("bilikara.server.CONTEXT", context):
+            handler.do_POST()
+        return writes
+
+    def test_exact_local_retirement_is_small_and_replay_is_idempotent(self):
+        calls: list[dict[str, object]] = []
+
+        def retire(**identity):
+            calls.append(identity)
+            return len(calls) == 1
+
+        context = SimpleNamespace(
+            touch_client=lambda _client_id, is_host=True: None,
+            retire_host_playback_program=retire,
+            snapshot=lambda: self.fail("retirement must not return a snapshot"),
+        )
+        first = self.run_request(context, self.body(), local=True)
+        replay = self.run_request(context, self.body(), local=True)
+
+        expected = {"host_client_id": "host-client", **self.body()}
+        self.assertEqual(calls, [expected, expected])
+        self.assertEqual(first, [({"ok": True, "data": {"released": True}}, None)])
+        self.assertEqual(
+            replay,
+            [({"ok": True, "data": {"released": False}}, None)],
+        )
+
+    def test_exact_local_claim_is_small_and_does_not_return_a_snapshot(self):
+        calls: list[dict[str, object]] = []
+        context = SimpleNamespace(
+            touch_client=lambda _client_id, is_host=True: None,
+            claim_host_playback_program=lambda **identity: calls.append(identity)
+            or True,
+            snapshot=lambda: self.fail("claim must not return a snapshot"),
+        )
+
+        writes = self.run_request(
+            context,
+            self.body(),
+            local=True,
+            route="/api/player/claim-program",
+        )
+
+        self.assertEqual(
+            calls,
+            [{"host_client_id": "host-client", **self.body()}],
+        )
+        self.assertEqual(
+            writes,
+            [({"ok": True, "data": {"claimed": True}}, None)],
+        )
+
+    def test_nonlocal_client_cannot_retire_host_program(self):
+        context = SimpleNamespace(
+            touch_client=lambda _client_id, is_host=True: None,
+            claim_host_playback_program=lambda **_identity: self.fail(
+                "remote claim must be rejected"
+            ),
+            retire_host_playback_program=lambda **_identity: self.fail(
+                "remote retirement must be rejected"
+            ),
+        )
+        for route in (
+            "/api/player/claim-program",
+            "/api/player/retire-program",
+        ):
+            with self.subTest(route=route):
+                writes = self.run_request(
+                    context, self.body(), local=False, route=route
+                )
+                self.assertEqual(
+                    writes,
+                    [
+                        (
+                            {"ok": False, "error": "forbidden"},
+                            server_module.HTTPStatus.FORBIDDEN,
+                        )
+                    ],
+                )
+
+    def test_invalid_identity_is_rejected_without_retirement(self):
+        generation_context = SimpleNamespace(
+            touch_client=lambda _client_id, is_host=True: None,
+            retire_host_playback_program=lambda **_identity: self.fail(
+                "invalid retirement must not be forwarded"
+            ),
+        )
+        body = {**self.body(), "playback_generation": 0}
+        generation_writes = self.run_request(
+            generation_context, body, local=True
+        )
+        self.assertEqual(
+            generation_writes[0][1], server_module.HTTPStatus.BAD_REQUEST
+        )
+        self.assertFalse(generation_writes[0][0]["ok"])
+
+        def reject_invalid_identity(**_identity):
+            raise ValueError("invalid Host playback artifact identity")
+
+        identity_context = SimpleNamespace(
+            touch_client=lambda _client_id, is_host=True: None,
+            retire_host_playback_program=reject_invalid_identity,
+        )
+        malformed = {**self.body(), "artifact_set_id": "not-rust-issued"}
+        identity_writes = self.run_request(
+            identity_context, malformed, local=True
+        )
+        self.assertEqual(
+            identity_writes[0][1], server_module.HTTPStatus.BAD_REQUEST
+        )
+        self.assertFalse(identity_writes[0][0]["ok"])
+
+    def test_app_context_retirement_does_not_notify_or_advance_revision(self):
+        calls = []
+        context = AppContext.__new__(AppContext)
+        context._state_revision = 41
+        context.cache_manager = SimpleNamespace(
+            claim_host_playback_program=lambda **identity: calls.append(
+                {"operation": "claim", **identity}
+            )
+            or True,
+            retire_host_playback_program=lambda **identity: calls.append(identity)
+            or True
+        )
+        context._notify_state_changed = lambda: self.fail(
+            "operational retirement must not notify SSE"
+        )
+
+        identity = {"host_client_id": "host-client", **self.body()}
+        claimed = context.claim_host_playback_program(**identity)
+        released = context.retire_host_playback_program(**identity)
+
+        self.assertTrue(claimed)
+        self.assertTrue(released)
+        self.assertEqual(calls, [{"operation": "claim", **identity}, identity])
+        self.assertEqual(context._state_revision, 41)
+
+    def test_controller_and_remote_do_not_own_host_retirement(self):
+        root = Path(__file__).resolve().parents[1] / "static"
+        self.assertNotIn(
+            "/api/player/retire-program",
+            (root / "controller.js").read_text(encoding="utf-8"),
+        )
+        self.assertNotIn(
+            "/api/player/claim-program",
+            (root / "controller.js").read_text(encoding="utf-8"),
+        )
+        self.assertNotIn(
+            "/api/player/retire-program",
+            (root / "remote.js").read_text(encoding="utf-8"),
+        )
+        self.assertNotIn(
+            "/api/player/claim-program",
+            (root / "remote.js").read_text(encoding="utf-8"),
+        )
 
 
 class CacheRetryRouteTest(unittest.TestCase):
@@ -2033,21 +3671,34 @@ class CacheRetryRouteTest(unittest.TestCase):
         context = SimpleNamespace(
             touch_client=lambda client_id, is_host=True: None,
             is_current_item=lambda item_id: item_id == "current-song",
-            retry_cache_item=lambda item_id, force=False: retries.append(
-                {"item_id": item_id, "force": force}
+            retry_cache_item=lambda item_id, force=False, **kwargs: retries.append(
+                {"item_id": item_id, "force": force, **kwargs}
             ),
             snapshot=lambda: {"current_item": {"id": "current-song"}},
         )
 
         handler.path = "/api/cache/retry"
         handler.headers = {}
-        handler._read_json_body = lambda: {"item_id": "current-song", "force": True}
+        handler._read_json_body = lambda: {
+            "item_id": "current-song",
+            "expected_item_incarnation_id": "i-current",
+            "force": True,
+        }
         handler._write_json = lambda payload, status=None: writes.append(payload)
 
         with patch("bilikara.server.CONTEXT", context):
             handler.do_POST()
 
-        self.assertEqual(retries, [{"item_id": "current-song", "force": True}])
+        self.assertEqual(
+            retries,
+            [
+                {
+                    "item_id": "current-song",
+                    "expected_item_incarnation_id": "i-current",
+                    "force": True,
+                }
+            ],
+        )
         self.assertEqual(writes[0], {"ok": True, "data": {"current_item": {"id": "current-song"}}})
 
     def test_current_item_is_not_silently_forced(self):
@@ -2055,21 +3706,33 @@ class CacheRetryRouteTest(unittest.TestCase):
         retries: list[dict] = []
         context = SimpleNamespace(
             touch_client=lambda client_id, is_host=True: None,
-            retry_cache_item=lambda item_id, force=False: retries.append(
-                {"item_id": item_id, "force": force}
+            retry_cache_item=lambda item_id, force=False, **kwargs: retries.append(
+                {"item_id": item_id, "force": force, **kwargs}
             ),
             snapshot=lambda: {"current_item": {"id": "current-song"}},
         )
 
         handler.path = "/api/cache/retry"
         handler.headers = {}
-        handler._read_json_body = lambda: {"item_id": "current-song"}
+        handler._read_json_body = lambda: {
+            "item_id": "current-song",
+            "expected_item_incarnation_id": "i-current",
+        }
         handler._write_json = lambda payload, status=None: None
 
         with patch("bilikara.server.CONTEXT", context):
             handler.do_POST()
 
-        self.assertEqual(retries, [{"item_id": "current-song", "force": False}])
+        self.assertEqual(
+            retries,
+            [
+                {
+                    "item_id": "current-song",
+                    "expected_item_incarnation_id": "i-current",
+                    "force": False,
+                }
+            ],
+        )
 
     def test_retry_playlist_item_keeps_requested_force_flag(self):
         handler = BilikaraHandler.__new__(BilikaraHandler)
@@ -2077,21 +3740,123 @@ class CacheRetryRouteTest(unittest.TestCase):
         context = SimpleNamespace(
             touch_client=lambda client_id, is_host=True: None,
             is_current_item=lambda item_id: False,
-            retry_cache_item=lambda item_id, force=False: retries.append(
-                {"item_id": item_id, "force": force}
+            retry_cache_item=lambda item_id, force=False, **kwargs: retries.append(
+                {"item_id": item_id, "force": force, **kwargs}
             ),
             snapshot=lambda: {"playlist": [{"id": "queued-song"}]},
         )
 
         handler.path = "/api/cache/retry"
         handler.headers = {}
-        handler._read_json_body = lambda: {"item_id": "queued-song"}
+        handler._read_json_body = lambda: {
+            "item_id": "queued-song",
+            "expected_item_incarnation_id": "i-queued",
+        }
         handler._write_json = lambda payload, status=None: None
 
         with patch("bilikara.server.CONTEXT", context):
             handler.do_POST()
 
-        self.assertEqual(retries, [{"item_id": "queued-song", "force": False}])
+        self.assertEqual(
+            retries,
+            [
+                {
+                    "item_id": "queued-song",
+                    "expected_item_incarnation_id": "i-queued",
+                    "force": False,
+                }
+            ],
+        )
+
+    def test_stale_retry_is_consumed_once_without_retargeting_the_replacement(self):
+        handler = BilikaraHandler.__new__(BilikaraHandler)
+        writes: list[tuple[dict, object]] = []
+        retries: list[dict] = []
+
+        def reject_stale(item_id, force=False, **kwargs):
+            retries.append({"item_id": item_id, "force": force, **kwargs})
+            response = {
+                "schema_version": 1,
+                "status": "rejected",
+                "error": {
+                    "kind": "item_incarnation_mismatch",
+                    "message": "cache item changed before retry",
+                },
+            }
+            raise PlaylistStoreCommandError(
+                rust_runtime.RustAppStateRejectedError(
+                    "rejected",
+                    "item_incarnation_mismatch",
+                    "cache item changed before retry",
+                    response=response,
+                )
+            )
+
+        context = SimpleNamespace(
+            touch_client=lambda client_id, is_host=True: None,
+            retry_cache_item=reject_stale,
+            snapshot=lambda: {
+                "revision": 9,
+                "current_item": {
+                    "id": "same-song",
+                    "item_incarnation_id": "i-new",
+                },
+            },
+        )
+        handler.path = "/api/cache/retry"
+        handler.headers = {}
+        handler._read_json_body = lambda: {
+            "item_id": "same-song",
+            "expected_item_incarnation_id": "i-old",
+            "force": True,
+        }
+        handler._write_json = lambda payload, status=None: writes.append(
+            (payload, status)
+        )
+
+        with patch("bilikara.server.CONTEXT", context):
+            handler.do_POST()
+
+        self.assertEqual(
+            retries,
+            [
+                {
+                    "item_id": "same-song",
+                    "expected_item_incarnation_id": "i-old",
+                    "force": True,
+                }
+            ],
+        )
+        self.assertEqual(len(writes), 1)
+        self.assertIsNone(writes[0][1])
+        self.assertTrue(writes[0][0]["ok"])
+        self.assertTrue(writes[0][0]["stale"])
+        self.assertEqual(
+            writes[0][0]["data"]["current_item"]["item_incarnation_id"],
+            "i-new",
+        )
+
+    def test_retry_requires_an_exact_item_incarnation(self):
+        handler = BilikaraHandler.__new__(BilikaraHandler)
+        writes: list[tuple[dict, object]] = []
+        retries: list[dict] = []
+        context = SimpleNamespace(
+            touch_client=lambda client_id, is_host=True: None,
+            retry_cache_item=lambda *args, **kwargs: retries.append(kwargs),
+            snapshot=lambda: {},
+        )
+        handler.path = "/api/cache/retry"
+        handler.headers = {}
+        handler._read_json_body = lambda: {"item_id": "same-song", "force": True}
+        handler._write_json = lambda payload, status=None: writes.append(
+            (payload, status)
+        )
+
+        with patch("bilikara.server.CONTEXT", context):
+            handler.do_POST()
+
+        self.assertEqual(retries, [])
+        self.assertEqual(writes[0][1], server_module.HTTPStatus.BAD_REQUEST)
 
 
 class PlayerControlRouteTest(unittest.TestCase):
@@ -2110,6 +3875,7 @@ class PlayerControlRouteTest(unittest.TestCase):
         handler._read_json_body = lambda: {
             "action": "next-track",
             "item_id": "song-1",
+            "playback_generation": 17,
         }
         handler._write_json = lambda payload, status=None: writes.append(payload)
 
@@ -2118,6 +3884,7 @@ class PlayerControlRouteTest(unittest.TestCase):
 
         self.assertEqual(issued[0]["action"], "next-track")
         self.assertEqual(issued[0]["item_id"], "song-1")
+        self.assertEqual(issued[0]["playback_generation"], 17)
         self.assertEqual(writes[0]["data"]["player_control_command"]["action"], "next-track")
 
     def test_absolute_seek_route_forwards_target_seconds(self):
@@ -2136,6 +3903,7 @@ class PlayerControlRouteTest(unittest.TestCase):
             "action": "seek-absolute",
             "item_id": "song-1",
             "target_seconds": 262.5,
+            "playback_generation": 23,
         }
         handler._write_json = lambda payload, status=None: writes.append(payload)
 
@@ -2145,7 +3913,196 @@ class PlayerControlRouteTest(unittest.TestCase):
         self.assertEqual(issued[0]["action"], "seek-absolute")
         self.assertEqual(issued[0]["item_id"], "song-1")
         self.assertEqual(issued[0]["target_seconds"], 262.5)
+        self.assertEqual(issued[0]["playback_generation"], 23)
         self.assertEqual(writes[0]["data"]["player_control_command"]["target_seconds"], 262.5)
+
+    def test_program_relative_control_requires_an_exact_playback_generation(self):
+        handler = BilikaraHandler.__new__(BilikaraHandler)
+        writes: list[tuple[dict, object]] = []
+        issued: list[dict] = []
+        context = SimpleNamespace(
+            touch_client=lambda client_id, is_host=True: None,
+            issue_player_control=lambda **kwargs: issued.append(kwargs),
+            snapshot=lambda: {},
+        )
+
+        handler.path = "/api/player/control"
+        handler.headers = {}
+        handler._read_json_body = lambda: {
+            "action": "seek-relative",
+            "item_id": "song-1",
+            "delta_seconds": 15,
+        }
+        handler._write_json = lambda payload, status=None: writes.append((payload, status))
+
+        with patch("bilikara.server.CONTEXT", context):
+            handler.do_POST()
+
+        self.assertEqual(issued, [])
+        self.assertEqual(writes[0][1], server_module.HTTPStatus.BAD_REQUEST)
+
+
+class PlayerAudioVariantRouteTest(unittest.TestCase):
+    @staticmethod
+    def rejection(kind: str) -> PlaylistStoreCommandError:
+        response = {
+            "schema_version": 1,
+            "status": "rejected",
+            "error": {"kind": kind, "message": "stale audio target"},
+        }
+        return PlaylistStoreCommandError(
+            rust_runtime.RustAppStateRejectedError(
+                "rejected",
+                kind,
+                "stale audio target",
+                response=response,
+            )
+        )
+
+    def test_audio_variant_forwards_the_exact_item_incarnation(self):
+        handler = BilikaraHandler.__new__(BilikaraHandler)
+        writes: list[dict] = []
+        calls: list[dict] = []
+        context = SimpleNamespace(
+            touch_client=lambda client_id, is_host=True: None,
+            set_audio_variant=lambda item_id, variant_id, **kwargs: calls.append(
+                {
+                    "item_id": item_id,
+                    "variant_id": variant_id,
+                    **kwargs,
+                }
+            )
+            or True,
+            snapshot=lambda: {"revision": 4},
+        )
+
+        handler.path = "/api/player/audio-variant"
+        handler.headers = {}
+        handler._read_json_body = lambda: {
+            "item_id": "song-1",
+            "variant_id": "instrumental",
+            "expected_item_incarnation_id": "i-exact",
+        }
+        handler._write_json = lambda payload, status=None: writes.append(payload)
+
+        with patch("bilikara.server.CONTEXT", context):
+            handler.do_POST()
+
+        self.assertEqual(
+            calls,
+            [
+                {
+                    "item_id": "song-1",
+                    "variant_id": "instrumental",
+                    "expected_item_incarnation_id": "i-exact",
+                }
+            ],
+        )
+        self.assertEqual(writes, [{"ok": True, "data": {"revision": 4}}])
+
+    def test_stale_audio_variant_is_consumed_without_retry_or_user_error(self):
+        handler = BilikaraHandler.__new__(BilikaraHandler)
+        writes: list[tuple[dict, object]] = []
+        calls: list[dict] = []
+
+        def reject_stale(item_id, variant_id, **kwargs):
+            calls.append({"item_id": item_id, "variant_id": variant_id, **kwargs})
+            raise self.rejection("item_incarnation_mismatch")
+
+        context = SimpleNamespace(
+            touch_client=lambda client_id, is_host=True: None,
+            set_audio_variant=reject_stale,
+            snapshot=lambda: {"revision": 9, "current_item": {"id": "song-1"}},
+        )
+        handler.path = "/api/player/audio-variant"
+        handler.headers = {}
+        handler._read_json_body = lambda: {
+            "item_id": "song-1",
+            "variant_id": "instrumental",
+            "expected_item_incarnation_id": "i-old",
+        }
+        handler._write_json = lambda payload, status=None: writes.append((payload, status))
+
+        with patch("bilikara.server.CONTEXT", context):
+            handler.do_POST()
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            writes,
+            [
+                (
+                    {
+                        "ok": True,
+                        "data": {"revision": 9, "current_item": {"id": "song-1"}},
+                        "stale": True,
+                    },
+                    None,
+                )
+            ],
+        )
+
+    def test_audio_variant_requires_an_item_incarnation(self):
+        handler = BilikaraHandler.__new__(BilikaraHandler)
+        writes: list[tuple[dict, object]] = []
+        calls: list[dict] = []
+        context = SimpleNamespace(
+            touch_client=lambda client_id, is_host=True: None,
+            set_audio_variant=lambda *args, **kwargs: calls.append(kwargs),
+            snapshot=lambda: {},
+        )
+        handler.path = "/api/player/audio-variant"
+        handler.headers = {}
+        handler._read_json_body = lambda: {
+            "item_id": "song-1",
+            "variant_id": "instrumental",
+        }
+        handler._write_json = lambda payload, status=None: writes.append((payload, status))
+
+        with patch("bilikara.server.CONTEXT", context):
+            handler.do_POST()
+
+        self.assertEqual(calls, [])
+        self.assertEqual(writes[0][1], server_module.HTTPStatus.BAD_REQUEST)
+
+
+class PlaylistQueueConflictRouteTest(unittest.TestCase):
+    def test_stale_drag_and_departed_target_return_conflict_without_success_snapshot(self):
+        from bilikara.store import PlaylistStore
+        from tests.test_app_state_store import item
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = PlaylistStore(root / "state.json", root / "backup.json", root / "sessions")
+            try:
+                store.add_session_user("A")
+                for name in ["current", "a", "b"]:
+                    store.add_item(item(name), requester_name="A")
+                version = store.snapshot()["queue_version"]
+                store.move_to_next("b")
+                context = SimpleNamespace(touch_client=lambda *args, **kwargs: None,
+                    move_item_to_index=store.move_item_to_index, move_to_next=store.move_to_next,
+                    snapshot=store.snapshot)
+                for route, body, code in [
+                    ("/api/playlist/reorder", dict(item_id="a", index=0, expected_queue_version=version), "queue_changed"),
+                    ("/api/playlist/move-next", dict(item_id="missing"), "queue_item_missing"),
+                    ("/api/playlist/move-next", dict(item_id="current"), "queue_item_missing"),
+                ]:
+                    with self.subTest(route=route, code=code):
+                        before = store.snapshot()
+                        writes = []
+                        handler = BilikaraHandler.__new__(BilikaraHandler)
+                        handler.path, handler.headers = route, {}
+                        handler._read_json_body = lambda: body
+                        handler._write_json = lambda payload, status=None: writes.append((payload, status))
+                        with patch("bilikara.server.CONTEXT", context):
+                            handler.do_POST()
+                        self.assertEqual(len(writes), 1)
+                        self.assertFalse(writes[0][0]["ok"])
+                        self.assertEqual(writes[0][0]["code"], code)
+                        self.assertEqual(writes[0][1], server_module.HTTPStatus.CONFLICT)
+                        self.assertEqual(store.snapshot(), before)
+            finally:
+                store.shutdown()
 
 
 class PlaylistResortRouteTest(unittest.TestCase):

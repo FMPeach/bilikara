@@ -1,0 +1,737 @@
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const DEFAULT_GACHA_BUSY_MESSAGE: &str = "拉取任务执行中，请等待任务结束";
+const DEFAULT_BILIBILI_LOGGED_IN_MESSAGE: &str = "BBDown 已登录";
+const DEFAULT_BILIBILI_INVALID_DATA_MESSAGE: &str =
+    "BBDown 登录完成，但 BBDown.data 中未检测到有效的 SESSDATA 和 bili_jct";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GachaTaskStatus {
+    #[default]
+    Idle,
+    Running,
+    Success,
+    Partial,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GachaTaskUpdate {
+    pub status: GachaTaskStatus,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub error: String,
+    #[serde(default)]
+    pub result: Option<Value>,
+    #[serde(default = "default_true")]
+    pub blocking: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct GachaTaskSnapshot {
+    pub busy: bool,
+    pub background_busy: bool,
+    pub blocking: bool,
+    pub message: String,
+    pub last_status: GachaTaskStatus,
+    pub last_message: String,
+    pub last_error: String,
+    pub last_updated_at: f64,
+    pub last_result: Option<Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BilibiliLoginStatus {
+    #[default]
+    Idle,
+    Starting,
+    Waiting,
+    LoggedIn,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BilibiliLoginUpdate {
+    pub state: BilibiliLoginStatus,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub qr_image: String,
+    #[serde(default)]
+    pub login_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BilibiliLoginFacts {
+    pub logged_in: bool,
+    pub data_exists: bool,
+    pub data_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct BilibiliLoginSnapshot {
+    pub logged_in: bool,
+    pub state: BilibiliLoginStatus,
+    pub message: String,
+    pub data_path: String,
+    pub qr_image: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub login_url: String,
+}
+
+#[derive(Debug, Clone)]
+struct GachaTaskState {
+    status: GachaTaskStatus,
+    message: String,
+    error: String,
+    updated_at: f64,
+    result: Option<Value>,
+    blocking: bool,
+}
+
+impl Default for GachaTaskState {
+    fn default() -> Self {
+        Self {
+            status: GachaTaskStatus::Idle,
+            message: String::new(),
+            error: String::new(),
+            updated_at: 0.0,
+            result: None,
+            blocking: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BilibiliLoginState {
+    state: BilibiliLoginStatus,
+    message: String,
+    qr_image: String,
+    login_url: String,
+}
+
+impl Default for BilibiliLoginState {
+    fn default() -> Self {
+        Self {
+            state: BilibiliLoginStatus::Idle,
+            message: "未登录".to_string(),
+            qr_image: String::new(),
+            login_url: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct RuntimeStatusService {
+    gacha_task: GachaTaskState,
+    configured_task: Option<GachaTaskState>,
+    source_task: Option<GachaTaskState>,
+    gacha_refresh_lease: bool,
+    gacha_source_removal_lease: bool,
+    gacha_busy_message: String,
+    bilibili_login: BilibiliLoginState,
+    bilibili_generation: u64,
+    bilibili_worker: Option<u64>,
+    bilibili_success: Option<u64>,
+    refresh_generation: u64,
+    configured_refresh: Option<crate::gatcha_refresh::RefreshTicket>,
+    source_refresh: Option<crate::gatcha_refresh::RefreshTicket>,
+    source_exclusive: bool,
+    shared_sources: Option<std::sync::Arc<crate::gatcha_refresh::SourceTasks>>,
+}
+
+impl RuntimeStatusService {
+    #[cfg(any(feature = "native-host", test))]
+    pub(crate) fn owns_configured_refresh(
+        &self,
+        ticket: &crate::gatcha_refresh::RefreshTicket,
+    ) -> bool {
+        self.configured_refresh.as_ref().is_some_and(|current| {
+            current.0 == ticket.0 && std::sync::Arc::ptr_eq(&current.1, &ticket.1)
+        })
+    }
+    #[cfg(feature = "native-host")]
+    pub(crate) fn cancel_configured_refresh(&mut self) {
+        // Keep ownership until the worker retires; cancellation fences writes
+        // without admitting a second concurrent repository task.
+        if let Some((_, control)) = &self.configured_refresh {
+            control.stop();
+        }
+        if let Some((_, control)) = &self.source_refresh {
+            control.stop();
+        }
+        // An admitted task for the new credential must not reuse a completion
+        // cached by the previous account, even while its cancelled lane drains.
+        self.shared_sources = None;
+    }
+
+    pub(crate) fn begin_configured_refresh(
+        &mut self,
+        global_lock: bool,
+        task: GachaTaskUpdate,
+    ) -> Option<crate::gatcha_refresh::RefreshTicket> {
+        if self.configured_refresh.is_some()
+            || self.gacha_source_removal_lease
+            || self.source_exclusive
+            || (global_lock && (self.gacha_refresh_lease || self.source_refresh.is_some()))
+        {
+            return None;
+        }
+        if global_lock {
+            self.gacha_refresh_lease = true;
+        }
+        self.refresh_generation = self.refresh_generation.wrapping_add(1).max(1);
+        let ticket = (
+            self.refresh_generation,
+            std::sync::Arc::new(crate::gatcha_refresh::RefreshControl::default()),
+        );
+        self.attach_source_round(&ticket);
+        self.configured_refresh = Some(ticket.clone());
+        self.set_gacha_busy_message(DEFAULT_GACHA_BUSY_MESSAGE.into());
+        self.set_gacha_task(task);
+        self.configured_task = Some(self.gacha_task.clone());
+        Some(ticket)
+    }
+
+    fn attach_source_round(&mut self, ticket: &crate::gatcha_refresh::RefreshTicket) {
+        let sources = self
+            .shared_sources
+            .get_or_insert_with(Default::default)
+            .clone();
+        ticket.1.share_sources(sources);
+    }
+
+    #[cfg(feature = "native-host")]
+    pub(crate) fn begin_source_refresh(
+        &mut self,
+        task: GachaTaskUpdate,
+        exclusive: bool,
+    ) -> Option<crate::gatcha_refresh::RefreshTicket> {
+        if self.source_refresh.is_some()
+            || self.gacha_refresh_lease
+            || (exclusive && self.configured_refresh.is_some())
+        {
+            return None;
+        }
+        self.refresh_generation = self.refresh_generation.wrapping_add(1).max(1);
+        let ticket = (
+            self.refresh_generation,
+            std::sync::Arc::new(crate::gatcha_refresh::RefreshControl::default()),
+        );
+        self.attach_source_round(&ticket);
+        self.source_refresh = Some(ticket.clone());
+        self.source_exclusive = exclusive;
+        self.set_gacha_task(task);
+        self.source_task = Some(self.gacha_task.clone());
+        Some(ticket)
+    }
+
+    #[cfg(feature = "native-host")]
+    pub(crate) fn owns_source_refresh(
+        &self,
+        ticket: &crate::gatcha_refresh::RefreshTicket,
+    ) -> bool {
+        self.source_refresh.as_ref().is_some_and(|current| {
+            current.0 == ticket.0 && std::sync::Arc::ptr_eq(&current.1, &ticket.1)
+        })
+    }
+
+    #[cfg(feature = "native-host")]
+    pub(crate) fn finish_source_refresh(&mut self, generation: u64, task: GachaTaskUpdate) -> bool {
+        if self.source_refresh.as_ref().map(|ticket| ticket.0) != Some(generation) {
+            return false;
+        }
+        self.source_refresh = None;
+        self.source_task = None;
+        self.source_exclusive = false;
+        if self.configured_refresh.is_none() {
+            self.shared_sources = None;
+        }
+        self.set_gacha_task(task);
+        true
+    }
+
+    pub(crate) fn configured_refresh_progress(&mut self, generation: u64, mut progress: Value) {
+        if self.configured_refresh.as_ref().map(|t| t.0) == Some(generation) {
+            let incremental = progress.get("sources").is_some();
+            if incremental {
+                progress["sources"]["generation"] = serde_json::json!(generation);
+            }
+            self.set_gacha_task(GachaTaskUpdate {
+                status: GachaTaskStatus::Running,
+                message: if incremental {
+                    "正在拉取来源..."
+                } else {
+                    "正在重建抽卡缓存格式..."
+                }
+                .into(),
+                error: String::new(),
+                result: Some(serde_json::json!({"rebuild":progress})),
+                blocking: false,
+            });
+            self.configured_task = Some(self.gacha_task.clone());
+        }
+    }
+
+    pub(crate) fn finish_configured_refresh(
+        &mut self,
+        generation: u64,
+        global_lock: bool,
+        task: GachaTaskUpdate,
+    ) -> bool {
+        if self.configured_refresh.as_ref().map(|t| t.0) != Some(generation) {
+            return false;
+        }
+        self.configured_refresh = None;
+        self.configured_task = None;
+        if self.source_refresh.is_none() {
+            self.shared_sources = None;
+        }
+        if global_lock {
+            self.release_gacha_refresh();
+        }
+        self.set_gacha_task(task);
+        true
+    }
+
+    pub fn gacha_snapshot(&self) -> GachaTaskSnapshot {
+        // Keep the configured batch's progress visible while a foreground
+        // source completes. Neither lane may announce that the other is idle.
+        let task = self
+            .configured_task
+            .as_ref()
+            .or(self.source_task.as_ref())
+            .unwrap_or(&self.gacha_task);
+        let background_busy = self.configured_refresh.is_some()
+            || self.source_refresh.is_some()
+            || task.status == GachaTaskStatus::Running;
+        let blocking = task.blocking || self.source_task.as_ref().is_some_and(|task| task.blocking);
+        let busy = self.gacha_refresh_lease || (background_busy && blocking);
+        GachaTaskSnapshot {
+            busy,
+            background_busy,
+            blocking,
+            message: if busy {
+                self.effective_gacha_busy_message().to_string()
+            } else {
+                String::new()
+            },
+            last_status: task.status,
+            last_message: task.message.clone(),
+            last_error: task.error.clone(),
+            last_updated_at: task.updated_at,
+            last_result: task.result.clone(),
+        }
+    }
+
+    pub fn try_begin_gacha_refresh(
+        &mut self,
+        busy_message: String,
+        task: Option<GachaTaskUpdate>,
+    ) -> bool {
+        if self.gacha_refresh_lease
+            || self.source_refresh.is_some()
+            || self.configured_refresh.as_ref().is_some_and(|_| {
+                self.configured_task
+                    .as_ref()
+                    .is_some_and(|task| task.blocking)
+            })
+        {
+            return false;
+        }
+        self.gacha_refresh_lease = true;
+        self.set_gacha_busy_message(busy_message);
+        if let Some(update) = task {
+            self.set_gacha_task(update);
+        }
+        true
+    }
+
+    pub fn try_begin_gacha_source_removal(&mut self, busy_message: String) -> bool {
+        // Unlike an additive refresh, removal must not race even a nonblocking
+        // credential-restore scan, whose captured inputs could restore a source.
+        if self.configured_refresh.is_some() || !self.try_begin_gacha_refresh(busy_message, None) {
+            return false;
+        }
+        self.gacha_source_removal_lease = true;
+        true
+    }
+
+    pub fn release_gacha_refresh(&mut self) {
+        self.gacha_refresh_lease = false;
+        self.gacha_source_removal_lease = false;
+    }
+
+    pub fn set_gacha_task(&mut self, update: GachaTaskUpdate) {
+        self.gacha_task = GachaTaskState {
+            status: update.status,
+            message: update.message,
+            error: update.error,
+            updated_at: unix_timestamp_seconds(),
+            result: update.result,
+            blocking: update.blocking,
+        };
+    }
+
+    pub fn set_gacha_busy_message(&mut self, message: String) {
+        if !message.trim().is_empty() {
+            self.gacha_busy_message = message;
+        }
+    }
+
+    pub fn reset_gacha(&mut self) {
+        if let Some((_, control)) = self.configured_refresh.take() {
+            control.stop();
+        }
+        if let Some((_, control)) = self.source_refresh.take() {
+            control.stop();
+        }
+        self.configured_task = None;
+        self.source_task = None;
+        self.source_exclusive = false;
+        self.shared_sources = None;
+        self.gacha_task = GachaTaskState::default();
+        self.gacha_refresh_lease = false;
+        self.gacha_source_removal_lease = false;
+        self.gacha_busy_message.clear();
+    }
+
+    pub fn active_bilibili_generation(&self) -> Option<u64> {
+        matches!(
+            self.bilibili_login.state,
+            BilibiliLoginStatus::Starting | BilibiliLoginStatus::Waiting
+        )
+        .then_some(self.bilibili_generation)
+    }
+
+    pub fn claim_bilibili_worker(&mut self, generation: u64) -> bool {
+        if self.active_bilibili_generation() != Some(generation) || self.bilibili_worker.is_some() {
+            return false;
+        }
+        self.bilibili_worker = Some(generation);
+        true
+    }
+
+    pub fn complete_bilibili_login(&mut self, generation: u64, update: BilibiliLoginUpdate) {
+        if self.active_bilibili_generation() == Some(generation) {
+            self.bilibili_success =
+                (update.state == BilibiliLoginStatus::LoggedIn).then_some(generation);
+            self.set_bilibili_login(Some(generation), update);
+            self.bilibili_worker = None;
+        }
+    }
+
+    pub fn take_bilibili_success(&mut self, generation: u64) -> bool {
+        if self.bilibili_generation != generation
+            || self.bilibili_success != Some(generation)
+            || self.bilibili_login.state != BilibiliLoginStatus::LoggedIn
+        {
+            return false;
+        }
+        self.bilibili_success = None;
+        true
+    }
+
+    pub fn begin_bilibili_login(&mut self, message: String) -> u64 {
+        self.bilibili_worker = None;
+        self.bilibili_success = None;
+        self.bilibili_generation = self.bilibili_generation.wrapping_add(1).max(1);
+        self.bilibili_login = BilibiliLoginState {
+            state: BilibiliLoginStatus::Starting,
+            message,
+            qr_image: String::new(),
+            login_url: String::new(),
+        };
+        self.bilibili_generation
+    }
+
+    pub fn set_bilibili_login(
+        &mut self,
+        expected_generation: Option<u64>,
+        update: BilibiliLoginUpdate,
+    ) -> bool {
+        if update.login_url.len() > 4096
+            || (!update.login_url.is_empty()
+                && !crate::login_service::valid_qr_url(&update.login_url))
+        {
+            return false;
+        }
+        if expected_generation.is_some_and(|value| value != self.bilibili_generation) {
+            return false;
+        }
+        self.bilibili_login = BilibiliLoginState {
+            state: update.state,
+            message: update.message,
+            qr_image: update.qr_image,
+            login_url: update.login_url,
+        };
+        true
+    }
+
+    pub fn reset_bilibili_login(&mut self) {
+        self.bilibili_worker = None;
+        self.bilibili_success = None;
+        self.bilibili_generation = self.bilibili_generation.wrapping_add(1).max(1);
+        self.bilibili_login = BilibiliLoginState::default();
+    }
+
+    pub fn bilibili_snapshot(&self, facts: BilibiliLoginFacts) -> BilibiliLoginSnapshot {
+        let (logged_in, state, message) =
+            if self.bilibili_login.state == BilibiliLoginStatus::Failed {
+                (
+                    false,
+                    BilibiliLoginStatus::Failed,
+                    self.bilibili_login.message.clone(),
+                )
+            } else if facts.logged_in {
+                (
+                    true,
+                    BilibiliLoginStatus::LoggedIn,
+                    DEFAULT_BILIBILI_LOGGED_IN_MESSAGE.to_string(),
+                )
+            } else if facts.data_exists
+                && !matches!(
+                    self.bilibili_login.state,
+                    BilibiliLoginStatus::Starting | BilibiliLoginStatus::Waiting
+                )
+            {
+                (
+                    false,
+                    BilibiliLoginStatus::Failed,
+                    DEFAULT_BILIBILI_INVALID_DATA_MESSAGE.to_string(),
+                )
+            } else {
+                (
+                    false,
+                    self.bilibili_login.state,
+                    self.bilibili_login.message.clone(),
+                )
+            };
+        BilibiliLoginSnapshot {
+            logged_in,
+            state,
+            message,
+            data_path: facts.data_path,
+            login_url: if logged_in || state != BilibiliLoginStatus::Waiting {
+                String::new()
+            } else {
+                self.bilibili_login.login_url.clone()
+            },
+            qr_image: if logged_in {
+                String::new()
+            } else {
+                self.bilibili_login.qr_image.clone()
+            },
+        }
+    }
+
+    fn effective_gacha_busy_message(&self) -> &str {
+        if self.gacha_busy_message.trim().is_empty() {
+            DEFAULT_GACHA_BUSY_MESSAGE
+        } else {
+            &self.gacha_busy_message
+        }
+    }
+}
+
+impl Drop for RuntimeStatusService {
+    fn drop(&mut self) {
+        if let Some((_, control)) = &self.configured_refresh {
+            control.stop();
+        }
+        if let Some((_, control)) = &self.source_refresh {
+            control.stop();
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn unix_timestamp_seconds() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0.0, |duration| duration.as_secs_f64())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn running_task(blocking: bool) -> GachaTaskUpdate {
+        GachaTaskUpdate {
+            status: GachaTaskStatus::Running,
+            message: "refreshing".to_string(),
+            error: String::new(),
+            result: None,
+            blocking,
+        }
+    }
+
+    #[test]
+    fn source_removal_and_background_refresh_are_mutually_exclusive() {
+        let mut service = RuntimeStatusService::default();
+        let task = || GachaTaskUpdate {
+            status: GachaTaskStatus::Running,
+            message: String::new(),
+            error: String::new(),
+            result: None,
+            blocking: false,
+        };
+        let ticket = service.begin_configured_refresh(false, task()).unwrap();
+        assert!(!service.try_begin_gacha_source_removal("busy".into()));
+        assert!(service.finish_configured_refresh(ticket.0, false, task()));
+        assert!(service.try_begin_gacha_source_removal("busy".into()));
+        assert!(!service.try_begin_gacha_source_removal("busy".into()));
+        assert!(service.begin_configured_refresh(false, task()).is_none());
+        service.release_gacha_refresh();
+        assert!(service.begin_configured_refresh(false, task()).is_some());
+    }
+
+    #[test]
+    fn gacha_refresh_lease_is_exclusive_and_drives_busy_snapshot() {
+        let mut service = RuntimeStatusService::default();
+        assert!(service.try_begin_gacha_refresh("busy".to_string(), None));
+        assert!(!service.try_begin_gacha_refresh("other".to_string(), None));
+        let snapshot = service.gacha_snapshot();
+        assert!(snapshot.busy);
+        assert_eq!(snapshot.message, "busy");
+        service.release_gacha_refresh();
+        assert!(!service.gacha_snapshot().busy);
+    }
+
+    #[test]
+    fn nonblocking_gacha_background_task_is_visible_without_blocking_actions() {
+        let mut service = RuntimeStatusService::default();
+        service.set_gacha_busy_message("busy".to_string());
+        service.set_gacha_task(running_task(false));
+        let snapshot = service.gacha_snapshot();
+        assert!(snapshot.background_busy);
+        assert!(!snapshot.busy);
+        assert_eq!(snapshot.last_message, "refreshing");
+    }
+
+    #[test]
+    fn stale_bilibili_generation_cannot_replace_new_login_state() {
+        let mut service = RuntimeStatusService::default();
+        let old_generation = service.begin_bilibili_login("first".to_string());
+        let current_generation = service.begin_bilibili_login("second".to_string());
+        assert_ne!(old_generation, current_generation);
+        assert!(!service.set_bilibili_login(
+            Some(old_generation),
+            BilibiliLoginUpdate {
+                state: BilibiliLoginStatus::Failed,
+                message: "stale".to_string(),
+                qr_image: String::new(),
+                login_url: String::new(),
+            },
+        ));
+        assert_eq!(
+            service
+                .bilibili_snapshot(BilibiliLoginFacts {
+                    logged_in: false,
+                    data_exists: false,
+                    data_path: "data".to_string(),
+                })
+                .message,
+            "second"
+        );
+    }
+
+    #[test]
+    fn login_link_rejects_foreign_origins_and_resets_with_its_generation() {
+        let mut service = RuntimeStatusService::default();
+        let generation = service.begin_bilibili_login("start".into());
+        for url in [
+            "https://example.test/",
+            "http://account.bilibili.com/",
+            "https://account.bilibili.com:8443/",
+            "https://user@passport.bilibili.com/",
+        ] {
+            assert!(!service.set_bilibili_login(
+                Some(generation),
+                BilibiliLoginUpdate {
+                    state: BilibiliLoginStatus::Waiting,
+                    message: String::new(),
+                    qr_image: String::new(),
+                    login_url: url.into()
+                }
+            ));
+        }
+        assert!(service.set_bilibili_login(
+            Some(generation),
+            BilibiliLoginUpdate {
+                state: BilibiliLoginStatus::Waiting,
+                message: String::new(),
+                qr_image: String::new(),
+                login_url: "https://passport.bilibili.com/fixture".into()
+            }
+        ));
+        service.begin_bilibili_login("replacement".into());
+        assert!(
+            service
+                .bilibili_snapshot(BilibiliLoginFacts {
+                    logged_in: false,
+                    data_exists: false,
+                    data_path: String::new()
+                })
+                .login_url
+                .is_empty()
+        );
+        // Legacy FFI callers omit the additive field; no link is invented.
+        let old: BilibiliLoginUpdate =
+            serde_json::from_value(serde_json::json!({"state":"waiting","qr_image":"old"}))
+                .unwrap();
+        assert!(old.login_url.is_empty());
+    }
+
+    #[test]
+    fn bilibili_snapshot_combines_owned_state_with_filesystem_facts() {
+        let mut service = RuntimeStatusService::default();
+        let generation = service.begin_bilibili_login("starting".to_string());
+        assert!(service.set_bilibili_login(
+            Some(generation),
+            BilibiliLoginUpdate {
+                state: BilibiliLoginStatus::Waiting,
+                message: "scan".to_string(),
+                qr_image: "data:image/png;base64,abc".to_string(),
+                login_url: "https://account.bilibili.com/fixture".to_string(),
+            },
+        ));
+        let waiting = service.bilibili_snapshot(BilibiliLoginFacts {
+            logged_in: false,
+            data_exists: false,
+            data_path: String::new(),
+        });
+        assert_eq!(waiting.login_url, "https://account.bilibili.com/fixture");
+        let logged_in = service.bilibili_snapshot(BilibiliLoginFacts {
+            logged_in: true,
+            data_exists: true,
+            data_path: "BBDown.data".to_string(),
+        });
+        assert!(logged_in.logged_in);
+        assert_eq!(logged_in.state, BilibiliLoginStatus::LoggedIn);
+        assert!(logged_in.qr_image.is_empty());
+        assert!(logged_in.login_url.is_empty());
+        let serialized = serde_json::to_value(&logged_in).unwrap();
+        assert!(serialized.get("login_url").is_none());
+
+        service.reset_bilibili_login();
+        let invalid = service.bilibili_snapshot(BilibiliLoginFacts {
+            logged_in: false,
+            data_exists: true,
+            data_path: "BBDown.data".to_string(),
+        });
+        assert_eq!(invalid.state, BilibiliLoginStatus::Failed);
+        assert!(invalid.message.contains("SESSDATA"));
+    }
+}

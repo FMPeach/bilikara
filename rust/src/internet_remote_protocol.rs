@@ -1,0 +1,2479 @@
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::Value;
+use std::collections::BTreeMap;
+
+pub const INTERNET_REMOTE_PROTOCOL_VERSION: u16 = 1;
+pub const MAX_CONTROL_MESSAGE_BYTES: usize = 16 * 1024;
+pub const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
+pub const MAX_SEARCH_RESULTS: u16 = 80;
+pub const MAX_BROWSE_RESULTS: u16 = 100;
+pub const MAX_REMOTE_STATE_ITEMS: usize = 10_000;
+
+const MAX_EPOCH_BYTES: usize = 22;
+const MAX_CATALOG_ID_BYTES: usize = 128;
+const MAX_ITEM_ID_BYTES: usize = 512;
+const ITEM_INCARNATION_ID_BYTES: usize = 51;
+const MAX_AUDIO_VARIANT_ID_BYTES: usize = 128;
+const MAX_SEARCH_QUERY_BYTES: usize = 400;
+const MAX_SEARCH_QUERY_CHARS: usize = 100;
+const MAX_BROWSE_FILTER_BYTES: usize = 400;
+const MAX_BROWSE_FILTER_CHARS: usize = 100;
+const MAX_BROWSE_TAGS: usize = 10;
+const MAX_GATCHA_EXCLUSIONS: usize = 256;
+const MAX_SELECTED_AUDIO_PAGES: usize = 256;
+const MAX_NUMERIC_ID_BYTES: usize = 24;
+const MAX_SESSION_NAME_BYTES: usize = 96;
+const MAX_SESSION_NAME_CHARS: usize = 24;
+const MAX_SEEK_DELTA_SECONDS: i32 = 300;
+const MAX_AV_DELAY_MS: i32 = 5_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteLane {
+    Control,
+    Bulk,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteProfile {
+    Viewer,
+    Controller,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemotePlaylistPositionV1 {
+    #[default]
+    Tail,
+    Next,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteCapability {
+    ConnectionHealth,
+    StateRead,
+    CatalogRead,
+    PlaylistWrite,
+    PlaybackControl,
+    PlayerSettingsWrite,
+    SessionIdentityWrite,
+    RatingWrite,
+    CacheRetry,
+    GatchaManage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteOperation {
+    ConnectionHealth,
+    StateGet,
+    CatalogSearch,
+    CatalogBrowse,
+    CatalogCategoryBrowse,
+    SongDetail,
+    GatchaSearch,
+    GatchaBrowse,
+    GatchaFavlistBrowse,
+    GatchaPoolConfigGet,
+    GatchaCandidate,
+    GatchaPoolConfigSet,
+    GatchaUidPreview,
+    GatchaUidAdd,
+    GatchaSourceRemove,
+    GatchaRefresh,
+    GatchaFavlistPreview,
+    GatchaFavlistRefresh,
+    PlaylistAdd,
+    PlaylistRemove,
+    PlaylistMove,
+    PlaylistResort,
+    PlaylistMoveNext,
+    PlaylistPlayNow,
+    PlaybackPlay,
+    PlaybackPause,
+    PlaybackToggle,
+    PlaybackSeekRelative,
+    PlaybackSeekAbsolute,
+    PlaybackNext,
+    PlayerSetVolume,
+    PlayerSetMuted,
+    PlayerSetKeyShift,
+    PlayerSetAudioVariant,
+    PlayerSetAvDelay,
+    SessionSetIdentity,
+    SessionRename,
+    SessionResume,
+    RatingSubmit,
+    CacheRetry,
+}
+
+impl RemoteOperation {
+    pub const fn capability(self) -> RemoteCapability {
+        match self {
+            Self::ConnectionHealth => RemoteCapability::ConnectionHealth,
+            Self::StateGet => RemoteCapability::StateRead,
+            Self::CatalogSearch
+            | Self::CatalogBrowse
+            | Self::CatalogCategoryBrowse
+            | Self::SongDetail
+            | Self::GatchaSearch
+            | Self::GatchaBrowse
+            | Self::GatchaFavlistBrowse
+            | Self::GatchaPoolConfigGet
+            | Self::GatchaCandidate => RemoteCapability::CatalogRead,
+            Self::PlaylistAdd
+            | Self::PlaylistRemove
+            | Self::PlaylistMove
+            | Self::PlaylistResort
+            | Self::PlaylistMoveNext
+            | Self::PlaylistPlayNow => RemoteCapability::PlaylistWrite,
+            Self::PlaybackPlay
+            | Self::PlaybackPause
+            | Self::PlaybackToggle
+            | Self::PlaybackSeekRelative
+            | Self::PlaybackSeekAbsolute
+            | Self::PlaybackNext => RemoteCapability::PlaybackControl,
+            Self::PlayerSetVolume
+            | Self::PlayerSetMuted
+            | Self::PlayerSetKeyShift
+            | Self::PlayerSetAudioVariant
+            | Self::PlayerSetAvDelay => RemoteCapability::PlayerSettingsWrite,
+            Self::SessionSetIdentity | Self::SessionRename | Self::SessionResume => {
+                RemoteCapability::SessionIdentityWrite
+            }
+            Self::RatingSubmit => RemoteCapability::RatingWrite,
+            Self::CacheRetry => RemoteCapability::CacheRetry,
+            Self::GatchaPoolConfigSet
+            | Self::GatchaUidPreview
+            | Self::GatchaUidAdd
+            | Self::GatchaSourceRemove
+            | Self::GatchaRefresh
+            | Self::GatchaFavlistPreview
+            | Self::GatchaFavlistRefresh => RemoteCapability::GatchaManage,
+        }
+    }
+}
+
+pub const fn profile_allows(profile: RemoteProfile, operation: RemoteOperation) -> bool {
+    match profile {
+        RemoteProfile::Viewer => matches!(
+            operation.capability(),
+            RemoteCapability::ConnectionHealth
+                | RemoteCapability::StateRead
+                | RemoteCapability::CatalogRead
+        ),
+        RemoteProfile::Controller => matches!(
+            operation.capability(),
+            RemoteCapability::ConnectionHealth
+                | RemoteCapability::StateRead
+                | RemoteCapability::CatalogRead
+                | RemoteCapability::PlaylistWrite
+                | RemoteCapability::PlaybackControl
+                | RemoteCapability::PlayerSettingsWrite
+                | RemoteCapability::SessionIdentityWrite
+                | RemoteCapability::RatingWrite
+                | RemoteCapability::CacheRetry
+                | RemoteCapability::GatchaManage
+        ),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteCatalogBrowseKindV1 {
+    Name,
+    Artist,
+}
+
+/// Preserve the caller's action until it reaches the authoritative state lock.
+/// In particular, an adjustment must never be derived from a Remote snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RemoteAvDelayActionV1 {
+    Adjust { delta_ms: i32 },
+    SetEffective { effective_delay_ms: i32 },
+    ResetLocal {},
+    ToggleLock {},
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", content = "body")]
+pub enum RemoteRequestV1 {
+    #[serde(rename = "connection.health")]
+    ConnectionHealth,
+    #[serde(rename = "state.get")]
+    StateGet { since_revision: Option<u64> },
+    #[serde(rename = "catalog.search")]
+    CatalogSearch {
+        query: String,
+        limit: u16,
+        #[serde(default)]
+        offset: u32,
+    },
+    #[serde(rename = "catalog.browse")]
+    CatalogBrowse {
+        kind: RemoteCatalogBrowseKindV1,
+        letter: String,
+        query: String,
+        tag: String,
+        locale: String,
+        limit: u16,
+        #[serde(default)]
+        offset: u32,
+    },
+    #[serde(rename = "catalog.category_browse")]
+    CatalogCategoryBrowse {
+        tags: Vec<String>,
+        tag45s: Vec<String>,
+        query: String,
+        offset: u32,
+        limit: u16,
+    },
+    #[serde(rename = "catalog.song_detail")]
+    SongDetail { catalog_item_id: String },
+    #[serde(rename = "gatcha.search")]
+    GatchaSearch {
+        query: String,
+        limit: u16,
+        #[serde(default)]
+        offset: u32,
+    },
+    #[serde(rename = "gatcha.browse")]
+    GatchaBrowse {
+        uid: String,
+        query: String,
+        offset: u32,
+        limit: u16,
+    },
+    #[serde(rename = "gatcha.favlist_browse")]
+    GatchaFavlistBrowse {
+        folder_id: String,
+        query: String,
+        offset: u32,
+        limit: u16,
+    },
+    #[serde(rename = "gatcha.pool_config_get")]
+    GatchaPoolConfigGet,
+    #[serde(rename = "gatcha.candidate")]
+    GatchaCandidate,
+    #[serde(rename = "gatcha.pool_config_set")]
+    GatchaPoolConfigSet {
+        uid_weight: u8,
+        favlist_weight: u8,
+        excluded_uids: Vec<String>,
+        excluded_favlist_folders: Vec<String>,
+    },
+    #[serde(rename = "gatcha.uid_preview")]
+    GatchaUidPreview { uid: String },
+    #[serde(rename = "gatcha.uid_add")]
+    GatchaUidAdd { uid: String },
+    #[serde(rename = "gatcha.source_remove")]
+    GatchaSourceRemove { source: String, id: String },
+    #[serde(rename = "gatcha.refresh")]
+    GatchaRefresh,
+    #[serde(rename = "gatcha.favlist_preview")]
+    GatchaFavlistPreview { uid: String },
+    #[serde(rename = "gatcha.favlist_refresh")]
+    GatchaFavlistRefresh {
+        uid: String,
+        folder_ids: Vec<String>,
+        #[serde(default)]
+        folder_titles: BTreeMap<String, String>,
+    },
+    #[serde(rename = "playlist.add")]
+    PlaylistAdd {
+        catalog_item_id: String,
+        position: RemotePlaylistPositionV1,
+        allow_repeat: bool,
+        selected_video_page: Option<u32>,
+        selected_audio_pages: Vec<u32>,
+        expected_revision: u64,
+    },
+    #[serde(rename = "playlist.remove")]
+    PlaylistRemove {
+        item_id: String,
+        expected_revision: u64,
+    },
+    #[serde(rename = "playlist.move")]
+    PlaylistMove {
+        item_id: String,
+        target_index: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_queue_version: Option<String>,
+        expected_revision: u64,
+    },
+    #[serde(rename = "playlist.resort")]
+    PlaylistResort { expected_revision: u64 },
+    #[serde(rename = "playlist.move_next")]
+    PlaylistMoveNext {
+        item_id: String,
+        expected_revision: u64,
+    },
+    #[serde(rename = "playlist.play_now")]
+    PlaylistPlayNow {
+        item_id: String,
+        expected_revision: u64,
+    },
+    #[serde(rename = "playback.play")]
+    PlaybackPlay {
+        item_id: String,
+        playback_generation: u64,
+    },
+    #[serde(rename = "playback.pause")]
+    PlaybackPause {
+        item_id: String,
+        playback_generation: u64,
+    },
+    #[serde(rename = "playback.toggle")]
+    PlaybackToggle {
+        item_id: String,
+        playback_generation: u64,
+    },
+    #[serde(rename = "playback.seek_relative")]
+    PlaybackSeekRelative {
+        item_id: String,
+        playback_generation: u64,
+        delta_seconds: i32,
+    },
+    #[serde(rename = "playback.seek_absolute")]
+    PlaybackSeekAbsolute {
+        item_id: String,
+        playback_generation: u64,
+        target_seconds: u32,
+    },
+    #[serde(rename = "playback.next")]
+    PlaybackNext { playback_generation: u64 },
+    #[serde(rename = "player.set_volume")]
+    PlayerSetVolume {
+        volume_percent: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_item_incarnation_id: Option<String>,
+    },
+    #[serde(rename = "player.set_muted")]
+    PlayerSetMuted { is_muted: bool },
+    #[serde(rename = "player.set_key_shift")]
+    PlayerSetKeyShift { key_shift: i8 },
+    #[serde(rename = "player.set_audio_variant")]
+    PlayerSetAudioVariant {
+        item_id: String,
+        variant_id: String,
+        expected_item_incarnation_id: String,
+        expected_revision: u64,
+    },
+    #[serde(rename = "player.set_av_delay")]
+    PlayerSetAvDelay { effective_delay_ms: i32 },
+    #[serde(rename = "player.av_delay_action")]
+    PlayerAvDelayAction(RemoteAvDelayActionV1),
+    #[serde(rename = "session.set_identity")]
+    SessionSetIdentity { name: String },
+    #[serde(rename = "session.rename")]
+    SessionRename {
+        name: String,
+        user_id: String,
+        expected_name: String,
+    },
+    #[serde(rename = "session.resume")]
+    SessionResume { user_id: String },
+    #[serde(rename = "rating.submit")]
+    RatingSubmit { play_id: String, score: u8 },
+    #[serde(rename = "cache.retry")]
+    CacheRetry {
+        #[serde(default)]
+        force: bool,
+        item_id: String,
+        expected_item_incarnation_id: String,
+        expected_revision: u64,
+    },
+}
+
+impl RemoteRequestV1 {
+    pub const fn operation(&self) -> RemoteOperation {
+        match self {
+            Self::ConnectionHealth => RemoteOperation::ConnectionHealth,
+            Self::StateGet { .. } => RemoteOperation::StateGet,
+            Self::CatalogSearch { .. } => RemoteOperation::CatalogSearch,
+            Self::CatalogBrowse { .. } => RemoteOperation::CatalogBrowse,
+            Self::CatalogCategoryBrowse { .. } => RemoteOperation::CatalogCategoryBrowse,
+            Self::SongDetail { .. } => RemoteOperation::SongDetail,
+            Self::GatchaSearch { .. } => RemoteOperation::GatchaSearch,
+            Self::GatchaBrowse { .. } => RemoteOperation::GatchaBrowse,
+            Self::GatchaFavlistBrowse { .. } => RemoteOperation::GatchaFavlistBrowse,
+            Self::GatchaPoolConfigGet => RemoteOperation::GatchaPoolConfigGet,
+            Self::GatchaCandidate => RemoteOperation::GatchaCandidate,
+            Self::GatchaPoolConfigSet { .. } => RemoteOperation::GatchaPoolConfigSet,
+            Self::GatchaUidPreview { .. } => RemoteOperation::GatchaUidPreview,
+            Self::GatchaUidAdd { .. } => RemoteOperation::GatchaUidAdd,
+            Self::GatchaSourceRemove { .. } => RemoteOperation::GatchaSourceRemove,
+            Self::GatchaRefresh => RemoteOperation::GatchaRefresh,
+            Self::GatchaFavlistPreview { .. } => RemoteOperation::GatchaFavlistPreview,
+            Self::GatchaFavlistRefresh { .. } => RemoteOperation::GatchaFavlistRefresh,
+            Self::PlaylistAdd { .. } => RemoteOperation::PlaylistAdd,
+            Self::PlaylistRemove { .. } => RemoteOperation::PlaylistRemove,
+            Self::PlaylistMove { .. } => RemoteOperation::PlaylistMove,
+            Self::PlaylistResort { .. } => RemoteOperation::PlaylistResort,
+            Self::PlaylistMoveNext { .. } => RemoteOperation::PlaylistMoveNext,
+            Self::PlaylistPlayNow { .. } => RemoteOperation::PlaylistPlayNow,
+            Self::PlaybackPlay { .. } => RemoteOperation::PlaybackPlay,
+            Self::PlaybackPause { .. } => RemoteOperation::PlaybackPause,
+            Self::PlaybackToggle { .. } => RemoteOperation::PlaybackToggle,
+            Self::PlaybackSeekRelative { .. } => RemoteOperation::PlaybackSeekRelative,
+            Self::PlaybackSeekAbsolute { .. } => RemoteOperation::PlaybackSeekAbsolute,
+            Self::PlaybackNext { .. } => RemoteOperation::PlaybackNext,
+            Self::PlayerSetVolume { .. } => RemoteOperation::PlayerSetVolume,
+            Self::PlayerSetMuted { .. } => RemoteOperation::PlayerSetMuted,
+            Self::PlayerSetKeyShift { .. } => RemoteOperation::PlayerSetKeyShift,
+            Self::PlayerSetAudioVariant { .. } => RemoteOperation::PlayerSetAudioVariant,
+            Self::PlayerSetAvDelay { .. } => RemoteOperation::PlayerSetAvDelay,
+            Self::PlayerAvDelayAction(_) => RemoteOperation::PlayerSetAvDelay,
+            Self::SessionSetIdentity { .. } => RemoteOperation::SessionSetIdentity,
+            Self::SessionRename { .. } => RemoteOperation::SessionRename,
+            Self::SessionResume { .. } => RemoteOperation::SessionResume,
+            Self::RatingSubmit { .. } => RemoteOperation::RatingSubmit,
+            Self::CacheRetry { .. } => RemoteOperation::CacheRetry,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RemoteRequestEnvelopeV1 {
+    pub v: u16,
+    pub lane: RemoteLane,
+    pub epoch: String,
+    pub seq: u64,
+    pub id: String,
+    #[serde(flatten)]
+    pub request: RemoteRequestV1,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RemoteValidationContext<'a> {
+    pub expected_lane: RemoteLane,
+    pub expected_epoch: &'a str,
+    pub last_sequence: Option<u64>,
+    pub profile: RemoteProfile,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteProtocolError {
+    MessageTooLarge,
+    MalformedEnvelope,
+    UnsupportedVersion,
+    InvalidLane,
+    InvalidEpoch,
+    StaleEpoch,
+    InvalidSequence,
+    ReplayedSequence,
+    InvalidRequestId,
+    UnknownRequestKind,
+    InvalidRequestBody,
+    CapabilityDenied,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireEnvelope {
+    v: u16,
+    lane: RemoteLane,
+    epoch: String,
+    seq: u64,
+    id: String,
+    kind: String,
+    body: Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmptyBody {}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StateGetBody {
+    since_revision: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogSearchBody {
+    query: String,
+    limit: u16,
+    #[serde(default)]
+    offset: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogBrowseBody {
+    kind: RemoteCatalogBrowseKindV1,
+    letter: String,
+    query: String,
+    tag: String,
+    locale: String,
+    limit: u16,
+    #[serde(default)]
+    offset: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogCategoryBrowseBody {
+    tags: Vec<String>,
+    tag45s: Vec<String>,
+    query: String,
+    offset: u32,
+    limit: u16,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GatchaBrowseBody {
+    uid: String,
+    query: String,
+    #[serde(default)]
+    offset: u32,
+    #[serde(default = "default_browse_limit")]
+    limit: u16,
+}
+
+const fn default_browse_limit() -> u16 {
+    MAX_BROWSE_RESULTS
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GatchaFavlistBrowseBody {
+    folder_id: String,
+    query: String,
+    #[serde(default)]
+    offset: u32,
+    #[serde(default = "default_browse_limit")]
+    limit: u16,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GatchaPoolConfigBody {
+    uid_weight: u8,
+    favlist_weight: u8,
+    excluded_uids: Vec<String>,
+    excluded_favlist_folders: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GatchaUidBody {
+    uid: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GatchaSourceRemoveBody {
+    source: String,
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GatchaFavlistRefreshBody {
+    uid: String,
+    folder_ids: Vec<String>,
+    #[serde(default)]
+    folder_titles: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogItemBody {
+    catalog_item_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogMutationBody {
+    catalog_item_id: String,
+    #[serde(default)]
+    position: RemotePlaylistPositionV1,
+    #[serde(default)]
+    allow_repeat: bool,
+    #[serde(default)]
+    selected_video_page: Option<u32>,
+    #[serde(default)]
+    selected_audio_pages: Vec<u32>,
+    expected_revision: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ItemMutationBody {
+    item_id: String,
+    expected_revision: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IncarnationMutationBody {
+    #[serde(default)]
+    force: bool,
+    item_id: String,
+    expected_item_incarnation_id: String,
+    expected_revision: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MoveItemBody {
+    item_id: String,
+    target_index: u32,
+    #[serde(default)]
+    expected_queue_version: Option<String>,
+    expected_revision: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RevisionBody {
+    expected_revision: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SeekRelativeBody {
+    item_id: String,
+    playback_generation: u64,
+    delta_seconds: i32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SeekAbsoluteBody {
+    item_id: String,
+    playback_generation: u64,
+    target_seconds: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlaybackItemBody {
+    item_id: String,
+    playback_generation: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlaybackGenerationBody {
+    playback_generation: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VolumeBody {
+    volume_percent: u16,
+    #[serde(default)]
+    expected_item_incarnation_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MutedBody {
+    is_muted: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeyShiftBody {
+    key_shift: i8,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AudioVariantBody {
+    item_id: String,
+    variant_id: String,
+    expected_item_incarnation_id: String,
+    expected_revision: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AvDelayBody {
+    effective_delay_ms: i32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IdentityBody {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RatingBody {
+    play_id: String,
+    score: u8,
+}
+
+fn body<T: DeserializeOwned>(value: Value) -> Result<T, RemoteProtocolError> {
+    serde_json::from_value(value).map_err(|_| RemoteProtocolError::InvalidRequestBody)
+}
+
+fn valid_text(value: &str, max_bytes: usize, max_chars: usize) -> bool {
+    !value.contains('\0')
+        && !value.chars().any(char::is_control)
+        && !value.is_empty()
+        && value.len() <= max_bytes
+        && value.chars().count() <= max_chars
+        && !value.trim().is_empty()
+}
+
+fn valid_optional_text(value: &str, max_bytes: usize, max_chars: usize) -> bool {
+    value.is_empty()
+        || (!value.contains('\0')
+            && !value.chars().any(char::is_control)
+            && value.len() <= max_bytes
+            && value.chars().count() <= max_chars
+            && value.trim() == value)
+}
+
+fn valid_numeric_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_NUMERIC_ID_BYTES
+        && !value.starts_with('0')
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn valid_optional_numeric_id(value: &str) -> bool {
+    value.is_empty() || valid_numeric_id(value)
+}
+
+fn valid_folder_selector(value: &str) -> bool {
+    if let Some((uid, folder_id)) = value.split_once(':') {
+        valid_numeric_id(uid) && valid_numeric_id(folder_id) && !folder_id.contains(':')
+    } else {
+        valid_numeric_id(value)
+    }
+}
+
+fn valid_browse_tags(values: &[String]) -> bool {
+    values.len() <= MAX_BROWSE_TAGS
+        && values
+            .iter()
+            .all(|value| valid_text(value, MAX_BROWSE_FILTER_BYTES, MAX_BROWSE_FILTER_CHARS))
+}
+
+fn valid_exclusions(values: &[String], validator: impl Fn(&str) -> bool) -> bool {
+    values.len() <= MAX_GATCHA_EXCLUSIONS && values.iter().all(|value| validator(value))
+}
+
+fn valid_base64url(value: &str, exact_bytes: usize) -> bool {
+    value.len() == exact_bytes
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+fn valid_uuid_v4(value: &str) -> bool {
+    if value.len() != 36 {
+        return false;
+    }
+    let bytes = value.as_bytes();
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        if matches!(index, 8 | 13 | 18 | 23) {
+            if byte != b'-' {
+                return false;
+            }
+        } else if !byte.is_ascii_hexdigit() {
+            return false;
+        }
+    }
+    bytes[14] == b'4' && matches!(bytes[19].to_ascii_lowercase(), b'8' | b'9' | b'a' | b'b')
+}
+
+fn valid_revision(value: u64) -> bool {
+    value <= MAX_SAFE_JSON_INTEGER
+}
+
+fn valid_playback_generation(value: u64) -> bool {
+    (1..=MAX_SAFE_JSON_INTEGER).contains(&value)
+}
+
+fn valid_item_incarnation_id(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == ITEM_INCARNATION_ID_BYTES
+        && bytes[0] == b'i'
+        && bytes[1] == b'-'
+        && bytes[34] == b'-'
+        && bytes[2..34].iter().all(u8::is_ascii_hexdigit)
+        && bytes[35..].iter().all(u8::is_ascii_hexdigit)
+}
+
+fn validate_request(request: &RemoteRequestV1) -> Result<(), RemoteProtocolError> {
+    let valid_item = |value: &str| valid_text(value, MAX_ITEM_ID_BYTES, MAX_ITEM_ID_BYTES);
+    let valid_catalog = |value: &str| valid_catalog_item_id(value);
+    let valid_expected = |value: u64| valid_revision(value);
+    let valid = match request {
+        RemoteRequestV1::ConnectionHealth
+        | RemoteRequestV1::GatchaPoolConfigGet
+        | RemoteRequestV1::GatchaCandidate
+        | RemoteRequestV1::GatchaRefresh => true,
+        RemoteRequestV1::StateGet { since_revision } => since_revision.is_none_or(valid_revision),
+        RemoteRequestV1::CatalogSearch {
+            query,
+            limit,
+            offset,
+        }
+        | RemoteRequestV1::GatchaSearch {
+            query,
+            limit,
+            offset,
+        } => {
+            valid_text(query, MAX_SEARCH_QUERY_BYTES, MAX_SEARCH_QUERY_CHARS)
+                && (1..=MAX_SEARCH_RESULTS).contains(limit)
+                && *offset <= 100_000
+        }
+        RemoteRequestV1::CatalogBrowse {
+            letter,
+            query,
+            tag,
+            locale,
+            limit,
+            offset,
+            ..
+        } => {
+            valid_optional_text(letter, 8, 2)
+                && *offset <= 100_000
+                && valid_optional_text(query, MAX_BROWSE_FILTER_BYTES, MAX_BROWSE_FILTER_CHARS)
+                && valid_optional_text(tag, MAX_BROWSE_FILTER_BYTES, MAX_BROWSE_FILTER_CHARS)
+                && valid_optional_text(locale, 32, 16)
+                && (1..=MAX_BROWSE_RESULTS).contains(limit)
+        }
+        RemoteRequestV1::CatalogCategoryBrowse {
+            tags,
+            tag45s,
+            query,
+            limit,
+            ..
+        } => {
+            valid_browse_tags(tags)
+                && valid_browse_tags(tag45s)
+                && valid_optional_text(query, MAX_BROWSE_FILTER_BYTES, MAX_BROWSE_FILTER_CHARS)
+                && (1..=MAX_BROWSE_RESULTS).contains(limit)
+        }
+        RemoteRequestV1::SongDetail { catalog_item_id } => valid_catalog(catalog_item_id),
+        RemoteRequestV1::GatchaBrowse {
+            uid, query, limit, ..
+        } => {
+            valid_optional_numeric_id(uid)
+                && valid_optional_text(query, MAX_BROWSE_FILTER_BYTES, MAX_BROWSE_FILTER_CHARS)
+                && (1..=MAX_BROWSE_RESULTS).contains(limit)
+        }
+        RemoteRequestV1::GatchaFavlistBrowse {
+            folder_id,
+            query,
+            limit,
+            ..
+        } => {
+            (folder_id.is_empty() || valid_folder_selector(folder_id))
+                && valid_optional_text(query, MAX_BROWSE_FILTER_BYTES, MAX_BROWSE_FILTER_CHARS)
+                && (1..=MAX_BROWSE_RESULTS).contains(limit)
+        }
+        RemoteRequestV1::GatchaPoolConfigSet {
+            uid_weight,
+            favlist_weight,
+            excluded_uids,
+            excluded_favlist_folders,
+        } => {
+            *uid_weight <= 100
+                && *favlist_weight <= 100
+                && u16::from(*uid_weight) + u16::from(*favlist_weight) == 100
+                && valid_exclusions(excluded_uids, valid_numeric_id)
+                && valid_exclusions(excluded_favlist_folders, valid_folder_selector)
+        }
+        RemoteRequestV1::GatchaUidPreview { uid }
+        | RemoteRequestV1::GatchaUidAdd { uid }
+        | RemoteRequestV1::GatchaFavlistPreview { uid } => valid_numeric_id(uid),
+        RemoteRequestV1::GatchaSourceRemove { source, id } => match source.as_str() {
+            "uid" => valid_numeric_id(id),
+            "favlist" => valid_folder_selector(id),
+            _ => false,
+        },
+        RemoteRequestV1::GatchaFavlistRefresh {
+            uid,
+            folder_ids,
+            folder_titles,
+        } => {
+            valid_numeric_id(uid)
+                && !folder_ids.is_empty()
+                && valid_exclusions(folder_ids, valid_numeric_id)
+                && folder_titles.len() <= 100
+                && folder_titles
+                    .iter()
+                    .all(|(id, title)| folder_ids.contains(id) && title.chars().count() <= 200)
+        }
+        RemoteRequestV1::PlaylistAdd {
+            catalog_item_id,
+            selected_video_page,
+            selected_audio_pages,
+            expected_revision,
+            ..
+        } => {
+            (valid_catalog(catalog_item_id)
+                || (catalog_item_id
+                    .strip_prefix("youtube:")
+                    .is_some_and(crate::media_source::valid_youtube_id)
+                    && selected_video_page.is_none()
+                    && selected_audio_pages.is_empty()))
+                && valid_manual_binding_selection(*selected_video_page, selected_audio_pages)
+                && valid_expected(*expected_revision)
+        }
+        RemoteRequestV1::PlaylistRemove {
+            item_id,
+            expected_revision,
+        }
+        | RemoteRequestV1::PlaylistMoveNext {
+            item_id,
+            expected_revision,
+        }
+        | RemoteRequestV1::PlaylistPlayNow {
+            item_id,
+            expected_revision,
+        } => valid_item(item_id) && valid_expected(*expected_revision),
+        RemoteRequestV1::PlaylistMove {
+            item_id,
+            target_index,
+            expected_queue_version,
+            expected_revision,
+        } => {
+            valid_item(item_id)
+                && (*target_index as usize) < MAX_REMOTE_STATE_ITEMS
+                && expected_queue_version.as_ref().is_none_or(|value| {
+                    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+                && valid_expected(*expected_revision)
+        }
+        RemoteRequestV1::PlaylistResort { expected_revision } => valid_expected(*expected_revision),
+        RemoteRequestV1::PlaybackPlay {
+            item_id,
+            playback_generation,
+        }
+        | RemoteRequestV1::PlaybackPause {
+            item_id,
+            playback_generation,
+        }
+        | RemoteRequestV1::PlaybackToggle {
+            item_id,
+            playback_generation,
+        } => valid_item(item_id) && valid_playback_generation(*playback_generation),
+        RemoteRequestV1::PlaybackSeekRelative {
+            item_id,
+            playback_generation,
+            delta_seconds,
+        } => {
+            valid_item(item_id)
+                && valid_playback_generation(*playback_generation)
+                && *delta_seconds != 0
+                && (-MAX_SEEK_DELTA_SECONDS..=MAX_SEEK_DELTA_SECONDS).contains(delta_seconds)
+        }
+        RemoteRequestV1::PlaybackSeekAbsolute {
+            item_id,
+            playback_generation,
+            ..
+        } => valid_item(item_id) && valid_playback_generation(*playback_generation),
+        RemoteRequestV1::PlaybackNext {
+            playback_generation,
+        } => valid_playback_generation(*playback_generation),
+        RemoteRequestV1::PlayerSetVolume {
+            volume_percent,
+            expected_item_incarnation_id,
+        } => {
+            i32::from(*volume_percent) <= crate::MAX_VOLUME_PERCENT
+                && expected_item_incarnation_id
+                    .as_ref()
+                    .is_none_or(|id| id.is_empty() || valid_item_incarnation_id(id))
+        }
+        RemoteRequestV1::PlayerSetMuted { .. } => true,
+        RemoteRequestV1::PlayerSetKeyShift { key_shift } => (-6..=6).contains(key_shift),
+        RemoteRequestV1::PlayerSetAudioVariant {
+            item_id,
+            variant_id,
+            expected_item_incarnation_id,
+            expected_revision,
+        } => {
+            valid_item(item_id)
+                && valid_text(
+                    variant_id,
+                    MAX_AUDIO_VARIANT_ID_BYTES,
+                    MAX_AUDIO_VARIANT_ID_BYTES,
+                )
+                && valid_item_incarnation_id(expected_item_incarnation_id)
+                && valid_expected(*expected_revision)
+        }
+        RemoteRequestV1::PlayerSetAvDelay { effective_delay_ms } => {
+            (-MAX_AV_DELAY_MS..=MAX_AV_DELAY_MS).contains(effective_delay_ms)
+        }
+        RemoteRequestV1::PlayerAvDelayAction(action) => match action {
+            RemoteAvDelayActionV1::SetEffective { effective_delay_ms } => {
+                (-MAX_AV_DELAY_MS..=MAX_AV_DELAY_MS).contains(effective_delay_ms)
+            }
+            _ => true,
+        },
+        RemoteRequestV1::SessionResume { user_id } => {
+            user_id.len() == 64 && user_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }
+        RemoteRequestV1::SessionRename {
+            name,
+            user_id,
+            expected_name,
+        } => {
+            valid_text(name, MAX_SESSION_NAME_BYTES, MAX_SESSION_NAME_CHARS)
+                && valid_text(
+                    expected_name,
+                    MAX_SESSION_NAME_BYTES,
+                    MAX_SESSION_NAME_CHARS,
+                )
+                && user_id.len() == 64
+                && user_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }
+        RemoteRequestV1::SessionSetIdentity { name } => {
+            valid_text(name, MAX_SESSION_NAME_BYTES, MAX_SESSION_NAME_CHARS)
+        }
+        RemoteRequestV1::RatingSubmit { play_id, score } => {
+            valid_item(play_id) && (1..=5).contains(score)
+        }
+        RemoteRequestV1::CacheRetry {
+            item_id,
+            expected_item_incarnation_id,
+            expected_revision,
+            ..
+        } => {
+            valid_item(item_id)
+                && valid_item_incarnation_id(expected_item_incarnation_id)
+                && valid_expected(*expected_revision)
+        }
+    };
+    valid
+        .then_some(())
+        .ok_or(RemoteProtocolError::InvalidRequestBody)
+}
+
+fn valid_catalog_item_id(value: &str) -> bool {
+    if value.len() > MAX_CATALOG_ID_BYTES {
+        return false;
+    }
+    let (bvid, page) = value.split_once("_p").unwrap_or((value, ""));
+    if bvid.len() != 12
+        || !bvid.starts_with("BV")
+        || !bvid[2..].bytes().all(|byte| byte.is_ascii_alphanumeric())
+    {
+        return false;
+    }
+    page.is_empty()
+        || (page.len() <= 6
+            && !page.starts_with('0')
+            && page.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn valid_manual_binding_selection(
+    selected_video_page: Option<u32>,
+    selected_audio_pages: &[u32],
+) -> bool {
+    match selected_video_page {
+        None => selected_audio_pages.is_empty(),
+        Some(page) => {
+            page > 0
+                && !selected_audio_pages.is_empty()
+                && selected_audio_pages.len() <= MAX_SELECTED_AUDIO_PAGES
+                && selected_audio_pages.iter().all(|value| *value > 0)
+                && selected_audio_pages
+                    .iter()
+                    .enumerate()
+                    .all(|(index, value)| !selected_audio_pages[..index].contains(value))
+        }
+    }
+}
+
+fn parse_request(kind: &str, value: Value) -> Result<RemoteRequestV1, RemoteProtocolError> {
+    let request = match kind {
+        "connection.health" => {
+            let _: EmptyBody = body(value)?;
+            RemoteRequestV1::ConnectionHealth
+        }
+        "state.get" => {
+            let body: StateGetBody = body(value)?;
+            RemoteRequestV1::StateGet {
+                since_revision: body.since_revision,
+            }
+        }
+        "catalog.search" => {
+            let body: CatalogSearchBody = body(value)?;
+            RemoteRequestV1::CatalogSearch {
+                query: body.query,
+                limit: body.limit,
+                offset: body.offset,
+            }
+        }
+        "catalog.browse" => {
+            let body: CatalogBrowseBody = body(value)?;
+            RemoteRequestV1::CatalogBrowse {
+                kind: body.kind,
+                letter: body.letter,
+                query: body.query,
+                tag: body.tag,
+                locale: body.locale,
+                limit: body.limit,
+                offset: body.offset,
+            }
+        }
+        "catalog.category_browse" => {
+            let body: CatalogCategoryBrowseBody = body(value)?;
+            RemoteRequestV1::CatalogCategoryBrowse {
+                tags: body.tags,
+                tag45s: body.tag45s,
+                query: body.query,
+                offset: body.offset,
+                limit: body.limit,
+            }
+        }
+        "catalog.song_detail" => {
+            let body: CatalogItemBody = body(value)?;
+            RemoteRequestV1::SongDetail {
+                catalog_item_id: body.catalog_item_id,
+            }
+        }
+        "gatcha.search" => {
+            let body: CatalogSearchBody = body(value)?;
+            RemoteRequestV1::GatchaSearch {
+                query: body.query,
+                limit: body.limit,
+                offset: body.offset,
+            }
+        }
+        "gatcha.browse" => {
+            let body: GatchaBrowseBody = body(value)?;
+            RemoteRequestV1::GatchaBrowse {
+                uid: body.uid,
+                query: body.query,
+                offset: body.offset,
+                limit: body.limit,
+            }
+        }
+        "gatcha.favlist_browse" => {
+            let body: GatchaFavlistBrowseBody = body(value)?;
+            RemoteRequestV1::GatchaFavlistBrowse {
+                folder_id: body.folder_id,
+                query: body.query,
+                offset: body.offset,
+                limit: body.limit,
+            }
+        }
+        "gatcha.pool_config_get" | "gatcha.candidate" | "gatcha.refresh" => {
+            let _: EmptyBody = body(value)?;
+            match kind {
+                "gatcha.pool_config_get" => RemoteRequestV1::GatchaPoolConfigGet,
+                "gatcha.candidate" => RemoteRequestV1::GatchaCandidate,
+                _ => RemoteRequestV1::GatchaRefresh,
+            }
+        }
+        "gatcha.pool_config_set" => {
+            let body: GatchaPoolConfigBody = body(value)?;
+            RemoteRequestV1::GatchaPoolConfigSet {
+                uid_weight: body.uid_weight,
+                favlist_weight: body.favlist_weight,
+                excluded_uids: body.excluded_uids,
+                excluded_favlist_folders: body.excluded_favlist_folders,
+            }
+        }
+        "gatcha.uid_preview" | "gatcha.uid_add" | "gatcha.favlist_preview" => {
+            let body: GatchaUidBody = body(value)?;
+            match kind {
+                "gatcha.uid_preview" => RemoteRequestV1::GatchaUidPreview { uid: body.uid },
+                "gatcha.uid_add" => RemoteRequestV1::GatchaUidAdd { uid: body.uid },
+                _ => RemoteRequestV1::GatchaFavlistPreview { uid: body.uid },
+            }
+        }
+        "gatcha.source_remove" => {
+            let body: GatchaSourceRemoveBody = body(value)?;
+            RemoteRequestV1::GatchaSourceRemove {
+                source: body.source,
+                id: body.id,
+            }
+        }
+        "gatcha.favlist_refresh" => {
+            let body: GatchaFavlistRefreshBody = body(value)?;
+            RemoteRequestV1::GatchaFavlistRefresh {
+                uid: body.uid,
+                folder_ids: body.folder_ids,
+                folder_titles: body.folder_titles,
+            }
+        }
+        "playlist.add" => {
+            let body: CatalogMutationBody = body(value)?;
+            RemoteRequestV1::PlaylistAdd {
+                catalog_item_id: body.catalog_item_id,
+                position: body.position,
+                allow_repeat: body.allow_repeat,
+                selected_video_page: body.selected_video_page,
+                selected_audio_pages: body.selected_audio_pages,
+                expected_revision: body.expected_revision,
+            }
+        }
+        "playlist.remove" | "playlist.move_next" | "playlist.play_now" => {
+            let body: ItemMutationBody = body(value)?;
+            match kind {
+                "playlist.remove" => RemoteRequestV1::PlaylistRemove {
+                    item_id: body.item_id,
+                    expected_revision: body.expected_revision,
+                },
+                "playlist.move_next" => RemoteRequestV1::PlaylistMoveNext {
+                    item_id: body.item_id,
+                    expected_revision: body.expected_revision,
+                },
+                "playlist.play_now" => RemoteRequestV1::PlaylistPlayNow {
+                    item_id: body.item_id,
+                    expected_revision: body.expected_revision,
+                },
+                _ => unreachable!("playlist item mutation kind changed"),
+            }
+        }
+        "cache.retry" => {
+            let body: IncarnationMutationBody = body(value)?;
+            RemoteRequestV1::CacheRetry {
+                force: body.force,
+                item_id: body.item_id,
+                expected_item_incarnation_id: body.expected_item_incarnation_id,
+                expected_revision: body.expected_revision,
+            }
+        }
+        "playlist.move" => {
+            let body: MoveItemBody = body(value)?;
+            RemoteRequestV1::PlaylistMove {
+                item_id: body.item_id,
+                target_index: body.target_index,
+                expected_queue_version: body.expected_queue_version,
+                expected_revision: body.expected_revision,
+            }
+        }
+        "playlist.resort" => {
+            let body: RevisionBody = body(value)?;
+            RemoteRequestV1::PlaylistResort {
+                expected_revision: body.expected_revision,
+            }
+        }
+        "playback.play" | "playback.pause" | "playback.toggle" => {
+            let body: PlaybackItemBody = body(value)?;
+            match kind {
+                "playback.play" => RemoteRequestV1::PlaybackPlay {
+                    item_id: body.item_id,
+                    playback_generation: body.playback_generation,
+                },
+                "playback.pause" => RemoteRequestV1::PlaybackPause {
+                    item_id: body.item_id,
+                    playback_generation: body.playback_generation,
+                },
+                _ => RemoteRequestV1::PlaybackToggle {
+                    item_id: body.item_id,
+                    playback_generation: body.playback_generation,
+                },
+            }
+        }
+        "playback.seek_relative" => {
+            let body: SeekRelativeBody = body(value)?;
+            RemoteRequestV1::PlaybackSeekRelative {
+                item_id: body.item_id,
+                playback_generation: body.playback_generation,
+                delta_seconds: body.delta_seconds,
+            }
+        }
+        "playback.seek_absolute" => {
+            let body: SeekAbsoluteBody = body(value)?;
+            RemoteRequestV1::PlaybackSeekAbsolute {
+                item_id: body.item_id,
+                playback_generation: body.playback_generation,
+                target_seconds: body.target_seconds,
+            }
+        }
+        "playback.next" => {
+            let body: PlaybackGenerationBody = body(value)?;
+            RemoteRequestV1::PlaybackNext {
+                playback_generation: body.playback_generation,
+            }
+        }
+        "player.set_volume" => {
+            let body: VolumeBody = body(value)?;
+            RemoteRequestV1::PlayerSetVolume {
+                volume_percent: body.volume_percent,
+                expected_item_incarnation_id: body.expected_item_incarnation_id,
+            }
+        }
+        "player.set_muted" => {
+            let body: MutedBody = body(value)?;
+            RemoteRequestV1::PlayerSetMuted {
+                is_muted: body.is_muted,
+            }
+        }
+        "player.set_key_shift" => {
+            let body: KeyShiftBody = body(value)?;
+            RemoteRequestV1::PlayerSetKeyShift {
+                key_shift: body.key_shift,
+            }
+        }
+        "player.set_audio_variant" => {
+            let body: AudioVariantBody = body(value)?;
+            RemoteRequestV1::PlayerSetAudioVariant {
+                item_id: body.item_id,
+                variant_id: body.variant_id,
+                expected_item_incarnation_id: body.expected_item_incarnation_id,
+                expected_revision: body.expected_revision,
+            }
+        }
+        "player.set_av_delay" => {
+            let body: AvDelayBody = body(value)?;
+            RemoteRequestV1::PlayerSetAvDelay {
+                effective_delay_ms: body.effective_delay_ms,
+            }
+        }
+        "player.av_delay_action" => RemoteRequestV1::PlayerAvDelayAction(body(value)?),
+        "session.set_identity" => {
+            let body: IdentityBody = body(value)?;
+            RemoteRequestV1::SessionSetIdentity { name: body.name }
+        }
+        "session.resume" => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct ResumeBody {
+                user_id: String,
+            }
+            let body: ResumeBody = body(value)?;
+            RemoteRequestV1::SessionResume {
+                user_id: body.user_id,
+            }
+        }
+        "session.rename" => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct RenameBody {
+                name: String,
+                user_id: String,
+                expected_name: String,
+            }
+            let body: RenameBody = body(value)?;
+            RemoteRequestV1::SessionRename {
+                name: body.name,
+                user_id: body.user_id,
+                expected_name: body.expected_name,
+            }
+        }
+        "rating.submit" => {
+            let body: RatingBody = body(value)?;
+            RemoteRequestV1::RatingSubmit {
+                play_id: body.play_id,
+                score: body.score,
+            }
+        }
+        _ => return Err(RemoteProtocolError::UnknownRequestKind),
+    };
+    validate_request(&request)?;
+    Ok(request)
+}
+
+pub fn decode_remote_request_v1(
+    message: &str,
+    context: RemoteValidationContext<'_>,
+) -> Result<RemoteRequestEnvelopeV1, RemoteProtocolError> {
+    if message.len() > MAX_CONTROL_MESSAGE_BYTES {
+        return Err(RemoteProtocolError::MessageTooLarge);
+    }
+    let wire: WireEnvelope =
+        serde_json::from_str(message).map_err(|_| RemoteProtocolError::MalformedEnvelope)?;
+    if wire.v != INTERNET_REMOTE_PROTOCOL_VERSION {
+        return Err(RemoteProtocolError::UnsupportedVersion);
+    }
+    if wire.lane != context.expected_lane {
+        return Err(RemoteProtocolError::InvalidLane);
+    }
+    if !valid_base64url(&wire.epoch, MAX_EPOCH_BYTES)
+        || !valid_base64url(context.expected_epoch, MAX_EPOCH_BYTES)
+    {
+        return Err(RemoteProtocolError::InvalidEpoch);
+    }
+    if wire.epoch != context.expected_epoch {
+        return Err(RemoteProtocolError::StaleEpoch);
+    }
+    if wire.seq == 0 || wire.seq > MAX_SAFE_JSON_INTEGER {
+        return Err(RemoteProtocolError::InvalidSequence);
+    }
+    if context
+        .last_sequence
+        .is_some_and(|last_sequence| wire.seq <= last_sequence)
+    {
+        return Err(RemoteProtocolError::ReplayedSequence);
+    }
+    if !valid_uuid_v4(&wire.id) {
+        return Err(RemoteProtocolError::InvalidRequestId);
+    }
+    let request = parse_request(&wire.kind, wire.body)?;
+    if !profile_allows(context.profile, request.operation()) {
+        return Err(RemoteProtocolError::CapabilityDenied);
+    }
+    Ok(RemoteRequestEnvelopeV1 {
+        v: wire.v,
+        lane: wire.lane,
+        epoch: wire.epoch,
+        seq: wire.seq,
+        id: wire.id,
+        request,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemotePlaybackModeV1 {
+    Local,
+    Online,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteCacheStatusV1 {
+    Pending,
+    Queued,
+    Downloading,
+    Ready,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteAudioVariantV1 {
+    pub id: String,
+    pub label: String,
+    pub page: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteCacheDownloadTrackV1 {
+    pub key: String,
+    pub label: String,
+    pub current_bytes: u64,
+    pub target_bytes: u64,
+    pub done: bool,
+    pub phase: String,
+    pub attempt: u32,
+    pub max_attempts: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemotePlaylistItemV1 {
+    #[serde(
+        default,
+        skip_serializing_if = "crate::media_source::MediaSource::is_bilibili"
+    )]
+    pub media_source: crate::media_source::MediaSource,
+    pub id: String,
+    pub item_incarnation_id: String,
+    pub bvid: String,
+    pub page: u32,
+    pub display_title: String,
+    pub cover_url: String,
+    pub owner_mid: u64,
+    pub owner_name: String,
+    pub requester_name: String,
+    pub cache_status: RemoteCacheStatusV1,
+    pub cache_progress: f32,
+    #[serde(default)]
+    pub cache_activity_at: f64,
+    #[serde(default)]
+    pub cache_download_current_bytes: u64,
+    #[serde(default)]
+    pub cache_download_total_bytes: u64,
+    #[serde(default)]
+    pub cache_download_tracks: Vec<RemoteCacheDownloadTrackV1>,
+    pub selected_pages: Vec<u32>,
+    pub selected_durations: Vec<u32>,
+    pub selected_parts: Vec<String>,
+    pub available_pages: Vec<u32>,
+    pub available_durations: Vec<u32>,
+    pub available_parts: Vec<String>,
+    pub audio_variants: Vec<RemoteAudioVariantV1>,
+    pub selected_audio_variant_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteHistoryEntryV1 {
+    #[serde(
+        default,
+        skip_serializing_if = "crate::media_source::MediaSource::is_bilibili"
+    )]
+    pub media_source: crate::media_source::MediaSource,
+    pub bvid: String,
+    pub page: u32,
+    pub display_title: String,
+    pub requested_at: f64,
+    pub requester_name: String,
+    pub request_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemotePlayerSettingsV1 {
+    pub effective_av_delay_ms: i32,
+    pub av_delay_locked: bool,
+    #[serde(default)]
+    pub av_delay_lock_button_enabled: bool,
+    #[serde(default)]
+    pub av_delay_has_local_adjustment: bool,
+    pub volume_percent: u16,
+    pub is_muted: bool,
+    pub key_shift: i8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteAutomaticVolumeV1 {
+    pub enabled: bool,
+    pub calibrated: bool,
+    pub scanner_available: bool,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemotePlaybackStatusV1 {
+    pub playing: bool,
+    pub position_seconds: f64,
+    pub duration_seconds: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteSessionUserV1 {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteStateV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automatic_volume: Option<RemoteAutomaticVolumeV1>,
+    pub v: u16,
+    #[serde(default)]
+    pub queue_version: String,
+    pub revision: u64,
+    pub session_generation: u64,
+    pub playback_generation: u64,
+    pub playback_mode: RemotePlaybackModeV1,
+    pub current_item: Option<RemotePlaylistItemV1>,
+    pub playlist: Vec<RemotePlaylistItemV1>,
+    pub history: Vec<RemoteHistoryEntryV1>,
+    pub session_users: Vec<String>,
+    #[serde(default)]
+    pub session_user_entries: Vec<RemoteSessionUserV1>,
+    #[serde(default)]
+    pub session_users_version: String,
+    #[serde(default)]
+    pub session_user_edit_version: u32,
+    pub player_settings: RemotePlayerSettingsV1,
+    pub player_status: Option<RemotePlaybackStatusV1>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    const EPOCH: &str = "abcdefghijklmnopqrstuv";
+    const REQUEST_ID: &str = "123e4567-e89b-42d3-a456-426614174000";
+
+    fn request(kind: &str, body: Value) -> String {
+        json!({
+            "v": 1,
+            "lane": "control",
+            "epoch": EPOCH,
+            "seq": 1,
+            "id": REQUEST_ID,
+            "kind": kind,
+            "body": body,
+        })
+        .to_string()
+    }
+
+    fn context(profile: RemoteProfile) -> RemoteValidationContext<'static> {
+        RemoteValidationContext {
+            expected_lane: RemoteLane::Control,
+            expected_epoch: EPOCH,
+            last_sequence: None,
+            profile,
+        }
+    }
+
+    #[test]
+    fn av_delay_actions_preserve_intent_and_settings_authorization() {
+        for payload in [
+            json!({"type": "adjust", "delta_ms": 50}),
+            json!({"type": "set_effective", "effective_delay_ms": -200}),
+            json!({"type": "reset_local"}),
+            json!({"type": "toggle_lock"}),
+        ] {
+            let wire = request("player.av_delay_action", payload.clone());
+            let decoded =
+                decode_remote_request_v1(&wire, context(RemoteProfile::Controller)).unwrap();
+            assert_eq!(serde_json::to_value(decoded).unwrap()["body"], payload);
+            assert_eq!(
+                decode_remote_request_v1(&wire, context(RemoteProfile::Viewer)),
+                Err(RemoteProtocolError::CapabilityDenied)
+            );
+        }
+        for payload in [
+            json!({"type": "adjust", "delta_ms": true}),
+            json!({"type": "adjust", "delta_ms": 1.5}),
+            json!({"type": "adjust", "delta_ms": 50, "effective_delay_ms": 0}),
+            json!({"type": "adjust"}),
+            json!({"type": "set_persistent", "effective_delay_ms": 50}),
+            json!({"type": "reset_local", "delta_ms": 50}),
+        ] {
+            assert_eq!(
+                decode_remote_request_v1(
+                    &request("player.av_delay_action", payload),
+                    context(RemoteProfile::Controller)
+                ),
+                Err(RemoteProtocolError::InvalidRequestBody)
+            );
+        }
+        // Existing clients retain an explicitly absolute setting operation.
+        assert!(
+            decode_remote_request_v1(
+                &request("player.set_av_delay", json!({"effective_delay_ms": 50})),
+                context(RemoteProfile::Controller)
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn viewer_decodes_bounded_read_requests() {
+        let decoded = decode_remote_request_v1(
+            &request("catalog.search", json!({"query": "测试", "limit": 80})),
+            context(RemoteProfile::Viewer),
+        )
+        .unwrap();
+        assert_eq!(decoded.seq, 1);
+        assert_eq!(decoded.request.operation(), RemoteOperation::CatalogSearch);
+        let encoded = serde_json::to_value(&decoded).unwrap();
+        assert_eq!(encoded["kind"], "catalog.search");
+        assert_eq!(encoded["body"]["limit"], 80);
+        assert!(encoded.get("request").is_none());
+        assert!(profile_allows(
+            RemoteProfile::Viewer,
+            RemoteOperation::StateGet
+        ));
+        assert!(profile_allows(
+            RemoteProfile::Viewer,
+            RemoteOperation::SongDetail
+        ));
+    }
+
+    #[test]
+    fn search_offsets_are_optional_bounded_and_remain_read_only() {
+        for kind in ["catalog.search", "gatcha.search"] {
+            for offset in [0, 80, 216, 100_000] {
+                let decoded = decode_remote_request_v1(
+                    &request(kind, json!({"query":"song", "limit":80, "offset":offset})),
+                    context(RemoteProfile::Viewer),
+                )
+                .unwrap();
+                let encoded = serde_json::to_value(decoded).unwrap();
+                assert_eq!(encoded["body"]["offset"], offset);
+            }
+            for offset in [json!(-1), json!(1.5), json!(100_001), json!("80")] {
+                assert!(
+                    decode_remote_request_v1(
+                        &request(kind, json!({"query":"song", "limit":80, "offset":offset})),
+                        context(RemoteProfile::Viewer),
+                    )
+                    .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn viewer_cannot_mutate_and_controller_can() {
+        let message = request(
+            "playlist.remove",
+            json!({"item_id": "item-1", "expected_revision": 4}),
+        );
+        assert_eq!(
+            decode_remote_request_v1(&message, context(RemoteProfile::Viewer)),
+            Err(RemoteProtocolError::CapabilityDenied)
+        );
+        assert_eq!(
+            decode_remote_request_v1(&message, context(RemoteProfile::Controller))
+                .unwrap()
+                .request
+                .operation(),
+            RemoteOperation::PlaylistRemove
+        );
+    }
+
+    #[test]
+    fn gatcha_browse_supports_bounded_pagination_with_legacy_defaults() {
+        let legacy = decode_remote_request_v1(
+            &request("gatcha.browse", json!({"uid": "42", "query": ""})),
+            context(RemoteProfile::Viewer),
+        )
+        .unwrap();
+        assert!(matches!(
+            legacy.request,
+            RemoteRequestV1::GatchaBrowse {
+                offset: 0,
+                limit: 100,
+                ..
+            }
+        ));
+
+        let paged = decode_remote_request_v1(
+            &request(
+                "gatcha.browse",
+                json!({"uid": "42", "query": "song", "offset": 100, "limit": 50}),
+            ),
+            context(RemoteProfile::Viewer),
+        )
+        .unwrap();
+        assert!(matches!(
+            paged.request,
+            RemoteRequestV1::GatchaBrowse {
+                offset: 100,
+                limit: 50,
+                ..
+            }
+        ));
+
+        assert_eq!(
+            decode_remote_request_v1(
+                &request(
+                    "gatcha.browse",
+                    json!({"uid": "42", "query": "", "offset": 0, "limit": 101}),
+                ),
+                context(RemoteProfile::Viewer),
+            ),
+            Err(RemoteProtocolError::InvalidRequestBody)
+        );
+    }
+
+    #[test]
+    fn gatcha_favlist_browse_accepts_bounded_pagination_fields() {
+        let paged = decode_remote_request_v1(
+            &request(
+                "gatcha.favlist_browse",
+                json!({
+                    "folder_id": "42:100",
+                    "query": "高达",
+                    "offset": 100,
+                    "limit": 50
+                }),
+            ),
+            context(RemoteProfile::Viewer),
+        )
+        .unwrap();
+        assert!(matches!(
+            paged.request,
+            RemoteRequestV1::GatchaFavlistBrowse {
+                offset: 100,
+                limit: 50,
+                ..
+            }
+        ));
+
+        let compatible = decode_remote_request_v1(
+            &request(
+                "gatcha.favlist_browse",
+                json!({"folder_id": "42:100", "query": ""}),
+            ),
+            context(RemoteProfile::Viewer),
+        )
+        .unwrap();
+        assert!(matches!(
+            compatible.request,
+            RemoteRequestV1::GatchaFavlistBrowse {
+                offset: 0,
+                limit: MAX_BROWSE_RESULTS,
+                ..
+            }
+        ));
+
+        assert_eq!(
+            decode_remote_request_v1(
+                &request(
+                    "gatcha.favlist_browse",
+                    json!({"folder_id": "42:100", "query": "", "limit": 101}),
+                ),
+                context(RemoteProfile::Viewer),
+            ),
+            Err(RemoteProtocolError::InvalidRequestBody)
+        );
+    }
+
+    #[test]
+    fn playlist_add_preserves_position_and_repeat_policy_with_safe_defaults() {
+        let explicit = decode_remote_request_v1(
+            &request(
+                "playlist.add",
+                json!({
+                    "catalog_item_id": "BV1ab411c7mD",
+                    "position": "next",
+                    "allow_repeat": true,
+                    "selected_video_page": 2,
+                    "selected_audio_pages": [1, 3],
+                    "expected_revision": 4,
+                }),
+            ),
+            context(RemoteProfile::Controller),
+        )
+        .unwrap();
+        assert!(matches!(
+            explicit.request,
+            RemoteRequestV1::PlaylistAdd {
+                position: RemotePlaylistPositionV1::Next,
+                allow_repeat: true,
+                selected_video_page: Some(2),
+                selected_audio_pages,
+                ..
+            } if selected_audio_pages == vec![1, 3]
+        ));
+
+        let compatible = decode_remote_request_v1(
+            &request(
+                "playlist.add",
+                json!({
+                    "catalog_item_id": "BV1ab411c7mD",
+                    "expected_revision": 4,
+                }),
+            ),
+            context(RemoteProfile::Controller),
+        )
+        .unwrap();
+        assert!(matches!(
+            compatible.request,
+            RemoteRequestV1::PlaylistAdd {
+                position: RemotePlaylistPositionV1::Tail,
+                allow_repeat: false,
+                selected_video_page: None,
+                selected_audio_pages,
+                ..
+            } if selected_audio_pages.is_empty()
+        ));
+    }
+
+    #[test]
+    fn shared_remote_browse_requests_are_typed_and_bounded() {
+        let browse = decode_remote_request_v1(
+            &request(
+                "catalog.browse",
+                json!({
+                    "kind": "artist",
+                    "letter": "A",
+                    "query": "",
+                    "tag": "anime",
+                    "locale": "ja",
+                    "limit": 100,
+                }),
+            ),
+            context(RemoteProfile::Viewer),
+        )
+        .unwrap();
+        assert!(matches!(
+            browse.request,
+            RemoteRequestV1::CatalogBrowse {
+                kind: RemoteCatalogBrowseKindV1::Artist,
+                limit: 100,
+                ..
+            }
+        ));
+
+        let category = decode_remote_request_v1(
+            &request(
+                "catalog.category_browse",
+                json!({
+                    "tags": ["anime"],
+                    "tag45s": ["female"],
+                    "query": "",
+                    "offset": 100,
+                    "limit": 100,
+                }),
+            ),
+            context(RemoteProfile::Viewer),
+        )
+        .unwrap();
+        assert_eq!(
+            category.request.operation(),
+            RemoteOperation::CatalogCategoryBrowse
+        );
+    }
+
+    #[test]
+    fn local_source_removal_is_controller_only_and_strictly_scoped() {
+        for body in [
+            json!({"source":"uid","id":"42"}),
+            json!({"source":"favlist","id":"42:10"}),
+        ] {
+            let message = request("gatcha.source_remove", body);
+            let decoded =
+                decode_remote_request_v1(&message, context(RemoteProfile::Controller)).unwrap();
+            assert_eq!(
+                decoded.request.operation(),
+                RemoteOperation::GatchaSourceRemove
+            );
+            assert_eq!(
+                decode_remote_request_v1(&message, context(RemoteProfile::Viewer)),
+                Err(RemoteProtocolError::CapabilityDenied)
+            );
+        }
+        for body in [
+            json!({"source":"d1","id":"42"}),
+            json!({"source":"uid","id":"../42"}),
+            json!({"source":"favlist","id":"42:10:11"}),
+            json!({"source":"uid","id":"42","path":"other.json"}),
+        ] {
+            assert!(
+                decode_remote_request_v1(
+                    &request("gatcha.source_remove", body),
+                    context(RemoteProfile::Controller)
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn gatcha_management_requires_controller_and_rejects_unsafe_ids() {
+        let refresh = request("gatcha.refresh", json!({}));
+        assert_eq!(
+            decode_remote_request_v1(&refresh, context(RemoteProfile::Viewer)),
+            Err(RemoteProtocolError::CapabilityDenied)
+        );
+        assert_eq!(
+            decode_remote_request_v1(&refresh, context(RemoteProfile::Controller))
+                .unwrap()
+                .request
+                .operation(),
+            RemoteOperation::GatchaRefresh
+        );
+
+        for message in [
+            request("gatcha.uid_preview", json!({"uid": "https://example.test"})),
+            request(
+                "gatcha.favlist_refresh",
+                json!({"uid": "123", "folder_ids": []}),
+            ),
+            request(
+                "gatcha.pool_config_set",
+                json!({
+                    "uid_weight": 80,
+                    "favlist_weight": 80,
+                    "excluded_uids": [],
+                    "excluded_favlist_folders": [],
+                }),
+            ),
+        ] {
+            assert_eq!(
+                decode_remote_request_v1(&message, context(RemoteProfile::Controller)),
+                Err(RemoteProtocolError::InvalidRequestBody)
+            );
+        }
+    }
+
+    #[test]
+    fn controller_playback_requests_require_click_time_target_identity() {
+        let decoded = decode_remote_request_v1(
+            &request(
+                "playback.toggle",
+                json!({"item_id": "item-1", "playback_generation": 7}),
+            ),
+            context(RemoteProfile::Controller),
+        )
+        .unwrap();
+        assert_eq!(decoded.request.operation(), RemoteOperation::PlaybackToggle);
+
+        let seek = decode_remote_request_v1(
+            &request(
+                "playback.seek_relative",
+                json!({
+                    "item_id": "item-1",
+                    "playback_generation": 7,
+                    "delta_seconds": 15,
+                }),
+            ),
+            context(RemoteProfile::Controller),
+        )
+        .unwrap();
+        assert!(matches!(
+            seek.request,
+            RemoteRequestV1::PlaybackSeekRelative {
+                ref item_id,
+                playback_generation: 7,
+                delta_seconds: 15,
+            } if item_id == "item-1"
+        ));
+
+        let absolute_seek = decode_remote_request_v1(
+            &request(
+                "playback.seek_absolute",
+                json!({
+                    "item_id": "item-1",
+                    "playback_generation": 7,
+                    "target_seconds": 42,
+                }),
+            ),
+            context(RemoteProfile::Controller),
+        )
+        .unwrap();
+        assert!(matches!(
+            absolute_seek.request,
+            RemoteRequestV1::PlaybackSeekAbsolute {
+                ref item_id,
+                playback_generation: 7,
+                target_seconds: 42,
+            } if item_id == "item-1"
+        ));
+
+        let next = decode_remote_request_v1(
+            &request("playback.next", json!({"playback_generation": 7})),
+            context(RemoteProfile::Controller),
+        )
+        .unwrap();
+        assert!(matches!(
+            next.request,
+            RemoteRequestV1::PlaybackNext {
+                playback_generation: 7,
+            }
+        ));
+
+        for missing_target in [
+            request("playback.toggle", json!({})),
+            request("playback.seek_relative", json!({"delta_seconds": 15})),
+            request("playback.seek_absolute", json!({"target_seconds": 42})),
+            request("playback.next", json!({})),
+        ] {
+            assert_eq!(
+                decode_remote_request_v1(&missing_target, context(RemoteProfile::Controller),),
+                Err(RemoteProtocolError::InvalidRequestBody),
+            );
+        }
+    }
+
+    #[test]
+    fn item_mutations_require_click_time_incarnation_identity() {
+        for (kind, body) in [
+            (
+                "player.set_audio_variant",
+                json!({
+                    "item_id": "item-1",
+                    "variant_id": "p1_off_vocal",
+                    "expected_item_incarnation_id": "i-0123456789abcdef0123456789abcdef-0000000000000001",
+                    "expected_revision": 4,
+                }),
+            ),
+            (
+                "cache.retry",
+                json!({
+                    "item_id": "item-1",
+                    "expected_item_incarnation_id": "i-0123456789abcdef0123456789abcdef-0000000000000001",
+                    "expected_revision": 4,
+                }),
+            ),
+        ] {
+            assert!(
+                decode_remote_request_v1(&request(kind, body), context(RemoteProfile::Controller),)
+                    .is_ok()
+            );
+        }
+
+        for (kind, body) in [
+            (
+                "player.set_audio_variant",
+                json!({
+                    "item_id": "item-1",
+                    "variant_id": "p1_off_vocal",
+                    "expected_revision": 4,
+                }),
+            ),
+            (
+                "cache.retry",
+                json!({"item_id": "item-1", "expected_revision": 4}),
+            ),
+        ] {
+            assert_eq!(
+                decode_remote_request_v1(&request(kind, body), context(RemoteProfile::Controller)),
+                Err(RemoteProtocolError::InvalidRequestBody),
+            );
+        }
+    }
+
+    #[test]
+    fn cache_retry_preserves_optional_force_and_rejects_non_booleans() {
+        let mut body = json!({"item_id":"item-1", "expected_item_incarnation_id":"i-0123456789abcdef0123456789abcdef-0000000000000001", "expected_revision":4});
+        for force in [None, Some(false), Some(true)] {
+            if let Some(force) = force {
+                body["force"] = json!(force);
+            }
+            let decoded = decode_remote_request_v1(
+                &request("cache.retry", body.clone()),
+                context(RemoteProfile::Controller),
+            )
+            .unwrap();
+            assert!(
+                matches!(decoded.request, RemoteRequestV1::CacheRetry { force: actual, .. } if actual == force.unwrap_or(false))
+            );
+        }
+        body["force"] = json!("true");
+        assert_eq!(
+            decode_remote_request_v1(
+                &request("cache.retry", body),
+                context(RemoteProfile::Controller)
+            ),
+            Err(RemoteProtocolError::InvalidRequestBody)
+        );
+    }
+
+    #[test]
+    fn envelope_rejects_unknown_fields_version_lane_epoch_replay_and_bad_ids() {
+        let extra = json!({
+            "v": 1,
+            "lane": "control",
+            "epoch": EPOCH,
+            "seq": 1,
+            "id": REQUEST_ID,
+            "kind": "connection.health",
+            "body": {},
+            "extra": true,
+        })
+        .to_string();
+        assert_eq!(
+            decode_remote_request_v1(&extra, context(RemoteProfile::Viewer)),
+            Err(RemoteProtocolError::MalformedEnvelope)
+        );
+
+        for (field, value, expected) in [
+            ("v", json!(2), RemoteProtocolError::UnsupportedVersion),
+            ("lane", json!("bulk"), RemoteProtocolError::InvalidLane),
+            ("epoch", json!("bad"), RemoteProtocolError::InvalidEpoch),
+            (
+                "id",
+                json!("not-uuid-v4"),
+                RemoteProtocolError::InvalidRequestId,
+            ),
+        ] {
+            let mut envelope =
+                serde_json::from_str::<Value>(&request("connection.health", json!({}))).unwrap();
+            envelope[field] = value;
+            assert_eq!(
+                decode_remote_request_v1(&envelope.to_string(), context(RemoteProfile::Viewer)),
+                Err(expected),
+                "field {field}"
+            );
+        }
+
+        let mut replay = context(RemoteProfile::Viewer);
+        replay.last_sequence = Some(1);
+        assert_eq!(
+            decode_remote_request_v1(&request("connection.health", json!({})), replay),
+            Err(RemoteProtocolError::ReplayedSequence)
+        );
+
+        let stale_epoch = request("connection.health", json!({})).replace(EPOCH, &"z".repeat(22));
+        assert_eq!(
+            decode_remote_request_v1(&stale_epoch, context(RemoteProfile::Viewer)),
+            Err(RemoteProtocolError::StaleEpoch)
+        );
+
+        let oversized = " ".repeat(MAX_CONTROL_MESSAGE_BYTES + 1);
+        assert_eq!(
+            decode_remote_request_v1(&oversized, context(RemoteProfile::Viewer)),
+            Err(RemoteProtocolError::MessageTooLarge)
+        );
+    }
+
+    #[test]
+    fn volume_boost_round_trips_beyond_byte_range() {
+        for volume in [0, 100, 101, 255, 256, 375, 500] {
+            let envelope = decode_remote_request_v1(
+                &request("player.set_volume", json!({"volume_percent": volume})),
+                context(RemoteProfile::Controller),
+            )
+            .expect("supported gain");
+            assert_eq!(
+                envelope.request,
+                RemoteRequestV1::PlayerSetVolume {
+                    volume_percent: volume,
+                    expected_item_incarnation_id: None,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn volume_request_preserves_optional_song_guard() {
+        let id = "i-0123456789abcdef0123456789abcdef-0000000000000001";
+        for expected in [id, ""] {
+            let envelope = decode_remote_request_v1(
+                &request(
+                    "player.set_volume",
+                    json!({"volume_percent": 500, "expected_item_incarnation_id": expected}),
+                ),
+                context(RemoteProfile::Controller),
+            )
+            .expect("guarded volume");
+            assert_eq!(
+                envelope.request,
+                RemoteRequestV1::PlayerSetVolume {
+                    volume_percent: 500,
+                    expected_item_incarnation_id: Some(expected.into()),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn request_bodies_reject_unknown_fields_and_unsafe_bounds() {
+        let cases = [
+            request("connection.health", json!({"extra": true})),
+            request("catalog.search", json!({"query": " ", "limit": 80})),
+            request("catalog.search", json!({"query": "ok", "limit": 81})),
+            request("playback.seek_relative", json!({"delta_seconds": 301})),
+            request(
+                "playback.seek_absolute",
+                json!({
+                    "item_id": "item-1",
+                    "playback_generation": 7,
+                    "target_seconds": -1,
+                }),
+            ),
+            request("player.set_volume", json!({"volume_percent": 501})),
+            request("player.set_key_shift", json!({"key_shift": 7})),
+            request("rating.submit", json!({"play_id": "p", "score": 0})),
+        ];
+        for message in cases {
+            assert_eq!(
+                decode_remote_request_v1(&message, context(RemoteProfile::Controller)),
+                Err(RemoteProtocolError::InvalidRequestBody)
+            );
+        }
+    }
+
+    #[test]
+    fn playlist_add_rejects_incomplete_or_unsafe_manual_binding_selections() {
+        let invalid_bodies = [
+            json!({
+                "catalog_item_id": "BV1ab411c7mD",
+                "selected_video_page": 0,
+                "selected_audio_pages": [1],
+                "expected_revision": 4,
+            }),
+            json!({
+                "catalog_item_id": "BV1ab411c7mD",
+                "selected_audio_pages": [1],
+                "expected_revision": 4,
+            }),
+            json!({
+                "catalog_item_id": "BV1ab411c7mD",
+                "selected_video_page": 1,
+                "selected_audio_pages": [],
+                "expected_revision": 4,
+            }),
+            json!({
+                "catalog_item_id": "BV1ab411c7mD",
+                "selected_video_page": 1,
+                "selected_audio_pages": [2, 2],
+                "expected_revision": 4,
+            }),
+            json!({
+                "catalog_item_id": "BV1ab411c7mD",
+                "selected_video_page": 1,
+                "selected_audio_pages": vec![2; MAX_SELECTED_AUDIO_PAGES + 1],
+                "expected_revision": 4,
+            }),
+        ];
+        for body in invalid_bodies {
+            assert_eq!(
+                decode_remote_request_v1(
+                    &request("playlist.add", body),
+                    context(RemoteProfile::Controller),
+                ),
+                Err(RemoteProtocolError::InvalidRequestBody)
+            );
+        }
+    }
+
+    #[test]
+    fn youtube_identity_is_only_admitted_for_single_video_quick_requests() {
+        let body = json!({"catalog_item_id":"youtube:YE7VzlLtp-4","position":"tail","expected_revision":4});
+        assert!(
+            decode_remote_request_v1(
+                &request("playlist.add", body.clone()),
+                context(RemoteProfile::Controller)
+            )
+            .is_ok()
+        );
+        for invalid in [
+            json!({"selected_video_page":1,"selected_audio_pages":[1]}),
+            json!({"catalog_item_id":"youtube:bad"}),
+            json!({"catalog_item_id":"youtube:YE7VzlLtp-4&list=playlist"}),
+        ] {
+            let mut changed = body.clone();
+            changed
+                .as_object_mut()
+                .unwrap()
+                .extend(invalid.as_object().unwrap().clone());
+            assert!(
+                decode_remote_request_v1(
+                    &request("playlist.add", changed),
+                    context(RemoteProfile::Controller)
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            decode_remote_request_v1(
+                &request(
+                    "catalog.song_detail",
+                    json!({"catalog_item_id":"youtube:YE7VzlLtp-4"})
+                ),
+                context(RemoteProfile::Viewer)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn catalog_ids_are_bvids_with_an_optional_positive_page() {
+        for catalog_item_id in ["BV1ab411c7mD", "BV1ab411c7mD_p1", "BV1ab411c7mD_p123"] {
+            let decoded = decode_remote_request_v1(
+                &request(
+                    "catalog.song_detail",
+                    json!({"catalog_item_id": catalog_item_id}),
+                ),
+                context(RemoteProfile::Viewer),
+            )
+            .unwrap();
+            assert_eq!(decoded.request.operation(), RemoteOperation::SongDetail);
+        }
+        for catalog_item_id in [
+            "https://www.bilibili.com/video/BV1ab411c7mD",
+            "BV1ab411c7mD_p0",
+            "BV1ab411c7mD_p01",
+            "BV1ab411c7mD_p1_extra",
+            "av123",
+        ] {
+            assert_eq!(
+                decode_remote_request_v1(
+                    &request(
+                        "catalog.song_detail",
+                        json!({"catalog_item_id": catalog_item_id}),
+                    ),
+                    context(RemoteProfile::Viewer),
+                ),
+                Err(RemoteProtocolError::InvalidRequestBody),
+                "catalog_item_id {catalog_item_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn maintenance_and_arbitrary_transport_routes_are_not_protocol_kinds() {
+        for kind in [
+            "app.shutdown",
+            "app.update",
+            "diagnostics.export",
+            "cache.configure",
+            "http.request",
+            "url.open",
+        ] {
+            assert_eq!(
+                decode_remote_request_v1(
+                    &request(kind, json!({})),
+                    context(RemoteProfile::Controller)
+                ),
+                Err(RemoteProtocolError::UnknownRequestKind),
+                "kind {kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_state_shape_has_no_local_paths_urls_or_maintenance_state() {
+        let state = RemoteStateV1 {
+            automatic_volume: None,
+            queue_version: "version".to_owned(),
+            v: INTERNET_REMOTE_PROTOCOL_VERSION,
+            revision: 4,
+            session_generation: 2,
+            playback_generation: 3,
+            playback_mode: RemotePlaybackModeV1::Local,
+            current_item: Some(RemotePlaylistItemV1 {
+                media_source: Default::default(),
+                id: "item-1".into(),
+                item_incarnation_id: "i-0123456789abcdef0123456789abcdef-0000000000000001".into(),
+                bvid: "BV1example".into(),
+                page: 1,
+                display_title: "Song".into(),
+                cover_url: "https://i0.hdslb.com/example.jpg".into(),
+                owner_mid: 42,
+                owner_name: "Singer".into(),
+                requester_name: "Guest".into(),
+                cache_status: RemoteCacheStatusV1::Ready,
+                cache_progress: 1.0,
+                cache_activity_at: 0.0,
+                cache_download_current_bytes: 0,
+                cache_download_total_bytes: 0,
+                cache_download_tracks: Vec::new(),
+                selected_pages: vec![1],
+                selected_durations: vec![180],
+                selected_parts: vec!["伴奏".into()],
+                available_pages: vec![1],
+                available_durations: vec![180],
+                available_parts: vec!["伴奏".into()],
+                audio_variants: vec![RemoteAudioVariantV1 {
+                    id: "main".into(),
+                    label: "伴奏".into(),
+                    page: 1,
+                }],
+                selected_audio_variant_id: "main".into(),
+            }),
+            playlist: vec![],
+            history: vec![],
+            session_user_entries: vec![],
+            session_users_version: String::new(),
+            session_user_edit_version: 0,
+            session_users: vec!["Guest".into()],
+            player_settings: RemotePlayerSettingsV1 {
+                effective_av_delay_ms: 0,
+                av_delay_locked: false,
+                av_delay_lock_button_enabled: false,
+                av_delay_has_local_adjustment: false,
+                volume_percent: 80,
+                is_muted: false,
+                key_shift: 0,
+            },
+            player_status: Some(RemotePlaybackStatusV1 {
+                playing: true,
+                position_seconds: 12.5,
+                duration_seconds: 180.0,
+            }),
+        };
+        let encoded = serde_json::to_string(&state).unwrap();
+        for forbidden in [
+            "original_url",
+            "resolved_url",
+            "video_relative_path",
+            "artifact_relative_directory",
+            "cookie",
+            "gatcha",
+            "app_update",
+            "diagnostic",
+        ] {
+            assert!(!encoded.contains(forbidden), "forbidden field {forbidden}");
+        }
+    }
+}

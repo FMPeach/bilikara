@@ -1,0 +1,154 @@
+# libav MP4 copy-remux 契约
+
+Rust 入口是 `LibavMetadataProbe::copy_remux_mp4(&CopyRemuxRequest, &AtomicBool)`，
+实现位于 `rust-runtime/src/experimental_libav/remux.rs`。`media-libav/remux.c`
+作为 `probe.c` 的私有实现单元复用 discovery、fd 限制、packet accounting 和释放规则。
+只有 developer driver 的 `compare --copy-remux audio|video` 显式调用它。
+
+固定 profile：`mp4_single_h264_or_aac_faststart_v1`。输入必须是受信任、稳定、
+本地 regular file、自包含 MP4-family，有 `ftyp`、`moov`、`mdat`，且**总共恰好一个**
+符合 expected kind 的 H.264 video 或 AAC audio stream。多轨不会通过挑选/丢弃变成单轨。
+fragmented AAC 输入输出为普通 MP4；本 profile 不输出 fragments。
+FLAC-in-MP4、raw FLAC、其他 codec/container、加密和动态 decoder configuration
+不属于本 profile。没有转码、encoder、DSP、混音、分离音视频合并或应用 A/V 对齐。
+
+## 运行
+
+从仓库根目录使用固定 FFmpeg **9.0.1** 的同构建测试 prefix：
+
+```bash
+REMUX_PREFIX="/absolute/test-prefix"
+REMUX_OUT=/tmp/bilikara-remux
+cargo run --manifest-path xtask/Cargo.toml --locked --target host-tuple -- libav-companion --prefix "$REMUX_PREFIX" --out "$REMUX_OUT/companion" --test
+cargo build --manifest-path rust-runtime/Cargo.toml --locked --example libav_metadata
+rust-runtime/target/debug/examples/libav_metadata compare \
+  "$REMUX_OUT/companion/libbilikara_media_libav.so" "$REMUX_PREFIX" \
+  "/absolute/fixtures/aac.m4a" synthetic-aac \
+  --copy-remux audio > "$REMUX_OUT/comparison.json" 2>/dev/null
+```
+
+默认每次实验创建私有目录，分别生成 `companion.mp4` / `reference.mp4`，返回后清理。
+要保留一次有界输出，显式加 `--keep-outputs /absolute/NEW-directory`；该目录必须不存在，
+且 `--repeat` 必须为 1。普通比较仍支持 1–10 次。库入口的 destination 始终是调用方
+要求保留的独立实验文件；默认清理属于 developer harness 的实验范围。
+
+使用完整 build/configuration/library-version 协商与 child-only
+`LD_LIBRARY_PATH=PREFIX/lib`，先验证两种 CLI identity 才执行 reference。
+报告仅保留版本、allowlisted build flags、公用 fixture label、操作/检查摘要、差异、
+耗时与文件大小。有效 CLI 参数完整记录，路径位置用固定占位符；不保存源路径、
+任意 tags、media bytes 或 native/CLI stderr。metadata probe、metadata comparison 和 packet comparison 分别显式调用。
+
+## ABI、所有权和失败
+
+metadata/scan 的结构尺寸保持兼容。 `bm_remux_info_v1` / `bm_copy_remux_mp4_v1` /
+`bm_remux_release_v1`，独立协商 request、result 和嵌入的 packet scan 尺寸。
+旧 companion 缺少 capability 时本操作 `Unavailable`，不会调用 CLI 代替它。
+AV 对象、enum 和 decoder bytes 留在 C；Rust 验证结果并由分配它的 companion 释放。
+
+Rust 先以 read-only fd 打开输入；初次 destination 检查使用 `symlink_metadata`，
+也拒绝 dangling symlink、source 的 hard-link/symlink alias。随后在 destination
+文件系统创建随机命名的独占 `0700` staging 目录及空文件。C 只收到这个私有路径，
+永远拿不到公开 destination。输入的所有 subordinate `io_open` 仍被拒绝。
+fast-start 的输出 context 仅允许对**这个 staging 路径**的 read reopen，禁止其他路径
+和 write reopen。没有全局 callback、协议或 probe 权限放宽。
+
+C 按顺序检查 header → 每包写入 → interleave flush → trailer/fast-start →
+AVIO flush/error → close，再用原有 fd-only discovery 重开并逐字节核对完整 extradata、
+codec、尺寸、sample rate、channel layout。9.0.1 的 fast-start helper 未传播的
+read AVIO error 也在该 read handle 的 close callback 中保留。
+Rust 在发布前复用 normalization 的 `read_box_header` 做最多 4096 个顶层 box 的检查，
+确认普通 leading-moov 输出，并用 metadata/scan 复核单轨、codec、可读 EOF、包数、payload
+总字节数及 PTS/DTS 起止边界：按各自实际 time base 比较，每个边界允许最多
+200ms 偏差（含边界），未知时间仍拒绝。该容差不是完整性证明；包数、payload
+总字节数、完整解码配置及 clean EOF 的检查仍保留，没有 full decode。
+源文件缺 `mdat` 仍是 `InvalidMedia`，即使旧 probe/scan 能成功。
+
+最后一次 cancellation 检查后，以 `fs::hard_link(staging, destination)` 做同文件系统
+原子 no-replace 发布，使用共享 publisher 相同的原语，避免耦合其 normalization-specific test hook。
+发生任何此前的错误/取消，都只清理 owned scratch，不删除竞争方 destination。
+链接成功即 committed；此后的晚取消不改写成功结果，scratch 清理失败返回固定
+`owned_scratch_cleanup_incomplete` warning。不增加 crash/power-loss durability 保证。
+
+保持 `Unavailable`、`InvalidRequest`、`SourceMissing`、`UnsupportedFormat`、
+`UnsupportedCodec`、`UnsupportedContainerLayout`、`MediaContractViolation`、
+`InvalidMedia`、`Io`、`Cancelled`、backend failure 的区别。错误消息只含固定原因和
+数字阶段；corrupt flag、empty EOF、read 阶段与 write/trailer/close 阶段有明确区别。
+可用结果包含input/output scan、output metadata、profile、finalized/published、
+layout/configuration checks 和输出大小；不携带内部路径。
+
+## 时间戳与内容
+
+保留输入媒体时间线，允许 muxer 的 time-base/container 表示变化。复制完整
+`AVCodecParameters`（包括全部 AAC ASC / H.264 avcC 和 coded side data），只重置
+输出 muxer 应选择的 codec tag；不照搬输入 tags、track IDs、container duration/start。
+校验基准另存为初始配置的完整副本，避免 demuxer 在读包时更新 `codecpar` 改写基准。
+每包原样交给 muxer，包括它支持的相关 side data；不是从两个 AAC bytes 重建配置。
+`AV_PKT_DATA_NEW_EXTRADATA` 改变配置、encryption 或 parameter change 明确拒绝。
+
+在 `avformat_write_header` 后，才按**实际** `AVStream.time_base` 使用
+`av_packet_rescale_ts`。保留负数；PTS/DTS 缺失、duration 未知/非正、非递增 DTS、
+PTS < DTS 或超出本 profile 支持的 mux timing 范围，返回 `UnsupportedContainerLayout`。
+不将未知值补零，不使用 `genpts`，不独立归零每个 timestamp。输出固定
+`avoid_negative_ts=disabled`、`use_editlist=1`、`movflags=+faststart`，关闭自动 BSF。
+AVC 视频另启用 `negative_cts_offsets`，避免重排帧与正起始时间组合导致
+封装后的 PTS/DTS 被 edit list 移到零。重读后的时间戳边界允许上述 200ms 容差；
+正起始重排帧的回归须逐项断言时间戳完全不变，不靠容差掩盖偏移。
+AAC、FLAC 的封装选项不变。该选项只改变 MP4 的时间表表示，不重编码。
+读取直接延续 find-stream-info 的缓冲前缀，无 seek/flush/reopen，也不保留整份输入。
+`av_interleaved_write_frame` 在 9.0.1 中即使失败也消费/清空 packet；所有退出路径释放
+末包和 contexts。取消在读包、写包前后及发布前观察；不声称 native trailer 每段都能立即中断。
+
+同构建 CLI 使用 `-copyts -map 0:0 -c copy -copytb 1 -map_metadata -1
+-map_metadata:s -1 -map_chapters -1 -fflags -autobsf -avoid_negative_ts disabled
+-movflags +faststart -use_editlist 1 -f mp4 -n`，并保留既有 discovery/fd 限制。
+它不等同于 DownKyi 全部参数的实现。
+
+比较除 metadata 和 packet scan 外，还在小样本内直接比较有序 demuxed payload、
+完整 extradata、每包 PTS/DTS/duration 及 skip-samples。每文件上限 4 MiB、256 包、
+24 MiB 的临时 ffprobe JSON，足以容纳已有约 3.47 MB / 60 包的 H.264 fixture；
+packet bytes/JSON 只存在内存，不能序列化为报告。长 packet-scan fixture 不进入此内容比较。
+时间仅允许到实际目标 tick 的精确 nearest/ties-away rescale；不使用百分比/大时间容差。
+未知不能当作零或已证实相等。文件字节、metadata 顺序和容器 padding 不要求一致。
+
+比较须保留 AAC 的负起始时间和完整扩展配置，正起始时间不得自动归零。
+合成编码包的 streamcopy 比较不能代替完整 decoder 样本；CLI diagnostics
+必须保留，不能把带诊断的执行报告为 clean reference execution。
+
+fragmented AAC 的末包 duration 为 136/44100 秒，转普通 MP4 后多出
+`discard_padding=888`。本地 `mov.c` 的末包处理与 `demux.c` 的 skip-data 注入将
+AAC-LC 的 1024-sample frame 表达为 `1024 - 136 = 888` 个尾部丢弃 samples。
+比较器只认可与同一完整 AAC-LC ASC、已知精确 duration 匹配的这一末包表示；不推广到
+HE-AAC、不调整时间、不容忍 padding 偏差。报告单独列出该 representation。
+共有 libav 血统不构成独立 decoder/browser-playback 证据。
+
+## 有限回归
+
+```bash
+npm run test:media -- \
+  --companion "$REMUX_OUT/companion/libbilikara_media_libav.so" \
+  --prefix "$REMUX_PREFIX" --fixtures "/absolute/fixtures" \
+  --long-fixture /absolute/fixtures/synthetic_hires_large.mp4 \
+  --out "$REMUX_OUT/live" --copy-remux \
+  --old-companion "/absolute/previous-metadata-companion.so" \
+  --shim-test "$REMUX_OUT/companion/test_shim" \
+  --remux-old-companion /absolute/previous-scan-companion.so \
+  --fault-companion "$REMUX_OUT/companion/libbilikara_media_libav_test.so" \
+  --fragmented-fixture /absolute/fixtures/fragmented.m4a
+```
+
+保留 metadata/scan assertions，以及真实 H.264/AAC/扩展 ASC/fragmented/正起始
+比较、错误 kind/多轨/损坏/missing-mdat/不支持格式与 codec、旧 capability、默认清理、
+显式保留与 privacy。复用已有工具链与 fixtures。
+`--test` 额外构建私有 fault companion（不是生产 companion）；只在测试加载。
+它在第三个真实写包后触发 flag，或真实 trailer 完成后返回 EIO，另有三次真实读取后
+EIO/corrupt/unknown-DTS 注入，驱动真正 Rust staging/publisher/error cleanup。
+另以同时修改输入 `codecpar` 和 `NEW_EXTRADATA` 的检查点验证动态配置在写包阶段被拒绝。
+测试也真实创建初次检查之后出现的 destination、existing source aliases、dangling
+symlink，验证源/竞争文件字节、零残留 scratch 和 descriptor 数稳定；发布后的晚取消
+与清理失败保留成功。负控检测漏包、配置截短、payload、PTS 和 padding 改变。
+
+参考资料：[上游 remuxing 示例](https://ffmpeg.org/doxygen/trunk/remuxing_8c-example.html)、
+[MP4 muxer 文档](https://ffmpeg.org/ffmpeg-formats.html#mov_002c-mp4_002c-ismv)。
+ABI/ownership 依据实际安装的 **9.0.1** `avformat.h`、`avio.h`、`codec_par.h`、
+`packet.h`，以及同版本 `codec_par.c`、`packet.c`、`mux.c`、`movenc.c`、`mux_utils.c`、
+`mov.c`、`demux.c`。没有照搬示例中未检查 trailer/close 的错误处理。

@@ -1,0 +1,289 @@
+@import url("/styles.css");
+
+html,
+body,
+.presentation-output-shell,
+.presentation-output-frame {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+}
+
+html,
+body {
+  min-width: 320px;
+  min-height: 100%;
+  background: #000;
+}
+
+body {
+  user-select: none;
+}
+
+body.is-cursor-hidden,
+body.is-cursor-hidden * {
+  cursor: none !important;
+}
+
+.presentation-output-shell {
+  position: fixed;
+  inset: 0;
+  background: #000;
+}
+
+.presentation-output-frame {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+  place-items: center;
+  border: 0;
+  border-radius: 0;
+  background: #000;
+  box-shadow: none;
+}
+
+.presentation-output-frame video[data-presentation-output-video] {
+  display: block;
+  min-width: 0;
+  min-height: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #000;
+}
+
+.presentation-output-frame .player-delay-overlay {
+  z-index: 10;
+  border-radius: 0;
+}
+
+.presentation-output-empty {
+  width: 100%;
+  height: 100%;
+  display: grid;
+  place-items: center;
+  padding: 28px;
+  color: rgba(255, 255, 255, 0.68);
+  background: radial-gradient(circle at center, #25201d, #050505 72%);
+  text-align: center;
+}
+
+.presentation-output-empty p {
+  margin: 0;
+  font-size: clamp(17px, 2.2vw, 28px);
+  font-weight: 650;
+}
+
+.presentation-output-control {
+  --presentation-action-collapsed-width: 84px;
+  --presentation-action-expanded-width: 112px;
+  --presentation-action-label-width: 110px;
+  --presentation-action-label-gap: 8px;
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  z-index: 30;
+}
+
+.presentation-output-exit {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--presentation-action-collapsed-width);
+  min-width: var(--presentation-action-collapsed-width);
+  max-width: none;
+  min-height: 42px;
+  padding: 0 12px;
+  overflow: hidden;
+  border: var(--settings-panel-border);
+  border-radius: 12px;
+  color: var(--ink);
+  background: var(--settings-panel-bg);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.24);
+  backdrop-filter: none;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+  transition:
+    width 170ms cubic-bezier(0.16, 1, 0.3, 1),
+    color 120ms ease-out,
+    background 120ms ease-out,
+    border-color 120ms ease-out;
+}
+
+.presentation-output-action-icons {
+  display: inline-flex;
+  align-items: center;
+  gap: 0;
+}
+
+.presentation-output-action-icons svg {
+  width: 20px;
+  height: 20px;
+  flex: 0 0 auto;
+}
+
+.presentation-output-action-divider {
+  width: 1px;
+  height: 18px;
+  margin: 0 9px;
+  background: currentColor;
+  opacity: 0.22;
+}
+
+.presentation-output-phone-icon,
+.presentation-output-action-divider,
+.presentation-output-exit-label {
+  transition:
+    flex-basis 150ms cubic-bezier(0.16, 1, 0.3, 1),
+    width 150ms cubic-bezier(0.16, 1, 0.3, 1),
+    max-width 150ms cubic-bezier(0.16, 1, 0.3, 1),
+    margin 150ms cubic-bezier(0.16, 1, 0.3, 1),
+    opacity 110ms ease-out,
+    transform 150ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.presentation-output-exit-label {
+  max-width: 0;
+  overflow: hidden;
+  opacity: 0;
+  font-size: 13px;
+  line-height: 1;
+  white-space: nowrap;
+  transform: translateX(-4px);
+}
+
+.presentation-output-control.is-pointer-hover .presentation-output-exit:not(:disabled) {
+  width: var(--presentation-action-expanded-width);
+  color: var(--ink);
+  background: var(--settings-panel-bg);
+  border-color: var(--accent);
+}
+
+@supports (color: color-mix(in srgb, black, white)) {
+  .presentation-output-control.is-pointer-hover .presentation-output-exit:not(:disabled) {
+    background: color-mix(in srgb, var(--settings-panel-bg) 88%, var(--accent) 12%);
+    border-color: color-mix(in srgb, var(--accent) 42%, transparent);
+  }
+}
+
+.presentation-output-exit:focus-visible {
+  outline: 3px solid rgba(208, 90, 63, 0.48);
+  outline-offset: 3px;
+}
+
+.presentation-output-exit:disabled {
+  opacity: 0.48;
+  cursor: default;
+}
+
+.presentation-output-remote-popover {
+  position: absolute;
+  top: calc(100% + 10px);
+  right: 0;
+  visibility: hidden;
+  opacity: 0;
+  transform: scale(0.96);
+  transform-origin: top right;
+  transition:
+    opacity 200ms ease-out,
+    transform 200ms cubic-bezier(0.16, 1, 0.3, 1),
+    visibility 0s linear 200ms;
+  pointer-events: none;
+}
+
+.presentation-output-control.is-qr-pinned .presentation-output-remote-popover {
+  visibility: visible;
+  opacity: 1;
+  transform: translateY(0);
+  transition-delay: 0s;
+  pointer-events: auto;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .presentation-output-control.is-pointer-hover .presentation-output-remote-popover {
+    visibility: visible;
+    opacity: 1;
+    transform: translateY(0);
+    transition-delay: 0s;
+    pointer-events: auto;
+  }
+
+  .presentation-output-control.is-pointer-hover .presentation-output-phone-icon {
+    width: 0;
+    flex-basis: 0;
+    opacity: 0;
+    transform: scale(0.72);
+  }
+
+  .presentation-output-control.is-pointer-hover .presentation-output-action-divider {
+    width: 0;
+    margin: 0;
+    opacity: 0;
+  }
+
+  .presentation-output-control.is-pointer-hover .presentation-output-exit-label {
+    max-width: var(--presentation-action-label-width);
+    margin-left: var(--presentation-action-label-gap);
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+.presentation-output-error {
+  position: fixed;
+  left: 50%;
+  bottom: 18px;
+  z-index: 31;
+  max-width: min(760px, calc(100vw - 36px));
+  margin: 0;
+  padding: 11px 15px;
+  transform: translateX(-50%);
+  border: 1px solid rgba(255, 175, 154, 0.34);
+  border-radius: 12px;
+  color: #fff4ef;
+  background: rgba(91, 24, 13, 0.86);
+  font-size: 13px;
+  text-align: center;
+}
+
+.hidden {
+  display: none !important;
+}
+
+@media (max-width: 560px) {
+  .presentation-output-control {
+    --presentation-action-collapsed-width: 80px;
+    top: 10px;
+    right: 10px;
+  }
+
+  .presentation-output-exit {
+    min-height: 38px;
+    padding: 0 10px;
+  }
+
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation: none !important;
+    transition: none !important;
+  }
+}
+
+/* Android audience output is controlled by the Host, including its QR panel. */
+:root[data-output-platform="android"] #controller-exit { display: none; }
+:root[data-output-platform="android"] .presentation-output-control { width: 0; height: 0; }
+:root[data-output-platform="android"] .presentation-output-remote-popover { top: 0; }
+:root[data-output-platform="android"] .presentation-output-control:not(.is-qr-pinned) .presentation-output-remote-popover {
+  visibility: hidden;
+  opacity: 0;
+  pointer-events: none;
+}

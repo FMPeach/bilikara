@@ -1,0 +1,3776 @@
+mod configured_refresh;
+mod source_order;
+mod source_removal;
+use crate::bilibili_service::{BilibiliHttpClient, BilibiliServiceError};
+use crate::gatcha_refresh::RefreshControl;
+pub(crate) use configured_refresh::execute_configured_refresh;
+#[cfg(feature = "native-host")]
+pub(crate) use configured_refresh::rebuild_needed;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value, json};
+pub use source_order::SourceEdit;
+pub(crate) use source_order::validate_edit as validate_source_edit;
+pub(crate) use source_removal::validate_source_removal;
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use url::form_urlencoded;
+
+const UID_SCHEMA_VERSION: u64 = 2;
+const CACHE_SCHEMA_VERSION: u64 = 3;
+const FAVLIST_SCHEMA_VERSION: u64 = 2;
+const POOL_CONFIG_SCHEMA_VERSION: u64 = 1;
+const EXPIRED_VIDEO_TITLE: &str = "已失效视频";
+const SPACE_ARC_URL: &str = "https://api.bilibili.com/x/space/wbi/arc/search";
+const SPACE_PROFILE_URL: &str = "https://api.bilibili.com/x/space/wbi/acc/info";
+const FAVLIST_FOLDERS_URL: &str = "https://api.bilibili.com/x/v3/fav/folder/created/list-all";
+const FAVLIST_ITEMS_URL: &str = "https://api.bilibili.com/x/v3/fav/resource/list";
+const GATCHA_REQUEST_DELAY: Duration = Duration::from_secs(5);
+const FAVLIST_REQUEST_DELAY: Duration = Duration::from_secs(3);
+
+#[derive(Debug)]
+struct UidFetchResult {
+    entries: Vec<Value>,
+    first_bvid: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatchaPaths {
+    pub uid_file: PathBuf,
+    pub cache_file: PathBuf,
+    pub favlist_file: PathBuf,
+    pub pool_config_file: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum GatchaOperation {
+    UidSnapshot,
+    RemoveSource {
+        source: String,
+        id: String,
+    },
+    EditSources {
+        source: String,
+        expected_version: String,
+        edit: SourceEdit,
+    },
+    PreviewSourceEdit {
+        source: String,
+        expected_version: String,
+        edit: SourceEdit,
+    },
+    PoolConfigSnapshot,
+    PoolConfigUpdate {
+        #[serde(default)]
+        uid_weight: Option<i64>,
+        #[serde(default)]
+        favlist_weight: Option<i64>,
+        #[serde(default)]
+        excluded_uids: Option<Vec<String>>,
+        #[serde(default)]
+        excluded_favlist_folders: Option<Vec<String>>,
+    },
+    Candidate {
+        #[serde(default)]
+        cookie_available: bool,
+        #[serde(default)]
+        pool_config: Option<Value>,
+    },
+    Search {
+        query: String,
+        #[serde(default)]
+        offset: usize,
+        #[serde(default = "default_search_limit")]
+        limit: usize,
+    },
+    BrowseUid {
+        #[serde(default)]
+        uid: String,
+        #[serde(default)]
+        query: String,
+        #[serde(default)]
+        offset: usize,
+        #[serde(default = "default_browse_limit")]
+        limit: usize,
+    },
+    BrowseFavlist {
+        #[serde(default)]
+        folder_id: String,
+        #[serde(default)]
+        query: String,
+        #[serde(default)]
+        offset: usize,
+        #[serde(default = "default_browse_limit")]
+        limit: usize,
+    },
+    FavlistUpdatedAt,
+    PreviewUid {
+        uid: String,
+        cookie: String,
+        #[serde(default = "default_user_agent")]
+        user_agent: String,
+        #[serde(default = "default_referer")]
+        referer: String,
+        #[serde(default = "default_timeout_ms")]
+        timeout_ms: u64,
+    },
+    AddUid {
+        uid: String,
+        cookie: String,
+        #[serde(default)]
+        keywords: Vec<String>,
+        #[serde(default = "default_user_agent")]
+        user_agent: String,
+        #[serde(default = "default_referer")]
+        referer: String,
+        #[serde(default = "default_timeout_ms")]
+        timeout_ms: u64,
+    },
+    RefreshAll {
+        cookie: String,
+        #[serde(default)]
+        keywords: Vec<String>,
+        #[serde(default = "default_user_agent")]
+        user_agent: String,
+        #[serde(default = "default_referer")]
+        referer: String,
+        #[serde(default = "default_timeout_ms")]
+        timeout_ms: u64,
+    },
+    PreviewFavlist {
+        uid: String,
+        cookie: String,
+        #[serde(default)]
+        folder_keywords: Vec<String>,
+        #[serde(default = "default_user_agent")]
+        user_agent: String,
+        #[serde(default = "default_referer")]
+        referer: String,
+        #[serde(default = "default_timeout_ms")]
+        timeout_ms: u64,
+    },
+    RefreshFavlist {
+        uid: String,
+        #[serde(default)]
+        folder_ids: Option<Vec<String>>,
+        cookie: String,
+        #[serde(default)]
+        folder_keywords: Vec<String>,
+        #[serde(default = "default_user_agent")]
+        user_agent: String,
+        #[serde(default = "default_referer")]
+        referer: String,
+        #[serde(default = "default_timeout_ms")]
+        timeout_ms: u64,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GatchaRepositoryRequest {
+    #[serde(default = "schema_version")]
+    pub schema_version: u32,
+    pub paths: GatchaPaths,
+    #[serde(default)]
+    pub default_uids: Vec<String>,
+    #[serde(flatten)]
+    pub operation: GatchaOperation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GatchaRepositoryError {
+    pub kind: String,
+    pub message: String,
+}
+
+static REPOSITORY_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+pub fn execute_gatcha(request: &GatchaRepositoryRequest) -> Result<Value, GatchaRepositoryError> {
+    execute_gatcha_controlled(request, &RefreshControl::default())
+}
+
+pub(crate) fn execute_gatcha_controlled(
+    request: &GatchaRepositoryRequest,
+    control: &RefreshControl,
+) -> Result<Value, GatchaRepositoryError> {
+    control.check()?;
+    if request.schema_version != 1 {
+        return Err(error("invalid_request", "unsupported schema version"));
+    }
+    if let GatchaOperation::RemoveSource { source, id } = &request.operation {
+        validate_source_removal(source, id)?;
+    }
+    if let GatchaOperation::EditSources {
+        source,
+        expected_version,
+        edit,
+    }
+    | GatchaOperation::PreviewSourceEdit {
+        source,
+        expected_version,
+        edit,
+    } = &request.operation
+    {
+        validate_source_edit(source, expected_version, edit)?;
+    }
+    if !requires_mutation_lock(&request.operation) {
+        if matches!(
+            request.operation,
+            GatchaOperation::AddUid { .. }
+                | GatchaOperation::RefreshFavlist { .. }
+                | GatchaOperation::RefreshAll { .. }
+        ) {
+            control.commit(|| {
+                let _guard = repository_guard()?;
+                uid_snapshot(&request.paths.uid_file, &request.default_uids)
+            })?;
+        } else {
+            uid_snapshot(&request.paths.uid_file, &request.default_uids)?;
+        }
+        return execute_gatcha_operation(request, control);
+    }
+    let _guard = repository_guard()?;
+    // A destructive edit must read the existing file strictly, not seed a
+    // missing configuration as an incidental effect of deleting a favorite.
+    if !matches!(
+        request.operation,
+        GatchaOperation::RemoveSource { .. }
+            | GatchaOperation::EditSources { .. }
+            | GatchaOperation::PreviewSourceEdit { .. }
+    ) {
+        uid_snapshot(&request.paths.uid_file, &request.default_uids)?;
+    }
+    execute_gatcha_operation(request, control)
+}
+
+fn requires_mutation_lock(operation: &GatchaOperation) -> bool {
+    matches!(
+        operation,
+        GatchaOperation::PoolConfigUpdate { .. }
+            | GatchaOperation::RemoveSource { .. }
+            | GatchaOperation::EditSources { .. }
+            | GatchaOperation::PreviewSourceEdit { .. }
+    )
+}
+
+fn repository_guard() -> Result<MutexGuard<'static, ()>, GatchaRepositoryError> {
+    REPOSITORY_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| error("state", "Gacha repository lock is poisoned"))
+}
+
+fn execute_gatcha_operation(
+    request: &GatchaRepositoryRequest,
+    control: &RefreshControl,
+) -> Result<Value, GatchaRepositoryError> {
+    match &request.operation {
+        GatchaOperation::RemoveSource { source, id } => {
+            source_removal::remove_source(&request.paths, source, id)
+        }
+        GatchaOperation::EditSources {
+            source,
+            expected_version,
+            edit,
+        } => match edit {
+            SourceEdit::Remove { ids } => {
+                source_removal::remove_sources(&request.paths, source, ids, Some(expected_version))
+            }
+            SourceEdit::Cleanup { ids } => {
+                source_removal::cleanup_sources(&request.paths, source, ids, expected_version)
+            }
+            SourceEdit::Move { id, before_id } => source_order::move_source(
+                &request.paths,
+                source,
+                expected_version,
+                id,
+                before_id.as_deref(),
+            ),
+            SourceEdit::MoveMany { ids, before_id } => source_order::move_sources_controlled(
+                &request.paths,
+                source,
+                expected_version,
+                ids,
+                before_id.as_deref(),
+                true,
+            ),
+        },
+        GatchaOperation::PreviewSourceEdit {
+            source,
+            expected_version,
+            edit,
+        } => {
+            if let SourceEdit::Move { id, before_id } = edit {
+                source_order::move_source_controlled(
+                    &request.paths,
+                    source,
+                    expected_version,
+                    id,
+                    before_id.as_deref(),
+                    false,
+                )
+            } else if let SourceEdit::MoveMany { ids, before_id } = edit {
+                source_order::move_sources_controlled(
+                    &request.paths,
+                    source,
+                    expected_version,
+                    ids,
+                    before_id.as_deref(),
+                    false,
+                )
+            } else {
+                Err(error(
+                    "invalid_request",
+                    "Only source moves have a read-only preview",
+                ))
+            }
+        }
+        GatchaOperation::UidSnapshot => {
+            uid_snapshot(&request.paths.uid_file, &request.default_uids)
+        }
+        GatchaOperation::PoolConfigSnapshot => {
+            Ok(load_pool_config(&request.paths.pool_config_file))
+        }
+        GatchaOperation::PoolConfigUpdate {
+            uid_weight,
+            favlist_weight,
+            excluded_uids,
+            excluded_favlist_folders,
+        } => update_pool_config(
+            &request.paths.pool_config_file,
+            *uid_weight,
+            *favlist_weight,
+            excluded_uids.as_deref(),
+            excluded_favlist_folders.as_deref(),
+        ),
+        GatchaOperation::Candidate {
+            cookie_available,
+            pool_config,
+        } => draw_candidate(&request.paths, *cookie_available, pool_config.as_ref()),
+        GatchaOperation::Search {
+            query,
+            offset,
+            limit,
+        } => search(&request.paths, query, *offset, *limit),
+        GatchaOperation::BrowseUid {
+            uid,
+            query,
+            offset,
+            limit,
+        } => browse_uid(&request.paths, uid, query, *offset, *limit),
+        GatchaOperation::BrowseFavlist {
+            folder_id,
+            query,
+            offset,
+            limit,
+        } => browse_favlist(&request.paths, folder_id, query, *offset, *limit),
+        GatchaOperation::FavlistUpdatedAt => {
+            let payload = load_favlist(&request.paths.favlist_file);
+            Ok(json!({"updated_at": number(&payload, "updated_at")}))
+        }
+        GatchaOperation::PreviewUid {
+            uid,
+            cookie,
+            user_agent,
+            referer,
+            timeout_ms,
+        } => preview_uid(
+            &request.paths,
+            uid,
+            &network_client(cookie, user_agent, referer, *timeout_ms)?,
+        ),
+        GatchaOperation::AddUid {
+            uid,
+            cookie,
+            keywords,
+            user_agent,
+            referer,
+            timeout_ms,
+        } => add_uid(
+            &request.paths,
+            uid,
+            keywords,
+            &network_client(cookie, user_agent, referer, *timeout_ms)?,
+            control,
+        ),
+        GatchaOperation::RefreshAll {
+            cookie,
+            keywords,
+            user_agent,
+            referer,
+            timeout_ms,
+        } => refresh_all(
+            &request.paths,
+            keywords,
+            &network_client(cookie, user_agent, referer, *timeout_ms)?,
+            control,
+            &|_| {},
+        ),
+        GatchaOperation::PreviewFavlist {
+            uid,
+            cookie,
+            folder_keywords,
+            user_agent,
+            referer,
+            timeout_ms,
+        } => preview_favlist(
+            uid,
+            folder_keywords,
+            &network_client(cookie, user_agent, referer, *timeout_ms)?,
+        ),
+        GatchaOperation::RefreshFavlist {
+            uid,
+            folder_ids,
+            cookie,
+            folder_keywords,
+            user_agent,
+            referer,
+            timeout_ms,
+        } => refresh_favlist(
+            &request.paths,
+            uid,
+            folder_ids.as_deref(),
+            folder_keywords,
+            &network_client(cookie, user_agent, referer, *timeout_ms)?,
+            control,
+        ),
+    }
+}
+
+/// One-time Native Alpha migration. Never reset source choices on each login.
+/// The marker is separate because ordinary UID/profile writes normalize their
+/// own schema. Commit UIDs first: an interrupted marker write is safe to retry.
+#[cfg(any(feature = "native-host", test))]
+pub(crate) fn initialize_native_uids(
+    paths: &GatchaPaths,
+    defaults: &[String],
+) -> Result<bool, GatchaRepositoryError> {
+    let _guard = repository_guard()?;
+    let marker = paths
+        .uid_file
+        .with_file_name("native-library-defaults.json");
+    let bytes = match fs::read(&paths.uid_file) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return Err(error("library_storage", "无法读取曲库来源配置")),
+    };
+    let parsed = bytes
+        .as_ref()
+        .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok());
+    if parsed.as_ref().is_some_and(|value| {
+        value["schema_version"]
+            .as_u64()
+            .is_some_and(|version| version > UID_SCHEMA_VERSION)
+    }) {
+        return Err(error(
+            "library_version",
+            "曲库配置来自更新版本，已保留原文件，请更新软件",
+        ));
+    }
+    let valid = parsed.as_ref().is_some_and(|v| {
+        (v["schema_version"].is_null() || v["schema_version"] == UID_SCHEMA_VERSION)
+            && v["profiles"].is_object()
+            && v["uids"].as_array().is_some_and(|uids| {
+                uids.iter()
+                    .all(|uid| uid.as_str().and_then(normalize_uid).is_some())
+            })
+    });
+    let recovered = bytes.is_some() && !valid;
+    if recovered {
+        use std::io::Write;
+        let base = paths.uid_file.with_file_name("gatcha_uids.corrupt.json");
+        let mut target = base.clone();
+        let mut sequence = 0;
+        loop {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&target)
+            {
+                Ok(mut file) => {
+                    file.write_all(bytes.as_ref().unwrap())
+                        .and_then(|_| file.sync_all())
+                        .map_err(|_| error("library_storage", "无法备份损坏的曲库来源配置"))?;
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    sequence += 1;
+                    target = base.with_file_name(format!("gatcha_uids.corrupt-{sequence}.json"));
+                }
+                Err(_) => return Err(error("library_storage", "无法备份损坏的曲库来源配置")),
+            }
+        }
+    }
+    let seeded = read_object(&marker).is_some_and(|v| v.get("schema_version") == Some(&json!(1)));
+    if valid && seeded {
+        return Ok(false);
+    }
+    let mut payload = if let Some(value) = parsed.filter(|v| v.is_object() && v["uids"].is_array())
+    {
+        value
+    } else {
+        json!({"schema_version":UID_SCHEMA_VERSION,"uids":[],"profiles":{}})
+    };
+    let mut uids = normalized_uids_from_value(payload.get("uids"));
+    if !seeded || uids.is_empty() && recovered {
+        uids.extend_from_slice(defaults);
+    }
+    if !payload["profiles"].is_object() {
+        payload["profiles"] = json!({});
+    }
+    payload["schema_version"] = json!(UID_SCHEMA_VERSION);
+    payload["uids"] = json!(normalized_uids(&uids));
+    payload["updated_at"] = json!(unix_timestamp());
+    atomic_write_json(&paths.uid_file, &payload)?;
+    atomic_write_json(&marker, &json!({"schema_version":1}))?;
+    Ok(recovered)
+}
+
+fn uid_snapshot(path: &Path, default_uids: &[String]) -> Result<Value, GatchaRepositoryError> {
+    let mut payload = read_object(path).unwrap_or_else(|| {
+        Map::from_iter([
+            ("schema_version".to_owned(), json!(UID_SCHEMA_VERSION)),
+            ("uids".to_owned(), json!(normalized_uids(default_uids))),
+            ("profiles".to_owned(), json!({})),
+            ("updated_at".to_owned(), json!(unix_timestamp())),
+        ])
+    });
+    let should_write = !path.exists();
+    let uids = normalized_uids_from_value(payload.get("uids"));
+    let profiles = payload
+        .remove("profiles")
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    let updated_at = number_map(&payload, "updated_at");
+    let normalized = json!({
+        "schema_version": UID_SCHEMA_VERSION,
+        "uids": uids,
+        "profiles": profiles,
+        "updated_at": updated_at,
+    });
+    if should_write {
+        atomic_write_json(path, &normalized)?;
+    }
+    Ok(json!({
+        "uids": normalized["uids"],
+        "count": normalized["uids"].as_array().map_or(0, Vec::len),
+        "profiles": normalized["profiles"],
+        "updated_at": updated_at,
+    }))
+}
+
+fn load_pool_config(path: &Path) -> Value {
+    let payload = read_object(path).unwrap_or_default();
+    normalize_pool_config(&Value::Object(payload))
+}
+
+pub(crate) fn normalize_pool_config(value: &Value) -> Value {
+    let payload = value.as_object().cloned().unwrap_or_default();
+    json!({
+        "schema_version": POOL_CONFIG_SCHEMA_VERSION,
+        "uid_weight": clamped_weight(payload.get("uid_weight"), 50),
+        "favlist_weight": clamped_weight(payload.get("favlist_weight"), 50),
+        "excluded_uids": normalized_strings(payload.get("excluded_uids")),
+        "excluded_favlist_folders": normalized_strings(payload.get("excluded_favlist_folders")),
+        "updated_at": number_map(&payload, "updated_at"),
+    })
+}
+
+fn update_pool_config(
+    path: &Path,
+    uid_weight: Option<i64>,
+    favlist_weight: Option<i64>,
+    excluded_uids: Option<&[String]>,
+    excluded_folders: Option<&[String]>,
+) -> Result<Value, GatchaRepositoryError> {
+    let mut payload = load_pool_config(path);
+    let object = payload
+        .as_object_mut()
+        .ok_or_else(|| error("state", "invalid pool configuration"))?;
+    if let Some(weight) = uid_weight {
+        object.insert("uid_weight".to_owned(), json!(weight.clamp(0, 100)));
+    }
+    if let Some(weight) = favlist_weight {
+        object.insert("favlist_weight".to_owned(), json!(weight.clamp(0, 100)));
+    }
+    if let Some(values) = excluded_uids {
+        object.insert(
+            "excluded_uids".to_owned(),
+            json!(normalized_strings_slice(values)),
+        );
+    }
+    if let Some(values) = excluded_folders {
+        object.insert(
+            "excluded_favlist_folders".to_owned(),
+            json!(normalized_strings_slice(values)),
+        );
+    }
+    object.insert("updated_at".to_owned(), json!(unix_timestamp()));
+    atomic_write_json(path, &payload)?;
+    Ok(payload)
+}
+
+fn load_cache(path: &Path) -> Value {
+    let payload = read_object(path).unwrap_or_default();
+    json!({
+        "schema_version": CACHE_SCHEMA_VERSION,
+        "uids": payload.get("uids").filter(|value| value.is_object()).cloned().unwrap_or_else(|| json!({})),
+        "profiles": payload.get("profiles").filter(|value| value.is_object()).cloned().unwrap_or_else(|| json!({})),
+        "uid_checkpoints": payload.get("uid_checkpoints").filter(|value| value.is_object()).cloned().unwrap_or_else(|| json!({})),
+        "refresh_summary": payload.get("refresh_summary").filter(|value| value.is_object()).cloned().unwrap_or_else(|| json!({})),
+        "updated_at": number_map(&payload, "updated_at"),
+    })
+}
+
+fn load_favlist(path: &Path) -> Value {
+    let payload = read_object(path).unwrap_or_default();
+    let legacy_uid = text_map(&payload, "uid");
+    let mut folders = Vec::new();
+    for value in array_map(&payload, "folders") {
+        let Some(mut folder) = value.as_object().cloned() else {
+            continue;
+        };
+        let uid = first_text(&folder, &["uid", "mid"]).unwrap_or_else(|| legacy_uid.clone());
+        if !uid.is_empty() {
+            folder.insert("uid".to_owned(), Value::String(uid));
+        }
+        folders.push(Value::Object(folder));
+    }
+    let mut items = Vec::new();
+    for value in array_map(&payload, "items") {
+        let Some(mut item) = value.as_object().cloned() else {
+            continue;
+        };
+        let uid = first_text(&item, &["fav_uid"]).unwrap_or_else(|| legacy_uid.clone());
+        if !uid.is_empty() {
+            item.insert("fav_uid".to_owned(), Value::String(uid));
+        }
+        if first_text(&item, &["source"]).is_none() {
+            item.insert("source".to_owned(), Value::String("favlist".to_owned()));
+        }
+        items.push(Value::Object(item));
+    }
+    let items = dedupe_entries(&items);
+    let mut uids: BTreeSet<String> = normalized_strings(payload.get("uids"))
+        .into_iter()
+        .collect();
+    for folder in &folders {
+        if let Some(uid) = folder
+            .as_object()
+            .and_then(|value| first_text(value, &["uid", "mid"]))
+        {
+            uids.insert(uid);
+        }
+    }
+    for item in &items {
+        if let Some(uid) = item
+            .as_object()
+            .and_then(|value| first_text(value, &["fav_uid"]))
+        {
+            uids.insert(uid);
+        }
+    }
+    json!({
+        "schema_version": FAVLIST_SCHEMA_VERSION,
+        "uid": legacy_uid,
+        "uids": uids,
+        "folders": folders,
+        "items": items,
+        "updated_at": number_map(&payload, "updated_at"),
+    })
+}
+
+fn network_client(
+    cookie: &str,
+    user_agent: &str,
+    referer: &str,
+    timeout_ms: u64,
+) -> Result<BilibiliHttpClient, GatchaRepositoryError> {
+    BilibiliHttpClient::new(cookie, user_agent, referer, timeout_ms).map_err(network_error)
+}
+
+fn preview_uid(
+    paths: &GatchaPaths,
+    raw_uid: &str,
+    client: &BilibiliHttpClient,
+) -> Result<Value, GatchaRepositoryError> {
+    let uid = required_uid(raw_uid)?;
+    let profile = fetch_profile(client, &uid)?;
+    let resolved_uid = text_value(&profile, "uid");
+    let uid_payload = uid_snapshot(&paths.uid_file, &[])?;
+    let cache = load_cache(&paths.cache_file);
+    let existing = cache
+        .pointer(&format!("/uids/{resolved_uid}"))
+        .and_then(Value::as_array)
+        .map(|items| dedupe_entries(items))
+        .unwrap_or_default();
+    let mode = if existing.is_empty() {
+        "full"
+    } else {
+        "incremental"
+    };
+    Ok(json!({
+        "uid": resolved_uid,
+        "name": profile["name"],
+        "space_url": profile["space_url"],
+        "avatar_url": profile.get("avatar_url").cloned().unwrap_or_else(|| json!("")),
+        "already_followed": normalized_strings(uid_payload.get("uids")).contains(&resolved_uid),
+        "cache_mode": mode,
+        "cache_mode_label": if mode == "incremental" { "最新" } else { "所有" },
+        "cached_count": existing.len(),
+    }))
+}
+
+fn add_uid(
+    paths: &GatchaPaths,
+    raw_uid: &str,
+    keywords: &[String],
+    client: &BilibiliHttpClient,
+    control: &RefreshControl,
+) -> Result<Value, GatchaRepositoryError> {
+    let uid = required_uid(raw_uid)?;
+    let (mut result, shared) = control.source(format!("uid:{uid}"), || {
+        add_uid_source(paths, &uid, keywords, client, control)
+    })?;
+    if shared {
+        result["added"] = json!(false);
+        result["cache"]["added_count"] = json!(0);
+        result["entries"] = json!([]);
+    }
+    Ok(result)
+}
+
+fn add_uid_source(
+    paths: &GatchaPaths,
+    uid: &str,
+    keywords: &[String],
+    client: &BilibiliHttpClient,
+    control: &RefreshControl,
+) -> Result<Value, GatchaRepositoryError> {
+    let was_member = normalized_strings(uid_snapshot(&paths.uid_file, &[])?.get("uids"))
+        .contains(&uid.to_owned());
+    let profile = fetch_profile(client, uid)?;
+    let uid = text_value(&profile, "uid");
+    let (added, uids, cache) = control.commit(|| {
+        let _guard = repository_guard()?;
+        let mut uid_payload = uid_snapshot(paths.uid_file.as_path(), &[])?;
+        let mut uids = normalized_strings(uid_payload.get("uids"));
+        let added = !uids.contains(&uid);
+        if added && was_member {
+            return Err(error("cancelled", "来源已删除，已丢弃过期拉取结果"));
+        }
+        if added {
+            uids.push(uid.clone());
+        }
+        let mut profiles = uid_payload
+            .get("profiles")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        profiles.insert(uid.clone(), profile.clone());
+        uid_payload = json!({
+            "schema_version": UID_SCHEMA_VERSION,
+            "uids": uids,
+            "profiles": profiles,
+            "updated_at": unix_timestamp(),
+        });
+        atomic_write_json(&paths.uid_file, &uid_payload)?;
+        Ok((added, uids, load_cache(&paths.cache_file)))
+    })?;
+    let existing = cache
+        .pointer(&format!("/uids/{uid}"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let incremental = !dedupe_entries(&existing).is_empty();
+    let checkpoint = incremental
+        .then(|| uid_refresh_checkpoint(&cache, &uid, &existing))
+        .flatten();
+    let fresh =
+        fetch_uid_entries_controlled(client, &uid, keywords, checkpoint.as_deref(), control)?;
+    let (added_count, total_count, entries) = control.commit(|| {
+        persist_refreshed_uid(
+            paths,
+            &uid,
+            &profile,
+            &existing,
+            &fresh.entries,
+            fresh.first_bvid.as_deref(),
+            incremental,
+        )
+    })?;
+    Ok(json!({
+        "uid": uid,
+        "name": profile["name"],
+        "space_url": profile["space_url"],
+        "avatar_url": profile.get("avatar_url").cloned().unwrap_or_else(|| json!("")),
+        "added": added,
+        "uids": uids,
+        "cache": {
+            "uid": uid,
+            "mode": if incremental { "incremental" } else { "full" },
+            "added_count": added_count,
+            "total_count": total_count,
+        },
+        "entries": entries,
+    }))
+}
+
+fn refresh_all(
+    paths: &GatchaPaths,
+    keywords: &[String],
+    client: &BilibiliHttpClient,
+    control: &RefreshControl,
+    notify: &dyn Fn(Value),
+) -> Result<Value, GatchaRepositoryError> {
+    control.check()?;
+    let (configured, legacy_cache, initial_checkpoints) = {
+        let _guard = repository_guard()?;
+        let uid_payload = uid_snapshot(&paths.uid_file, &[])?;
+        let raw_cache = read_object(&paths.cache_file).unwrap_or_default();
+        let mut configured = normalized_strings(uid_payload.get("uids"));
+        let previous = Value::Object(raw_cache.clone())["refresh_summary"].clone();
+        let retry = control.retries_failed_sources()
+            && previous["completed"] == true
+            && crate::gatcha_refresh::summary_has_errors(&previous);
+        if retry {
+            let failed: HashSet<String> = array(&previous, "errors")
+                .iter()
+                .filter_map(|v| v["uid"].as_str().map(str::to_owned))
+                .collect();
+            // Retry failed sources first, but a normal manual refresh must
+            // still advance healthy sources and retain the complete summary.
+            configured.sort_by_key(|uid| !failed.contains(uid));
+        }
+        let initial_checkpoints =
+            uid_refresh_checkpoints(&load_cache(&paths.cache_file), &configured);
+        (
+            configured,
+            integer_value(raw_cache.get("schema_version")).unwrap_or(0)
+                < CACHE_SCHEMA_VERSION as i64
+                || !raw_cache.get("profiles").is_some_and(Value::is_object),
+            initial_checkpoints,
+        )
+    };
+    let mut results = Vec::new();
+    let mut errors = Vec::new();
+    let mut added_entries = Vec::new();
+    control.commit(|| {
+        persist_refresh_summary(paths, &results, &errors, "", false, configured.len())
+    })?;
+    for (index, uid) in configured.iter().enumerate() {
+        control.check()?;
+        notify(
+            json!({"phase":"uid", "current_uid":uid, "uid_index":index + 1, "uid_total":configured.len(),
+            "pending_uids":&configured[index+1..],
+            "failed_uids":errors.iter().map(|v: &Value|v["uid"].clone()).collect::<Vec<_>>(),
+            "sources":{"uids":results.len()+errors.len(), "favorites":0}}),
+        );
+        let result = control.source(format!("uid:{uid}"), || {
+            let (known_profile, existing) = {
+                let _guard = repository_guard()?;
+                let uid_payload = uid_snapshot(&paths.uid_file, &[])?;
+                if !normalized_strings(uid_payload.get("uids")).contains(uid) {
+                    return Err(error("cancelled", "来源已删除，已丢弃过期拉取结果"));
+                }
+                let cache = load_cache(&paths.cache_file);
+                let existing = cache
+                    .pointer(&format!("/uids/{uid}"))
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                (
+                    uid_payload
+                        .pointer(&format!("/profiles/{uid}"))
+                        .filter(|value| valid_profile(value))
+                        .cloned(),
+                    existing,
+                )
+            };
+            let profile = known_profile
+                .as_ref()
+                .filter(|value| valid_profile(value))
+                .cloned()
+                .map(Ok)
+                .unwrap_or_else(|| fetch_profile(client, uid))?;
+            let incremental = !legacy_cache && !dedupe_entries(&existing).is_empty();
+            let stop_bvid = incremental
+                .then(|| initial_checkpoints.get(uid).cloned().flatten())
+                .flatten();
+            let fresh =
+                fetch_uid_entries_controlled(client, uid, keywords, stop_bvid.as_deref(), control)?;
+            let (added_count, total_count, entries) = control.commit(|| {
+                persist_refreshed_uid(
+                    paths,
+                    uid,
+                    &profile,
+                    &existing,
+                    &fresh.entries,
+                    fresh.first_bvid.as_deref(),
+                    incremental,
+                )
+            })?;
+            Ok::<Value, GatchaRepositoryError>(json!({
+                "uid": uid,
+                "name":profile["name"], "space_url":profile["space_url"],
+                "avatar_url":profile.get("avatar_url").cloned().unwrap_or_else(|| json!("")),
+                "added":false,
+                "cache": {"uid":uid, "mode": if incremental { "incremental" } else { "full" },
+                    "added_count": added_count, "total_count": total_count},
+                "entries":entries,
+            }))
+        });
+        match result {
+            Ok((value, shared)) => {
+                let mut summary = value["cache"].clone();
+                if shared {
+                    summary["added_count"] = json!(0);
+                } else {
+                    added_entries.extend(array(&value, "entries").iter().cloned());
+                }
+                results.push(summary);
+            }
+            Err(failure) if failure.kind == "cancelled" => {
+                control.check()?;
+            }
+            Err(failure) => errors.push(json!({"uid": uid, "error": failure.message})),
+        }
+        control.commit(|| {
+            persist_refresh_summary(paths, &results, &errors, "", false, configured.len())
+        })?;
+        notify(
+            json!({"phase":"uid","uid_index":index+1,"uid_total":configured.len(),
+            "pending_uids":&configured[index+1..],
+            "failed_uids":errors.iter().map(|v|v["uid"].clone()).collect::<Vec<_>>(),
+            "sources":{"uids":results.len()+errors.len(),"favorites":0}}),
+        );
+    }
+    control.check()?;
+    let favlist_result = refresh_existing_favlist(
+        paths,
+        client,
+        control,
+        None,
+        &|index, total, current| {
+            notify(
+                json!({"phase":"favlist","current_folder_id":current,"favlist_index":index,"favlist_total":total,
+                "failed_uids":errors.iter().map(|v|v["uid"].clone()).collect::<Vec<_>>(),
+                "sources":{"uids":results.len()+errors.len(),"favorites":index}}),
+            );
+        },
+    )?;
+    let favlist_errors = array(&favlist_result, "errors");
+    let favlist_error = favlist_errors
+        .iter()
+        .map(|failure| {
+            format!(
+                "{}:{} {}",
+                failure["uid"].as_str().unwrap_or_default(),
+                failure["folder_id"].as_str().unwrap_or_default(),
+                failure["error"].as_str().unwrap_or("收藏夹拉取失败")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let mut result = control.commit(|| {
+        persist_refresh_summary(
+            paths,
+            &results,
+            &errors,
+            &favlist_error,
+            true,
+            configured.len(),
+        )
+    })?;
+    result["refresh_summary"]["favlist_errors"] = json!(favlist_errors);
+    result["refresh_summary"]["favlist_succeeded"] = favlist_result["succeeded"].clone();
+    control.commit(|| {
+        let _guard = repository_guard()?;
+        let mut latest = load_cache(&paths.cache_file);
+        latest["refresh_summary"] = result["refresh_summary"].clone();
+        atomic_write_json(&paths.cache_file, &latest)?;
+        result = latest;
+        Ok(())
+    })?;
+    // Completion-only delta: never persist or re-upload a previous task's delta.
+    result["favlist_entries"] = favlist_result["entries"].clone();
+    result["added_entries"] = json!(added_entries);
+    Ok(result)
+}
+
+fn persist_refreshed_uid(
+    paths: &GatchaPaths,
+    uid: &str,
+    profile: &Value,
+    baseline_entries: &[Value],
+    fresh_entries: &[Value],
+    first_bvid: Option<&str>,
+    incremental: bool,
+) -> Result<(usize, usize, Vec<Value>), GatchaRepositoryError> {
+    let _guard = repository_guard()?;
+    let mut uid_payload = uid_snapshot(&paths.uid_file, &[])?;
+    if !normalized_strings(uid_payload.get("uids"))
+        .iter()
+        .any(|configured| configured == uid)
+    {
+        return Err(error("cancelled", "来源已删除，已丢弃过期拉取结果"));
+    }
+    let uid_object = uid_payload
+        .as_object_mut()
+        .ok_or_else(|| error("state", "invalid Gacha UID configuration"))?;
+    uid_object
+        .entry("profiles")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| error("state", "invalid Gacha UID profiles"))?
+        .insert(uid.to_owned(), profile.clone());
+    let updated_at = unix_timestamp();
+    uid_object.insert("updated_at".to_owned(), json!(updated_at));
+    atomic_write_json(&paths.uid_file, &uid_payload)?;
+
+    let mut cache = load_cache(&paths.cache_file);
+    let cache_object = cache
+        .as_object_mut()
+        .ok_or_else(|| error("state", "invalid Gacha cache"))?;
+    let cache_uids = cache_object
+        .entry("uids")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| error("state", "invalid Gacha UID cache"))?;
+    let latest_entries = cache_uids
+        .get(uid)
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let concurrent_change = latest_entries != baseline_entries;
+    let (entries, added_count) = if incremental || concurrent_change {
+        merge_incremental_entries(&latest_entries, fresh_entries)
+    } else {
+        let entries = dedupe_entries(fresh_entries);
+        let count = entries.len();
+        (entries, count)
+    };
+    let total_count = entries.len();
+    let additions = entries
+        .iter()
+        .take(added_count)
+        .cloned()
+        .map(|mut entry| {
+            // Keep the completion metadata formerly enriched by added_entries()
+            // when it selected rows from the final cache snapshot.
+            if let Some(object) = entry.as_object_mut() {
+                object.entry("mid").or_insert_with(|| json!(uid));
+                for (field, source) in [("owner_name", "name"), ("owner_url", "space_url")] {
+                    if !object.contains_key(field)
+                        && profile[source].as_str().is_some_and(|v| !v.is_empty())
+                    {
+                        object.insert(field.into(), profile[source].clone());
+                    }
+                }
+            }
+            entry
+        })
+        .collect();
+    cache_uids.insert(uid.to_owned(), Value::Array(entries));
+    cache_object
+        .entry("profiles")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| error("state", "invalid Gacha profile cache"))?
+        .insert(uid.to_owned(), profile.clone());
+    persist_uid_checkpoint(cache_object, uid, first_bvid)?;
+    cache_object.insert("updated_at".to_owned(), json!(updated_at));
+    atomic_write_json(&paths.cache_file, &cache)?;
+    Ok((added_count, total_count, additions))
+}
+
+fn persist_refresh_summary(
+    paths: &GatchaPaths,
+    results: &[Value],
+    errors: &[Value],
+    favlist_error: &str,
+    completed: bool,
+    total_count: usize,
+) -> Result<Value, GatchaRepositoryError> {
+    let _guard = repository_guard()?;
+    let mut cache = load_cache(&paths.cache_file);
+    let updated_at = unix_timestamp();
+    let cache_object = cache
+        .as_object_mut()
+        .ok_or_else(|| error("state", "invalid Gacha cache"))?;
+    cache_object.insert("updated_at".to_owned(), json!(updated_at));
+    cache_object.insert(
+        "refresh_summary".to_owned(),
+        json!({
+            "uids": results,
+            "errors": errors,
+            "favlist_error": favlist_error,
+            "completed": completed,
+            "completed_count": results.len() + errors.len(),
+            "total_count": total_count,
+            "updated_at": updated_at,
+        }),
+    );
+    atomic_write_json(&paths.cache_file, &cache)?;
+    Ok(cache)
+}
+
+fn preview_favlist(
+    raw_uid: &str,
+    folder_keywords: &[String],
+    client: &BilibiliHttpClient,
+) -> Result<Value, GatchaRepositoryError> {
+    let uid = required_uid(raw_uid)?;
+    let folders = fetch_favlist_folders(client, &uid)?;
+    let public: Vec<Value> = folders
+        .iter()
+        .filter_map(Value::as_object)
+        .filter(|folder| public_folder(folder))
+        .filter_map(|folder| folder_summary(folder, folder_keywords))
+        .collect();
+    Ok(json!({
+        "uid": uid,
+        "folder_count": folders.len(),
+        "public_folder_count": public.len(),
+        "selected_folder_ids": public.iter().filter(|folder| folder.get("selected").and_then(Value::as_bool).unwrap_or(false)).filter_map(|folder| folder.get("id").and_then(Value::as_str)).collect::<Vec<_>>(),
+        "folders": public,
+    }))
+}
+
+fn refresh_favlist(
+    paths: &GatchaPaths,
+    raw_uid: &str,
+    selected_folder_ids: Option<&[String]>,
+    folder_keywords: &[String],
+    client: &BilibiliHttpClient,
+    control: &RefreshControl,
+) -> Result<Value, GatchaRepositoryError> {
+    let uid = required_uid(raw_uid)?;
+    let selected: Option<HashSet<String>> = selected_folder_ids.map(|values| {
+        values
+            .iter()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .collect()
+    });
+    if selected.as_ref().is_some_and(HashSet::is_empty) {
+        return Err(error("invalid_request", "请选择至少一个收藏夹"));
+    }
+    let existing_folders: HashSet<_> = array(&load_favlist(&paths.favlist_file), "folders")
+        .iter()
+        .filter_map(Value::as_object)
+        .filter(|folder| text_map(folder, "uid") == uid)
+        .map(folder_id)
+        .collect();
+    let folders = fetch_favlist_folders(client, &uid)?;
+    let mut matched = 0;
+    let mut item_count = 0;
+    let mut additions = Vec::new();
+    let mut errors = Vec::new();
+    for folder in folders.iter().filter_map(Value::as_object) {
+        if !public_folder(folder) {
+            continue;
+        }
+        let Some(mut summary) = folder_summary(folder, folder_keywords) else {
+            continue;
+        };
+        let folder_id = text_value(&summary, "id");
+        let include = selected
+            .as_ref()
+            .map(|values| values.contains(&folder_id))
+            .unwrap_or_else(|| summary["selected"].as_bool().unwrap_or(false));
+        if !include {
+            continue;
+        }
+        summary
+            .as_object_mut()
+            .expect("folder summary")
+            .remove("selected");
+        summary
+            .as_object_mut()
+            .expect("folder summary")
+            .insert("uid".to_owned(), Value::String(uid.clone()));
+        let result = control.source(format!("favlist:{uid}:{folder_id}"), || {
+            let fresh = fetch_favlist_entries_controlled(client, &uid, folder, None, control)?;
+            let (entries, item_count) = control.commit(|| {
+                persist_favlist_source_expected(
+                    paths,
+                    &uid,
+                    &folder_id,
+                    &fresh,
+                    Some(&summary),
+                    existing_folders.contains(&folder_id),
+                )
+            })?;
+            Ok(json!({"uid":uid,"folder_id":folder_id,"item_count":item_count,"entries":entries}))
+        });
+        match result {
+            Ok((value, shared)) => {
+                matched += 1;
+                item_count += value["item_count"].as_u64().unwrap_or(0);
+                if !shared {
+                    additions.extend(array(&value, "entries").iter().cloned());
+                }
+            }
+            Err(failure) if failure.kind == "cancelled" => {
+                control.check()?;
+                continue;
+            }
+            Err(failure) => {
+                errors.push(json!({"uid":uid,"folder_id":folder_id,"error":failure.message}))
+            }
+        }
+    }
+    control.check()?;
+    let error_message = errors
+        .iter()
+        .map(|failure| {
+            format!(
+                "{}:{} {}",
+                uid,
+                text_value(failure, "folder_id"),
+                text_value(failure, "error")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Ok(
+        json!({"uid":uid,"folder_count":folders.len(),"matched_folder_count":matched,
+        "item_count":item_count,"updated_at":unix_timestamp(),"entries":dedupe_entries(&additions),
+        "favlist_succeeded":matched,"favlist_errors":errors,
+        "favlist_error":error_message}),
+    )
+}
+
+/// Read/merge/write under the short repository lock, never across HTTP work.
+/// A manual full scan replaces only its own folder; other source edits survive.
+fn persist_favlist_source(
+    paths: &GatchaPaths,
+    uid: &str,
+    id: &str,
+    incoming: &[Value],
+    replacement: Option<&Value>,
+) -> Result<(Vec<Value>, usize), GatchaRepositoryError> {
+    persist_favlist_source_expected(paths, uid, id, incoming, replacement, replacement.is_none())
+}
+
+fn persist_favlist_source_expected(
+    paths: &GatchaPaths,
+    uid: &str,
+    id: &str,
+    incoming: &[Value],
+    replacement: Option<&Value>,
+    require_existing: bool,
+) -> Result<(Vec<Value>, usize), GatchaRepositoryError> {
+    let _guard = repository_guard()?;
+    let mut current = load_favlist(&paths.favlist_file);
+    if require_existing
+        && !array(&current, "folders")
+            .iter()
+            .filter_map(Value::as_object)
+            .any(|folder| text_map(folder, "uid") == uid && folder_id(folder) == id)
+    {
+        return Err(error("cancelled", "收藏夹已删除，已丢弃过期拉取结果"));
+    }
+    let mut known_bvids: HashSet<String> = array(&current, "items")
+        .iter()
+        .filter_map(|entry| entry["bvid"].as_str().map(str::to_owned))
+        .collect();
+    let additions: Vec<_> = incoming
+        .iter()
+        .filter(|entry| {
+            entry["bvid"]
+                .as_str()
+                .is_some_and(|bvid| known_bvids.insert(bvid.to_owned()))
+        })
+        .cloned()
+        .collect();
+    let mut existing: Vec<Value> = array(&current, "items")
+        .iter()
+        .filter(|entry| {
+            entry.as_object().is_none_or(|object| {
+                replacement.is_none()
+                    || first_text(object, &["fav_uid"]).as_deref() != Some(uid)
+                    || first_text(object, &["fav_folder_id"]).as_deref() != Some(id)
+            })
+        })
+        .cloned()
+        .collect();
+    let entries = if replacement.is_some() {
+        existing.extend_from_slice(incoming);
+        dedupe_entries(&existing)
+    } else {
+        merge_incremental_entries(&existing, incoming).0
+    };
+    let item_count = entries
+        .iter()
+        .filter(|entry| {
+            text_value(entry, "fav_uid") == uid && text_value(entry, "fav_folder_id") == id
+        })
+        .count();
+    current["items"] = json!(entries);
+    if let Some(folder) = replacement {
+        let mut folders: BTreeMap<_, _> = array(&current, "folders")
+            .iter()
+            .filter_map(Value::as_object)
+            .map(|row| {
+                (
+                    (text_map(row, "uid"), folder_id(row)),
+                    Value::Object(row.clone()),
+                )
+            })
+            .collect();
+        folders.insert((uid.to_owned(), id.to_owned()), folder.clone());
+        current["folders"] = json!(folders.into_values().collect::<Vec<_>>());
+        let mut uids: BTreeSet<String> = normalized_strings(current.get("uids"))
+            .into_iter()
+            .collect();
+        uids.insert(uid.to_owned());
+        current["uids"] = json!(uids);
+        current["uid"] = json!(uid);
+    }
+    current["updated_at"] = json!(unix_timestamp());
+    atomic_write_json(&paths.favlist_file, &current)?;
+    Ok((additions, item_count))
+}
+
+fn refresh_existing_favlist(
+    paths: &GatchaPaths,
+    client: &BilibiliHttpClient,
+    control: &RefreshControl,
+    retry_folders: Option<&[Value]>,
+    notify: &dyn Fn(usize, usize, Option<&str>),
+) -> Result<Value, GatchaRepositoryError> {
+    refresh_existing_favlist_with(
+        paths,
+        control,
+        retry_folders,
+        notify,
+        &|uid, folder, checkpoint| {
+            fetch_favlist_entries_controlled(client, uid, folder, checkpoint, control)
+        },
+    )
+}
+
+fn refresh_existing_favlist_with(
+    paths: &GatchaPaths,
+    control: &RefreshControl,
+    retry_folders: Option<&[Value]>,
+    notify: &dyn Fn(usize, usize, Option<&str>),
+    fetch: &impl Fn(
+        &str,
+        &Map<String, Value>,
+        Option<&str>,
+    ) -> Result<Vec<Value>, GatchaRepositoryError>,
+) -> Result<Value, GatchaRepositoryError> {
+    let payload = load_favlist(&paths.favlist_file);
+    let folders = array(&payload, "folders");
+    let mut entries = Vec::new();
+    let mut errors = Vec::new();
+    let mut succeeded = 0;
+    for (index, folder) in folders.iter().filter_map(Value::as_object).enumerate() {
+        control.check()?;
+        let uid =
+            first_text(folder, &["uid", "mid"]).unwrap_or_else(|| text_value(&payload, "uid"));
+        let id = folder_id(folder);
+        if uid.is_empty()
+            || id.is_empty()
+            || retry_folders.is_some_and(|failed| {
+                !failed.is_empty()
+                    && !failed
+                        .iter()
+                        .any(|v| v["uid"] == uid && v["folder_id"] == id)
+            })
+        {
+            continue;
+        }
+        let checkpoint = array(&payload, "items")
+            .iter()
+            .find(|v| v["fav_uid"] == uid && v["fav_folder_id"] == id)
+            .and_then(|v| v["bvid"].as_str());
+        notify(index, folders.len(), Some(&id));
+        let source = control.source(format!("favlist:{uid}:{id}"), || {
+            let fresh = fetch(&uid, folder, checkpoint)?;
+            let (entries, item_count) =
+                control.commit(|| persist_favlist_source(paths, &uid, &id, &fresh, None))?;
+            Ok(json!({"uid":uid,"folder_id":id,"item_count":item_count,"entries":entries}))
+        });
+        let (source, shared) = match source {
+            Ok(value) => value,
+            Err(failure) if failure.kind == "cancelled" => return Err(failure),
+            Err(failure) => {
+                errors.push(json!({"uid":uid,"folder_id":id,"error":failure.message}));
+                continue;
+            }
+        };
+        if !shared {
+            entries.extend(array(&source, "entries").iter().cloned());
+        }
+        succeeded += 1;
+        notify(index + 1, folders.len(), None);
+    }
+    Ok(json!({"entries":dedupe_entries(&entries),"errors":errors,"succeeded":succeeded}))
+}
+
+fn fetch_profile(client: &BilibiliHttpClient, uid: &str) -> Result<Value, GatchaRepositoryError> {
+    let payload = client
+        .get_wbi_json(
+            SPACE_PROFILE_URL,
+            BTreeMap::from([("mid".to_owned(), uid.to_owned())]),
+            "UP 主信息获取失败",
+        )
+        .map_err(network_error)?;
+    let data = payload
+        .get("data")
+        .and_then(Value::as_object)
+        .ok_or_else(|| error("invalid_response", "UP 主信息获取失败"))?;
+    let resolved_uid = first_text(data, &["mid"]).unwrap_or_else(|| uid.to_owned());
+    let name = first_text(data, &["name"]).unwrap_or_default();
+    if normalize_uid(&resolved_uid).is_none() || name.is_empty() {
+        return Err(error("not_found", "没有找到这个 UID 对应的 UP 主"));
+    }
+    let mut profile = json!({
+        "uid": normalize_uid(&resolved_uid).unwrap_or(resolved_uid.clone()),
+        "name": name,
+        "space_url": format!("https://space.bilibili.com/{resolved_uid}"),
+    });
+    if let Some(avatar) = first_text(data, &["face"]) {
+        profile
+            .as_object_mut()
+            .expect("profile object")
+            .insert("avatar_url".to_owned(), Value::String(avatar));
+    }
+    Ok(profile)
+}
+
+fn uid_refresh_checkpoint(cache: &Value, uid: &str, existing: &[Value]) -> Option<String> {
+    if let Some(checkpoint) = cache
+        .pointer(&format!("/uid_checkpoints/{uid}"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(checkpoint.to_owned());
+    }
+
+    let added_count = cache
+        .pointer("/refresh_summary/uids")
+        .and_then(Value::as_array)
+        .and_then(|results| {
+            results.iter().find_map(|result| {
+                let object = result.as_object()?;
+                (first_text(object, &["uid"]).as_deref() == Some(uid)
+                    && first_text(object, &["mode"]).as_deref() == Some("incremental"))
+                .then(|| integer(object, &["added_count"]).unwrap_or(0).max(0) as usize)
+            })
+        })
+        .unwrap_or(0);
+
+    existing
+        .get(added_count)
+        .or_else(|| existing.first())
+        .and_then(Value::as_object)
+        .and_then(|entry| first_text(entry, &["bvid"]))
+}
+
+fn uid_refresh_checkpoints(cache: &Value, uids: &[String]) -> BTreeMap<String, Option<String>> {
+    uids.iter()
+        .map(|uid| {
+            let existing = cache
+                .pointer(&format!("/uids/{uid}"))
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            (uid.clone(), uid_refresh_checkpoint(cache, uid, existing))
+        })
+        .collect()
+}
+
+fn persist_uid_checkpoint(
+    cache: &mut Map<String, Value>,
+    uid: &str,
+    first_bvid: Option<&str>,
+) -> Result<(), GatchaRepositoryError> {
+    let checkpoints = cache
+        .entry("uid_checkpoints")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| error("state", "invalid Gacha UID checkpoints"))?;
+    if let Some(first_bvid) = first_bvid.map(str::trim).filter(|value| !value.is_empty()) {
+        checkpoints.insert(uid.to_owned(), Value::String(first_bvid.to_owned()));
+    }
+    Ok(())
+}
+
+fn fetch_uid_entries_controlled(
+    client: &BilibiliHttpClient,
+    uid: &str,
+    keywords: &[String],
+    stop_bvid: Option<&str>,
+    control: &RefreshControl,
+) -> Result<UidFetchResult, GatchaRepositoryError> {
+    let mut output = Vec::new();
+    let mut seen = HashSet::new();
+    let mut first_bvid = None;
+    let page_size = 50usize;
+    let mut page = 1usize;
+    loop {
+        control.check()?;
+        if page > 1 {
+            control.sleep(GATCHA_REQUEST_DELAY)?;
+        }
+        let payload = retry_request_controlled(
+            control,
+            GATCHA_REQUEST_DELAY,
+            |_| true,
+            || {
+                client.get_wbi_json_controlled(
+                    SPACE_ARC_URL,
+                    BTreeMap::from([
+                        ("mid".to_owned(), uid.to_owned()),
+                        ("ps".to_owned(), page_size.to_string()),
+                        ("tid".to_owned(), "0".to_owned()),
+                        ("pn".to_owned(), page.to_string()),
+                        ("order".to_owned(), "pubdate".to_owned()),
+                        ("platform".to_owned(), "web".to_owned()),
+                    ]),
+                    "稿件列表拉取失败",
+                    || control.check().is_err(),
+                )
+            },
+        )?;
+        let videos = payload
+            .pointer("/data/list/vlist")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        if page == 1 {
+            first_bvid = videos
+                .iter()
+                .filter_map(Value::as_object)
+                .find_map(|video| first_text(video, &["bvid"]));
+        }
+        let reached_checkpoint =
+            stop_bvid.is_some_and(|checkpoint| page_contains_bvid(videos, checkpoint));
+        output.extend(uid_page_entries(uid, videos, keywords, &mut seen));
+        if reached_checkpoint || videos.len() < page_size {
+            break;
+        }
+        page += 1;
+    }
+    Ok(UidFetchResult {
+        entries: output,
+        first_bvid,
+    })
+}
+
+fn uid_page_entries(
+    uid: &str,
+    videos: &[Value],
+    keywords: &[String],
+    seen: &mut HashSet<String>,
+) -> Vec<Value> {
+    let mut output = Vec::new();
+    for video in videos.iter().filter_map(Value::as_object) {
+        let bvid = first_text(video, &["bvid"]).unwrap_or_default();
+        let title = first_text(video, &["title"]).unwrap_or_default();
+        if bvid.is_empty()
+            || title.is_empty()
+            || (!keywords.is_empty()
+                && !keywords
+                    .iter()
+                    .any(|keyword| !keyword.is_empty() && title.contains(keyword)))
+            || !seen.insert(bvid.clone())
+        {
+            continue;
+        }
+        let owner_name = first_text(video, &["author", "owner_name"]).unwrap_or_default();
+        // A collaborator's space also lists joint submissions. Its UID is the
+        // source being scanned, while the video's mid identifies the uploader.
+        let owner_uid = first_text(video, &["mid", "owner_mid"]).unwrap_or_else(|| uid.to_owned());
+        let mut entry = json!({
+            "mid": owner_uid,
+            "bvid": bvid,
+            "title": title,
+            "url": format!("https://www.bilibili.com/video/{bvid}"),
+        });
+        let object = entry.as_object_mut().expect("entry object");
+        if !owner_name.is_empty() {
+            object.insert("owner_name".to_owned(), Value::String(owner_name));
+            object.insert(
+                "owner_url".to_owned(),
+                Value::String(format!("https://space.bilibili.com/{owner_uid}")),
+            );
+        }
+        add_video_extras(object, video);
+        output.push(entry);
+    }
+    output
+}
+
+// The standalone/source maintenance CLI keeps its original source UID and
+// filtered-page contract. Reuse parsing/extras/WBI; do not change Host refresh.
+pub(crate) fn source_catalog_uid_page(
+    client: &BilibiliHttpClient,
+    uid: &str,
+    page: usize,
+    keywords: &[String],
+) -> Result<(Vec<Value>, usize), BilibiliServiceError> {
+    let payload = client.get_wbi_json(
+        SPACE_ARC_URL,
+        BTreeMap::from([
+            ("mid".into(), uid.into()),
+            ("ps".into(), "50".into()),
+            ("tid".into(), "0".into()),
+            ("pn".into(), page.to_string()),
+            ("order".into(), "pubdate".into()),
+            ("platform".into(), "web".into()),
+        ]),
+        "稿件列表拉取失败",
+    )?;
+    let mut output = Vec::new();
+    for video in payload
+        .pointer("/data/list/vlist")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        for mut item in uid_page_entries(
+            uid,
+            std::slice::from_ref(video),
+            keywords,
+            &mut HashSet::new(),
+        ) {
+            item["mid"] = json!(uid);
+            if item.get("owner_url").is_some() {
+                item["owner_url"] = json!(format!("https://space.bilibili.com/{uid}"));
+            }
+            output.push(item);
+        }
+    }
+    Ok((
+        output,
+        payload
+            .pointer("/data/page/count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize,
+    ))
+}
+
+/// One page for the explicit monthly catalog job; uses the same WBI client and
+/// entry interpretation as configured-library refresh, without changing local caches.
+#[cfg(feature = "native-host")]
+pub(crate) fn catalog_uid_page(
+    client: &BilibiliHttpClient,
+    uid: &str,
+    page: usize,
+    keywords: &[String],
+) -> Result<(Vec<Value>, usize, usize), BilibiliServiceError> {
+    let payload = client.get_wbi_json(
+        SPACE_ARC_URL,
+        BTreeMap::from([
+            ("mid".into(), uid.into()),
+            ("ps".into(), "50".into()),
+            ("tid".into(), "0".into()),
+            ("pn".into(), page.to_string()),
+            ("order".into(), "pubdate".into()),
+            ("platform".into(), "web".into()),
+        ]),
+        "稿件列表拉取失败",
+    )?;
+    let videos = payload
+        .pointer("/data/list/vlist")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let total = payload
+        .pointer("/data/page/count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    Ok((
+        uid_page_entries(uid, videos, keywords, &mut HashSet::new()),
+        total,
+        videos.len(),
+    ))
+}
+
+fn page_contains_bvid(videos: &[Value], checkpoint: &str) -> bool {
+    videos
+        .iter()
+        .filter_map(Value::as_object)
+        .filter_map(|video| first_text(video, &["bvid"]))
+        .any(|bvid| bvid == checkpoint)
+}
+
+fn fetch_favlist_folders(
+    client: &BilibiliHttpClient,
+    uid: &str,
+) -> Result<Vec<Value>, GatchaRepositoryError> {
+    let query = encode_query(&[("up_mid", uid.to_owned()), ("platform", "web".to_owned())]);
+    let payload = retry_request(
+        FAVLIST_REQUEST_DELAY,
+        |error| error.kind == "risk_control",
+        || {
+            client.get_api_json(
+                &format!("{FAVLIST_FOLDERS_URL}?{query}"),
+                "收藏夹列表拉取失败",
+            )
+        },
+    )?;
+    Ok(payload
+        .pointer("/data/list")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default())
+}
+
+fn fetch_favlist_entries_controlled(
+    client: &BilibiliHttpClient,
+    uid: &str,
+    folder: &Map<String, Value>,
+    checkpoint: Option<&str>,
+    control: &RefreshControl,
+) -> Result<Vec<Value>, GatchaRepositoryError> {
+    let media_id = folder_id(folder);
+    if media_id.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut output = Vec::new();
+    let page_size = 20usize;
+    let mut page = 1usize;
+    loop {
+        control.check()?;
+        if page > 1 {
+            control.sleep(FAVLIST_REQUEST_DELAY)?;
+        }
+        let query = encode_query(&[
+            ("media_id", media_id.clone()),
+            ("platform", "web".to_owned()),
+            ("pn", page.to_string()),
+            ("ps", page_size.to_string()),
+            ("order", "mtime".to_owned()),
+            ("type", "0".to_owned()),
+        ]);
+        let payload = retry_request_controlled(
+            control,
+            FAVLIST_REQUEST_DELAY,
+            |error| error.kind == "risk_control",
+            || {
+                client.get_api_json_controlled(
+                    &format!("{FAVLIST_ITEMS_URL}?{query}"),
+                    "收藏夹内容拉取失败",
+                    || control.check().is_err(),
+                )
+            },
+        )?;
+        let data = payload.get("data").and_then(Value::as_object);
+        let medias = data
+            .and_then(|value| value.get("medias"))
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let folder_title = first_text(folder, &["title"]).unwrap_or_default();
+        for media in medias.iter().filter_map(Value::as_object) {
+            let bvid = first_text(media, &["bvid"]).unwrap_or_default();
+            let title = first_text(media, &["title"]).unwrap_or_default();
+            if bvid.is_empty() || title.is_empty() {
+                continue;
+            }
+            let upper = media.get("upper").and_then(Value::as_object);
+            let owner_uid = upper
+                .and_then(|value| first_text(value, &["mid"]))
+                .or_else(|| first_text(media, &["upper_mid"]))
+                .unwrap_or_default();
+            let owner_name = upper
+                .and_then(|value| first_text(value, &["name"]))
+                .or_else(|| first_text(media, &["upper_name"]))
+                .unwrap_or_default();
+            let mut entry = json!({
+                "mid": owner_uid,
+                "bvid": bvid,
+                "title": title,
+                "url": format!("https://www.bilibili.com/video/{bvid}"),
+                "fav_uid": uid,
+                "fav_folder_id": media_id,
+                "fav_folder_title": folder_title,
+                "source": "favlist",
+            });
+            let object = entry.as_object_mut().expect("entry object");
+            if !owner_name.is_empty() {
+                object.insert("owner_name".to_owned(), Value::String(owner_name));
+            }
+            if !owner_uid.is_empty() {
+                object.insert(
+                    "owner_url".to_owned(),
+                    Value::String(format!("https://space.bilibili.com/{owner_uid}")),
+                );
+            }
+            add_video_extras(object, media);
+            output.push(entry);
+        }
+        let media_count = data
+            .and_then(|value| value.get("info"))
+            .and_then(Value::as_object)
+            .and_then(|value| integer(value, &["media_count"]))
+            .unwrap_or(0)
+            .max(0) as usize;
+        let has_more = data
+            .and_then(|value| value.get("has_more"))
+            .and_then(Value::as_bool);
+        if medias.is_empty()
+            || checkpoint.is_some_and(|bvid| page_contains_bvid(medias, bvid))
+            || (media_count > 0 && page * page_size >= media_count)
+            || (media_count == 0 && medias.len() < page_size)
+            || has_more == Some(false)
+        {
+            break;
+        }
+        page += 1;
+    }
+    Ok(output)
+}
+
+fn folder_summary(folder: &Map<String, Value>, keywords: &[String]) -> Option<Value> {
+    let id = folder_id(folder);
+    let title = first_text(folder, &["title"]).unwrap_or_default();
+    if id.is_empty() || title.is_empty() {
+        return None;
+    }
+    let normalized = title.to_lowercase().replace(['ｋ', 'Ｋ'], "k");
+    Some(json!({
+        "id": id,
+        "fid": first_text(folder, &["fid"]).unwrap_or_default(),
+        "title": title,
+        "media_count": integer(folder, &["media_count"]).unwrap_or(0),
+        "selected": keywords.iter().any(|keyword| normalized.contains(&keyword.to_lowercase())),
+    }))
+}
+
+fn public_folder(folder: &Map<String, Value>) -> bool {
+    integer(folder, &["attr"]).unwrap_or(0) & 1 == 0
+}
+
+fn folder_id(folder: &Map<String, Value>) -> String {
+    first_text(folder, &["id", "media_id", "fid"])
+        .filter(|value| value.chars().all(|character| character.is_ascii_digit()))
+        .unwrap_or_default()
+}
+
+fn add_video_extras(target: &mut Map<String, Value>, source: &Map<String, Value>) {
+    if let Some(value) = first_text(
+        source,
+        &["cover_url", "cover", "pic", "pic_url", "thumbnail"],
+    ) {
+        target.insert("cover_url".to_owned(), Value::String(value));
+    }
+    let played = first_text(
+        source,
+        &["played_count", "play_count", "play", "view", "views"],
+    )
+    .or_else(|| {
+        source
+            .get("cnt_info")
+            .and_then(Value::as_object)
+            .and_then(|value| first_text(value, &["play", "view", "played_count"]))
+    })
+    .or_else(|| {
+        source
+            .get("stat")
+            .and_then(Value::as_object)
+            .and_then(|value| first_text(value, &["view", "play", "played_count"]))
+    });
+    if let Some(value) = played {
+        target.insert("played_count".to_owned(), Value::String(value));
+    }
+    if let Some(value) = duration_text(source.get("duration").or_else(|| source.get("length"))) {
+        target.insert("preserved_1".to_owned(), Value::String(value));
+    }
+}
+
+fn duration_text(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    if let Some(seconds) = value.as_u64() {
+        return Some(seconds.to_string());
+    }
+    if let Some(seconds) = value
+        .as_f64()
+        .filter(|value| value.is_finite() && *value >= 0.0)
+    {
+        return Some((seconds as u64).to_string());
+    }
+    let text = value.as_str()?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if text.contains(':') {
+        let mut seconds = 0u64;
+        for part in text.split(':') {
+            seconds = seconds.checked_mul(60)?.checked_add(part.parse().ok()?)?;
+        }
+        return Some(seconds.to_string());
+    }
+    text.parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .map(|value| (value as u64).to_string())
+        .or_else(|| Some(text.to_owned()))
+}
+
+fn merge_incremental_entries(existing: &[Value], fresh: &[Value]) -> (Vec<Value>, usize) {
+    let mut existing = dedupe_entries(existing);
+    let indexes: std::collections::HashMap<String, usize> = existing
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| entry_key(entry).map(|key| (key, index)))
+        .collect();
+    let mut new_entries = Vec::new();
+    for fresh_entry in dedupe_entries(fresh) {
+        let Some(key) = entry_key(&fresh_entry) else {
+            continue;
+        };
+        if let Some(index) = indexes.get(&key) {
+            merge_entry_fields(&mut existing[*index], &fresh_entry);
+        } else {
+            new_entries.push(fresh_entry);
+        }
+    }
+    let added = new_entries.len();
+    new_entries.extend(existing);
+    (new_entries, added)
+}
+
+fn entry_key(value: &Value) -> Option<String> {
+    let entry = value.as_object()?;
+    let bvid = first_text(entry, &["bvid"])?;
+    let uid = first_text(entry, &["fav_uid"]).unwrap_or_default();
+    let folder = first_text(entry, &["fav_folder_id"]).unwrap_or_default();
+    Some(if !uid.is_empty() && !folder.is_empty() {
+        format!("favlist:{uid}:{folder}:{bvid}")
+    } else {
+        bvid
+    })
+}
+
+fn merge_entry_fields(existing: &mut Value, fresh: &Value) {
+    let (Some(existing), Some(fresh)) = (existing.as_object_mut(), fresh.as_object()) else {
+        return;
+    };
+    for key in [
+        "mid",
+        "title",
+        "url",
+        "owner_name",
+        "owner_url",
+        "cover_url",
+        "preserved_1",
+        "preserved_2",
+        "preserved_3",
+        "preserved_4",
+        "preserved_5",
+    ] {
+        let current = first_text(existing, &[key]).unwrap_or_default();
+        if current.is_empty()
+            && let Some(value) = fresh.get(key).filter(|value| !value.is_null())
+        {
+            existing.insert(key.to_owned(), value.clone());
+        }
+    }
+    if let Some(value) = fresh.get("played_count").filter(|value| !value.is_null()) {
+        existing.insert("played_count".to_owned(), value.clone());
+    }
+}
+
+fn encode_query(values: &[(&str, String)]) -> String {
+    let mut serializer = form_urlencoded::Serializer::new(String::new());
+    for (key, value) in values {
+        serializer.append_pair(key, value);
+    }
+    serializer.finish()
+}
+
+pub(crate) fn required_uid(value: &str) -> Result<String, GatchaRepositoryError> {
+    let value = value.trim();
+    let parsed = url::Url::parse(value)
+        .or_else(|_| url::Url::parse(&format!("https://{value}")))
+        .ok();
+    let uid = parsed
+        .as_ref()
+        .and_then(|url| {
+            (matches!(url.scheme(), "http" | "https")
+                && url.host_str() == Some("space.bilibili.com"))
+            .then(|| {
+                url.path()
+                    .trim_matches('/')
+                    .split('/')
+                    .next()
+                    .unwrap_or_default()
+            })
+        })
+        .unwrap_or(value);
+    normalize_uid(uid).ok_or_else(|| error("invalid_request", "UID 格式不正确"))
+}
+
+fn valid_profile(value: &Value) -> bool {
+    value.as_object().is_some_and(|profile| {
+        first_text(profile, &["uid"]).is_some() && first_text(profile, &["name"]).is_some()
+    })
+}
+
+fn text_value(value: &Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(|value| match value {
+            Value::String(text) => Some(text.trim().to_owned()),
+            Value::Number(number) => Some(number.to_string()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+fn network_error(value: BilibiliServiceError) -> GatchaRepositoryError {
+    error(&value.kind, value.message)
+}
+
+fn retry_request<T, Retry, Request>(
+    delay: Duration,
+    should_retry: Retry,
+    request: Request,
+) -> Result<T, GatchaRepositoryError>
+where
+    Retry: Fn(&BilibiliServiceError) -> bool,
+    Request: FnMut() -> Result<T, BilibiliServiceError>,
+{
+    retry_request_controlled(&RefreshControl::default(), delay, should_retry, request)
+}
+
+fn retry_request_controlled<T, Retry, Request>(
+    control: &RefreshControl,
+    delay: Duration,
+    should_retry: Retry,
+    mut request: Request,
+) -> Result<T, GatchaRepositoryError>
+where
+    Retry: Fn(&BilibiliServiceError) -> bool,
+    Request: FnMut() -> Result<T, BilibiliServiceError>,
+{
+    for attempt in 0..3 {
+        control.check()?;
+        match request() {
+            Ok(value) => return Ok(value),
+            Err(failure) if attempt < 2 && should_retry(&failure) => control.sleep(delay)?,
+            Err(failure) => return Err(network_error(failure)),
+        }
+    }
+    unreachable!("bounded retry loop always returns")
+}
+
+fn draw_candidate(
+    paths: &GatchaPaths,
+    cookie_available: bool,
+    pool_config: Option<&Value>,
+) -> Result<Value, GatchaRepositoryError> {
+    let uid_payload = uid_snapshot(&paths.uid_file, &[])?;
+    let cache = load_cache(&paths.cache_file);
+    let favlist = load_favlist(&paths.favlist_file);
+    let config = pool_config
+        .map(normalize_pool_config)
+        .unwrap_or_else(|| load_pool_config(&paths.pool_config_file));
+    let excluded_uids: HashSet<String> = normalized_strings(config.get("excluded_uids"))
+        .into_iter()
+        .collect();
+    let excluded_folders: HashSet<String> =
+        normalized_strings(config.get("excluded_favlist_folders"))
+            .into_iter()
+            .collect();
+    let uid_weight = integer_value(config.get("uid_weight"))
+        .unwrap_or(50)
+        .clamp(0, 100) as u32;
+    let favlist_weight = integer_value(config.get("favlist_weight"))
+        .unwrap_or(50)
+        .clamp(0, 100) as u32;
+    let cache_uids = cache.get("uids").and_then(Value::as_object);
+    let mut uid_candidates: Vec<(String, Vec<Value>)> = Vec::new();
+    for uid in normalized_strings(uid_payload.get("uids")) {
+        if uid_weight == 0 || excluded_uids.contains(&uid) {
+            continue;
+        }
+        let entries = cache_uids
+            .and_then(|values| values.get(&uid))
+            .and_then(Value::as_array)
+            .map(|values| valid_entries(values))
+            .unwrap_or_default();
+        if !entries.is_empty() {
+            uid_candidates.push((uid, entries));
+        }
+    }
+    let mut fav_candidates = Vec::new();
+    if favlist_weight > 0 {
+        for value in array(&favlist, "items") {
+            let Some(object) = value.as_object() else {
+                continue;
+            };
+            if expired_entry(object) {
+                continue;
+            }
+            let uid = first_text(object, &["fav_uid"]).unwrap_or_default();
+            let folder = first_text(object, &["fav_folder_id"]).unwrap_or_default();
+            let compound = if uid.is_empty() {
+                folder.clone()
+            } else {
+                format!("{uid}:{folder}")
+            };
+            if excluded_folders.contains(&folder) || excluded_folders.contains(&compound) {
+                continue;
+            }
+            fav_candidates.push(value.clone());
+        }
+    }
+    if uid_candidates.is_empty() && fav_candidates.is_empty() {
+        return Err(if cookie_available {
+            error("empty_pool", "本地稿件缓存还没准备好，请稍后再试")
+        } else {
+            error("missing_cookie", "请登录 Bilibili 账号或输入 Cookie")
+        });
+    }
+    let choose_favlist = match (uid_candidates.is_empty(), fav_candidates.is_empty()) {
+        (true, false) => true,
+        (false, true) => false,
+        (false, false) => {
+            let total = (uid_weight + favlist_weight).max(1);
+            random_index(total as usize) < favlist_weight as usize
+        }
+        (true, true) => false,
+    };
+    if choose_favlist {
+        let chosen = fav_candidates
+            .get(random_index(fav_candidates.len()))
+            .and_then(Value::as_object)
+            .ok_or_else(|| error("empty_pool", "收藏夹卡池没有可用稿件"))?;
+        return Ok(candidate_payload(chosen, "favlist", None));
+    }
+    let (uid, entries) = uid_candidates
+        .get(random_index(uid_candidates.len()))
+        .ok_or_else(|| error("empty_pool", "UID 卡池没有可用稿件"))?;
+    let chosen = entries
+        .get(random_index(entries.len()))
+        .and_then(Value::as_object)
+        .ok_or_else(|| error("empty_pool", "UID 卡池没有可用稿件"))?;
+    Ok(candidate_payload(chosen, "cache", Some(uid)))
+}
+
+fn search(
+    paths: &GatchaPaths,
+    query: &str,
+    offset: usize,
+    limit: usize,
+) -> Result<Value, GatchaRepositoryError> {
+    if offset > 100_000 {
+        return Err(error("invalid_offset", "Search offset is out of range"));
+    }
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return Ok(json!({"items": []}));
+    }
+    let cache = load_cache(&paths.cache_file);
+    let favlist = load_favlist(&paths.favlist_file);
+    let configured = uid_snapshot(&paths.uid_file, &[])?;
+    let mut values: Vec<Value> = array(&configured, "uids")
+        .iter()
+        .filter_map(Value::as_str)
+        .flat_map(|uid| array(&cache["uids"], uid).iter().cloned())
+        .collect();
+    values.extend(array(&favlist, "items").iter().cloned());
+    let mut seen = HashSet::new();
+    let matches: Vec<_> = values
+        .iter()
+        .filter_map(Value::as_object)
+        .filter(|entry| {
+            first_text(entry, &["title"])
+                .unwrap_or_default()
+                .to_lowercase()
+                .contains(&needle)
+        })
+        .filter(|entry| first_text(entry, &["bvid"]).is_some_and(|bvid| seen.insert(bvid)))
+        .collect();
+    let matched_count = matches.len();
+    let items: Vec<_> = matches
+        .into_iter()
+        .skip(offset)
+        .take(limit.clamp(1, 500))
+        .map(entry_payload)
+        .collect();
+    let next_offset = offset + items.len();
+    Ok(
+        json!({"items": items, "matched_count": matched_count, "offset": offset,
+        "next_offset": next_offset, "has_more": next_offset < matched_count}),
+    )
+}
+
+/// Enrich read projections and return whether the local library has candidates.
+#[cfg(any(feature = "native-host", test))]
+pub(crate) fn annotate_local(
+    paths: &GatchaPaths,
+    items: &mut [Value],
+) -> Result<bool, GatchaRepositoryError> {
+    let configured = uid_snapshot(&paths.uid_file, &[])?;
+    let cache = load_cache(&paths.cache_file);
+    let favorites = load_favlist(&paths.favlist_file);
+    let followed: BTreeMap<_, _> = array(&configured, "uids")
+        .iter()
+        .filter_map(Value::as_str)
+        .flat_map(|uid| array(&cache["uids"], uid))
+        .filter_map(|entry| Some((entry["bvid"].as_str()?, entry)))
+        .collect();
+    let favorited: BTreeMap<_, _> = array(&favorites, "items")
+        .iter()
+        .filter_map(|entry| Some((entry["bvid"].as_str()?, entry)))
+        .collect();
+    let profiles: BTreeMap<_, _> = cache["profiles"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .chain(configured["profiles"].as_object().into_iter().flatten())
+        .collect();
+    for item in items {
+        let Some(item) = item.as_object_mut() else {
+            continue;
+        };
+        let bv = item.get("bvid").and_then(Value::as_str).unwrap_or_default();
+        if let Some(entry) = favorited.get(bv) {
+            item.insert("local_source".into(), json!("favlist"));
+            for key in ["fav_uid", "fav_folder_title"] {
+                item.entry(key).or_insert_with(|| entry[key].clone());
+            }
+        } else if let Some(entry) = followed.get(bv) {
+            item.insert("local_source".into(), json!("follow"));
+            item.entry("mid").or_insert_with(|| entry["mid"].clone());
+        }
+        if first_text(item, &["owner_avatar_url", "avatar_url"]).is_some() {
+            continue;
+        }
+        let name = first_text(item, &["owner_name", "author"])
+            .unwrap_or_default()
+            .to_lowercase();
+        let uid = first_text(item, &["owner_mid", "mid"]).unwrap_or_default();
+        let profile = profiles
+            .get(&uid)
+            .copied()
+            .filter(|profile| {
+                name.is_empty()
+                    || profile["name"].as_str().unwrap_or_default().to_lowercase() == name
+            })
+            .or_else(|| {
+                profiles
+                    .values()
+                    .find(|p| {
+                        !name.is_empty()
+                            && p["name"].as_str().unwrap_or_default().to_lowercase() == name
+                    })
+                    .copied()
+            });
+        if let Some(avatar) = profile
+            .and_then(|p| p["avatar_url"].as_str())
+            .filter(|s| !s.is_empty())
+        {
+            item.insert("owner_avatar_url".into(), json!(avatar));
+        }
+    }
+    Ok(!followed.is_empty() || !favorited.is_empty())
+}
+
+fn browse_uid(
+    paths: &GatchaPaths,
+    selected_uid: &str,
+    query: &str,
+    offset: usize,
+    limit: usize,
+) -> Result<Value, GatchaRepositoryError> {
+    let uid_payload = uid_snapshot(&paths.uid_file, &[])?;
+    let cache = load_cache(&paths.cache_file);
+    let configured = normalized_strings(uid_payload.get("uids"));
+    let profiles = uid_payload.get("profiles").and_then(Value::as_object);
+    let cache_profiles = cache.get("profiles").and_then(Value::as_object);
+    let cache_uids = cache.get("uids").and_then(Value::as_object);
+    let mut owners = Vec::new();
+    for uid in &configured {
+        let entries = cache_uids
+            .and_then(|values| values.get(uid))
+            .and_then(Value::as_array)
+            .map(|values| dedupe_entries(values))
+            .unwrap_or_default();
+        let profile = profiles
+            .and_then(|values| values.get(uid))
+            .and_then(Value::as_object)
+            .or_else(|| {
+                cache_profiles
+                    .and_then(|values| values.get(uid))
+                    .and_then(Value::as_object)
+            });
+        let name = profile
+            .and_then(|value| first_text(value, &["name"]))
+            .or_else(|| {
+                entries
+                    .iter()
+                    .filter_map(Value::as_object)
+                    .find_map(|entry| first_text(entry, &["owner_name", "author"]))
+            })
+            .unwrap_or_else(|| format!("UID {uid}"));
+        owners.push(json!({
+            "uid": uid,
+            "name": name,
+            "space_url": profile.and_then(|value| first_text(value, &["space_url"])).unwrap_or_else(|| format!("https://space.bilibili.com/{uid}")),
+            "avatar_url": profile.and_then(|value| first_text(value, &["avatar_url"])).unwrap_or_default(),
+            "count": entries.len(),
+        }));
+    }
+    let selected = selected_uid.trim();
+    let valid_selected = if configured.iter().any(|uid| uid == selected) {
+        selected
+    } else {
+        ""
+    };
+    let needle = query.trim().to_lowercase();
+    let matched_items: Vec<Value> = if valid_selected.is_empty() {
+        Vec::new()
+    } else {
+        cache_uids
+            .and_then(|values| values.get(valid_selected))
+            .and_then(Value::as_array)
+            .map(|values| {
+                dedupe_entries(values)
+                    .iter()
+                    .filter_map(Value::as_object)
+                    .filter(|entry| {
+                        needle.is_empty()
+                            || first_text(entry, &["title"])
+                                .unwrap_or_default()
+                                .to_lowercase()
+                                .contains(&needle)
+                    })
+                    .map(entry_payload)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let bounded_limit = limit.clamp(1, 10_000);
+    let matched_count = matched_items.len();
+    let items: Vec<Value> = matched_items
+        .into_iter()
+        .skip(offset)
+        .take(bounded_limit)
+        .collect();
+    let next_offset = offset.saturating_add(items.len()).min(matched_count);
+    let display = source_order::project(paths, "uid", &mut owners, "uid");
+    let mut result = json!({
+        "owners": owners,
+        "selected_uid": valid_selected,
+        "query": query.trim(),
+        "offset": offset,
+        "limit": bounded_limit,
+        "matched_count": matched_count,
+        "has_more": next_offset < matched_count,
+        "next_offset": next_offset,
+        "items": items,
+        "updated_at": number(&cache, "updated_at"),
+    });
+    result
+        .as_object_mut()
+        .unwrap()
+        .extend(display.as_object().unwrap().clone());
+    Ok(result)
+}
+
+fn browse_favlist(
+    paths: &GatchaPaths,
+    selected_folder: &str,
+    query: &str,
+    offset: usize,
+    limit: usize,
+) -> Result<Value, GatchaRepositoryError> {
+    let payload = load_favlist(&paths.favlist_file);
+    let cache = load_cache(&paths.cache_file);
+    let uid_payload = uid_snapshot(&paths.uid_file, &[])?;
+    let profiles = uid_payload.get("profiles").and_then(Value::as_object);
+    let cache_profiles = cache.get("profiles").and_then(Value::as_object);
+    let legacy_uid = payload
+        .get("uid")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mut folders = Vec::new();
+    for value in array(&payload, "folders") {
+        let Some(folder) = value.as_object() else {
+            continue;
+        };
+        let folder_id = first_text(folder, &["media_id", "id", "fid"]).unwrap_or_default();
+        if folder_id.is_empty() {
+            continue;
+        }
+        let uid = first_text(folder, &["uid", "mid"]).unwrap_or_else(|| legacy_uid.to_owned());
+        let profile = profiles
+            .and_then(|values| values.get(&uid))
+            .and_then(Value::as_object)
+            .or_else(|| {
+                cache_profiles
+                    .and_then(|values| values.get(&uid))
+                    .and_then(Value::as_object)
+            });
+        folders.push(json!({
+            "id": browser_folder_id(&uid, &folder_id),
+            "folder_id": folder_id,
+            "fid": first_text(folder, &["fid"]).unwrap_or_default(),
+            "title": first_text(folder, &["title"]).unwrap_or_else(|| folder_id.clone()),
+            "media_count": integer(folder, &["media_count"]).unwrap_or(0),
+            "count": integer(folder, &["media_count"]).unwrap_or(0),
+            "uid": uid,
+            "avatar_url": profile.and_then(|value| first_text(value, &["avatar_url"])).unwrap_or_default(),
+        }));
+    }
+    let mut selected = selected_folder.trim().to_owned();
+    if !selected.is_empty()
+        && !folders
+            .iter()
+            .any(|folder| folder.get("id").and_then(Value::as_str) == Some(&selected))
+    {
+        let matches: Vec<&Value> = folders
+            .iter()
+            .filter(|folder| folder.get("folder_id").and_then(Value::as_str) == Some(&selected))
+            .collect();
+        selected = if matches.len() == 1 {
+            matches[0]
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        } else {
+            String::new()
+        };
+    }
+    let (selected_uid, selected_id) = split_folder_id(&selected);
+    let needle = query.trim().to_lowercase();
+    let matched_items: Vec<Value> = if selected.is_empty() {
+        Vec::new()
+    } else {
+        dedupe_entries(array(&payload, "items"))
+            .iter()
+            .filter_map(Value::as_object)
+            .filter(|entry| {
+                first_text(entry, &["fav_folder_id"]).as_deref() == Some(selected_id.as_str())
+                    && (selected_uid.is_empty()
+                        || first_text(entry, &["fav_uid"]).as_deref()
+                            == Some(selected_uid.as_str()))
+                    && (needle.is_empty()
+                        || first_text(entry, &["title"])
+                            .unwrap_or_default()
+                            .to_lowercase()
+                            .contains(&needle))
+            })
+            .map(entry_payload)
+            .collect()
+    };
+    let bounded_limit = limit.clamp(1, 10_000);
+    let matched_count = matched_items.len();
+    let items: Vec<Value> = matched_items
+        .into_iter()
+        .skip(offset)
+        .take(bounded_limit)
+        .collect();
+    let next_offset = offset.saturating_add(items.len()).min(matched_count);
+    let display = source_order::project(paths, "favlist", &mut folders, "id");
+    let mut result = json!({
+        "folders": folders,
+        "selected_folder_id": selected,
+        "query": query.trim(),
+        "offset": offset,
+        "limit": bounded_limit,
+        "matched_count": matched_count,
+        "has_more": next_offset < matched_count,
+        "next_offset": next_offset,
+        "items": items,
+        "updated_at": number(&payload, "updated_at"),
+    });
+    result
+        .as_object_mut()
+        .unwrap()
+        .extend(display.as_object().unwrap().clone());
+    Ok(result)
+}
+
+fn candidate_payload(entry: &Map<String, Value>, source: &str, uid: Option<&String>) -> Value {
+    let mut payload = Map::new();
+    payload.insert(
+        "mid".to_owned(),
+        Value::String(
+            first_text(entry, &["mid"])
+                .or_else(|| uid.cloned())
+                .unwrap_or_default(),
+        ),
+    );
+    for key in ["bvid", "title", "url", "owner_name", "owner_url"] {
+        payload.insert(
+            key.to_owned(),
+            Value::String(first_text(entry, &[key]).unwrap_or_default()),
+        );
+    }
+    payload.insert("source".to_owned(), Value::String(source.to_owned()));
+    for key in ["cover_url", "played_count", "preserved_1"] {
+        if let Some(value) = first_text(entry, &[key]) {
+            payload.insert(key.to_owned(), Value::String(value));
+        }
+    }
+    Value::Object(payload)
+}
+
+#[cfg(test)]
+mod candidate_card_tests {
+    use super::*;
+
+    #[test]
+    fn random_candidates_keep_cover_duration_plays_and_uploader_metadata() {
+        let entry = json!({"bvid":"BV1z84y1p7oS","title":"Test song","url":"https://www.bilibili.com/video/BV1z84y1p7oS",
+            "owner_name":"Test UP","owner_url":"https://space.bilibili.com/42","cover_url":"https://i0.hdslb.com/test.jpg",
+            "played_count":"1234","preserved_1":"241","cookie":"never export"});
+        for source in ["cache", "favlist"] {
+            let candidate = candidate_payload(entry.as_object().unwrap(), source, None);
+            for key in [
+                "owner_name",
+                "owner_url",
+                "cover_url",
+                "played_count",
+                "preserved_1",
+            ] {
+                assert_eq!(candidate[key], entry[key]);
+            }
+            assert!(candidate.get("cookie").is_none());
+        }
+    }
+}
+
+fn entry_payload(entry: &Map<String, Value>) -> Value {
+    let mut payload = Map::new();
+    for (target, keys) in [
+        ("mid", &["mid"][..]),
+        ("bvid", &["bvid"][..]),
+        ("title", &["title"][..]),
+        ("url", &["url"][..]),
+        ("owner_name", &["owner_name", "author"][..]),
+        ("owner_url", &["owner_url"][..]),
+    ] {
+        payload.insert(
+            target.to_owned(),
+            Value::String(first_text(entry, keys).unwrap_or_default()),
+        );
+    }
+    for key in [
+        "source",
+        "fav_uid",
+        "fav_folder_id",
+        "fav_folder_title",
+        "cover_url",
+        "played_count",
+        "preserved_1",
+    ] {
+        if let Some(value) = first_text(entry, &[key]) {
+            payload.insert(key.to_owned(), Value::String(value));
+        }
+    }
+    Value::Object(payload)
+}
+
+fn valid_entries(values: &[Value]) -> Vec<Value> {
+    values
+        .iter()
+        .filter(|value| value.as_object().is_some_and(|entry| !expired_entry(entry)))
+        .cloned()
+        .collect()
+}
+
+fn expired_entry(entry: &Map<String, Value>) -> bool {
+    first_text(entry, &["title"]).as_deref() == Some(EXPIRED_VIDEO_TITLE)
+}
+
+fn dedupe_entries(values: &[Value]) -> Vec<Value> {
+    let mut seen = HashSet::new();
+    let mut output = Vec::new();
+    for value in values {
+        let Some(entry) = value.as_object() else {
+            continue;
+        };
+        let bvid = first_text(entry, &["bvid"]).unwrap_or_default();
+        if bvid.is_empty() {
+            continue;
+        }
+        let fav_uid = first_text(entry, &["fav_uid"]).unwrap_or_default();
+        let folder_id = first_text(entry, &["fav_folder_id"]).unwrap_or_default();
+        let key = if !fav_uid.is_empty() && !folder_id.is_empty() {
+            format!("favlist:{fav_uid}:{folder_id}:{bvid}")
+        } else {
+            bvid
+        };
+        if seen.insert(key) {
+            output.push(value.clone());
+        }
+    }
+    output
+}
+
+type CachedObject = (PathBuf, SystemTime, u64, Map<String, Value>);
+static READ_CACHE: OnceLock<Mutex<VecDeque<CachedObject>>> = OnceLock::new();
+
+fn read_object(path: &Path) -> Option<Map<String, Value>> {
+    let metadata = fs::metadata(path).ok()?;
+    let modified = metadata.modified().ok()?;
+    let cache = READ_CACHE.get_or_init(Mutex::default);
+    {
+        let mut cached = cache.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(index) = cached.iter().position(|(key, stamp, len, _)| {
+            key == path && *stamp == modified && *len == metadata.len()
+        }) {
+            let entry = cached.remove(index).unwrap();
+            let value = entry.3.clone();
+            cached.push_back(entry);
+            return Some(value);
+        }
+    }
+    let bytes = fs::read(path).ok()?;
+    let value = serde_json::from_slice::<Value>(&bytes)
+        .ok()?
+        .as_object()?
+        .clone();
+    // This is only a bounded read projection. Atomic repository writes evict it;
+    // external legacy writers are detected through modification time and size.
+    if bytes.len() <= 16 * 1024 * 1024 && fs::metadata(path).ok()?.modified().ok()? == modified {
+        let mut cached = cache.lock().unwrap_or_else(|p| p.into_inner());
+        cached.retain(|(key, _, _, _)| key != path);
+        while cached.len() >= 4 {
+            cached.pop_front();
+        }
+        cached.push_back((path.to_owned(), modified, metadata.len(), value.clone()));
+    }
+    Some(value)
+}
+
+fn atomic_write_json(path: &Path, payload: &Value) -> Result<(), GatchaRepositoryError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| error("filesystem", "Gacha file has no parent directory"))?;
+    fs::create_dir_all(parent).map_err(|value| error("filesystem", value.to_string()))?;
+    let suffix = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let temp = parent.join(format!(
+        ".{}.{}.{}.tmp",
+        path.file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("gatcha"),
+        std::process::id(),
+        suffix
+    ));
+    let encoded = serde_json::to_vec_pretty(payload)
+        .map_err(|value| error("serialization", value.to_string()))?;
+    fs::write(&temp, encoded).map_err(|value| error("filesystem", value.to_string()))?;
+    replace_file(&temp, path).map_err(|value| error("filesystem", value.to_string()))?;
+    if let Some(cache) = READ_CACHE.get() {
+        cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|(key, _, _, _)| key != path);
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    // SAFETY: Both paths are valid, null-terminated UTF-16 buffers for this call.
+    let moved = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn normalized_uids(values: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    values
+        .iter()
+        .filter_map(|value| normalize_uid(value))
+        .filter(|value| seen.insert(value.clone()))
+        .collect()
+}
+
+fn normalized_uids_from_value(value: Option<&Value>) -> Vec<String> {
+    let values: Vec<String> = value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str().map(str::to_owned))
+        .collect();
+    normalized_uids(&values)
+}
+
+fn normalize_uid(value: &str) -> Option<String> {
+    let trimmed = value.trim().trim_start_matches('0');
+    if trimmed.is_empty() || !trimmed.chars().all(|value| value.is_ascii_digit()) {
+        return None;
+    }
+    Some(trimmed.to_owned())
+}
+
+fn normalized_strings(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn normalized_strings_slice(values: &[String]) -> Vec<String> {
+    values
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn clamped_weight(value: Option<&Value>, default: i64) -> i64 {
+    integer_value(value).unwrap_or(default).clamp(0, 100)
+}
+
+fn integer_value(value: Option<&Value>) -> Option<i64> {
+    value.and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse().ok()))
+}
+
+fn number(value: &Value, key: &str) -> f64 {
+    value
+        .get(key)
+        .and_then(|value| value.as_f64().or_else(|| value.as_str()?.parse().ok()))
+        .unwrap_or(0.0)
+}
+
+fn number_map(value: &Map<String, Value>, key: &str) -> f64 {
+    value
+        .get(key)
+        .and_then(|value| value.as_f64().or_else(|| value.as_str()?.parse().ok()))
+        .unwrap_or(0.0)
+}
+
+fn text_map(value: &Map<String, Value>, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_owned()
+}
+
+fn first_text(value: &Map<String, Value>, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        value.get(*key).and_then(|value| match value {
+            Value::String(text) if !text.trim().is_empty() => Some(text.trim().to_owned()),
+            Value::Number(number) => Some(number.to_string()),
+            _ => None,
+        })
+    })
+}
+
+fn integer(value: &Map<String, Value>, keys: &[&str]) -> Option<i64> {
+    keys.iter().find_map(|key| {
+        value
+            .get(*key)
+            .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse().ok()))
+    })
+}
+
+fn array<'a>(value: &'a Value, key: &str) -> &'a [Value] {
+    value
+        .get(key)
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
+fn array_map<'a>(value: &'a Map<String, Value>, key: &str) -> &'a [Value] {
+    value
+        .get(key)
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
+fn browser_folder_id(uid: &str, folder_id: &str) -> String {
+    if uid.is_empty() {
+        folder_id.to_owned()
+    } else {
+        format!("{uid}:{folder_id}")
+    }
+}
+
+fn split_folder_id(value: &str) -> (String, String) {
+    value
+        .split_once(':')
+        .map(|(uid, folder)| (uid.trim().to_owned(), folder.trim().to_owned()))
+        .unwrap_or_else(|| (String::new(), value.trim().to_owned()))
+}
+
+fn unix_timestamp() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0.0, |duration| duration.as_secs_f64())
+}
+
+fn random_index(length: usize) -> usize {
+    if length <= 1 {
+        return 0;
+    }
+    let time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos() as u64);
+    let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut value = time ^ counter.rotate_left(17) ^ (std::process::id() as u64);
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+    ((value ^ (value >> 31)) as usize) % length
+}
+
+fn error(kind: &str, message: impl Into<String>) -> GatchaRepositoryError {
+    GatchaRepositoryError {
+        kind: kind.to_owned(),
+        message: message.into(),
+    }
+}
+
+fn schema_version() -> u32 {
+    1
+}
+
+fn default_search_limit() -> usize {
+    30
+}
+
+fn default_browse_limit() -> usize {
+    10_000
+}
+
+fn default_user_agent() -> String {
+    "Mozilla/5.0".to_owned()
+}
+
+fn default_referer() -> String {
+    "https://www.bilibili.com/".to_owned()
+}
+
+fn default_timeout_ms() -> u64 {
+    20_000
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::thread;
+
+    fn paths(root: &Path) -> GatchaPaths {
+        GatchaPaths {
+            uid_file: root.join("uids.json"),
+            cache_file: root.join("cache.json"),
+            favlist_file: root.join("favlist.json"),
+            pool_config_file: root.join("pool.json"),
+        }
+    }
+
+    fn temp_root(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "bilikara-gatcha-{name}-{}-{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    #[test]
+    fn favorites_publish_only_new_entries_and_retry_only_failed_folders() {
+        let root = temp_root("partial-favorites");
+        fs::create_dir_all(&root).unwrap();
+        let paths = paths(&root);
+        atomic_write_json(
+            &paths.favlist_file,
+            &json!({"schema_version":FAVLIST_SCHEMA_VERSION,
+            "folders":[{"uid":"1","id":"10"},{"uid":"2","id":"20"}],
+            "items":[{"bvid":"BVexisting01","title":"old","fav_uid":"1","fav_folder_id":"10"}]}),
+        )
+        .unwrap();
+        let control = RefreshControl::default();
+        let first = refresh_existing_favlist_with(&paths,&control,None,&|_,_,_|{},&|uid,_,checkpoint| {
+            if uid == "2" { return Err(error("network","fixture failed")); }
+            assert_eq!(checkpoint,Some("BVexisting01"));
+            Ok(vec![json!({"bvid":"BVnew0000001","title":"new","fav_uid":"1","fav_folder_id":"10"}),
+                json!({"bvid":"BVexisting01","title":"updated","fav_uid":"1","fav_folder_id":"10"})])
+        }).unwrap();
+        assert_eq!(first["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(first["entries"][0]["bvid"], "BVnew0000001");
+        assert_eq!(first["errors"][0]["folder_id"], "20");
+        let second = refresh_existing_favlist_with(&paths,&control,first["errors"].as_array().map(Vec::as_slice),&|_,_,_|{},&|uid,_,checkpoint| {
+            assert_eq!(uid,"2");
+            assert_eq!(checkpoint,None);
+            Ok(vec![json!({"bvid":"BVnew0000002","title":"recovered","fav_uid":"2","fav_folder_id":"20"})])
+        }).unwrap();
+        assert!(second["errors"].as_array().unwrap().is_empty());
+        assert_eq!(second["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            load_favlist(&paths.favlist_file)["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn uid_inputs_accept_space_links_and_reject_video_or_foreign_links() {
+        for input in [
+            "00042",
+            "space.bilibili.com/42",
+            "https://space.bilibili.com/42",
+            "http://space.bilibili.com/42/video?tid=0",
+        ] {
+            assert_eq!(required_uid(input).unwrap(), "42");
+        }
+        for input in [
+            "0",
+            "BV1z84y1p7oS",
+            "https://evil.test/42",
+            "https://space.bilibili.com.evil.test/42",
+        ] {
+            assert!(required_uid(input).is_err());
+        }
+    }
+
+    #[test]
+    fn joint_submission_uses_uploader_identity_and_avoids_collaborator_avatar() {
+        let entries = uid_page_entries(
+            "156933",
+            &[json!({
+                "bvid":"BV181Yv6NEyo", "title":"KANADE", "author":"VZRXS", "mid":671767
+            })],
+            &[],
+            &mut HashSet::new(),
+        );
+        assert_eq!(entries[0]["mid"], "671767");
+        assert_eq!(entries[0]["owner_url"], "https://space.bilibili.com/671767");
+        assert_eq!(
+            candidate_payload(
+                entries[0].as_object().unwrap(),
+                "cache",
+                Some(&"156933".into())
+            )["mid"],
+            "671767"
+        );
+        let root = temp_root("joint-owner");
+        fs::create_dir_all(&root).unwrap();
+        let p = paths(&root);
+        atomic_write_json(
+            &p.uid_file,
+            &json!({"schema_version":2,
+            "uids":["156933"], "profiles":{
+                "156933":{"name":"Tsuki-岭月","avatar_url":"https://image.test/collaborator"},
+                "671767":{"name":"VZRXS","avatar_url":"https://image.test/uploader"}
+            }}),
+        )
+        .unwrap();
+        // Earlier caches may still contain the source UID, alongside the actual author name.
+        let mut legacy = vec![json!({"bvid":"BV181Yv6NEyo", "mid":"156933", "owner_name":"VZRXS"})];
+        annotate_local(&p, &mut legacy).unwrap();
+        assert_eq!(legacy[0]["owner_avatar_url"], "https://image.test/uploader");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn catalog_badges_prefer_favorites_and_use_matching_owner_profiles() {
+        let root = temp_root("annotations");
+        fs::create_dir_all(&root).unwrap();
+        let p = paths(&root);
+        atomic_write_json(&p.uid_file, &json!({"schema_version":2,"uids":["42"],"profiles":{"1":{"name":"UP","avatar_url":"https://image.test/wrong"},"42":{"name":"UP","avatar_url":"https://image.test/up"}}})).unwrap();
+        atomic_write_json(&p.cache_file, &json!({"schema_version":3,"uids":{"42":[{"bvid":"BV1z84y1p7oS","title":"Song","mid":"42"}],"999":[{"bvid":"BV1xx411c7mD","title":"Unconfigured"}]},"profiles":{}})).unwrap();
+        let mut items =
+            vec![json!({"bvid":"BV1z84y1p7oS","owner_name":"UP","mid":"42","source":"cloudflare"})];
+        annotate_local(&p, &mut items).unwrap();
+        assert_eq!(items[0]["local_source"], "follow");
+        assert_eq!(items[0]["owner_avatar_url"], "https://image.test/up");
+        assert_eq!(items[0]["source"], "cloudflare");
+        atomic_write_json(&p.favlist_file, &json!({"schema_version":2,"items":[{"bvid":"BV1z84y1p7oS","title":"Song","fav_uid":"42","fav_folder_title":"Karaoke"}],"folders":[]})).unwrap();
+        annotate_local(&p, &mut items).unwrap();
+        assert_eq!(items[0]["local_source"], "favlist");
+        assert_eq!(items[0]["fav_folder_title"], "Karaoke");
+        assert_eq!(
+            search(&p, "Unconfigured", 0, 30).unwrap()["items"],
+            json!([])
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn wire_request_deserializes_flattened_operation() {
+        let request: GatchaRepositoryRequest = serde_json::from_value(json!({
+            "schema_version": 1,
+            "paths": {
+                "uid_file": "uids.json",
+                "cache_file": "cache.json",
+                "favlist_file": "favlist.json",
+                "pool_config_file": "pool.json"
+            },
+            "default_uids": ["42"],
+            "operation": "candidate",
+            "cookie_available": false
+        }))
+        .expect("wire request");
+        assert!(matches!(
+            request.operation,
+            GatchaOperation::Candidate { .. }
+        ));
+    }
+
+    #[test]
+    fn local_search_deduplicates_video_matches_before_counting_and_paging() {
+        let root = temp_root("search-overlapping-sources");
+        let paths = paths(&root);
+        fs::create_dir_all(&root).unwrap();
+        atomic_write_json(
+            &paths.uid_file,
+            &json!({"schema_version":2,"uids":["42","43"],"profiles":{}}),
+        )
+        .unwrap();
+        atomic_write_json(
+            &paths.cache_file,
+            &json!({"schema_version":3,"uids":{
+            "42":[{"bvid":"BV1xx411c7mD","title":"Song original","owner_name":"Original UP"},
+                {"bvid":"BV1xx411c7mD","title":"Song duplicate"},
+                {"bvid":"BV1z84y1p7oS","title":"Song second"}],
+            "43":[{"bvid":"BV1xx411c7mD","title":"Song overlap"}],
+            "999":[{"bvid":"BV0000000002","title":"Song unconfigured"}]},"profiles":{}}),
+        )
+        .unwrap();
+        atomic_write_json(
+            &paths.favlist_file,
+            &json!({"schema_version":2,"items":[
+            {"bvid":"BV1xx411c7mD","title":"Song renamed","fav_uid":"42","fav_folder_id":"10"},
+            {"bvid":"BV1xx411c7mD","title":"Song renamed","fav_uid":"42","fav_folder_id":"20"},
+            {"bvid":"BV0000000001","title":"Song favorite"},
+            {"bvid":"BV0000000002","title":"Unrelated"}],"folders":[]}),
+        )
+        .unwrap();
+        let before = [&paths.uid_file, &paths.cache_file, &paths.favlist_file]
+            .map(|path| fs::read(path).unwrap());
+        let first = search(&paths, "SONG", 0, 2).unwrap();
+        assert_eq!(first["matched_count"], 3);
+        assert_eq!(first["items"][0]["bvid"], "BV1xx411c7mD");
+        assert_eq!(first["items"][0]["owner_name"], "Original UP");
+        assert_eq!(first["items"][1]["bvid"], "BV1z84y1p7oS");
+        assert_eq!(first["next_offset"], 2);
+        assert_eq!(first["has_more"], true);
+        let second = search(&paths, "Song", 2, 2).unwrap();
+        assert_eq!(second["matched_count"], 3);
+        assert_eq!(second["items"].as_array().unwrap().len(), 1);
+        assert_eq!(second["items"][0]["bvid"], "BV0000000001");
+        assert_eq!(second["next_offset"], 3);
+        assert_eq!(second["has_more"], false);
+        let renamed = search(&paths, "renamed", 0, 80).unwrap();
+        assert_eq!(renamed["matched_count"], 1);
+        assert_eq!(renamed["items"][0]["fav_folder_id"], "10");
+        let after = [&paths.uid_file, &paths.cache_file, &paths.favlist_file]
+            .map(|path| fs::read(path).unwrap());
+        assert_eq!(
+            before, after,
+            "Search must not remove source/folder memberships"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn local_search_counts_matches_and_pages_beyond_eighty() {
+        let root = temp_root("search-pages");
+        let paths = paths(&root);
+        fs::create_dir_all(&root).unwrap();
+        atomic_write_json(
+            &paths.uid_file,
+            &json!({"schema_version":2,"uids":["42"],"profiles":{}}),
+        )
+        .unwrap();
+        let items: Vec<_> = (0..221)
+            .map(|n| {
+                json!({
+                    "bvid":format!("BV{n:010}"), "title":format!("Offline song {n}")
+                })
+            })
+            .collect();
+        atomic_write_json(
+            &paths.cache_file,
+            &json!({"schema_version":3,"uids":{"42":items},"profiles":{}}),
+        )
+        .unwrap();
+        for offset in [0, 80, 160, 216, 221] {
+            let result = search(&paths, "Offline", offset, 80).unwrap();
+            assert_eq!(result["matched_count"], 221);
+            assert_eq!(
+                result["items"].as_array().unwrap().len(),
+                (221 - offset).min(80)
+            );
+            assert_eq!(result["has_more"], offset + 80 < 221);
+            if offset < 221 {
+                assert_eq!(result["items"][0]["bvid"], format!("BV{offset:010}"));
+            }
+        }
+        assert_eq!(
+            search(&paths, "song 220", 0, 80).unwrap()["matched_count"],
+            1
+        );
+        assert_eq!(
+            search(&paths, "missing", 0, 80).unwrap()["matched_count"],
+            0
+        );
+        assert!(search(&paths, "Offline", 100_001, 80).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn uid_browse_returns_stable_bounded_pages() {
+        let root = temp_root("browse-pages");
+        let paths = paths(&root);
+        fs::create_dir_all(&root).expect("create root");
+        atomic_write_json(
+            &paths.uid_file,
+            &json!({"schema_version": 2, "uids": ["42"], "profiles": {}, "updated_at": 1}),
+        )
+        .expect("write uids");
+        let items: Vec<Value> = (0..205)
+            .map(|index| {
+                json!({
+                    "bvid": format!("BV{:010}", index),
+                    "title": format!("song-{index:03}"),
+                    "owner_name": "Singer"
+                })
+            })
+            .collect();
+        atomic_write_json(
+            &paths.cache_file,
+            &json!({
+                "schema_version": 3,
+                "uids": {"42": items},
+                "profiles": {},
+                "updated_at": 2
+            }),
+        )
+        .expect("write cache");
+
+        let request = GatchaRepositoryRequest {
+            schema_version: 1,
+            paths,
+            default_uids: vec![],
+            operation: GatchaOperation::BrowseUid {
+                uid: "42".to_owned(),
+                query: String::new(),
+                offset: 100,
+                limit: 100,
+            },
+        };
+        let page = execute_gatcha(&request).expect("browse page");
+
+        assert_eq!(page["items"].as_array().map(Vec::len), Some(100));
+        assert_eq!(page["items"][0]["title"], "song-100");
+        assert_eq!(page["matched_count"], 205);
+        assert_eq!(page["has_more"], true);
+        assert_eq!(page["next_offset"], 200);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn favlist_browse_filters_before_returning_bounded_pages() {
+        let root = temp_root("favlist-browse-pages");
+        let paths = paths(&root);
+        fs::create_dir_all(&root).expect("create root");
+        atomic_write_json(
+            &paths.uid_file,
+            &json!({"schema_version": 2, "uids": ["42"], "profiles": {}, "updated_at": 1}),
+        )
+        .expect("write uids");
+        atomic_write_json(
+            &paths.cache_file,
+            &json!({"schema_version": 3, "uids": {}, "profiles": {}, "updated_at": 2}),
+        )
+        .expect("write cache");
+        let items: Vec<Value> = (0..221)
+            .map(|index| {
+                json!({
+                    "bvid": format!("BV{:010}", index),
+                    "title": if index == 150 {
+                        "机动战士高达".to_owned()
+                    } else {
+                        format!("song-{index:03}")
+                    },
+                    "fav_uid": "42",
+                    "fav_folder_id": "100",
+                })
+            })
+            .collect();
+        atomic_write_json(
+            &paths.favlist_file,
+            &json!({
+                "schema_version": 2,
+                "folders": [{"uid": "42", "media_id": "100", "title": "收藏夹", "media_count": 221}],
+                "items": items,
+                "updated_at": 3,
+            }),
+        )
+        .expect("write favlist");
+
+        let first_page = execute_gatcha(&GatchaRepositoryRequest {
+            schema_version: 1,
+            paths: paths.clone(),
+            default_uids: vec![],
+            operation: GatchaOperation::BrowseFavlist {
+                folder_id: "42:100".to_owned(),
+                query: String::new(),
+                offset: 0,
+                limit: 100,
+            },
+        })
+        .expect("browse first page");
+        assert_eq!(first_page["items"].as_array().map(Vec::len), Some(100));
+        assert_eq!(first_page["matched_count"], 221);
+        assert_eq!(first_page["has_more"], true);
+        assert_eq!(first_page["next_offset"], 100);
+
+        let filtered = execute_gatcha(&GatchaRepositoryRequest {
+            schema_version: 1,
+            paths,
+            default_uids: vec![],
+            operation: GatchaOperation::BrowseFavlist {
+                folder_id: "42:100".to_owned(),
+                query: "高达".to_owned(),
+                offset: 0,
+                limit: 100,
+            },
+        })
+        .expect("browse filtered page");
+        assert_eq!(filtered["matched_count"], 1);
+        assert_eq!(filtered["items"].as_array().map(Vec::len), Some(1));
+        assert_eq!(filtered["items"][0]["title"], "机动战士高达");
+        assert_eq!(filtered["has_more"], false);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn incremental_merge_keeps_new_items_first_and_existing_order_stable() {
+        let existing = vec![
+            json!({"bvid": "BV1xx411c7mD", "title": "first", "played_count": "1"}),
+            json!({"bvid": "BV1yy411c7mD", "title": "second"}),
+        ];
+        let fresh = vec![
+            json!({"bvid": "BV1zz411c7mD", "title": "new"}),
+            json!({"bvid": "BV1xx411c7mD", "title": "replacement", "played_count": "2"}),
+        ];
+        let (merged, added) = merge_incremental_entries(&existing, &fresh);
+        assert_eq!(added, 1);
+        assert_eq!(merged[0]["bvid"], "BV1zz411c7mD");
+        assert_eq!(merged[1]["bvid"], "BV1xx411c7mD");
+        assert_eq!(merged[1]["title"], "first");
+        assert_eq!(merged[1]["played_count"], "2");
+        assert_eq!(merged[2]["bvid"], "BV1yy411c7mD");
+    }
+
+    #[test]
+    fn pool_configuration_is_persisted_and_clamped() {
+        let root = temp_root("config");
+        let paths = paths(&root);
+        let request = GatchaRepositoryRequest {
+            schema_version: 1,
+            paths: paths.clone(),
+            default_uids: Vec::new(),
+            operation: GatchaOperation::PoolConfigUpdate {
+                uid_weight: Some(120),
+                favlist_weight: Some(-5),
+                excluded_uids: Some(vec![" 42 ".to_owned()]),
+                excluded_favlist_folders: Some(vec!["42:7".to_owned()]),
+            },
+        };
+        let updated = execute_gatcha(&request).expect("update config");
+        assert_eq!(updated["uid_weight"], 100);
+        assert_eq!(updated["favlist_weight"], 0);
+        let loaded = load_pool_config(&paths.pool_config_file);
+        assert_eq!(loaded["excluded_uids"], json!(["42"]));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn read_only_snapshot_is_not_blocked_by_repository_mutation_lock() {
+        let root = temp_root("concurrent-read");
+        let paths = paths(&root);
+        fs::create_dir_all(&root).expect("create root");
+        atomic_write_json(
+            &paths.uid_file,
+            &json!({"schema_version": 2, "uids": [], "profiles": {}, "updated_at": 1}),
+        )
+        .expect("write uids");
+        atomic_write_json(
+            &paths.pool_config_file,
+            &json!({"uid_weight": 40, "favlist_weight": 60}),
+        )
+        .expect("write pool config");
+        let request = GatchaRepositoryRequest {
+            schema_version: 1,
+            paths,
+            default_uids: Vec::new(),
+            operation: GatchaOperation::PoolConfigSnapshot,
+        };
+        let mutation_guard = REPOSITORY_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("lock repository mutation");
+        let (sender, receiver) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            sender
+                .send(execute_gatcha(&request))
+                .expect("send snapshot result");
+        });
+
+        let completed_while_mutation_is_active =
+            receiver.recv_timeout(Duration::from_millis(250)).is_ok();
+        drop(mutation_guard);
+        worker.join().expect("join snapshot worker");
+        let _ = fs::remove_dir_all(root);
+        assert!(
+            completed_while_mutation_is_active,
+            "read-only Gacha snapshots must not wait for a long network refresh"
+        );
+    }
+
+    #[test]
+    fn refresh_all_network_work_does_not_hold_repository_mutation_lock() {
+        let operation = GatchaOperation::RefreshAll {
+            cookie: "cookie".to_owned(),
+            keywords: Vec::new(),
+            user_agent: "agent".to_owned(),
+            referer: "referer".to_owned(),
+            timeout_ms: 1_000,
+        };
+        assert!(!requires_mutation_lock(&operation));
+        for operation in [
+            json!({"operation":"add_uid","uid":"1","cookie":"fixture"}),
+            json!({"operation":"refresh_favlist","uid":"1","cookie":"fixture","folder_ids":["10"]}),
+        ] {
+            let operation = serde_json::from_value(operation).unwrap();
+            assert!(!requires_mutation_lock(&operation));
+        }
+    }
+
+    #[test]
+    fn parallel_favorite_commits_preserve_other_folders_and_publish_exact_deltas() {
+        let root = temp_root("parallel-favorites");
+        fs::create_dir_all(&root).unwrap();
+        let paths = paths(&root);
+        let entry = |folder: &str, bvid: &str| {
+            json!({"fav_uid":"1","fav_folder_id":folder,
+            "bvid":bvid,"title":bvid})
+        };
+        atomic_write_json(
+            &paths.favlist_file,
+            &json!({"schema_version":FAVLIST_SCHEMA_VERSION,
+            "uid":"1","folders":[{"id":"10"}],"items":[entry("10","BVOLD")]}),
+        )
+        .unwrap();
+        let background = RefreshControl::default();
+        let foreground = RefreshControl::default();
+        let sources = std::sync::Arc::new(crate::gatcha_refresh::SourceTasks::default());
+        background.share_sources(sources.clone());
+        foreground.share_sources(sources);
+        let result = refresh_existing_favlist_with(
+            &paths,
+            &background,
+            None,
+            &|_, _, _| {},
+            &|uid, _, checkpoint| {
+                assert_eq!(checkpoint, Some("BVOLD"));
+                // Manual source commits after the background snapshot, before
+                // the background request returns. No real HTTP or catalog call.
+                let imported = foreground
+                    .source("favlist:1:20".into(), || {
+                        let (entries, count) = foreground.commit(|| {
+                            persist_favlist_source(
+                                &paths,
+                                uid,
+                                "20",
+                                &[entry("20", "BVMANUAL"), entry("20", "BVMANUAL")],
+                                Some(&json!({"uid":uid,"id":"20","title":"Manual"})),
+                            )
+                        })?;
+                        assert_eq!(count, 1, "folder totals must deduplicate BVIDs");
+                        Ok(json!({"entries":entries,"item_count":count}))
+                    })
+                    .unwrap();
+                assert!(!imported.1);
+                assert_eq!(imported.0["entries"][0]["bvid"], "BVMANUAL");
+                Ok(vec![entry("10", "BVAUTO"), entry("10", "BVOLD")])
+            },
+        )
+        .unwrap();
+        assert_eq!(result["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(result["entries"][0]["bvid"], "BVAUTO");
+        let reused = foreground
+            .source("favlist:1:10".into(), || panic!("duplicate favorite HTTP"))
+            .unwrap();
+        assert!(reused.1);
+        assert_eq!(reused.0["item_count"], 2);
+        assert!(reused.0.get("entries").is_none());
+        let saved = load_favlist(&paths.favlist_file);
+        assert_eq!(saved["folders"].as_array().unwrap().len(), 2);
+        assert_eq!(saved["items"].as_array().unwrap().len(), 3);
+        assert!(
+            array(&saved, "items")
+                .iter()
+                .any(|v| v["bvid"] == "BVMANUAL")
+        );
+        assert!(
+            saved.get("entries").is_none(),
+            "completion deltas must not be persisted"
+        );
+        // A later full folder pull replaces that folder only. A duplicate
+        // BVID from another folder retains its own membership but is not shared twice.
+        let (delta, count) = persist_favlist_source(
+            &paths,
+            "1",
+            "10",
+            &[entry("10", "BVMANUAL")],
+            Some(&json!({"uid":"1","id":"10","title":"Replaced"})),
+        )
+        .unwrap();
+        assert!(delta.is_empty());
+        assert_eq!(count, 1);
+        let saved = load_favlist(&paths.favlist_file);
+        assert_eq!(array(&saved, "items").len(), 2);
+        assert!(
+            array(&saved, "items")
+                .iter()
+                .all(|v| v["bvid"] == "BVMANUAL")
+        );
+        assert_eq!(saved["folders"][0]["title"], "Replaced");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn removed_sources_and_cancelled_tasks_cannot_write_stale_cache_snapshots() {
+        let root = temp_root("cancelled-source-commit");
+        fs::create_dir_all(&root).unwrap();
+        let paths = paths(&root);
+        atomic_write_json(
+            &paths.uid_file,
+            &json!({"schema_version":UID_SCHEMA_VERSION,"uids":[],"profiles":{}}),
+        )
+        .unwrap();
+        atomic_write_json(
+            &paths.cache_file,
+            &json!({"schema_version":CACHE_SCHEMA_VERSION,"uids":{},"profiles":{}}),
+        )
+        .unwrap();
+        atomic_write_json(
+            &paths.favlist_file,
+            &json!({"schema_version":FAVLIST_SCHEMA_VERSION,"folders":[],"items":[]}),
+        )
+        .unwrap();
+        let before = [&paths.uid_file, &paths.cache_file, &paths.favlist_file]
+            .map(|path| fs::read(path).unwrap());
+        assert_eq!(
+            persist_refreshed_uid(
+                &paths,
+                "1",
+                &json!({"uid":"1"}),
+                &[],
+                &[json!({"bvid":"BVSTALE"})],
+                Some("BVSTALE"),
+                false
+            )
+            .unwrap_err()
+            .kind,
+            "cancelled"
+        );
+        assert_eq!(
+            persist_favlist_source(&paths, "1", "10", &[json!({"bvid":"BVSTALE"})], None)
+                .unwrap_err()
+                .kind,
+            "cancelled"
+        );
+        assert_eq!(
+            persist_favlist_source_expected(
+                &paths,
+                "1",
+                "10",
+                &[json!({"bvid":"BVSTALE"})],
+                Some(&json!({"uid":"1","id":"10"})),
+                true
+            )
+            .unwrap_err()
+            .kind,
+            "cancelled"
+        );
+        let stopped = RefreshControl::default();
+        stopped.stop();
+        assert_eq!(
+            stopped
+                .commit(|| persist_favlist_source(
+                    &paths,
+                    "1",
+                    "10",
+                    &[],
+                    Some(&json!({"uid":"1","id":"10"}))
+                ))
+                .unwrap_err()
+                .kind,
+            "cancelled"
+        );
+        let after = [&paths.uid_file, &paths.cache_file, &paths.favlist_file]
+            .map(|path| fs::read(path).unwrap());
+        assert_eq!(
+            after, before,
+            "a rejected/cancelled commit must not alter any cache file"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn refreshed_uid_is_persisted_without_overwriting_concurrent_cache_changes() {
+        let root = temp_root("refresh-persistence");
+        let paths = paths(&root);
+        fs::create_dir_all(&root).expect("create root");
+        atomic_write_json(
+            &paths.uid_file,
+            &json!({"schema_version": 2, "uids": ["1", "2"], "profiles": {}, "updated_at": 1}),
+        )
+        .expect("write uids");
+        atomic_write_json(
+            &paths.cache_file,
+            &json!({
+                "schema_version": 3,
+                "uids": {
+                    "1": [{"bvid": "BVCONCURRENT", "title": "concurrent"}],
+                    "2": [{"bvid": "BVOTHER", "title": "other"}]
+                },
+                "profiles": {},
+                "updated_at": 1
+            }),
+        )
+        .expect("write cache");
+
+        let (added, total, entries) = persist_refreshed_uid(
+            &paths,
+            "1",
+            &json!({"uid": "1", "name": "owner", "space_url": "https://space.bilibili.com/1"}),
+            &[],
+            &[json!({"bvid": "BVFRESH", "title": "fresh"})],
+            Some("BVFRESH"),
+            false,
+        )
+        .expect("persist refreshed uid");
+
+        let cache = read_object(&paths.cache_file).expect("read cache");
+        assert_eq!(added, 1);
+        assert_eq!(total, 2);
+        assert_eq!(entries[0]["mid"], "1");
+        assert_eq!(entries[0]["owner_name"], "owner");
+        assert_eq!(entries[0]["owner_url"], "https://space.bilibili.com/1");
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry["bvid"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["BVFRESH"]
+        );
+        assert_eq!(cache["uids"]["1"][0]["bvid"], "BVFRESH");
+        assert_eq!(cache["uids"]["1"][1]["bvid"], "BVCONCURRENT");
+        assert_eq!(cache["uids"]["2"][0]["bvid"], "BVOTHER");
+        assert_eq!(cache["profiles"]["1"]["name"], "owner");
+        assert_eq!(cache["uid_checkpoints"]["1"], "BVFRESH");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_checkpoint_uses_the_entry_before_the_last_incremental_additions() {
+        let cache = json!({
+            "uid_checkpoints": {},
+            "refresh_summary": {
+                "uids": [{
+                    "uid": "42",
+                    "mode": "incremental",
+                    "added_count": 1
+                }]
+            }
+        });
+        let existing = vec![
+            json!({"bvid": "BVNEW0000001", "title": "new"}),
+            json!({"bvid": "BVOLD0000001", "title": "old boundary"}),
+        ];
+
+        assert_eq!(
+            uid_refresh_checkpoint(&cache, "42", &existing).as_deref(),
+            Some("BVOLD0000001")
+        );
+    }
+
+    #[test]
+    fn persisted_checkpoint_takes_priority_over_legacy_refresh_summary() {
+        let cache = json!({
+            "uid_checkpoints": {"42": "BVRAW0000001"},
+            "refresh_summary": {
+                "uids": [{"uid": "42", "mode": "incremental", "added_count": 1}]
+            }
+        });
+        let existing = vec![
+            json!({"bvid": "BVNEW0000001", "title": "new"}),
+            json!({"bvid": "BVOLD0000001", "title": "old boundary"}),
+        ];
+
+        assert_eq!(
+            uid_refresh_checkpoint(&cache, "42", &existing).as_deref(),
+            Some("BVRAW0000001")
+        );
+    }
+
+    #[test]
+    fn refresh_checkpoints_are_frozen_before_progress_summary_is_replaced() {
+        let mut cache = json!({
+            "uids": {
+                "42": [
+                    {"bvid": "BVNEW0000001", "title": "new"},
+                    {"bvid": "BVOLD0000001", "title": "old boundary"}
+                ]
+            },
+            "uid_checkpoints": {},
+            "refresh_summary": {
+                "uids": [{"uid": "42", "mode": "incremental", "added_count": 1}]
+            }
+        });
+        let checkpoints = uid_refresh_checkpoints(&cache, &["42".to_owned()]);
+        cache["refresh_summary"] = json!({"uids": []});
+
+        assert_eq!(
+            checkpoints.get("42").and_then(Option::as_deref),
+            Some("BVOLD0000001")
+        );
+        assert_eq!(
+            uid_refresh_checkpoint(&cache, "42", cache["uids"]["42"].as_array().unwrap())
+                .as_deref(),
+            Some("BVNEW0000001")
+        );
+    }
+
+    #[test]
+    fn checkpoint_detection_uses_raw_posts_before_keyword_filtering() {
+        let videos = vec![
+            json!({"bvid": "BVNEW0000001", "title": "karaoke new"}),
+            json!({"bvid": "BVRAW0000001", "title": "ordinary upload"}),
+        ];
+
+        assert!(page_contains_bvid(&videos, "BVRAW0000001"));
+    }
+
+    #[test]
+    fn refresh_progress_is_visible_before_refresh_finishes() {
+        let root = temp_root("refresh-progress");
+        let paths = paths(&root);
+        fs::create_dir_all(&root).expect("create root");
+
+        persist_refresh_summary(&paths, &[], &[], "", false, 3).expect("persist refresh progress");
+
+        let cache = read_object(&paths.cache_file).expect("read refresh progress");
+        assert_eq!(cache["refresh_summary"]["completed"], false);
+        assert_eq!(cache["refresh_summary"]["completed_count"], 0);
+        assert_eq!(cache["refresh_summary"]["total_count"], 3);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn empty_candidate_retains_guest_and_authenticated_failure_messages() {
+        let root = temp_root("candidate-empty");
+        let paths = paths(&root);
+        fs::create_dir_all(&root).unwrap();
+        let guest = draw_candidate(&paths, false, None).unwrap_err();
+        assert_eq!(guest.kind, "missing_cookie");
+        assert_eq!(guest.message, "请登录 Bilibili 账号或输入 Cookie");
+        let authenticated = draw_candidate(&paths, true, None).unwrap_err();
+        assert_eq!(authenticated.kind, "empty_pool");
+        assert_eq!(authenticated.message, "本地稿件缓存还没准备好，请稍后再试");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn candidate_respects_exclusions_and_expired_titles() {
+        let root = temp_root("candidate");
+        let paths = paths(&root);
+        fs::create_dir_all(&root).expect("create root");
+        atomic_write_json(
+            &paths.uid_file,
+            &json!({"schema_version": 2, "uids": ["1", "2"], "profiles": {}, "updated_at": 1}),
+        )
+        .expect("write uids");
+        atomic_write_json(
+            &paths.cache_file,
+            &json!({"schema_version": 3, "uids": {
+                "1": [{"bvid": "BVDEAD", "title": EXPIRED_VIDEO_TITLE, "url": "dead"}],
+                "2": [{"bvid": "BVLIVE", "title": "live", "url": "live"}]
+            }, "profiles": {}, "updated_at": 1}),
+        )
+        .expect("write cache");
+        atomic_write_json(
+            &paths.pool_config_file,
+            &json!({"uid_weight": 100, "favlist_weight": 0, "excluded_uids": ["1"]}),
+        )
+        .expect("write config");
+        let result = draw_candidate(&paths, true, None).expect("draw candidate");
+        assert_eq!(result["bvid"], "BVLIVE");
+        assert_eq!(result["mid"], "2");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn favlist_entries_are_deduplicated_per_folder() {
+        let values = vec![
+            json!({"bvid": "BV1", "fav_uid": "1", "fav_folder_id": "2"}),
+            json!({"bvid": "BV1", "fav_uid": "1", "fav_folder_id": "2"}),
+            json!({"bvid": "BV1", "fav_uid": "1", "fav_folder_id": "3"}),
+        ];
+        assert_eq!(dedupe_entries(&values).len(), 2);
+    }
+}

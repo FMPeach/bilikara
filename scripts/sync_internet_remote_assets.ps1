@@ -1,0 +1,60 @@
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$Destination
+)
+
+$ErrorActionPreference = "Stop"
+
+$repositoryRoot = Split-Path -Parent $PSScriptRoot
+$staticRoot = Join-Path $repositoryRoot "static"
+$destinationRoot = if ([System.IO.Path]::IsPathRooted($Destination)) {
+    [System.IO.Path]::GetFullPath($Destination)
+} else {
+    [System.IO.Path]::GetFullPath((Join-Path (Get-Location) $Destination))
+}
+$files = @(
+    "accent-palette.css",
+    "browse-search.js",
+    "browse-search.css",
+    "export-download.js",
+    "export-guard.js",
+    "i18n.json",
+    "internet-remote-transport.js",
+    "qrcode-generator.js",
+    "part-selector.js",
+    "playback-restart.js",
+    "playback-sheet-gestures.js",
+    "request-input.js",
+    "qrcode-generator.LICENSE",
+    "remote-access.css",
+    "remote-queue.css",
+    "remote-queue.js",
+    "remote-transport-client.js",
+    "remote.css",
+    "remote.html",
+    "remote.js",
+    "result-pagination.css",
+    "result-pagination.js",
+    "search-result-media.css",
+    "search-result-media.js",
+    "request-tabs.css",
+    "ui-surfaces.css",
+    "song-detail.css",
+    "song-detail.js",
+    "status-indicators.css",
+    "source-status.js",
+    "volume-control.css",
+    "volume-control.js"
+)
+
+New-Item -ItemType Directory -Path $destinationRoot -Force | Out-Null
+foreach ($file in $files) {
+    Copy-Item -LiteralPath (Join-Path $staticRoot $file) -Destination (Join-Path $destinationRoot $file) -Force
+}
+
+$sourcePictures = Join-Path $staticRoot "pic"
+$destinationPictures = Join-Path $destinationRoot "pic"
+New-Item -ItemType Directory -Path $destinationPictures -Force | Out-Null
+Get-ChildItem -LiteralPath $sourcePictures -File | Copy-Item -Destination $destinationPictures -Force
+
+Write-Host "Synced the shared bilikara Remote assets to $destinationRoot"

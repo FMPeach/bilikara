@@ -10,6 +10,7 @@ import math
 import mimetypes
 import os
 import re
+import secrets
 import socket
 import sys
 import threading
@@ -21,6 +22,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
+from .rust_runtime import start_monthly_refresh_in_background
+
+from . import rust_runtime
 from .bilibili import (
     BilibiliError,
     ManualBindingRequiredError,
@@ -45,29 +49,34 @@ from .bilibili import (
     search_gatcha_cache,
     update_gatcha_pool_config,
 )
-from .lark_pool_client import (
-    LarkPoolError,
-    append_lark_pool_entries_in_background,
+from .shared_catalog import (
+    CatalogError,
+    append_catalog_entries_in_background,
     approve_cloudflare_review_items,
-    browse_d1_category_pool,
-    browse_d1_pool,
     delete_cloudflare_mid_entries,
     delete_cloudflare_pool_entry,
     delete_cloudflare_video_entry,
+    list_cloudflare_blacklist,
     pending_cloudflare_review_items,
     prewarm_cloudflare_pool,
+    reject_cloudflare_review_item,
     reset_cloudflare_video_tags,
-    search_lark_pool,
-    search_lark_pool_table,
+    restore_cloudflare_blacklist_item,
+    read_catalog,
     submit_cloudflare_song_rating,
+    trigger_cloudflare_maintenance_job,
     verify_cloudflare_bilikara_secret,
 )
-from .cache import CacheManager
-from .playback_selector import (
-    PlaybackCapabilityError,
-    PlaybackSelector,
-    playback_selector_snapshot,
+from .internet_remote import (
+    InternetRemoteDispatchError,
+    close_peer as close_internet_remote_peer,
+    dispatch as dispatch_internet_remote,
+    open_peer as open_internet_remote_peer,
+    remote_state as internet_remote_state,
+    submit_rating_background,
 )
+from .cache import CacheManager, _debug_print
+from .rust_backend import PlaybackCapabilityError
 from .config import (
     APP_RELEASES_URL,
     APP_VERSION,
@@ -83,6 +92,7 @@ from .config import (
     ensure_directories,
 )
 from .diagnostics import DiagnosticArtifact, build_diagnostic_artifact, redact_text
+from .models import HistoryEntry, PlaylistItem
 from .networking import detect_lan_ipv4_addresses
 from .playlist_export import (
     playlist_csv_bytes,
@@ -90,8 +100,8 @@ from .playlist_export import (
     prewarm_playlist_export_fonts,
 )
 from .remote_identity import RemoteIdentityStore
-from .store import PlaylistStore
-from .updater import AppUpdateManager, check_for_update
+from .store import MAX_SAFE_JSON_INTEGER, PlaylistStore, PlaylistStoreCommandError
+from .updater import AppUpdateManager
 
 mimetypes.add_type("video/mp4", ".mp4")
 mimetypes.add_type("video/mp4", ".m4s")
@@ -103,11 +113,122 @@ RATING_SUBMISSION_KEY_LIMIT = 2000
 PLAYER_DIAGNOSTIC_LIMIT = 128
 PLAYER_DIAGNOSTIC_URL_RE = re.compile(r"(?i)\b(?:https?|file)://[^\s<>\"']+")
 MISSING_BILIBILI_VIDEO_MESSAGE = "啥都木有"
-RATING_PROMPT_THRESHOLD = 0.5
+PLAYER_STATUS_MAX_SECONDS = 7 * 24 * 60 * 60
+PLAYER_STATUS_ITEM_ID_MAX_BYTES = 512
+PLAYER_STATUS_PHASES = frozenset(
+    {
+        "ready-paused",
+        "starting",
+        "playing",
+        "paused",
+        "needs-user-gesture",
+        "failed",
+        "ended",
+    }
+)
 REMOTE_IDENTITY_COOKIE = "bilikara_remote_token"
 REMOTE_IDENTITY_COOKIE_MAX_AGE = 365 * 24 * 60 * 60
 CONTAINER_RUNTIME_MARKERS = ("docker", "containerd", "kubepods", "lxc")
 LOCAL_EXPORT_SHUTDOWN_GRACE_SECONDS = 10.0
+
+
+def _positive_safe_player_status_integer(value: object, field: str) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 1
+        or value > MAX_SAFE_JSON_INTEGER
+    ):
+        raise ValueError(f"{field} must be a positive safe integer")
+    return value
+
+
+def _bounded_player_status_number(value: object, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field} must be a number")
+    number = float(value)
+    if not math.isfinite(number) or number < 0 or number > PLAYER_STATUS_MAX_SECONDS:
+        raise ValueError(f"{field} must be finite and within the supported range")
+    return number
+
+
+def _normalize_player_status_observation(
+    *,
+    playback_generation: object,
+    status_sequence: object,
+    item_id: object,
+    observed_phase: object,
+    is_paused: object,
+    current_time: object,
+    duration: object,
+    client_info: object | None = None,
+) -> dict[str, object]:
+    generation = _positive_safe_player_status_integer(
+        playback_generation, "playback_generation"
+    )
+    sequence = _positive_safe_player_status_integer(status_sequence, "status_sequence")
+    if not isinstance(item_id, str):
+        raise ValueError("item_id must be a bounded non-empty string")
+    normalized_item_id = item_id.strip()
+    if (
+        not normalized_item_id
+        or "\0" in normalized_item_id
+        or len(normalized_item_id.encode("utf-8")) > PLAYER_STATUS_ITEM_ID_MAX_BYTES
+    ):
+        raise ValueError("item_id must be a bounded non-empty string")
+    if not isinstance(observed_phase, str):
+        raise ValueError("observed_phase is invalid")
+    phase = observed_phase.strip()
+    if phase not in PLAYER_STATUS_PHASES:
+        raise ValueError("observed_phase is invalid")
+    if not isinstance(is_paused, bool):
+        raise ValueError("is_paused must be boolean")
+    expected_paused = phase != "playing"
+    if is_paused is not expected_paused:
+        raise ValueError("is_paused conflicts with observed_phase")
+
+    normalized: dict[str, object] = {
+        "playback_generation": generation,
+        "status_sequence": sequence,
+        "item_id": normalized_item_id,
+        "observed_phase": phase,
+        "is_paused": is_paused,
+        "current_time": _bounded_player_status_number(current_time, "current_time"),
+        "duration": _bounded_player_status_number(duration, "duration"),
+    }
+    if isinstance(client_info, dict):
+        normalized["client_info"] = {
+            "user_agent": str(client_info.get("user_agent") or "")[:500],
+            "platform": str(client_info.get("platform") or "")[:120],
+            "language": str(client_info.get("language") or "")[:80],
+            "vendor": str(client_info.get("vendor") or "")[:120],
+        }
+    return normalized
+
+
+def _projected_player_status(status: dict[str, object]) -> dict[str, object]:
+    projection = {
+        key: status[key]
+        for key in (
+            "playback_generation",
+            "item_id",
+            "observed_phase",
+            "is_paused",
+            "current_time",
+            "duration",
+            "updated_at",
+        )
+        if key in status
+    }
+    if isinstance(status.get("client_info"), dict):
+        projection["client_info"] = dict(status["client_info"])
+    return projection
+
+
+def _comparable_player_status(status: dict[str, object]) -> dict[str, object]:
+    comparable = _projected_player_status(status)
+    comparable.pop("updated_at", None)
+    return comparable
 
 
 def _player_diagnostic_number(value: object) -> float | None:
@@ -222,6 +343,15 @@ def _normalized_ip_address(value: object) -> ipaddress.IPv4Address | ipaddress.I
     return address
 
 
+def _loopback_companion_host(host: str) -> str | None:
+    if not (getattr(sys, "frozen", False) and os.name == "nt"):
+        return None
+    address = _normalized_ip_address(host)
+    if address is None or address.is_loopback or address.is_unspecified:
+        return None
+    return "127.0.0.1"
+
+
 def _url_host(host: str) -> str:
     return f"[{host}]" if ":" in host and not host.startswith("[") else host
 
@@ -229,6 +359,9 @@ def _url_host(host: str) -> str:
 def _local_ui_host(bind_host: str) -> str:
     if bind_host in {"0.0.0.0", "::"}:
         return "127.0.0.1"
+    companion = _loopback_companion_host(bind_host)
+    if companion:
+        return companion
     return bind_host
 
 
@@ -284,11 +417,18 @@ class SessionUserAlreadyExistsError(ValueError):
         super().__init__("该用户已存在")
 
 
+class PlayerStatusAdmissionError(ValueError):
+    def __init__(self, kind: str, message: str) -> None:
+        self.kind = str(kind or "player_status_rejected")
+        super().__init__(message)
+
+
 class AppContext:
     def __init__(self) -> None:
         ensure_directories()
         self._state_change_condition = threading.Condition()
         self._state_revision = 0
+        self._state_epoch = secrets.token_hex(16)
         self._sse_payload_condition = threading.Condition()
         self._sse_payload_revision = -1
         self._sse_payload = b""
@@ -312,6 +452,8 @@ class AppContext:
             on_restart_requested=self._request_update_restart,
         )
         self.cache_manager.prepare_session()
+        from .gatcha_refresh import new_owner
+        self._gatcha_refresh_owner = new_owner()
         self._closed = False
         self._server: ThreadingHTTPServer | None = None
         self._host = HOST
@@ -334,10 +476,6 @@ class AppContext:
         self._owner_enrichment: threading.Thread | None = None
         self._cloudflare_prewarm: threading.Thread | None = None
         self._playlist_export_prewarm: threading.Thread | None = None
-        self._player_control_lock = threading.RLock()
-        self._player_control_seq = 0
-        self._player_control_ack_seq = 0
-        self._player_control_command: dict[str, object] | None = None
         self._player_status_lock = threading.RLock()
         self._player_status: dict[str, object] | None = None
         self._player_diagnostic_lock = threading.RLock()
@@ -374,14 +512,22 @@ class AppContext:
         payload["gatcha_pool_config"] = gatcha_pool_config_snapshot()
         payload["gatcha_favlist_updated_at"] = gatcha_favlist_updated_at()
         payload["player_control_command"] = self.player_control_command_snapshot()
-        payload["player_status"] = self.player_status_snapshot(payload.get("current_item"))
+        payload["player_status"] = self.player_status_snapshot(payload)
         payload["app"] = {
             "version": APP_VERSION,
             "releases_url": APP_RELEASES_URL,
         }
         payload["app_update"] = self.app_update_snapshot()
         payload["state_revision"] = state_revision
+        payload["state_epoch"] = self._state_epoch
         return payload
+
+    def state_epoch_snapshot(self) -> str:
+        return self._state_epoch
+
+    def state_revision_snapshot(self) -> int:
+        with self._state_change_condition:
+            return self._state_revision
 
     def serialized_sse_state_event(self) -> tuple[int, bytes]:
         while True:
@@ -420,6 +566,7 @@ class AppContext:
         return refresh_gatcha_cache_in_background(
             on_start=self._notify_state_changed,
             on_done=self._notify_state_changed,
+            _owner=getattr(self, "_gatcha_refresh_owner", 0),
         )
 
     def app_update_snapshot(self) -> dict[str, object]:
@@ -444,6 +591,7 @@ class AppContext:
         self,
         browser_info: dict[str, object] | None = None,
         export_diagnostics: list[dict[str, object]] | None = None,
+        internet_remote_diagnostics: list[dict[str, object]] | None = None,
     ) -> DiagnosticArtifact:
         store_snapshot = self.store.snapshot()
         current_item = store_snapshot.get("current_item")
@@ -472,6 +620,7 @@ class AppContext:
             runtime_state=runtime_state,
             browser_info=browser_info,
             export_diagnostics=export_diagnostics,
+            internet_remote_diagnostics=internet_remote_diagnostics,
             local_usernames=local_usernames,
         )
 
@@ -491,6 +640,9 @@ class AppContext:
     def start_app_update(self, *, include_preview: bool = False) -> dict[str, object]:
         return self.update_manager.start(include_preview=include_preview)
 
+    def check_app_update(self, *, include_preview: bool = False) -> dict[str, object]:
+        return self.update_manager.check(include_preview=include_preview)
+
     def refresh_startup_gatcha_cache_in_background(self) -> bool:
         with self._startup_lock:
             if not self._startup_gatcha_refresh_bypass_available:
@@ -500,14 +652,25 @@ class AppContext:
             use_global_lock=False,
             upload_default_uids_to_lark=False,
             startup_schema_rebuild=True,
+            _owner=getattr(self, "_gatcha_refresh_owner", 0),
         )
 
-    def add_item(self, item, *, position: str, requester_name: str) -> None:
+    def add_item(
+        self,
+        item,
+        *,
+        position: str,
+        requester_name: str,
+        allow_repeat: bool,
+        requester_user_id: str | None = None,
+    ) -> None:
         self.store.add_item(
             item,
             position=position,
             requester_name=requester_name,
+            requester_user_id=requester_user_id,
             reset_av_delay=self.cache_manager.reset_offset_on_next,
+            allow_repeat=allow_repeat,
         )
         self.cache_manager.sync_with_playlist()
 
@@ -532,8 +695,33 @@ class AppContext:
                 self._rating_submission_keys.discard(old_key)
             return True
 
-    def advance_to_next(self) -> None:
+    def submit_rating_in_background(
+        self, session_user_name: str, play_id: str, bvid: str, score: int
+    ) -> bool:
+        if not self.register_rating_submission(session_user_name, play_id):
+            return False
+        submit_rating_background(session_user_name, play_id, bvid, score)
+        return True
+
+    def open_internet_remote_peer(
+        self, peer_id: str, epoch: str, profile: str = "controller"
+    ) -> dict[str, object]:
+        return open_internet_remote_peer(self, peer_id, epoch, profile)
+
+    def close_internet_remote_peer(self, peer_id: str) -> dict[str, object]:
+        return close_internet_remote_peer(self, peer_id)
+
+    def internet_remote_state(self) -> dict[str, object]:
+        return internet_remote_state(self)
+
+    def dispatch_internet_remote(
+        self, peer_id: str, lane: str, message: str
+    ) -> dict[str, object]:
+        return dispatch_internet_remote(self, peer_id, lane, message)
+
+    def advance_to_next(self, expected_playback_generation: int) -> None:
         self.store.advance_to_next(
+            expected_playback_generation=expected_playback_generation,
             reset_av_delay=self.cache_manager.reset_offset_on_next
         )
         self.cache_manager.sync_with_playlist()
@@ -563,12 +751,27 @@ class AppContext:
         self.store.move_item(item_id, direction)
         self.cache_manager.sync_with_playlist()
 
-    def move_item_to_index(self, item_id: str, index: int) -> None:
-        self.store.move_item_to_index(item_id, index)
+    def move_item_to_index(
+        self, item_id: str, index: int, *, expected_queue_version: str | None = None
+    ) -> None:
+        self.store.move_item_to_index(
+            item_id, index, expected_queue_version=expected_queue_version
+        )
         self.cache_manager.sync_with_playlist()
 
     def resort_playlist_by_cycle(self) -> None:
         self.store.resort_playlist_by_cycle()
+        self.cache_manager.sync_with_playlist()
+
+    def defer_current_item(self, body: dict) -> None:
+        self.store.defer_current_item(
+            body.get("item_id"),
+            expected_item_incarnation_id=body.get("expected_item_incarnation_id"),
+            expected_playback_generation=body.get("playback_generation"),
+            expected_playlist_item_ids=body.get("expected_playlist_item_ids"),
+            target_index=body.get("index"),
+            reset_av_delay=self.cache_manager.reset_offset_on_next,
+        )
         self.cache_manager.sync_with_playlist()
 
     def move_to_next(self, item_id: str) -> None:
@@ -590,8 +793,12 @@ class AppContext:
     def apply_av_delay_action(self, action: dict[str, object]) -> dict[str, object]:
         return self.store.apply_av_delay_action(action)
 
-    def set_volume_percent(self, volume_percent: int) -> int:
-        return self.store.set_volume_percent(volume_percent)
+    def set_volume_percent(
+        self, volume_percent: int, *, expected_item_incarnation_id: str | None = None
+    ) -> int:
+        return self.store.set_volume_percent(
+            volume_percent, expected_item_incarnation_id=expected_item_incarnation_id
+        )
 
     def set_muted(self, is_muted: bool) -> bool:
         return self.store.set_muted(is_muted)
@@ -602,8 +809,18 @@ class AppContext:
     def set_key_shift(self, key_shift: int) -> int:
         return self.store.set_key_shift(key_shift)
 
-    def set_audio_variant(self, item_id: str, variant_id: str) -> bool:
-        return self.store.set_audio_variant(item_id, variant_id)
+    def set_audio_variant(
+        self,
+        item_id: str,
+        variant_id: str,
+        *,
+        expected_item_incarnation_id: str,
+    ) -> bool:
+        return self.store.set_audio_variant(
+            item_id,
+            variant_id,
+            expected_item_incarnation_id=expected_item_incarnation_id,
+        )
 
     def add_session_user(self, name: str) -> None:
         self.store.add_session_user(name)
@@ -612,6 +829,15 @@ class AppContext:
         with self._remote_identity_lock:
             if self.store.remove_session_user(name):
                 self.remote_identities.revoke_name(name)
+
+    def edit_session_users(self, expected_version: str, edit: dict[str, object]) -> None:
+        with self._remote_identity_lock:
+            result = self.store.edit_session_users(expected_version, edit)
+            if result.get("previous_name"):
+                self.remote_identities.apply_native_rename(str(result["previous_name"]), str(result["name"]))
+                self._rename_rating_identity(str(result["previous_name"]), str(result["name"]))
+            for name in result.get("removed_names", []):
+                self.remote_identities.revoke_name(str(name))
 
     def remote_identity_snapshot(self, token: str) -> dict[str, object]:
         with self._remote_identity_lock:
@@ -622,6 +848,7 @@ class AppContext:
             return {
                 "registered": bool(name),
                 "name": name,
+                "user_id": next((user["id"] for user in self.store.snapshot().get("session_user_entries", []) if user["name"] == name), ""),
                 "session_id": self.remote_identities.snapshot_session_id(),
             }
 
@@ -646,22 +873,23 @@ class AppContext:
             return token, {
                 "registered": True,
                 "name": normalized,
+                "user_id": next((user["id"] for user in self.store.snapshot().get("session_user_entries", []) if user["name"] == normalized), ""),
                 "session_id": self.remote_identities.snapshot_session_id(),
             }
 
-    def rename_remote_identity(self, token: str, new_name: str) -> dict[str, object]:
+    def rename_remote_identity(self, token: str, new_name: str, *, expected_user_id: str | None = None, expected_name: str | None = None) -> dict[str, object]:
         with self._remote_identity_lock:
             current_name = self.remote_identities.resolve(token)
             if not current_name or not self.store.has_session_user(current_name):
                 self.remote_identities.revoke_token(token)
                 raise ValueError("remote identity is no longer valid")
-            renamed = self.store.rename_session_user(current_name, new_name)
-            if not self.remote_identities.rename(token, renamed):
-                raise ValueError("remote identity is no longer valid")
+            renamed = self.store.rename_session_user(current_name, new_name, expected_user_id=expected_user_id, expected_name=expected_name)
+            self.remote_identities.apply_native_rename(current_name, renamed)
             self._rename_rating_identity(current_name, renamed)
             return {
                 "registered": True,
                 "name": renamed,
+                "user_id": next((user["id"] for user in self.store.snapshot().get("session_user_entries", []) if user["name"] == renamed), ""),
                 "session_id": self.remote_identities.snapshot_session_id(),
             }
 
@@ -680,22 +908,6 @@ class AppContext:
 
     def move_session_user_to_index(self, name: str, index: int) -> None:
         self.store.move_session_user_to_index(name, index)
-
-    def capture_playback_selector(self) -> PlaybackSelector:
-        return self.store.capture_playback_selector()
-
-    def set_playback_selector_mode(self, mode: object) -> None:
-        self.store.set_playback_selector_mode(mode)
-
-    def playback_selector_capability_snapshot(self) -> dict[str, object]:
-        with self.store.lock:
-            mode = self.store.playback_selector_mode
-            warning = self.store.playback_selector_warning
-            state_revision = self._state_revision
-        return {
-            "playback_selector": playback_selector_snapshot(mode, warning),
-            "state_revision": state_revision,
-        }
 
     def set_cache_policy(
         self,
@@ -728,8 +940,18 @@ class AppContext:
         self._notify_state_changed()
         return result
 
-    def retry_cache_item(self, item_id: str, *, force: bool = False) -> None:
-        self.cache_manager.retry_item(item_id, force=force)
+    def retry_cache_item(
+        self,
+        item_id: str,
+        *,
+        expected_item_incarnation_id: str,
+        force: bool = False,
+    ) -> None:
+        self.cache_manager.retry_item(
+            item_id,
+            expected_item_incarnation_id=expected_item_incarnation_id,
+            force=force,
+        )
 
     def is_current_item(self, item_id: str) -> bool:
         return self.store.is_current_item(item_id)
@@ -738,103 +960,167 @@ class AppContext:
         self,
         *,
         action: str,
+        playback_generation: int,
         item_id: str = "",
         delta_seconds: int = 0,
         target_seconds: float | None = None,
     ) -> dict[str, object]:
-        with self._player_control_lock:
-            self._player_control_seq += 1
-            self._player_control_command = {
-                "seq": self._player_control_seq,
-                "action": action,
-                "item_id": item_id,
-                "delta_seconds": delta_seconds,
-                "target_seconds": target_seconds,
-                "issued_at": time.time(),
-            }
-            command = dict(self._player_control_command)
+        command = self.store.issue_player_control(
+            action=action,
+            playback_generation=playback_generation,
+            item_id=item_id,
+            delta_seconds=delta_seconds,
+            target_seconds=target_seconds,
+        )
         self._notify_state_changed()
         return command
 
     def ack_player_control(self, seq: int) -> None:
-        with self._player_control_lock:
-            self._player_control_ack_seq = max(self._player_control_ack_seq, int(seq))
-        self._notify_state_changed()
+        if self.store.ack_player_control(seq):
+            self._notify_state_changed()
 
     def player_control_command_snapshot(self) -> dict[str, object] | None:
-        with self._player_control_lock:
-            if not self._player_control_command:
-                return None
-            if int(self._player_control_command.get("seq") or 0) <= self._player_control_ack_seq:
-                return None
-            return dict(self._player_control_command)
+        return self.store.player_control_command_snapshot()
 
     def update_player_status(
         self,
         *,
+        playback_generation: int,
+        status_sequence: int,
         item_id: str,
+        observed_phase: str,
         is_paused: bool,
         current_time: float = 0.0,
-        duration: float | None = None,
+        duration: float = 0.0,
         client_info: object | None = None,
-    ) -> None:
-        normalized_item_id = str(item_id or "").strip()
-        if not normalized_item_id:
-            return
-        normalized_duration = 0.0
-        if duration is not None:
-            try:
-                normalized_duration = max(0.0, float(duration or 0.0))
-            except (TypeError, ValueError):
-                normalized_duration = 0.0
-        with self._player_status_lock:
-            previous_duration = 0.0
-            if (
-                isinstance(self._player_status, dict)
-                and str(self._player_status.get("item_id") or "").strip() == normalized_item_id
-            ):
-                try:
-                    previous_duration = max(0.0, float(self._player_status.get("duration") or 0.0))
-                except (TypeError, ValueError):
-                    previous_duration = 0.0
-            next_status = {
-                "item_id": normalized_item_id,
-                "is_paused": bool(is_paused),
-                "current_time": max(0.0, float(current_time or 0.0)),
-                "duration": normalized_duration or previous_duration,
-                "updated_at": time.time(),
-            }
-            if isinstance(client_info, dict):
-                next_status["client_info"] = {
-                    "user_agent": str(client_info.get("user_agent") or "")[:500],
-                    "platform": str(client_info.get("platform") or "")[:120],
-                    "language": str(client_info.get("language") or "")[:80],
-                    "vendor": str(client_info.get("vendor") or "")[:120],
+    ) -> dict[str, object]:
+        normalized = _normalize_player_status_observation(
+            playback_generation=playback_generation,
+            status_sequence=status_sequence,
+            item_id=item_id,
+            observed_phase=observed_phase,
+            is_paused=is_paused,
+            current_time=current_time,
+            duration=duration,
+            client_info=client_info,
+        )
+        generation = int(normalized["playback_generation"])
+        sequence = int(normalized["status_sequence"])
+        normalized_item_id = str(normalized["item_id"])
+
+        # AppContext.snapshot() observes the store before the status slot. Keep
+        # the same order here so a ThreadingHTTPServer status request cannot
+        # deadlock with or cross an AppState program mutation.
+        with self.store.lock:
+            with self._player_status_lock:
+                previous = (
+                    dict(self._player_status)
+                    if isinstance(self._player_status, dict)
+                    else None
+                )
+                same_status_lifetime = bool(
+                    previous
+                    and previous.get("playback_generation") == generation
+                    and previous.get("item_id") == normalized_item_id
+                )
+                if same_status_lifetime and not normalized["duration"]:
+                    normalized["duration"] = previous.get("duration", 0.0)
+                candidate = {
+                    key: value
+                    for key, value in normalized.items()
+                    if key != "status_sequence"
                 }
-            self._player_status = next_status
-        if (not is_paused) or float(current_time or 0.0) > 0:
-            self.store.mark_item_playback_started(normalized_item_id)
+                previous_sequence = (
+                    int(previous.get("status_sequence") or 0)
+                    if same_status_lifetime and previous
+                    else 0
+                )
+                if sequence < previous_sequence:
+                    raise PlayerStatusAdmissionError(
+                        "player_status_sequence_stale",
+                        "player status sequence is older than the accepted observation",
+                    )
+                duplicate = sequence == previous_sequence and previous_sequence > 0
+                if duplicate and _comparable_player_status(candidate) != _comparable_player_status(
+                    previous
+                ):
+                    raise PlayerStatusAdmissionError(
+                        "player_status_sequence_conflict",
+                        "player status sequence was replayed with a conflicting observation",
+                    )
 
-        reported_duration = next_status.get("duration")
-        if isinstance(reported_duration, (int, float)) and reported_duration > 0:
-            ratio = float(current_time or 0.0) / float(reported_duration)
-            if ratio >= RATING_PROMPT_THRESHOLD:
-                self.store.mark_session_played_threshold_reached(normalized_item_id)
+            try:
+                semantic_result = self.store.apply_player_status_observation(
+                    expected_playback_generation=generation,
+                    item_id=normalized_item_id,
+                    is_paused=bool(normalized["is_paused"]),
+                    current_time=float(normalized["current_time"]),
+                    duration=float(normalized["duration"]),
+                )
+            except PlaylistStoreCommandError as exc:
+                raise PlayerStatusAdmissionError(exc.kind, str(exc)) from exc
 
-        self._notify_state_changed()
+            if duplicate:
+                return {"accepted": True, "duplicate": True, "changed": False}
 
-    def player_status_snapshot(self, current_item_payload: object) -> dict[str, object] | None:
-        current_item_id = ""
-        if isinstance(current_item_payload, dict):
-            current_item_id = str(current_item_payload.get("id") or "").strip()
-        if not current_item_id:
+            with self._player_status_lock:
+                previous = (
+                    dict(self._player_status)
+                    if isinstance(self._player_status, dict)
+                    else None
+                )
+                visible_changed = (
+                    previous is None
+                    or _comparable_player_status(candidate)
+                    != _comparable_player_status(previous)
+                )
+                if visible_changed:
+                    self._player_status = {
+                        **candidate,
+                        "status_sequence": sequence,
+                        "updated_at": time.time(),
+                    }
+                else:
+                    self._player_status = {
+                        **previous,
+                        "status_sequence": sequence,
+                    }
+
+            if visible_changed and not semantic_result["changed"]:
+                self._notify_state_changed()
+            return {
+                "accepted": True,
+                "duplicate": False,
+                "changed": visible_changed,
+            }
+
+    def player_status_snapshot(self, authoritative_snapshot: object) -> dict[str, object] | None:
+        if not isinstance(authoritative_snapshot, dict):
+            return None
+        current_item = authoritative_snapshot.get("current_item")
+        playback_program = authoritative_snapshot.get("playback_program")
+        playback_generation = authoritative_snapshot.get("playback_generation")
+        if not isinstance(current_item, dict) or not isinstance(playback_program, dict):
+            return None
+        current_item_id = str(current_item.get("id") or "").strip()
+        program_item_id = str(playback_program.get("item_id") or "").strip()
+        if (
+            not current_item_id
+            or current_item_id != program_item_id
+            or isinstance(playback_generation, bool)
+            or not isinstance(playback_generation, int)
+        ):
             return None
         with self._player_status_lock:
             if not self._player_status:
                 return None
-            if str(self._player_status.get("item_id") or "").strip() != current_item_id:
+            if (
+                self._player_status.get("playback_generation") != playback_generation
+                or str(self._player_status.get("item_id") or "").strip()
+                != current_item_id
+            ):
                 return None
-            return dict(self._player_status)
+            return _projected_player_status(self._player_status)
 
     def restore_backup(self) -> bool:
         restored = self.store.restore_backup(
@@ -863,21 +1149,48 @@ class AppContext:
                 self._rating_submission_keys.clear()
                 self._rating_submission_key_order.clear()
         self.auto_restored_backup = False
-        with self._player_control_lock:
-            self._player_control_ack_seq = self._player_control_seq
-            self._player_control_command = None
         with self._player_status_lock:
             self._player_status = None
         self._notify_state_changed()
 
     def reset_player_state(self) -> None:
         self.store.reset_player_state()
-        with self._player_control_lock:
-            self._player_control_ack_seq = self._player_control_seq
-            self._player_control_command = None
         with self._player_status_lock:
             self._player_status = None
         self._notify_state_changed()
+
+    def restart_playback_program(self) -> bool:
+        return self.store.restart_playback_program()
+
+    def retire_host_playback_program(
+        self,
+        *,
+        host_client_id: str,
+        playback_generation: int,
+        item_incarnation_id: str,
+        artifact_set_id: str,
+    ) -> bool:
+        return self.cache_manager.retire_host_playback_program(
+            host_client_id=host_client_id,
+            playback_generation=playback_generation,
+            item_incarnation_id=item_incarnation_id,
+            artifact_set_id=artifact_set_id,
+        )
+
+    def claim_host_playback_program(
+        self,
+        *,
+        host_client_id: str,
+        playback_generation: int,
+        item_incarnation_id: str,
+        artifact_set_id: str,
+    ) -> bool:
+        return self.cache_manager.claim_host_playback_program(
+            host_client_id=host_client_id,
+            playback_generation=playback_generation,
+            item_incarnation_id=item_incarnation_id,
+            artifact_set_id=artifact_set_id,
+        )
 
     def bind_server(self, server: ThreadingHTTPServer, *, shutdown_on_last_client: bool) -> None:
         with self._client_lock:
@@ -1028,7 +1341,11 @@ class AppContext:
         if self._closed:
             return
         self._closed = True
+        from .gatcha_refresh import stop as stop_gatcha_refresh
+        if hasattr(self, "_gatcha_refresh_owner"):
+            stop_gatcha_refresh(self._gatcha_refresh_owner)
         self.cache_manager.shutdown()
+        self.store.shutdown()
 
     def _owner_enrichment_loop(self) -> None:
         for source_url in self.store.missing_owner_urls():
@@ -1095,7 +1412,46 @@ class AppContext:
         }
 
 
-CONTEXT = AppContext()
+class _LazyAppContext:
+    """Create the retained Host adapter only when its transport is used.
+
+    Importing handlers must not start a cache owner, write user files or race
+    another explicit AppState owner (including isolated integration fixtures).
+    """
+
+    def __init__(self) -> None:
+        self._instance = None
+        self._lock = threading.Lock()
+
+    def _get(self):
+        with self._lock:
+            if self._instance is None:
+                self._instance = AppContext()
+            return self._instance
+
+    def __getattr__(self, name):
+        return getattr(self._get(), name)
+
+    def __setattr__(self, name, value):
+        if name in {"_instance", "_lock"}:
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self._get(), name, value)
+
+    def __delattr__(self, name):
+        if name in {"_instance", "_lock"}:
+            object.__delattr__(self, name)
+        else:
+            delattr(self._get(), name)
+
+    def shutdown(self) -> None:
+        with self._lock:
+            instance = self._instance
+        if instance is not None:
+            instance.shutdown()
+
+
+CONTEXT = _LazyAppContext()
 atexit.register(CONTEXT.shutdown)
 
 
@@ -1157,19 +1513,11 @@ class BilikaraHandler(BaseHTTPRequestHandler):
         if route == "/api/state":
             self._write_json({"ok": True, "data": CONTEXT.snapshot()})
             return
-        if route == "/api/player/playback-selector":
+        if route == "/api/internet-remote/state":
             if not self._is_local_client():
-                self._write_json(
-                    {"ok": False, "error": "forbidden"},
-                    status=HTTPStatus.FORBIDDEN,
-                )
+                self._write_json({"ok": False, "error": "forbidden"}, status=HTTPStatus.FORBIDDEN)
                 return
-            self._write_json(
-                {
-                    "ok": True,
-                    "data": CONTEXT.playback_selector_capability_snapshot(),
-                }
-            )
+            self._write_json({"ok": True, "data": CONTEXT.internet_remote_state()})
             return
         if route == "/api/remote-identity":
             self._write_json({"ok": True, "data": CONTEXT.remote_identity_snapshot(self._remote_identity_token())})
@@ -1178,16 +1526,18 @@ class BilikaraHandler(BaseHTTPRequestHandler):
             self._write_json({"ok": True, "data": CONTEXT.app_update_snapshot()})
             return
         if route == "/api/app/update":
-            try:
-                include_preview = str(query.get("include_preview", [""])[0]).lower() in {
-                    "1",
-                    "true",
-                    "yes",
-                    "on",
+            include_preview = str(query.get("include_preview", [""])[0]).lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+            self._write_json(
+                {
+                    "ok": True,
+                    "data": CONTEXT.check_app_update(include_preview=include_preview),
                 }
-                self._write_json({"ok": True, "data": check_for_update(include_preview=include_preview)})
-            except Exception as e:
-                self._write_json({"ok": False, "error": str(e)}, status=HTTPStatus.BAD_GATEWAY)
+            )
             return
         if route == "/api/gatcha/candidate":
             try:
@@ -1213,80 +1563,36 @@ class BilikaraHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._write_json({"ok": False, "error": str(e)})
             return
-        if route == "/api/lark/search":
-            route_query = parse_qs(urlparse(self.path).query)
-            query = route_query.get("q", [""])[0]
-            table_index = route_query.get("table", [""])[0]
+        if route in {"/api/catalog/search", "/api/lark/search", "/api/d1/browse", "/api/d1/category-browse"}:
             try:
-                limit = max(1, min(100, int(route_query.get("limit", ["80"])[0] or "80")))
-            except (TypeError, ValueError):
-                limit = 80
-            try:
-                if table_index:
-                    results = search_lark_pool_table(query, int(table_index), limit=limit)
-                else:
-                    results = search_lark_pool(query, limit=limit)
-                results = annotate_gatcha_local_status(results)
-                self._write_json({"ok": True, "data": {"items": results}})
-            except Exception as e:
-                self._write_json({"ok": False, "error": str(e)})
-            return
-        if route == "/api/d1/browse":
-            route_query = parse_qs(urlparse(self.path).query)
-            kind = route_query.get("kind", route_query.get("type", ["name"]))[0]
-            letter = route_query.get("letter", [""])[0]
-            search_query = route_query.get("q", [""])[0]
-            tag = route_query.get("tag", [""])[0]
-            locale = route_query.get("locale", [""])[0]
-            try:
-                limit = max(1, min(500, int(route_query.get("limit", ["100"])[0] or "100")))
-            except (TypeError, ValueError):
-                limit = 100
-            try:
-                results = browse_d1_pool(kind, letter=letter, query=search_query, tag=tag, locale=locale, limit=limit)
-                if isinstance(results.get("items"), list):
-                    results["items"] = annotate_gatcha_local_status(results["items"])
+                results = read_catalog(route, urlparse(self.path).query)
+                results["items"] = annotate_gatcha_local_status(results["items"])
                 self._write_json({"ok": True, "data": results})
-            except Exception as e:
-                self._write_json({"ok": False, "error": str(e)})
-            return
-        if route == "/api/d1/category-browse":
-            route_query = parse_qs(urlparse(self.path).query)
-            tags = route_query.get("tag", [])
-            tags.extend(
-                tag
-                for packed in route_query.get("tags", [])
-                for tag in str(packed or "").split(",")
-            )
-            tag45s = route_query.get("tag45", [])
-            tag45s.extend(
-                tag
-                for packed in route_query.get("tag45s", [])
-                for tag in str(packed or "").split(",")
-            )
-            search_query = route_query.get("q", [""])[0]
-            try:
-                limit = max(1, min(100, int(route_query.get("limit", ["100"])[0] or "100")))
-            except (TypeError, ValueError):
-                limit = 100
-            try:
-                offset = max(0, int(route_query.get("offset", ["0"])[0] or "0"))
-            except (TypeError, ValueError):
-                offset = 0
-            try:
-                results = browse_d1_category_pool(tags, tag45s=tag45s, query=search_query, limit=limit, offset=offset)
-                if isinstance(results.get("items"), list):
-                    results["items"] = annotate_gatcha_local_status(results["items"])
-                self._write_json({"ok": True, "data": results})
-            except Exception as e:
-                self._write_json({"ok": False, "error": str(e)})
+            except CatalogError as exc:
+                self._write_json({"ok": False, "error": str(exc), "code": exc.code}, status=exc.status_code)
             return
         if route == "/api/gatcha/browse":
             route_query = parse_qs(urlparse(self.path).query)
             selected_uid = route_query.get("uid", [""])[0]
             search_query = route_query.get("q", [""])[0]
             try:
-                self._write_json({"ok": True, "data": browse_gatcha_cache(selected_uid, search_query)})
+                offset = max(0, int(route_query.get("offset", ["0"])[0] or "0"))
+            except (TypeError, ValueError):
+                offset = 0
+            try:
+                limit = max(1, min(10_000, int(route_query.get("limit", ["10000"])[0] or "10000")))
+            except (TypeError, ValueError):
+                limit = 10_000
+            try:
+                self._write_json({
+                    "ok": True,
+                    "data": browse_gatcha_cache(
+                        selected_uid,
+                        search_query,
+                        offset=offset,
+                        limit=limit,
+                    ),
+                })
             except Exception as e:
                 self._write_json({"ok": False, "error": str(e)})
             return
@@ -1295,7 +1601,23 @@ class BilikaraHandler(BaseHTTPRequestHandler):
             selected_folder_id = route_query.get("folder_id", [""])[0]
             search_query = route_query.get("q", [""])[0]
             try:
-                self._write_json({"ok": True, "data": browse_gatcha_favlist(selected_folder_id, search_query)})
+                offset = max(0, int(route_query.get("offset", ["0"])[0] or "0"))
+            except (TypeError, ValueError):
+                offset = 0
+            try:
+                limit = max(1, min(10_000, int(route_query.get("limit", ["10000"])[0] or "10000")))
+            except (TypeError, ValueError):
+                limit = 10_000
+            try:
+                self._write_json({
+                    "ok": True,
+                    "data": browse_gatcha_favlist(
+                        selected_folder_id,
+                        search_query,
+                        offset=offset,
+                        limit=limit,
+                    ),
+                })
             except Exception as e:
                 self._write_json({"ok": False, "error": str(e)})
             return
@@ -1427,7 +1749,6 @@ class BilikaraHandler(BaseHTTPRequestHandler):
                 if export_format == "image":
                     payload, content_type, default_filename = playlist_image_export(
                         history,
-                        logo_path=_playlist_export_logo_path(),
                         title=str(settings["title"]),
                         page_size=export_page_size,
                     )
@@ -1469,15 +1790,66 @@ class BilikaraHandler(BaseHTTPRequestHandler):
         
         try:
             body = self._read_json_body()
+            if route.startswith("/api/internet-remote/"):
+                if not self._is_local_client():
+                    self._write_json(
+                        {"ok": False, "error": "forbidden"},
+                        status=HTTPStatus.FORBIDDEN,
+                    )
+                    return
+                if route == "/api/internet-remote/peer/open":
+                    result = CONTEXT.open_internet_remote_peer(
+                        str(body.get("peer_id") or ""),
+                        str(body.get("epoch") or ""),
+                        str(body.get("profile") or "controller"),
+                    )
+                elif route == "/api/internet-remote/peer/close":
+                    result = CONTEXT.close_internet_remote_peer(
+                        str(body.get("peer_id") or "")
+                    )
+                elif route == "/api/internet-remote/dispatch":
+                    message = body.get("message")
+                    if not isinstance(message, str):
+                        raise ValueError("message must be a string")
+                    result = CONTEXT.dispatch_internet_remote(
+                        str(body.get("peer_id") or ""),
+                        str(body.get("lane") or ""),
+                        message,
+                    )
+                elif route == "/api/internet-remote/qr":
+                    remote_url = str(body.get("url") or "")
+                    if (
+                        len(remote_url) > 2048
+                        or not remote_url.startswith(
+                            "https://rtc.kevinx96.icu/remote.html#"
+                        )
+                    ):
+                        raise ValueError("invalid Internet Remote URL")
+                    qr_image = rust_runtime.generate_qr_image(remote_url, border=0)
+                    result = {"image": qr_image.data_url}
+                else:
+                    self._write_json(
+                        {"ok": False, "error": "not found"},
+                        status=HTTPStatus.NOT_FOUND,
+                    )
+                    return
+                self._write_json({"ok": True, "data": result})
+                return
             export_diagnostics = body.get("export_diagnostics") if isinstance(body, dict) else None
+            internet_remote_diagnostics = (
+                body.get("internet_remote_diagnostics")
+                if isinstance(body, dict)
+                else None
+            )
             if route == "/api/diagnostics/markdown":
                 if not self._is_local_client():
                     self._write_json({"ok": False, "error": "forbidden"}, status=HTTPStatus.FORBIDDEN)
                     return
-                if export_diagnostics is not None:
+                if export_diagnostics is not None or internet_remote_diagnostics is not None:
                     artifact = CONTEXT.build_diagnostics(
                         self._diagnostic_browser_info(body),
                         export_diagnostics=export_diagnostics,
+                        internet_remote_diagnostics=internet_remote_diagnostics,
                     )
                 else:
                     artifact = CONTEXT.build_diagnostics(self._diagnostic_browser_info(body))
@@ -1505,10 +1877,11 @@ class BilikaraHandler(BaseHTTPRequestHandler):
                     return
                 self._log_diagnostics_stage("diagnostics_authorized", diagnostic_context)
                 try:
-                    if export_diagnostics is not None:
+                    if export_diagnostics is not None or internet_remote_diagnostics is not None:
                         artifact = CONTEXT.build_diagnostics(
                             self._diagnostic_browser_info(body),
                             export_diagnostics=export_diagnostics,
+                            internet_remote_diagnostics=internet_remote_diagnostics,
                         )
                     else:
                         artifact = CONTEXT.build_diagnostics(self._diagnostic_browser_info(body))
@@ -1544,6 +1917,8 @@ class BilikaraHandler(BaseHTTPRequestHandler):
                 identity = CONTEXT.rename_remote_identity(
                     self._remote_identity_token(),
                     str(body.get("name") or ""),
+                    expected_user_id=body.get("user_id"),
+                    expected_name=body.get("expected_name"),
                 )
                 self._write_json({"ok": True, "data": identity})
                 return
@@ -1563,6 +1938,20 @@ class BilikaraHandler(BaseHTTPRequestHandler):
                 }
                 self._write_json({"ok": True, "data": CONTEXT.start_app_update(include_preview=include_preview)})
                 return
+            if route == "/api/app/update/check":
+                include_preview = str(body.get("include_preview", body.get("includePreview", ""))).lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                }
+                self._write_json(
+                    {
+                        "ok": True,
+                        "data": CONTEXT.check_app_update(include_preview=include_preview),
+                    }
+                )
+                return
             if route == "/api/app/open-url":
                 url_to_open = str(body.get("url", "")).strip()
                 if url_to_open.startswith(("http://", "https://")):
@@ -1578,7 +1967,23 @@ class BilikaraHandler(BaseHTTPRequestHandler):
                 self._handle_add(body)
                 return
             if route == "/api/player/next":
-                CONTEXT.advance_to_next()
+                expected_playback_generation = body.get("playback_generation")
+                if (
+                    isinstance(expected_playback_generation, bool)
+                    or not isinstance(expected_playback_generation, int)
+                    or expected_playback_generation < 1
+                    or expected_playback_generation > MAX_SAFE_JSON_INTEGER
+                ):
+                    raise ValueError("invalid playback_generation")
+                try:
+                    CONTEXT.advance_to_next(expected_playback_generation)
+                except PlaylistStoreCommandError as exc:
+                    if exc.kind != "playback_generation_mismatch":
+                        raise
+                    self._write_json(
+                        {"ok": True, "data": CONTEXT.snapshot(), "stale": True}
+                    )
+                    return
                 self._write_json({"ok": True, "data": CONTEXT.snapshot()})
                 return
             if route == "/api/playlist/remove":
@@ -1613,6 +2018,10 @@ class BilikaraHandler(BaseHTTPRequestHandler):
                 CONTEXT.remove_session_user(name)
                 self._write_json({"ok": True, "data": CONTEXT.snapshot()})
                 return
+            if route == "/api/session-users/edit":
+                CONTEXT.edit_session_users(str(body.get("expected_version") or ""), body.get("edit") or {})
+                self._write_json({"ok": True, "data": CONTEXT.snapshot()})
+                return
             if route == "/api/session-users/reorder":
                 name = str(body.get("name") or "").strip()
                 index = body.get("index")
@@ -1644,6 +2053,54 @@ class BilikaraHandler(BaseHTTPRequestHandler):
                     return
                 self._write_json({"ok": True, "data": {"verified": True}})
                 return
+            if route == "/api/admin-maintenance/trigger":
+                bilikara_secret = str(body.get("BILIKARA_ADMIN_SECRET") or "").strip()
+                if not self._verified_bilikara_secret(bilikara_secret):
+                    self._write_json({"ok": False, "error": "invalid secret"}, status=HTTPStatus.FORBIDDEN)
+                    return
+                job = str(body.get("job") or "").strip().lower()
+                if job not in {"monthly-d1-refresh", "tagger-yomi"}:
+                    self._write_json(
+                        {"ok": False, "error": "invalid maintenance job"},
+                        status=HTTPStatus.BAD_REQUEST,
+                    )
+                    return
+                requested_by = str(body.get("requested_by") or "")
+                try:
+                    if job == "monthly-d1-refresh":
+                        result = start_monthly_refresh_in_background(
+                            bilikara_secret,
+                            requested_by=requested_by,
+                        )
+                    else:
+                        result = trigger_cloudflare_maintenance_job(
+                            job,
+                            bilikara_secret,
+                            requested_by=requested_by,
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    message = str(exc or "maintenance job start failed").strip()[:360]
+                    self._write_json(
+                        {"ok": False, "error": message or "maintenance job start failed"},
+                        status=HTTPStatus.BAD_GATEWAY,
+                    )
+                    return
+                if not isinstance(result, dict):
+                    self._write_json(
+                        {"ok": False, "error": "maintenance job returned an invalid result"},
+                        status=HTTPStatus.BAD_GATEWAY,
+                    )
+                    return
+                if not result.get("success"):
+                    message = str(result.get("error") or "maintenance job start failed").strip()[:360]
+                    if "already running locally" in message:
+                        status = HTTPStatus.CONFLICT
+                    else:
+                        status = HTTPStatus.BAD_GATEWAY
+                    self._write_json({"ok": False, "error": message}, status=status)
+                    return
+                self._write_json({"ok": True, "data": result}, status=HTTPStatus.ACCEPTED)
+                return
             if route == "/api/admin-review/pending":
                 bilikara_secret = str(body.get("BILIKARA_ADMIN_SECRET") or "").strip()
                 if not self._verified_bilikara_secret(bilikara_secret):
@@ -1655,7 +2112,7 @@ class BilikaraHandler(BaseHTTPRequestHandler):
                     limit = 20
                 try:
                     result = pending_cloudflare_review_items(bilikara_secret, limit=limit)
-                except LarkPoolError as exc:
+                except CatalogError as exc:
                     self._write_json({"ok": False, "error": str(exc)}, status=HTTPStatus.BAD_GATEWAY)
                     return
                 self._write_json({"ok": True, "data": result})
@@ -1674,8 +2131,66 @@ class BilikaraHandler(BaseHTTPRequestHandler):
                     limit = 20
                 try:
                     result = approve_cloudflare_review_items(bvids, bilikara_secret, limit=limit)
-                except LarkPoolError as exc:
+                except CatalogError as exc:
                     self._write_json({"ok": False, "error": str(exc)}, status=HTTPStatus.BAD_GATEWAY)
+                    return
+                self._write_json({"ok": True, "data": result})
+                return
+            if route == "/api/admin-review/reject":
+                bilikara_secret = str(body.get("BILIKARA_ADMIN_SECRET") or "").strip()
+                if not self._verified_bilikara_secret(bilikara_secret):
+                    self._write_json({"ok": False, "error": "invalid secret"}, status=HTTPStatus.FORBIDDEN)
+                    return
+                result = reject_cloudflare_review_item(
+                    str(body.get("bvid") or ""),
+                    bilikara_secret,
+                    record=body.get("record") if isinstance(body.get("record"), dict) else None,
+                    rejected_by=str(body.get("rejected_by") or ""),
+                )
+                if not result.get("success"):
+                    self._write_json(
+                        {"ok": False, "error": str(result.get("error") or "review rejection failed")},
+                        status=HTTPStatus.BAD_GATEWAY,
+                    )
+                    return
+                self._write_json({"ok": True, "data": result})
+                return
+            if route == "/api/admin-blacklist/list":
+                bilikara_secret = str(body.get("BILIKARA_ADMIN_SECRET") or "").strip()
+                if not self._verified_bilikara_secret(bilikara_secret):
+                    self._write_json({"ok": False, "error": "invalid secret"}, status=HTTPStatus.FORBIDDEN)
+                    return
+                result = list_cloudflare_blacklist(
+                    bilikara_secret,
+                    query=str(body.get("query") or body.get("q") or ""),
+                    limit=body.get("limit") or 20,
+                    offset=body.get("offset") or 0,
+                    include_inactive=bool(body.get("include_inactive")),
+                )
+                if not result.get("success"):
+                    self._write_json(
+                        {"ok": False, "error": str(result.get("error") or "blacklist query failed")},
+                        status=HTTPStatus.BAD_GATEWAY,
+                    )
+                    return
+                self._write_json({"ok": True, "data": result})
+                return
+            if route == "/api/admin-blacklist/restore":
+                bilikara_secret = str(body.get("BILIKARA_ADMIN_SECRET") or "").strip()
+                if not self._verified_bilikara_secret(bilikara_secret):
+                    self._write_json({"ok": False, "error": "invalid secret"}, status=HTTPStatus.FORBIDDEN)
+                    return
+                result = restore_cloudflare_blacklist_item(
+                    str(body.get("bvid") or ""),
+                    bilikara_secret,
+                    restore_video=bool(body.get("restore_video")),
+                    restored_by=str(body.get("restored_by") or ""),
+                )
+                if not result.get("success"):
+                    self._write_json(
+                        {"ok": False, "error": str(result.get("error") or "blacklist restore failed")},
+                        status=HTTPStatus.BAD_GATEWAY,
+                    )
                     return
                 self._write_json({"ok": True, "data": result})
                 return
@@ -1764,7 +2279,15 @@ class BilikaraHandler(BaseHTTPRequestHandler):
                 index = body.get("index")
                 if not isinstance(index, int):
                     raise ValueError("index 必须是整数")
-                CONTEXT.move_item_to_index(body["item_id"], index)
+                CONTEXT.move_item_to_index(
+                    body["item_id"], index,
+                    expected_queue_version=body.get("expected_queue_version"),
+                )
+                self._write_json({"ok": True, "data": CONTEXT.snapshot()})
+                return
+            if route == "/api/playlist/defer-current":
+                self._require_id(body)
+                CONTEXT.defer_current_item(body)
                 self._write_json({"ok": True, "data": CONTEXT.snapshot()})
                 return
             if route == "/api/playlist/resort":
@@ -1786,18 +2309,6 @@ class BilikaraHandler(BaseHTTPRequestHandler):
                 if mode not in {"online", "local"}:
                     raise ValueError("mode 必须是 online 或 local")
                 CONTEXT.set_mode(mode)
-                self._write_json({"ok": True, "data": CONTEXT.snapshot()})
-                return
-            if route == "/api/player/playback-selector":
-                if not self._is_local_client():
-                    self._write_json(
-                        {"ok": False, "error": "forbidden"},
-                        status=HTTPStatus.FORBIDDEN,
-                    )
-                    return
-                if set(body) != {"mode"}:
-                    raise ValueError("request must contain only mode")
-                CONTEXT.set_playback_selector_mode(body.get("mode"))
                 self._write_json({"ok": True, "data": CONTEXT.snapshot()})
                 return
             if route == "/api/player/av-offset":
@@ -1851,7 +2362,13 @@ class BilikaraHandler(BaseHTTPRequestHandler):
                 if volume_percent is not None:
                     if not isinstance(volume_percent, int):
                         raise ValueError("volume_percent must be an integer")
-                    CONTEXT.set_volume_percent(volume_percent)
+                    if "expected_item_incarnation_id" in body:
+                        expected = body["expected_item_incarnation_id"]
+                        if not isinstance(expected, str):
+                            raise ValueError("expected_item_incarnation_id must be a string")
+                        CONTEXT.set_volume_percent(volume_percent, expected_item_incarnation_id=expected)
+                    else:
+                        CONTEXT.set_volume_percent(volume_percent)
                 if is_muted is not None:
                     if not isinstance(is_muted, bool):
                         raise ValueError("is_muted must be a boolean")
@@ -1862,8 +2379,34 @@ class BilikaraHandler(BaseHTTPRequestHandler):
                 return
             if route == "/api/cache/retry":
                 self._require_id(body)
+                expected_item_incarnation_id = body.get(
+                    "expected_item_incarnation_id"
+                )
+                if (
+                    not isinstance(expected_item_incarnation_id, str)
+                    or not expected_item_incarnation_id
+                ):
+                    raise ValueError("missing expected_item_incarnation_id")
                 force = bool(body.get("force"))
-                CONTEXT.retry_cache_item(body["item_id"], force=force)
+                try:
+                    CONTEXT.retry_cache_item(
+                        body["item_id"],
+                        expected_item_incarnation_id=expected_item_incarnation_id,
+                        force=force,
+                    )
+                except (
+                    PlaylistStoreCommandError,
+                    rust_runtime.RustRuntimeServiceError,
+                ) as exc:
+                    if getattr(exc, "kind", "") not in {
+                        "item_not_found",
+                        "item_incarnation_mismatch",
+                    }:
+                        raise
+                    self._write_json(
+                        {"ok": True, "data": CONTEXT.snapshot(), "stale": True}
+                    )
+                    return
                 self._write_json({"ok": True, "data": CONTEXT.snapshot()})
                 return
             if route == "/api/gatcha/pool-config":
@@ -1875,6 +2418,28 @@ class BilikaraHandler(BaseHTTPRequestHandler):
                 )
                 CONTEXT._notify_state_changed()
                 self._write_json({"ok": True, "data": {**gatcha_pool_config_detail(), **result}})
+                return
+            if route == "/api/gatcha/sources/edit":
+                # The source Host uses its existing trusted local-client boundary;
+                # native products require their Host bootstrap capability.
+                if not self._is_local_client():
+                    self._write_json({"ok": False, "error": "forbidden"}, status=HTTPStatus.FORBIDDEN)
+                    return
+                if set(body) != {"source", "expected_version", "edit"}:
+                    raise ValueError("invalid source edit")
+                from .bilibili import edit_gatcha_sources
+                result = edit_gatcha_sources(
+                    body.get("source"), body.get("expected_version"), body.get("edit"),
+                    on_done=CONTEXT._notify_state_changed,
+                )
+                self._write_json({"ok": True, "data": result})
+                return
+            if route == "/api/gatcha/source/remove":
+                from .bilibili import remove_gatcha_source
+                result = remove_gatcha_source(
+                    body.get("source"), body.get("id"), on_done=CONTEXT._notify_state_changed,
+                )
+                self._write_json({"ok": True, "data": result})
                 return
             if route == "/api/gatcha/uids/add":
                 result = add_gatcha_uid(
@@ -1920,14 +2485,45 @@ class BilikaraHandler(BaseHTTPRequestHandler):
                 variant_id = str(body.get("variant_id") or "").strip()
                 if not variant_id:
                     raise ValueError("missing variant_id")
-                if not CONTEXT.set_audio_variant(body["item_id"], variant_id):
+                expected_item_incarnation_id = body.get(
+                    "expected_item_incarnation_id"
+                )
+                if (
+                    not isinstance(expected_item_incarnation_id, str)
+                    or not expected_item_incarnation_id
+                ):
+                    raise ValueError("missing expected_item_incarnation_id")
+                try:
+                    changed = CONTEXT.set_audio_variant(
+                        body["item_id"],
+                        variant_id,
+                        expected_item_incarnation_id=expected_item_incarnation_id,
+                    )
+                except PlaylistStoreCommandError as exc:
+                    if exc.kind not in {
+                        "item_not_found",
+                        "item_incarnation_mismatch",
+                    }:
+                        raise
+                    self._write_json(
+                        {"ok": True, "data": CONTEXT.snapshot(), "stale": True}
+                    )
+                    return
+                if not changed:
                     raise ValueError("invalid audio variant")
                 self._write_json({"ok": True, "data": CONTEXT.snapshot()})
                 return
             if route == "/api/player/control":
                 action = str(body.get("action") or "").strip()
                 item_id = str(body.get("item_id") or "").strip()
-                if action not in {"toggle-play", "seek-relative", "seek-absolute", "next-track"}:
+                if action not in {
+                    "toggle-play",
+                    "play",
+                    "pause",
+                    "seek-relative",
+                    "seek-absolute",
+                    "next-track",
+                }:
                     raise ValueError("invalid player control action")
                 delta_seconds = int(body.get("delta_seconds") or 0)
                 target_seconds = None
@@ -1939,8 +2535,12 @@ class BilikaraHandler(BaseHTTPRequestHandler):
                     target_seconds = float(body.get("target_seconds") or 0.0)
                     if target_seconds < 0:
                         raise ValueError("target_seconds must be non-negative")
+                expected_playback_generation = _positive_safe_player_status_integer(
+                    body.get("playback_generation"), "playback_generation"
+                )
                 CONTEXT.issue_player_control(
                     action=action,
+                    playback_generation=expected_playback_generation,
                     item_id=item_id,
                     delta_seconds=delta_seconds,
                     target_seconds=target_seconds,
@@ -1948,31 +2548,63 @@ class BilikaraHandler(BaseHTTPRequestHandler):
                 self._write_json({"ok": True, "data": CONTEXT.snapshot()})
                 return
             if route == "/api/player/control-ack":
+                if not self._is_local_client():
+                    self._write_json({"ok": False, "error": "forbidden"}, status=HTTPStatus.FORBIDDEN)
+                    return
                 seq = body.get("seq")
-                if not isinstance(seq, int):
-                    raise ValueError("seq must be an integer")
+                if isinstance(seq, bool) or not isinstance(seq, int) or not 0 <= seq <= MAX_SAFE_JSON_INTEGER:
+                    raise ValueError("seq must be a non-negative safe integer")
                 CONTEXT.ack_player_control(seq)
                 self._write_json({"ok": True})
                 return
+            if route in {
+                "/api/player/claim-program",
+                "/api/player/retire-program",
+            }:
+                if not self._is_local_client():
+                    self._write_json(
+                        {"ok": False, "error": "forbidden"},
+                        status=HTTPStatus.FORBIDDEN,
+                    )
+                    return
+                playback_generation = _positive_safe_player_status_integer(
+                    body.get("playback_generation"), "playback_generation"
+                )
+                item_incarnation_id = body.get("item_incarnation_id")
+                artifact_set_id = body.get("artifact_set_id")
+                if (
+                    not isinstance(item_incarnation_id, str)
+                    or not item_incarnation_id
+                    or not isinstance(artifact_set_id, str)
+                    or not artifact_set_id
+                ):
+                    raise ValueError("invalid Host playback artifact identity")
+                identity = {
+                    "host_client_id": client_id,
+                    "playback_generation": playback_generation,
+                    "item_incarnation_id": item_incarnation_id,
+                    "artifact_set_id": artifact_set_id,
+                }
+                if route == "/api/player/claim-program":
+                    claimed = CONTEXT.claim_host_playback_program(**identity)
+                    self._write_json({"ok": True, "data": {"claimed": claimed}})
+                else:
+                    released = CONTEXT.retire_host_playback_program(**identity)
+                    self._write_json({"ok": True, "data": {"released": released}})
+                return
             if route == "/api/player/status":
-                item_id = str(body.get("item_id") or "").strip()
-                if not item_id:
-                    raise ValueError("missing item_id")
-                is_paused = body.get("is_paused")
-                if not isinstance(is_paused, bool):
-                    raise ValueError("is_paused must be boolean")
-                current_time = float(body.get("current_time") or 0.0)
-                duration = None
-                if "duration" in body:
-                    duration = float(body.get("duration") or 0.0)
-                CONTEXT.update_player_status(
-                    item_id=item_id,
-                    is_paused=is_paused,
-                    current_time=current_time,
-                    duration=duration,
+                observation = _normalize_player_status_observation(
+                    playback_generation=body.get("playback_generation"),
+                    status_sequence=body.get("status_sequence"),
+                    item_id=body.get("item_id"),
+                    observed_phase=body.get("observed_phase"),
+                    is_paused=body.get("is_paused"),
+                    current_time=body.get("current_time"),
+                    duration=body.get("duration"),
                     client_info=body.get("client_info"),
                 )
-                self._write_json({"ok": True})
+                result = CONTEXT.update_player_status(**observation)
+                self._write_json({"ok": True, "data": result})
                 return
             if route == "/api/player/diagnostic":
                 event = CONTEXT.record_player_diagnostic(_normalize_player_diagnostic(body))
@@ -1982,7 +2614,7 @@ class BilikaraHandler(BaseHTTPRequestHandler):
             if route == "/api/rating/log":
                 message = str(body.get("message") or "").strip()
                 if message:
-                    print(f"[rating-front] {message}", flush=True)
+                    _debug_print(f"[rating-front] {message}")
                 self._write_json({"ok": True})
                 return
             if route == "/api/rating/submit":
@@ -2016,7 +2648,7 @@ class BilikaraHandler(BaseHTTPRequestHandler):
                 if score < 1 or score > 5:
                     raise ValueError("score must be between 1 and 5")
                 duplicate = not CONTEXT.register_rating_submission(session_user_name, play_id)
-                print(f"[rating] user={session_user_name} play_id={play_id} bvid={bvid} score={score} duplicate={duplicate}", flush=True)
+                _debug_print(f"[rating] user={session_user_name} play_id={play_id} bvid={bvid} score={score} duplicate={duplicate}")
                 if not duplicate:
                     self._submit_rating_in_background(session_user_name, play_id, bvid, score)
                 self._write_json({
@@ -2089,6 +2721,16 @@ class BilikaraHandler(BaseHTTPRequestHandler):
                 return
             if route == "/api/player/reset":
                 CONTEXT.reset_player_state()
+                self._write_json({"ok": True, "data": CONTEXT.snapshot()})
+                return
+            if route == "/api/player/restart-program":
+                if not self._is_local_client():
+                    self._write_json(
+                        {"ok": False, "error": "forbidden"},
+                        status=HTTPStatus.FORBIDDEN,
+                    )
+                    return
+                CONTEXT.restart_playback_program()
                 self._write_json({"ok": True, "data": CONTEXT.snapshot()})
                 return
             if route == "/api/data/reset":
@@ -2186,6 +2828,36 @@ class BilikaraHandler(BaseHTTPRequestHandler):
                 },
                 status=HTTPStatus.CONFLICT,
             )
+        except PlayerStatusAdmissionError as exc:
+            self._write_json(
+                {
+                    "ok": True,
+                    "data": {
+                        "accepted": False,
+                        "duplicate": False,
+                        "changed": False,
+                        "reason": exc.kind,
+                    },
+                }
+            )
+        except InternetRemoteDispatchError as exc:
+            self._write_json(
+                {"ok": False, "error": str(exc), "code": exc.kind},
+                status=exc.status_code or {
+                    "player_busy": HTTPStatus.TOO_MANY_REQUESTS,
+                    "stale_command": HTTPStatus.CONFLICT,
+                    "queue_changed": HTTPStatus.CONFLICT,
+                    "queue_item_missing": HTTPStatus.CONFLICT,
+                }.get(exc.kind, HTTPStatus.BAD_REQUEST),
+            )
+        except PlaylistStoreCommandError as exc:
+            status = {
+                "player_busy": HTTPStatus.TOO_MANY_REQUESTS,
+                "stale_command": HTTPStatus.CONFLICT,
+                "queue_changed": HTTPStatus.CONFLICT,
+                "queue_item_missing": HTTPStatus.CONFLICT,
+            }.get(exc.kind, HTTPStatus.BAD_REQUEST)
+            self._write_json({"ok": False, "error": str(exc), "code": exc.kind}, status=status)
         except ValueError as exc:
             self._write_json({"ok": False, "error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
         except Exception as exc:  # noqa: BLE001
@@ -2208,20 +2880,54 @@ class BilikaraHandler(BaseHTTPRequestHandler):
         selected_audio_pages = raw_selected_audio_pages if isinstance(raw_selected_audio_pages, list) else None
         if not CONTEXT.has_session_users():
             raise ValueError("请先在服务端添加本场 KTV 用户")
-        playback_selector = CONTEXT.capture_playback_selector()
+        admission = CONTEXT.snapshot()
+        requester_user_id = next((user["id"] for user in admission.get("session_user_entries", []) if user["name"] == requester_name), None)
         item = fetch_video_item(
             url,
             selected_video_page=selected_video_page,
             selected_audio_pages=selected_audio_pages,
-            playback_selector=playback_selector,
         )
-        existing_session_entry = CONTEXT.store.session_request_for_item(item)
-        active_duplicate = CONTEXT.store.active_duplicate_for_item(item)
-        if (existing_session_entry or active_duplicate) and not allow_repeat:
-            raise DuplicateSessionRequestError(item, existing_session_entry, active_duplicate)
-        CONTEXT.add_item(item, position=position, requester_name=requester_name)
         try:
-            append_lark_pool_entries_in_background(
+            if CONTEXT.snapshot().get("session_generation") != admission.get("session_generation"):
+                raise ValueError("本场已结束，请重新点歌")
+            CONTEXT.add_item(
+                item,
+                position=position,
+                requester_name=requester_name,
+                requester_user_id=requester_user_id,
+                allow_repeat=allow_repeat,
+            )
+        except PlaylistStoreCommandError as exc:
+            if exc.kind != "duplicate_session_request":
+                raise
+            details = exc.details
+            if not isinstance(details, dict):
+                raise RuntimeError("Rust AppState returned invalid duplicate details") from exc
+            session_payload = details.get("session_entry")
+            active_payload = details.get("active_item")
+            if session_payload is not None and not isinstance(session_payload, dict):
+                raise RuntimeError("Rust AppState returned invalid session duplicate") from exc
+            if active_payload is not None and not isinstance(active_payload, dict):
+                raise RuntimeError("Rust AppState returned invalid active duplicate") from exc
+            session_entry = (
+                HistoryEntry.from_dict(session_payload)
+                if isinstance(session_payload, dict)
+                else None
+            )
+            active_duplicate = (
+                PlaylistItem.from_dict(active_payload)
+                if isinstance(active_payload, dict)
+                else None
+            )
+            if session_entry is None and active_duplicate is None:
+                raise RuntimeError("Rust AppState returned an empty duplicate decision") from exc
+            raise DuplicateSessionRequestError(
+                item,
+                session_entry,
+                active_duplicate,
+            ) from exc
+        try:
+            append_catalog_entries_in_background(
                 [
                     {
                         "mid": str(item.owner_mid or ""),
@@ -2236,11 +2942,15 @@ class BilikaraHandler(BaseHTTPRequestHandler):
             )
         except Exception as exc:  # noqa: BLE001
             error = " ".join(str(exc).split())[:300] or type(exc).__name__
-            print(
-                f"[bilikara:lark] background append scheduling failed: {error}",
-                file=sys.stderr,
-                flush=True,
-            )
+            try:
+                print(
+                    f"[bilikara:catalog] background append scheduling failed: {error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            except (OSError, ValueError):
+                # Console failures cannot invalidate the committed song request.
+                pass
         self._write_json({"ok": True, "data": CONTEXT.snapshot()})
 
     def _delete_missing_bvid_from_pool_if_needed(self, body: dict, error: Exception) -> None:
@@ -2262,7 +2972,7 @@ class BilikaraHandler(BaseHTTPRequestHandler):
                 score=score,
             )
             if not result.get("success"):
-                print(f"[bilikara] rating submit failed: {result.get('error') or 'unknown error'}", flush=True)
+                _debug_print(f"[bilikara] rating submit failed: {result.get('error') or 'unknown error'}")
 
         threading.Thread(target=worker, daemon=True, name="bilikara-rating-submit").start()
 
@@ -2295,16 +3005,41 @@ class BilikaraHandler(BaseHTTPRequestHandler):
         prefix = "/media/"
         relative = route[len(prefix):] if route.startswith(prefix) else route
         decoded = unquote(relative)
+        decoded_path = Path(decoded)
         media_path = (CACHE_DIR / decoded).resolve()
-        if not _is_path_within(media_path, CACHE_DIR.resolve()) or not media_path.exists():
+        if (
+            decoded_path.is_absolute()
+            or not decoded_path.parts
+            or any(part in {".", ".."} or part.startswith(".") for part in decoded_path.parts)
+            or not _is_path_within(media_path, CACHE_DIR.resolve())
+        ):
             self._write_json({"ok": False, "error": "媒体文件不存在"}, status=HTTPStatus.NOT_FOUND)
             return
-        self._stream_file(
-            media_path,
-            content_type=self._guess_type(media_path),
-            allow_ranges=True,
-            head_only=head_only,
-        )
+        reader_lease = None
+        if decoded_path.parts[0] == "artifacts":
+            reader_lease = CONTEXT.cache_manager.acquire_media_reader(decoded)
+            if reader_lease is None:
+                self._write_json(
+                    {"ok": False, "error": "媒体文件不存在"},
+                    status=HTTPStatus.NOT_FOUND,
+                )
+                return
+        try:
+            if not media_path.is_file():
+                self._write_json(
+                    {"ok": False, "error": "媒体文件不存在"},
+                    status=HTTPStatus.NOT_FOUND,
+                )
+                return
+            self._stream_file(
+                media_path,
+                content_type=self._guess_type(media_path),
+                allow_ranges=True,
+                head_only=head_only,
+            )
+        finally:
+            if reader_lease is not None:
+                CONTEXT.cache_manager.release_media_reader(reader_lease)
 
     def _read_json_body(self) -> dict:
         raw_length = self.headers.get("Content-Length", "0")
@@ -2687,6 +3422,22 @@ def _serve(
     server = ThreadingHTTPServer((host, actual_port), BilikaraHandler)
     bound_host, bound_port = server.server_address[:2]
     actual_port = bound_port
+    loopback_server = None
+    loopback_host = _loopback_companion_host(host)
+    if loopback_host:
+        try:
+            loopback_server = ThreadingHTTPServer(
+                (loopback_host, actual_port),
+                BilikaraHandler,
+            )
+        except Exception:
+            server.server_close()
+            raise
+        threading.Thread(
+            target=loopback_server.serve_forever,
+            daemon=True,
+            name="bilikara-loopback-http",
+        ).start()
     CONTEXT.bind_server(server, shutdown_on_last_client=shutdown_on_last_client)
     if CONTEXT.cache_manager.bbdown_login_status().get("logged_in"):
         CONTEXT.refresh_startup_gatcha_cache_in_background()
@@ -2720,6 +3471,9 @@ def _serve(
     finally:
         CONTEXT.shutdown()
         server.server_close()
+        if loopback_server is not None:
+            loopback_server.shutdown()
+            loopback_server.server_close()
 
 
 def run(
@@ -2756,17 +3510,12 @@ def run_webui(
     )
 
 
-def _playlist_export_logo_path() -> Path | None:
-    for filename in ("bili.png", "bili.jpg", "bili.jpeg"):
-        candidate = STATIC_DIR / "pic" / filename
-        if candidate.exists():
-            return candidate
-    return None
-
-
 def _port_probe_hosts(host: str) -> tuple[str, ...]:
     if host == "0.0.0.0":
         return (host, "127.0.0.1")
+    companion = _loopback_companion_host(host)
+    if companion:
+        return (host, companion)
     return (host,)
 
 

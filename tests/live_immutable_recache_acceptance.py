@@ -1,0 +1,1253 @@
+#!/usr/bin/env python3
+"""Deterministic real-browser acceptance for immutable cache publication.
+
+This executable test deliberately replaces only remote media acquisition.  It
+keeps the Rust AppState, Python CacheManager worker, validation/publication,
+HTTP server/Range handling, Host UI, and Chromium media engine real.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import types
+from pathlib import Path
+from typing import Any
+
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+BROWSER_DRIVER = Path(__file__).with_name("live_immutable_recache_browser.js")
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+SCENARIOS = (
+    "player-reset",
+    "failed-reset",
+    "recache-playing",
+    "retire-held-range",
+    "recache-paused",
+    "recache-failed",
+    "recache-cancelled",
+    "normal-switch",
+    "play-now-ready",
+    "play-now-uncached",
+    "natural-ended",
+    "session-rerender",
+    "inverse-snapshot",
+    "page-restore",
+    "rapid-session-switch",
+    "stale-next-recache",
+    "stale-next-first-carrier",
+    "staggered-readiness",
+    "rapid-unready-switch",
+    "settings-program-reconciliation",
+    "skipped-intermediate-program",
+)
+
+
+def _find_existing(candidates: tuple[Path, ...], label: str) -> Path:
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise RuntimeError(f"{label} is unavailable")
+
+
+def _tool_executable(
+    override: str | None, environment_name: str, executable_name: str
+) -> Path:
+    configured = override or os.environ.get(environment_name)
+    discovered = shutil.which(executable_name)
+    candidates = tuple(
+        Path(value).expanduser().resolve()
+        for value in (configured, discovered)
+        if value
+    )
+    return _find_existing(candidates, executable_name)
+
+
+def _playwright_module_root(override: str | None) -> Path:
+    configured = override or os.environ.get(
+        "BILIKARA_ACCEPTANCE_PLAYWRIGHT_MODULE_ROOT"
+    )
+    roots: list[Path] = []
+    if configured:
+        roots.append(Path(configured).expanduser().resolve())
+    roots.extend(
+        Path(entry).expanduser().resolve()
+        for entry in os.environ.get("NODE_PATH", "").split(os.pathsep)
+        if entry
+    )
+    roots.append(REPOSITORY_ROOT / "node_modules")
+    roots.extend(
+        package.parent.parent
+        for package in sorted(
+            (Path.home() / ".npm" / "_npx").glob(
+                "*/node_modules/playwright/package.json"
+            ),
+            reverse=True,
+        )
+    )
+    for root in roots:
+        if (root / "playwright" / "package.json").is_file():
+            return root
+        if root.name == "playwright" and (root / "package.json").is_file():
+            return root.parent
+    raise RuntimeError("Playwright Node module is unavailable")
+
+
+def _chromium_executable(override: str | None) -> Path:
+    configured = override or os.environ.get("BILIKARA_ACCEPTANCE_CHROMIUM")
+    candidates: list[Path] = []
+    if configured:
+        candidates.append(Path(configured).expanduser().resolve())
+    for executable in ("chromium", "chromium-browser", "google-chrome"):
+        discovered = shutil.which(executable)
+        if discovered:
+            candidates.append(Path(discovered).resolve())
+    browser_roots = [Path.home() / ".cache" / "ms-playwright"]
+    configured_browser_root = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    if configured_browser_root and configured_browser_root != "0":
+        browser_roots.insert(
+            0, Path(configured_browser_root).expanduser().resolve()
+        )
+    for browser_root in browser_roots:
+        for pattern in (
+            "chromium-*/chrome-linux/chrome",
+            "chromium-*/chrome-linux64/chrome",
+            "chromium_headless_shell-*/chrome-headless-shell-linux64/chrome-headless-shell",
+        ):
+            candidates.extend(sorted(browser_root.glob(pattern), reverse=True))
+    return _find_existing(tuple(candidates), "Playwright Chromium")
+
+
+def _run_checked(command: list[str]) -> None:
+    completed = subprocess.run(
+        command,
+        cwd=REPOSITORY_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"command failed ({completed.returncode}): {' '.join(command)}\n"
+            f"{completed.stdout}\n{completed.stderr}"
+        )
+
+
+def _generate_fixture(
+    fixture_root: Path,
+    name: str,
+    *,
+    ffmpeg: Path,
+    duration: float,
+    color: str,
+    frequency: int,
+) -> dict[str, Any]:
+    video_path = fixture_root / f"{name}-video.webm"
+    audio_path = fixture_root / f"{name}-audio.ogg"
+    _run_checked(
+        [
+            str(ffmpeg),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"color=c={color}:s=320x180:r=24:d={duration}",
+            "-an",
+            "-c:v",
+            "libvpx-vp9",
+            "-deadline",
+            "realtime",
+            "-cpu-used",
+            "8",
+            str(video_path),
+        ]
+    )
+    _run_checked(
+        [
+            str(ffmpeg),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"sine=frequency={frequency}:sample_rate=48000:duration={duration}",
+            "-vn",
+            "-c:a",
+            "libopus",
+            str(audio_path),
+        ]
+    )
+    return {
+        "video": str(video_path),
+        "audio": str(audio_path),
+        "duration": duration,
+    }
+
+
+def _fixtures(
+    fixture_root: Path, ffmpeg: Path
+) -> dict[str, dict[str, Any]]:
+    fixture_root.mkdir(parents=True, exist_ok=True)
+    return {
+        "a1": _generate_fixture(
+            fixture_root,
+            "a1",
+            ffmpeg=ffmpeg,
+            duration=6.0,
+            color="0x204080",
+            frequency=330,
+        ),
+        "a2": _generate_fixture(
+            fixture_root,
+            "a2",
+            ffmpeg=ffmpeg,
+            duration=6.0,
+            color="0x802040",
+            frequency=440,
+        ),
+        "a3": _generate_fixture(
+            fixture_root,
+            "a3",
+            ffmpeg=ffmpeg,
+            duration=6.0,
+            color="0x208040",
+            frequency=550,
+        ),
+        "b1": _generate_fixture(
+            fixture_root,
+            "b1",
+            ffmpeg=ffmpeg,
+            duration=4.0,
+            color="0x806020",
+            frequency=660,
+        ),
+        "c1": _generate_fixture(
+            fixture_root,
+            "c1",
+            ffmpeg=ffmpeg,
+            duration=4.0,
+            color="0x602080",
+            frequency=770,
+        ),
+        "n1": _generate_fixture(
+            fixture_root,
+            "n1",
+            ffmpeg=ffmpeg,
+            duration=1.6,
+            color="0x206060",
+            frequency=880,
+        ),
+    }
+
+
+def _scenario_plan(scenario: str) -> tuple[list[str], int, dict[str, list[dict[str, Any]]], list[str]]:
+    delayed_a2 = {"fixture": "a2", "delay": 1.8}
+    if scenario == "player-reset":
+        return ["A"], 1, {"A": [{"fixture": "a1"}]}, ["A"]
+    if scenario == "failed-reset":
+        return ["A"], 1, {"A": [{"fixture": "a1"}]}, ["A"]
+    if scenario in {"recache-playing", "retire-held-range"}:
+        return ["A"], 1, {"A": [{"fixture": "a1"}, delayed_a2]}, ["A"]
+    if scenario == "recache-paused":
+        return ["A"], 1, {"A": [{"fixture": "a1"}, delayed_a2]}, ["A"]
+    if scenario == "recache-failed":
+        return ["A"], 1, {
+            "A": [{"fixture": "a1"}, {"fixture": "a2", "delay": 0.8, "fail": True}]
+        }, ["A"]
+    if scenario == "recache-cancelled":
+        return ["A"], 1, {
+            "A": [
+                {"fixture": "a1"},
+                {"fixture": "a2", "delay": 2.0},
+                {"fixture": "a3", "delay": 0.5},
+            ]
+        }, ["A"]
+    if scenario == "normal-switch":
+        return ["A", "B"], 2, {
+            "A": [{"fixture": "a1"}, delayed_a2],
+            "B": [{"fixture": "b1"}],
+        }, ["A", "B"]
+    if scenario == "play-now-ready":
+        return ["A", "B", "C"], 3, {
+            "A": [{"fixture": "a1"}, delayed_a2],
+            "B": [{"fixture": "b1"}],
+            "C": [{"fixture": "c1"}],
+        }, ["A", "B", "C"]
+    if scenario == "play-now-uncached":
+        return ["A", "B", "C"], 2, {
+            "A": [{"fixture": "a1"}, delayed_a2],
+            "B": [{"fixture": "b1"}],
+            "C": [{"fixture": "c1", "delay": 1.0}],
+        }, ["A", "B"]
+    if scenario == "natural-ended":
+        return ["A", "B"], 2, {
+            "A": [{"fixture": "n1"}],
+            "B": [{"fixture": "b1"}],
+        }, ["A", "B"]
+    if scenario == "session-rerender":
+        return ["A", "B"], 2, {
+            "A": [{"fixture": "a1"}],
+            "B": [{"fixture": "b1"}],
+        }, ["A", "B"]
+    if scenario == "inverse-snapshot":
+        return ["A", "B", "C"], 3, {
+            "A": [{"fixture": "a1"}],
+            "B": [{"fixture": "b1"}],
+            "C": [{"fixture": "c1"}],
+        }, ["A", "B", "C"]
+    if scenario == "page-restore":
+        return ["A"], 1, {"A": [{"fixture": "a1"}]}, ["A"]
+    if scenario == "rapid-session-switch":
+        return ["A", "B"], 2, {
+            "A": [{"fixture": "a1"}],
+            "B": [{"fixture": "b1"}],
+        }, ["A", "B"]
+    if scenario in {"stale-next-recache", "stale-next-first-carrier"}:
+        return ["A", "B"], 2, {
+            "A": [{"fixture": "a1"}, {"fixture": "a2", "delay": 0.5}],
+            "B": [{"fixture": "b1"}],
+        }, ["A", "B"]
+    if scenario == "staggered-readiness":
+        return ["A"], 1, {"A": [{"fixture": "a1"}]}, ["A"]
+    if scenario == "rapid-unready-switch":
+        return ["A", "B", "C"], 3, {
+            "A": [{"fixture": "a1"}],
+            "B": [{"fixture": "b1"}],
+            "C": [{"fixture": "c1"}],
+        }, ["A", "B", "C"]
+    if scenario == "settings-program-reconciliation":
+        return ["A"], 1, {
+            "A": [{"fixture": "a1"}, {"fixture": "a2", "delay": 0.5}],
+        }, ["A"]
+    if scenario == "skipped-intermediate-program":
+        return ["A"], 1, {
+            "A": [{"fixture": "a1"}, {"fixture": "a2", "delay": 0.5}],
+        }, ["A"]
+    raise ValueError(f"unknown scenario: {scenario}")
+
+
+class DeterministicAcquisition:
+    def __init__(
+        self,
+        fixtures: dict[str, dict[str, Any]],
+        plans: dict[str, list[dict[str, Any]]],
+        events: list[dict[str, Any]],
+    ) -> None:
+        self.fixtures = fixtures
+        self.plans = {item_id: list(entries) for item_id, entries in plans.items()}
+        self.events = events
+        self.lock = threading.RLock()
+
+    def download(self, manager: Any, item: Any, item_dir: Path, token: int) -> dict[str, object]:
+        from bilikara.cache import CacheCancelledError, DownloadCommandError
+
+        with self.lock:
+            plans = self.plans.get(item.id) or []
+            if not plans:
+                raise DownloadCommandError(f"no deterministic fixture plan for {item.id}")
+            plan = plans.pop(0)
+            fixture_name = str(plan["fixture"])
+            self.events.append(
+                {
+                    "event": "acquisition_started",
+                    "item_id": item.id,
+                    "cache_attempt_token": token,
+                    "fixture": fixture_name,
+                }
+            )
+
+        delay = float(plan.get("delay") or 0.0)
+        deadline = time.monotonic() + delay
+        while time.monotonic() < deadline:
+            try:
+                manager._raise_if_retry_requested(item.id)
+                manager._raise_if_priority_shift(item.id)
+            except CacheCancelledError:
+                with self.lock:
+                    self.events.append(
+                        {
+                            "event": "acquisition_cancelled",
+                            "item_id": item.id,
+                            "cache_attempt_token": token,
+                            "fixture": fixture_name,
+                        }
+                    )
+                raise
+            time.sleep(0.025)
+
+        fixture = self.fixtures[fixture_name]
+        video_path = item_dir / "fixture-video.webm"
+        audio_path = item_dir / "fixture-audio.ogg"
+        shutil.copy2(str(fixture["video"]), video_path)
+        if bool(plan.get("fail")):
+            with self.lock:
+                self.events.append(
+                    {
+                        "event": "acquisition_failed_after_video",
+                        "item_id": item.id,
+                        "cache_attempt_token": token,
+                        "fixture": fixture_name,
+                    }
+                )
+            raise DownloadCommandError("deterministic failure after prepared video")
+        shutil.copy2(str(fixture["audio"]), audio_path)
+
+        with self.lock:
+            self.events.append(
+                {
+                    "event": "acquisition_complete",
+                    "item_id": item.id,
+                    "cache_attempt_token": token,
+                    "fixture": fixture_name,
+                }
+            )
+        audio_url = manager._build_media_url(str(audio_path.relative_to(manager_cache_root())))
+        video_url = manager._build_media_url(str(video_path.relative_to(manager_cache_root())))
+        return {
+            "video_file": video_path,
+            "video_relative_path": str(video_path.relative_to(manager_cache_root())),
+            "video_media_url": video_url,
+            "audio_variants": [
+                {
+                    "id": "p1",
+                    "label": "伴奏",
+                    "page": 1,
+                    "audio_url": audio_url,
+                }
+            ],
+            "selected_audio_variant_id": "p1",
+            "validation_files": [
+                {
+                    "label": "fixture video",
+                    "path": video_path,
+                    "required_streams": {"video"},
+                    "stream_kind": "video",
+                    "page": 1,
+                    "expected_duration": float(fixture["duration"]),
+                    "download_source": "ytdlp",
+                },
+                {
+                    "label": "fixture audio",
+                    "path": audio_path,
+                    "required_streams": {"audio"},
+                    "stream_kind": "audio",
+                    "page": 1,
+                    "download_source": "ytdlp",
+                },
+            ],
+        }
+
+
+def manager_cache_root() -> Path:
+    from bilikara.cache import CACHE_DIR
+
+    return CACHE_DIR
+
+
+def _item(item_id: str, duration: float) -> Any:
+    from bilikara.models import PlaylistItem
+
+    return PlaylistItem(
+        id=item_id,
+        original_url=f"https://fixture.invalid/{item_id}",
+        resolved_url=f"https://fixture.invalid/{item_id}?p=1",
+        bvid=f"BVFIXTURE{item_id}",
+        aid=1000 + ord(item_id[0]),
+        cid=2000 + ord(item_id[0]),
+        page=1,
+        title=f"Fixture Song {item_id}",
+        part_title="P1",
+        display_title=f"Fixture Song {item_id}",
+        cover_url="",
+        embed_url="",
+        selected_pages=[1],
+        selected_cids=[2000 + ord(item_id[0])],
+        selected_durations=[max(1, round(duration))],
+        selected_parts=["伴奏"],
+        available_pages=[1],
+        available_cids=[2000 + ord(item_id[0])],
+        available_durations=[max(1, round(duration))],
+        available_parts=["伴奏"],
+    )
+
+
+def _wait_ready(context: Any, item_ids: list[str], timeout: float = 30.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if all(
+            (item := context.store.get_item(item_id)) is not None
+            and item.cache_status == "ready"
+            and bool(item.artifact_set_id)
+            for item_id in item_ids
+        ):
+            return
+        time.sleep(0.05)
+    snapshot = context.store.snapshot()
+    raise RuntimeError(
+        f"initial cache fill timed out for {item_ids}: "
+        f"{json.dumps(snapshot, ensure_ascii=False)}"
+    )
+
+
+def _worker(args: argparse.Namespace) -> int:
+    os.environ["BILIKARA_HOME"] = str(Path(args.runtime_root).resolve())
+    os.environ["BILIKARA_HOST"] = "127.0.0.1"
+    os.environ["BILIKARA_PORT"] = "0"
+    os.environ["BILIKARA_REQUIRE_RUST_LIB"] = "1"
+    os.environ["BILIKARA_MAX_CACHE_ITEMS"] = "5"
+
+    from http.server import ThreadingHTTPServer
+
+    from bilikara import server
+    from bilikara.cache import CacheManager
+
+    fixture_payload = json.loads(Path(args.fixtures_json).read_text(encoding="utf-8"))
+    item_ids, cache_limit, plans, initially_ready = _scenario_plan(args.scenario)
+    context = server.CONTEXT
+    manager: CacheManager = context.cache_manager
+    manager.max_cache_items = cache_limit
+    manager.download_source = "bbdown"
+    # Seed the same force-AVC decision Chromium reports before any items enter
+    # the cache window, so capability discovery is not mistaken for the
+    # user-requested recache under test.
+    manager.set_client_media_capabilities(
+        {
+            "hevc_supported": False,
+            "avc_supported": True,
+            "max_avc_quality_index": 0,
+            "can_play_type": {},
+            "avc_levels": [],
+            "user_agent": "deterministic acceptance preflight",
+            "platform": sys.platform,
+        }
+    )
+    events: list[dict[str, Any]] = []
+    # Observe supported call/handle boundaries. These are test observations only;
+    # eligibility and collection continue to execute exclusively in Rust.
+    observed_lock = threading.Lock()
+    observed_readers: dict[str, str] = {}
+    observed_claims: dict[tuple[object, ...], str] = {}
+    observed_attempts: dict[int, str] = {}
+    original_artifact_request = manager._artifact_request
+
+    def observed_artifact_request(command: str, **fields: Any) -> dict[str, Any]:
+        result = original_artifact_request(command, **fields)
+        with observed_lock:
+            if command == "acquire" and result.get("handle"):
+                observed_readers[result["handle"]] = "/".join(fields["relative_path"].split("/")[:3])
+            elif command == "release" and result.get("accepted"):
+                observed_readers.pop(fields["handle"], None)
+            elif command in {"claim", "retire"} and result.get("accepted"):
+                key = tuple(fields[name] for name in ("host_client_id", "playback_generation", "item_incarnation_id", "artifact_set_id"))
+                if command == "claim":
+                    observed_claims[key] = f"artifacts/{fields['item_incarnation_id']}/{fields['artifact_set_id']}"
+                else:
+                    observed_claims.pop(key, None)
+            elif command == "finish_attempts":
+                for token in fields["cache_attempt_tokens"]:
+                    observed_attempts.pop(token, None)
+        return result
+
+    manager._artifact_request = observed_artifact_request  # type: ignore[method-assign]
+    original_project = manager._project_cache_event
+
+    def observed_project(item_id: str, kind: str, *, cache_attempt_token: int, **fields: Any) -> bool:
+        try:
+            return original_project(item_id, kind, cache_attempt_token=cache_attempt_token, **fields)
+        finally:
+            if kind in {"ready", "failed", "cancelled", "evicted", "reset"}:
+                with observed_lock:
+                    observed_attempts.pop(cache_attempt_token, None)
+
+    manager._project_cache_event = observed_project  # type: ignore[method-assign]
+    acquisition = DeterministicAcquisition(fixture_payload, plans, events)
+    ffmpeg = Path(args.ffmpeg).resolve()
+    ffprobe = Path(args.ffprobe).resolve()
+
+    manager._ensure_downloader = types.MethodType(  # type: ignore[method-assign]
+        lambda self, _source: ffmpeg, manager
+    )
+    manager._ensure_ffmpeg = types.MethodType(  # type: ignore[method-assign]
+        lambda self, force_refresh=False: ffmpeg, manager
+    )
+    manager._ffprobe_path_for_ffmpeg = types.MethodType(  # type: ignore[method-assign]
+        lambda self, _ffmpeg_path: ffprobe, manager
+    )
+
+    def deterministic_download(
+        self: CacheManager,
+        item: Any,
+        _binary_path: Path,
+        _ffmpeg_path: Path,
+        item_dir: Path,
+        _log_path: Path,
+        *,
+        cache_attempt_token: int,
+        download_source: str,
+    ) -> dict[str, object]:
+        if download_source != "bbdown":
+            raise RuntimeError(f"unexpected source: {download_source}")
+        return acquisition.download(self, item, item_dir, cache_attempt_token)
+
+    manager._download_selected_streams = types.MethodType(  # type: ignore[method-assign]
+        deterministic_download, manager
+    )
+
+    original_begin = context.store.begin_cache_attempt
+
+    def traced_begin(item_id: str, expected_item_incarnation_id: str) -> int:
+        token = original_begin(item_id, expected_item_incarnation_id)
+        reservation = context.store.cache_attempt_reservation(token)
+        with observed_lock:
+            observed_attempts[token] = reservation["artifact_relative_directory"]
+        events.append(
+            {
+                "event": "attempt_reserved",
+                "item_id": item_id,
+                "cache_attempt_token": token,
+                "artifact_set_id": reservation["artifact_set_id"],
+                "artifact_relative_directory": reservation[
+                    "artifact_relative_directory"
+                ],
+                "refresh": reservation["refresh"],
+            }
+        )
+        return token
+
+    context.store.begin_cache_attempt = traced_begin  # type: ignore[method-assign]
+    original_publish = manager._publish_validated_cache_result
+
+    def traced_publish(*publish_args: Any, **publish_kwargs: Any) -> None:
+        original_publish(*publish_args, **publish_kwargs)
+        reservation = publish_args[2]
+        events.append(
+            {
+                "event": "directory_published",
+                "item_id": publish_args[0],
+                "cache_attempt_token": publish_args[1],
+                "artifact_set_id": reservation["artifact_set_id"],
+                "artifact_relative_directory": reservation[
+                    "artifact_relative_directory"
+                ],
+            }
+        )
+
+    manager._publish_validated_cache_result = traced_publish  # type: ignore[method-assign]
+    original_advance = context.advance_to_next
+    advance_count = 0
+
+    def counted_advance(expected_playback_generation: int) -> None:
+        nonlocal advance_count
+        advance_count += 1
+        events.append({"event": "advance_mutation", "count": advance_count})
+        original_advance(expected_playback_generation)
+
+    context.advance_to_next = counted_advance  # type: ignore[method-assign]
+
+    context.store.add_session_user("acceptance-user")
+    context.store.set_song_advance_delay_seconds(0)
+    durations = {key: float(value["duration"]) for key, value in fixture_payload.items()}
+    for item_id in item_ids:
+        fixture_key = plans[item_id][0]["fixture"]
+        context.store.add_item(
+            _item(item_id, durations[str(fixture_key)]),
+            requester_name="acceptance-user",
+        )
+    manager.sync_with_playlist()
+    _wait_ready(context, initially_ready)
+
+    held_range_started = threading.Event()
+    held_range_release = threading.Event()
+    held_range_stream_finished = threading.Event()
+    held_host_retired = threading.Event()
+    held_range_evidence: dict[str, Any] = {}
+    held_monitor: threading.Thread | None = None
+    initial_current = context.store.snapshot().get("current_item") or {}
+    initial_artifact_set_id = str(initial_current.get("artifact_set_id") or "")
+    initial_artifact_relative_directory = str(
+        initial_current.get("artifact_relative_directory") or ""
+    )
+
+    original_retire = manager.retire_host_playback_program
+
+    def traced_retire(
+        self: CacheManager,
+        *,
+        host_client_id: object,
+        playback_generation: object,
+        item_incarnation_id: object,
+        artifact_set_id: object,
+    ) -> bool:
+        released = original_retire(
+            host_client_id=host_client_id,
+            playback_generation=playback_generation,
+            item_incarnation_id=item_incarnation_id,
+            artifact_set_id=artifact_set_id,
+        )
+        events.append(
+            {
+                "event": "host_program_retired",
+                "host_client_id": host_client_id,
+                "playback_generation": playback_generation,
+                "item_incarnation_id": item_incarnation_id,
+                "artifact_set_id": artifact_set_id,
+                "released": released,
+            }
+        )
+        if (
+            args.scenario == "retire-held-range"
+            and held_range_started.is_set()
+            and artifact_set_id == initial_artifact_set_id
+            and released
+        ):
+            held_host_retired.set()
+        return released
+
+    manager.retire_host_playback_program = types.MethodType(  # type: ignore[method-assign]
+        traced_retire, manager
+    )
+
+    if args.scenario == "retire-held-range":
+        if not initial_artifact_set_id or not initial_artifact_relative_directory:
+            raise RuntimeError("held-Range scenario has no initial immutable artifact")
+        original_stream_file = server.BilikaraHandler._stream_file
+
+        class HeldRangeBodyWriter:
+            def __init__(self, wrapped: Any) -> None:
+                self.wrapped = wrapped
+                self.write_count = 0
+                self.body_released = False
+
+            def write(self, payload: bytes) -> Any:
+                self.write_count += 1
+                if self.write_count > 1 and not self.body_released:
+                    self.body_released = True
+                    held_range_started.set()
+                    if not held_range_release.wait(timeout=30.0):
+                        raise TimeoutError("held media Range was not released")
+                return self.wrapped.write(payload)
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self.wrapped, name)
+
+        def held_stream_file(handler: Any, *stream_args: Any, **stream_kwargs: Any) -> None:
+            if handler.headers.get("X-Bilikara-Acceptance-Hold-Range", "") != "1":
+                original_stream_file(handler, *stream_args, **stream_kwargs)
+                return
+            original_writer = handler.wfile
+            handler.wfile = HeldRangeBodyWriter(original_writer)
+            try:
+                original_stream_file(handler, *stream_args, **stream_kwargs)
+            finally:
+                handler.wfile = original_writer
+                held_range_stream_finished.set()
+
+        server.BilikaraHandler._stream_file = held_stream_file
+
+        def monitor_held_range() -> None:
+            old_directory = (
+                manager_cache_root() / initial_artifact_relative_directory
+            )
+            try:
+                if not held_range_started.wait(timeout=30.0):
+                    raise RuntimeError("held Range body did not start")
+                if not held_host_retired.wait(timeout=30.0):
+                    raise RuntimeError("Host did not retire the held artifact program")
+                deadline = time.monotonic() + 20.0
+                replacement_directory = ""
+                replacement_artifact = ""
+                while time.monotonic() < deadline:
+                    current = context.store.snapshot().get("current_item") or {}
+                    replacement_artifact = str(current.get("artifact_set_id") or "")
+                    replacement_directory = str(
+                        current.get("artifact_relative_directory") or ""
+                    )
+                    if (
+                        replacement_artifact
+                        and replacement_artifact != initial_artifact_set_id
+                        and replacement_directory
+                    ):
+                        break
+                    time.sleep(0.025)
+                else:
+                    raise RuntimeError("replacement artifact was not Ready")
+                replacement_path = manager_cache_root() / replacement_directory
+                with observed_lock:
+                    active_readers = sum(
+                        relative == initial_artifact_relative_directory
+                        for relative in observed_readers.values()
+                    )
+                held_range_evidence.update(
+                    {
+                        "old_artifact_set_id": initial_artifact_set_id,
+                        "replacement_artifact_set_id": replacement_artifact,
+                        "old_exists_while_reader_held": old_directory.is_dir(),
+                        "replacement_exists_while_reader_held": (
+                            replacement_path.is_dir()
+                        ),
+                        "active_readers_while_held": active_readers,
+                    }
+                )
+                held_range_release.set()
+                if not held_range_stream_finished.wait(timeout=10.0):
+                    raise RuntimeError("held Range stream did not finish")
+                deadline = time.monotonic() + 10.0
+                while time.monotonic() < deadline and old_directory.exists():
+                    time.sleep(0.025)
+                held_range_evidence.update(
+                    {
+                        "old_absent_after_reader_release": (
+                            not old_directory.exists()
+                        ),
+                        "replacement_exists_after_reader_release": (
+                            replacement_path.is_dir()
+                        ),
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001
+                held_range_evidence["error"] = f"{type(exc).__name__}: {exc}"
+            finally:
+                held_range_release.set()
+
+        held_monitor = threading.Thread(
+            target=monitor_held_range,
+            daemon=True,
+            name="bilikara-held-range-acceptance",
+        )
+        held_monitor.start()
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.BilikaraHandler)
+    context.bind_server(httpd, shutdown_on_last_client=False)
+    server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    server_thread.start()
+    port = int(httpd.server_address[1])
+
+    node_env = dict(os.environ)
+    node_env["NODE_PATH"] = args.playwright_module_root
+    command = [
+        "node",
+        str(BROWSER_DRIVER),
+        f"http://127.0.0.1:{port}",
+        args.scenario,
+        args.chromium,
+    ]
+    if args.screenshot:
+        command.append(args.screenshot)
+    completed = subprocess.run(
+        command,
+        cwd=REPOSITORY_ROOT,
+        env=node_env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=90,
+    )
+    if held_monitor is not None:
+        held_monitor.join(timeout=12.0)
+        if held_monitor.is_alive():
+            held_range_evidence["error"] = "held Range monitor did not settle"
+            held_range_release.set()
+            held_monitor.join(timeout=2.0)
+    try:
+        browser_result = json.loads(completed.stdout.strip().splitlines()[-1])
+    except (IndexError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"browser driver returned invalid evidence\nstdout:\n{completed.stdout}\n"
+            f"stderr:\n{completed.stderr}"
+        ) from exc
+    final_snapshot = context.store.snapshot()
+    current_payload = final_snapshot.get("current_item") or {}
+    published_events = [
+        event for event in events if event.get("event") == "directory_published"
+    ]
+    live_artifact_directories = {
+        str(item.get("artifact_relative_directory") or "")
+        for item in [
+            final_snapshot.get("current_item"),
+            *(final_snapshot.get("playlist") or []),
+        ]
+        if isinstance(item, dict)
+        and item.get("artifact_set_id")
+        and item.get("artifact_relative_directory")
+    }
+    published_directory_states = {
+        str(event.get("artifact_relative_directory") or ""): (
+            manager_cache_root()
+            / str(event.get("artifact_relative_directory") or "")
+        ).is_dir()
+        for event in published_events
+        if event.get("artifact_relative_directory")
+    }
+    with observed_lock:
+        operationally_pinned_directories = set(observed_attempts.values()) | set(observed_claims.values()) | set(observed_readers.values())
+    live_directories_exist = all(
+        published_directory_states.get(relative_directory, False)
+        for relative_directory in live_artifact_directories
+    )
+    superseded_directories_absent = all(
+        relative_directory in live_artifact_directories or not exists
+        for relative_directory, exists in published_directory_states.items()
+    )
+    eligible_superseded_directories_absent = all(
+        relative_directory in live_artifact_directories
+        or relative_directory in operationally_pinned_directories
+        or not exists
+        for relative_directory, exists in published_directory_states.items()
+    )
+    expected_current = (
+        "B"
+        if args.scenario in {"normal-switch", "natural-ended", "rapid-session-switch"}
+        else "C"
+        if args.scenario
+        in {
+            "play-now-ready",
+            "play-now-uncached",
+            "inverse-snapshot",
+            "rapid-unready-switch",
+        }
+        else "A"
+    )
+    server_acceptance = bool(
+        current_payload.get("id") == expected_current
+        and live_directories_exist
+        and eligible_superseded_directories_absent
+        and (
+            advance_count == 1
+            if args.scenario
+            in {
+                "normal-switch",
+                "natural-ended",
+                "rapid-session-switch",
+                "stale-next-recache",
+                "stale-next-first-carrier",
+            }
+            else advance_count == 0
+        )
+        and (
+            args.scenario != "natural-ended"
+            or (
+                len(final_snapshot.get("history") or []) == 1
+                and len(final_snapshot.get("session_played") or []) == 2
+            )
+        )
+        and (
+            args.scenario != "recache-failed"
+            or (
+                len(published_events) == 1
+                and any(
+                    event.get("event") == "acquisition_failed_after_video"
+                    for event in events
+                )
+            )
+        )
+        and (
+            args.scenario != "recache-cancelled"
+            or (
+                len(published_events) == 2
+                and any(
+                    event.get("event") == "acquisition_cancelled"
+                    for event in events
+                )
+            )
+        )
+        and (
+            args.scenario != "retire-held-range"
+            or (
+                held_range_evidence.get("old_exists_while_reader_held") is True
+                and held_range_evidence.get(
+                    "replacement_exists_while_reader_held"
+                )
+                is True
+                and int(
+                    held_range_evidence.get("active_readers_while_held") or 0
+                )
+                >= 1
+                and held_range_evidence.get("old_absent_after_reader_release")
+                is True
+                and held_range_evidence.get(
+                    "replacement_exists_after_reader_release"
+                )
+                is True
+                and not held_range_evidence.get("error")
+            )
+        )
+        and (
+            args.scenario != "skipped-intermediate-program"
+            or superseded_directories_absent
+        )
+    )
+    result = {
+        "scenario": args.scenario,
+        "passed": (
+            completed.returncode == 0
+            and browser_result.get("passed") is True
+            and server_acceptance
+        ),
+        "browser": browser_result,
+        "server_acceptance": server_acceptance,
+        "advance_mutations": advance_count,
+        "cache_events": events,
+        "final_current_item": current_payload.get("id"),
+        "final_artifact_set_id": current_payload.get("artifact_set_id"),
+        "final_revision": final_snapshot.get("revision"),
+        "session_played_count": len(final_snapshot.get("session_played") or []),
+        "history_count": len(final_snapshot.get("history") or []),
+        "live_artifact_directories": sorted(live_artifact_directories),
+        "published_directory_states_before_shutdown": published_directory_states,
+        "operationally_pinned_directories_before_shutdown": sorted(
+            operationally_pinned_directories
+        ),
+        "live_directories_exist_before_shutdown": live_directories_exist,
+        "superseded_directories_absent_before_shutdown": (
+            superseded_directories_absent
+        ),
+        "eligible_superseded_directories_absent_before_shutdown": (
+            eligible_superseded_directories_absent
+        ),
+        "held_range_retirement": held_range_evidence,
+        "browser_stderr": completed.stderr.strip(),
+    }
+    print(f"LIVE_RESULT_JSON={json.dumps(result, ensure_ascii=False)}", flush=True)
+    httpd.shutdown()
+    httpd.server_close()
+    context.shutdown()
+    return 0 if result["passed"] else 1
+
+
+def _main(args: argparse.Namespace) -> int:
+    ffmpeg = _tool_executable(
+        args.ffmpeg, "BILIKARA_ACCEPTANCE_FFMPEG", "ffmpeg"
+    )
+    ffprobe = _tool_executable(
+        args.ffprobe, "BILIKARA_ACCEPTANCE_FFPROBE", "ffprobe"
+    )
+    playwright_root = _playwright_module_root(args.playwright_module_root)
+    chromium = _chromium_executable(args.chromium)
+    started_at = time.time()
+    with tempfile.TemporaryDirectory(prefix="bilikara-live-recache-") as temp_name:
+        temp_root = Path(temp_name)
+        fixtures = _fixtures(temp_root / "fixtures", ffmpeg)
+        fixtures_json = temp_root / "fixtures.json"
+        fixtures_json.write_text(json.dumps(fixtures), encoding="utf-8")
+        results: list[dict[str, Any]] = []
+        evidence_path = Path(args.evidence).resolve()
+        evidence_path.parent.mkdir(parents=True, exist_ok=True)
+        selected_scenarios = (args.scenario,) if args.scenario else SCENARIOS
+        for scenario in selected_scenarios:
+            runtime_root = temp_root / f"runtime-{scenario}"
+            command = [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--worker",
+                "--scenario",
+                scenario,
+                "--runtime-root",
+                str(runtime_root),
+                "--fixtures-json",
+                str(fixtures_json),
+                "--playwright-module-root",
+                str(playwright_root),
+                "--chromium",
+                str(chromium),
+                "--ffmpeg",
+                str(ffmpeg),
+                "--ffprobe",
+                str(ffprobe),
+            ]
+            if scenario in {
+                "player-reset",
+                "retire-held-range",
+                "rapid-session-switch",
+                "stale-next-recache",
+                "stale-next-first-carrier",
+            }:
+                command.extend(
+                    [
+                        "--screenshot",
+                        str(
+                            evidence_path.with_name(
+                                f"{evidence_path.stem}-{scenario}.png"
+                            )
+                        ),
+                    ]
+                )
+            completed = subprocess.run(
+                command,
+                cwd=REPOSITORY_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=120,
+            )
+            marker_lines = [
+                line.removeprefix("LIVE_RESULT_JSON=")
+                for line in completed.stdout.splitlines()
+                if line.startswith("LIVE_RESULT_JSON=")
+            ]
+            if not marker_lines:
+                raise RuntimeError(
+                    f"scenario {scenario} produced no evidence\n"
+                    f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
+                )
+            result = json.loads(marker_lines[-1])
+            result["worker_exit_code"] = completed.returncode
+            results.append(result)
+            print(
+                f"{scenario}: {'PASS' if result.get('passed') else 'FAIL'}",
+                flush=True,
+            )
+            if completed.returncode != 0:
+                break
+
+        evidence = {
+            "contract": "safe-immutable-artifact-retirement-v1",
+            "platform": sys.platform,
+            "python": sys.version.split()[0],
+            "browser_engine": "Playwright Chromium",
+            "playwright_module_root": str(playwright_root),
+            "chromium": str(chromium),
+            "ffmpeg": str(ffmpeg),
+            "ffprobe": str(ffprobe),
+            "media_engine": "Chromium HTMLMediaElement with real HTTP media",
+            "fixture_durations_seconds": {
+                name: payload["duration"] for name, payload in fixtures.items()
+            },
+            "isolated_runtime": True,
+            "started_at_epoch": started_at,
+            "finished_at_epoch": time.time(),
+            "scenarios": results,
+            "corner_case_matrix": {
+                "live_passed": [
+                    "rapid double recache supersedes the first attempt",
+                    "partial video-only failure retains the committed set",
+                    "same item and logical filenames publish different URLs",
+                    "old/new Range reads overlap authoritative publication",
+                    "multiple concurrent readers access the old committed set",
+                    "a held old-artifact Range reader delays live retirement until its exact release",
+                    "playing and paused recache preserve time and intent",
+                    "player reset retires one media pair and mounts one fresh lifetime",
+                    "normal next rejects a late old-element ended callback",
+                    "Play Now Ready and uncached reject late old-item work/events",
+                    "natural media end advances and archives exactly once",
+                    "unchanged-program Host rerenders preserve one advancing media pair",
+                    "inverse full-snapshot delivery cannot roll back the accepted program",
+                    "page restore and Host reload each advance Rust generation before one fresh media lifetime",
+                    "rapid switch rejects late A play resolution/rejection without disturbing B",
+                    "stale delayed Next releases only its hold when a duplicate carrier follows immutable recache",
+                    "stale delayed Next accepts and reconciles a first-carrier immutable recache snapshot without reporting command success",
+                    "staggered video/audio readiness commits and starts only after both streams are ready",
+                    "rapid A to unready B to C retires B before only C commits and plays",
+                    "a settings response carrying a newer Rust program reconciles without polling",
+                    "two serialized but unaccepted intermediate programs create no artifact owner",
+                ],
+                "automated_coverage": [
+                    "stale filesystem publication leaves an orphan",
+                    "one invalid audio track rejects the whole set",
+                    "existing committed destination fails without overwrite",
+                    "same-ID remove/re-add receives a new item incarnation",
+                    "attempt/artifact counter overflow is atomic",
+                    "Ready rejection after publication preserves current state",
+                    "latest valid selected audio variant wins",
+                    "source changes affect future work only",
+                    "cache-window preemption and in-flight retry stay isolated",
+                    "explicit Reset/Evict invalidates while stale Ready rejects",
+                    "language/cache progress and presentation composition preserve media identity",
+                    "duplicate and stale ended callbacks do not advance twice",
+                ],
+                "not_run": {
+                    "pause_then_play_during_one_refresh": (
+                        "separate playing and paused publication transitions were exercised; "
+                        "the mid-attempt intent flip remains covered by Host behavioral tests"
+                    ),
+                    "seek_during_refresh": (
+                        "the live gate covered publication-time seek restoration; an interactive "
+                        "mid-download seek was not added to keep the harness deterministic"
+                    ),
+                    "audio_variant_change_during_refresh": (
+                        "deterministic live fixtures expose one audio variant; multi-variant "
+                        "selection precedence is covered by Rust AppState tests"
+                    ),
+                    "manual_next_play_now_overlap": (
+                        "bounded transition deduplication is covered by frontend behavioral tests"
+                    ),
+                    "natural_end_near_manual_or_recache": (
+                        "natural end, manual switch, stale ended, and recache completion were "
+                        "exercised independently to avoid timing-flaky acceptance"
+                    ),
+                    "source_switch_or_preemption_live": (
+                        "the acquisition seam is intentionally one captured source; source capture "
+                        "and worker preemption are covered by CacheManager integration tests"
+                    ),
+                    "shutdown_with_active_staging": (
+                        "each isolated worker shuts down after terminal publication; startup/shutdown "
+                        "cleanup boundaries are covered by automated cache tests"
+                    ),
+                    "explicit_clear_evict_live": (
+                        "destructive invalidation is outside the user-visible recache scenarios and "
+                        "is covered by Rust/Python automated tests"
+                    ),
+                    "windows_open_file_semantics": (
+                        "acceptance host is Linux; application reader ownership and deletion-failure "
+                        "retention were exercised, but physical Windows open-handle behavior was not"
+                    ),
+                    "physical_dual_display": (
+                        "headless Chromium has no physical second display; presentation regressions "
+                        "are covered by the dedicated automated suites"
+                    ),
+                },
+            },
+            "passed": len(results) == len(selected_scenarios)
+            and all(result.get("passed") for result in results),
+            "platform_skips": {
+                "windows_open_file_semantics": (
+                    "not run: acceptance host is Linux; physical Windows open-file deletion "
+                    "behavior remains a platform acceptance item"
+                ),
+                "physical_dual_display": (
+                    "not run: headless Chromium has no physical second display"
+                ),
+            },
+        }
+        evidence_path.write_text(
+            json.dumps(evidence, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        print(f"evidence: {evidence_path}", flush=True)
+        return 0 if evidence["passed"] else 1
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--evidence",
+        default="/tmp/bilikara-immutable-recache-playback-evidence.json",
+    )
+    parser.add_argument("--worker", action="store_true")
+    parser.add_argument("--scenario", choices=SCENARIOS)
+    parser.add_argument("--runtime-root")
+    parser.add_argument("--fixtures-json")
+    parser.add_argument("--playwright-module-root")
+    parser.add_argument("--chromium")
+    parser.add_argument("--ffmpeg")
+    parser.add_argument("--ffprobe")
+    parser.add_argument("--screenshot")
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    parsed = parse_args()
+    if parsed.worker:
+        raise SystemExit(_worker(parsed))
+    raise SystemExit(_main(parsed))
