@@ -38,7 +38,7 @@ for(const engine of [chromium,webkit])test(`${engine.name()} Remote sheet column
     await page.setViewportSize({width,height});
     await page.evaluate(({language,cache,long})=>{
       setLanguage(language);
-      Object.assign(state.data.current_item,{display_title:long?'长歌曲标题🎤'.repeat(30):'Fixture Song',requester_name:long?'点歌人'.repeat(30):'Fixture',owner_name:long?'Uploader '.repeat(30):'Uploader',cache_status:cache,cache_message:''});
+      Object.assign(state.data.current_item,{display_title:long?'长歌曲标题🎤'.repeat(30):'Fixture Song',requester_name:long?'点歌人'.repeat(30):'Fixture',owner_name:long?'Uploader '.repeat(30):'Uploader',cache_status:cache,cache_message:'',cache_download_current_bytes:215*1024*1024,cache_download_total_bytes:233*1024*1024});
       render();applyPlaybackSheetAdaptiveLayout();
     },{language,cache,long});
     await page.waitForFunction(()=>!state.playbackMetadataLayoutFrame);
@@ -52,7 +52,7 @@ for(const engine of [chromium,webkit])test(`${engine.name()} Remote sheet column
         buttons:[...left.querySelectorAll('.player-control-row button')].filter(n=>n.getClientRects().length&&getComputedStyle(n).visibility!=='hidden').map(bounds)};
     });
   }
-  for(const [width,height] of [[700,320],[812,375],[1024,600]])for(const language of ['zh','en','ja'])for(const cache of ['ready','failed']){
+  for(const [width,height] of [[700,320],[812,375],[1024,600]])for(const language of ['zh','en','ja'])for(const cache of ['ready','failed','downloading']){
     const result=await layout(width,height,language,cache,true);measurements.push({...result,language,cache});
     assert.equal(result.twoColumns,true);assert.equal(result.bodyScroll,false);
     assert.equal(result.leftScroll,false,JSON.stringify(result));assert.equal(result.leftOverflow,'hidden');assert.equal(result.leftTouch,'pan-x');
@@ -61,6 +61,15 @@ for(const engine of [chromium,webkit])test(`${engine.name()} Remote sheet column
   }
   const evidence=process.env.BILIKARA_SHEET_COLUMNS_EVIDENCE;
   if(evidence)mkdirSync(evidence,{recursive:true});
+  // Rotation/available-height changes must retire an old song-column offset
+  // through the real resize path, without manually calling the layout function.
+  await layout(812,240,'zh','downloading',true);
+  await primary.evaluate(n=>{n.scrollTop=100;});
+  assert.ok(await primary.evaluate(n=>n.scrollTop)>0);
+  await page.setViewportSize({width:852,height:393});
+  await page.waitForFunction(()=>!state.playbackMetadataLayoutFrame&&elements.playbackSheetPrimary.scrollTop===0);
+  assert.equal(await primary.evaluate(n=>n.scrollHeight>n.clientHeight+1),false);
+  assert.ok(await page.locator('#current-title').evaluate(n=>n.getBoundingClientRect().top>=elements.playbackSheetPrimary.getBoundingClientRect().top-1));
   await layout(812,375);assert.equal(await secondary.evaluate(n=>n.scrollHeight>n.clientHeight+1),true);
   const fixed=await primary.boundingBox(),right=await secondary.boundingBox();
   await page.mouse.move(right.x+8,right.y+right.height/2);await page.mouse.wheel(0,180);
