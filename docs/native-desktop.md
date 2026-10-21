@@ -208,7 +208,7 @@ are retired, along with desktop construction and libav prerequisite test drivers
 Media-operation and native business drivers now use Node and native artifacts;
 remaining Source Host/FFI consumers stay active until faithful replacements
 preserve their coverage. Remaining Python verification and publication
-entries stay explicit; these cutovers do not publish Preview 3 or retire all CI
+entries stay explicit; these cutovers do not publish a release or retire all CI
 Python requirements.
 
 `python -m bilikara` is the Source entry; `start_bilikara.sh` and the debug-log

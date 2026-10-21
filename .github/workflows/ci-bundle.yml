@@ -594,7 +594,7 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           files: ${{ steps.bundle-name.outputs.archive_name }}
-          generate_release_notes: true
+          generate_release_notes: ${{ contains(github.ref_name, '-preview.') }}
           prerelease: ${{ contains(github.ref_name, '-preview.') }}
           draft: true
 
@@ -717,7 +717,7 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           files: ${{ steps.android.outputs.apk }}
-          generate_release_notes: true
+          generate_release_notes: ${{ contains(github.ref_name, '-preview.') }}
           prerelease: ${{ contains(github.ref_name, '-preview.') }}
           draft: true
 

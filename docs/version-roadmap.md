@@ -4,7 +4,7 @@ This roadmap records current product direction and ownership. It is not a build 
 
 ## v0.8 — convergence and release stabilization
 
-**Preview 2 has shipped. Stable v0.8.0 is in preparation**; Preview 3 remains an unpublished draft. Preserve approved Preview 1 behavior and subsequent fixes. A source commit or an Actions development artifact is not a public release. The [stable release notes](releases/v0.8.0.md) and [announcement copy](releases/v0.8.0-announcement.md) are drafts, pending final artifact acceptance and an explicit publication decision.
+**Preview 2 has shipped. Stable v0.8.0 is in preparation.** Preserve approved Preview 1 behavior and subsequent fixes. A source commit or an Actions development artifact is not a public release.
 
 ### Delivered ownership
 
